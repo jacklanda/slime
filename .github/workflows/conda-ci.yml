@@ -53,7 +53,7 @@ jobs:
           echo "Current directory: $(pwd)"
 
           mkdir -p /root/
-          BASE_DIR=/root bash build_conda.sh
+          INSTALL_CONDA_IF_MISSING=1 BASE_DIR=/root bash build_conda.sh
         shell: bash
 
       - name: Download model and dataset
@@ -78,8 +78,8 @@ jobs:
           cd $GITHUB_WORKSPACE
           echo "Current directory: $(pwd)"
 
-          source ~/.bashrc
-          micromamba activate slime
+          source "$(conda info --base)/etc/profile.d/conda.sh"
+          conda activate slime
           export CUDA_HOME="$CONDA_PREFIX"
 
           source scripts/models/qwen3-30B-A3B.sh
@@ -95,8 +95,8 @@ jobs:
           cd $GITHUB_WORKSPACE
           echo "Current directory: $(pwd)"
 
-          source ~/.bashrc
-          micromamba activate slime
+          source "$(conda info --base)/etc/profile.d/conda.sh"
+          conda activate slime
           export CUDA_HOME="$CONDA_PREFIX"
 
           SLIME_TEST_ENABLE_EVAL=0 SLIME_TEST_USE_DEEPEP=0 SLIME_TEST_USE_FP8_ROLLOUT=0 python tests/test_qwen3_30B_A3B.py
