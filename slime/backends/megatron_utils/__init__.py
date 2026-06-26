@@ -18,7 +18,7 @@ try:
 
     deep_ep.Buffer.__init__ = new_init
 except ImportError:
-    logging.warning("deep_ep is not installed, some functionalities may be limited.")
+    logging.debug("deep_ep is not installed; DeepEP-specific functionality will be unavailable.")
 
 try:
     from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import (

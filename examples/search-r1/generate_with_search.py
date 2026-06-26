@@ -22,6 +22,9 @@ SEARCH_R1_CONFIGS = {
     # (Only used when search_backend="local")
     "local": {
         "search_url": "http://127.0.0.1:8000/retrieve",  # URL of your local retrieval server
+        "retrieval_mode": "hybrid",
+        "retrieval_max_words": 4096,
+        "timeout": 60,
         "proxy": None,  # Set to your proxy if needed
     },
     # ============== Google Search Configuration ==============
@@ -34,7 +37,7 @@ SEARCH_R1_CONFIGS = {
     # ============== Log Probability Collection ==============
     "return_logprob": True,  # Set to True to collect log probabilities for TIS metrics
     # ============== Reward Model Configuration ==============
-    "format_score": 0.2,
+    "format_score": 0.0,
 }
 
 
@@ -71,8 +74,12 @@ async def search(query: str) -> str:
             local_config["search_url"],
             query,
             SEARCH_R1_CONFIGS["topk"],
+            timeout=local_config["timeout"],
             proxy=local_config["proxy"],
+            retrieval_mode=local_config["retrieval_mode"],
+            retrieval_max_words=local_config["retrieval_max_words"],
         )
+        return result
     elif backend == "google":
         from google_search_server import google_search
 

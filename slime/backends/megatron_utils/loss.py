@@ -51,6 +51,22 @@ def get_rollout_top_p_logprob_kwargs(args: Namespace, batch: dict[str, Any]) -> 
     }
 
 
+def _response_logit_bounds(seq_start: int, total_length: int, response_length: int) -> tuple[int, int, int]:
+    prompt_length = total_length - response_length
+    if prompt_length < 0:
+        raise ValueError(f"total_length ({total_length}) must be >= response_length ({response_length}).")
+    response_offset = 1 if prompt_length == 0 and response_length > 0 else 0
+    logit_start = seq_start + prompt_length + response_offset - 1
+    logit_end = seq_start + total_length - 1
+    return logit_start, logit_end, response_offset
+
+
+def _pad_missing_response_prefix(value: torch.Tensor, response_length: int, response_offset: int) -> torch.Tensor:
+    if response_offset == 0:
+        return value
+    return F.pad(value, (response_offset, 0), value=0)
+
+
 def get_responses(
     logits: torch.Tensor,
     *,
@@ -96,9 +112,11 @@ def get_responses(
     for tokens, total_length, response_length in zip(unconcat_tokens, total_lengths, response_lengths, strict=False):
         if cp_size == 1:
             end += total_length
-            start = end - response_length
-            logits_chunk = logits[start - 1 : end - 1]
-            tokens_chunk = tokens[-response_length:]
+            logit_start, logit_end, response_offset = _response_logit_bounds(
+                end - total_length, total_length, response_length
+            )
+            logits_chunk = _pad_missing_response_prefix(logits[logit_start:logit_end], response_length, response_offset)
+            tokens_chunk = tokens[-response_length:] if response_length > 0 else tokens[0:0]
         elif args.allgather_cp:
             # DSA: global concat then contiguous CP split. Each rank owns logits for
             # global positions [chunk_start, chunk_end).
@@ -107,11 +125,9 @@ def get_responses(
             chunk_start = cp_rank * logits_local_len
             chunk_end = chunk_start + logits_local_len
 
-            prompt_length = total_length - response_length
-            resp_token_start = seq_start + prompt_length
-            resp_token_end = seq_start + total_length
-            logit_global_start = resp_token_start - 1
-            logit_global_end = resp_token_end - 1
+            logit_global_start, logit_global_end, response_offset = _response_logit_bounds(
+                seq_start, total_length, response_length
+            )
 
             s = max(logit_global_start, chunk_start)
             e = min(logit_global_end, chunk_end)
@@ -189,9 +205,9 @@ def _allgather_cp_redistribute(
         full_resps = []
         seq_start = 0
         for value, total_length, response_length in zip(values, total_lengths, response_lengths, strict=False):
-            prompt_length = total_length - response_length
-            logit_global_start = seq_start + prompt_length - 1
-            logit_global_end = seq_start + total_length - 1
+            logit_global_start, logit_global_end, response_offset = _response_logit_bounds(
+                seq_start, total_length, response_length
+            )
 
             s = max(logit_global_start, chunk_start)
             e = min(logit_global_end, chunk_end)
@@ -205,8 +221,8 @@ def _allgather_cp_redistribute(
                     requires_grad=True,
                 )
             else:
-                resp_start = s - logit_global_start
-                resp_end = e - logit_global_start
+                resp_start = response_offset + s - logit_global_start
+                resp_end = response_offset + e - logit_global_start
                 full_resp = F.pad(value, (resp_start, response_length - resp_end))
 
             assert full_resp.size(0) == response_length, f"Expected {response_length}, got {full_resp.size(0)}"
@@ -261,7 +277,8 @@ def _build_shifted_tokens(
 
     offset = 0
     for tokens, total_length in zip(unconcat_tokens, total_lengths, strict=False):
-        full_tokens[offset : offset + total_length - 1] = tokens[1:total_length]
+        if total_length > 1:
+            full_tokens[offset : offset + total_length - 1] = tokens[1:total_length]
         offset += total_length
 
     # allgather-CP: slice to local chunk
@@ -335,7 +352,6 @@ def _build_topp_keep_mask(
         for ids, offsets, total_length, response_length in zip(
             top_p_token_ids, top_p_token_offsets, total_lengths, response_lengths, strict=False
         ):
-            prompt_length = total_length - response_length
             chunk_size_cp, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
                 total_length, response_length
             )
@@ -355,9 +371,9 @@ def _build_topp_keep_mask(
         for ids, offsets, total_length, response_length in zip(
             top_p_token_ids, top_p_token_offsets, total_lengths, response_lengths, strict=False
         ):
-            prompt_length = total_length - response_length
-            logit_global_start = seq_start + prompt_length - 1
-            logit_global_end = seq_start + total_length - 1
+            logit_global_start, logit_global_end, response_offset = _response_logit_bounds(
+                seq_start, total_length, response_length
+            )
             s = max(logit_global_start, chunk_start)
             e = min(logit_global_end, chunk_end)
             if e > s:
@@ -365,7 +381,7 @@ def _build_topp_keep_mask(
                     keep,
                     ids,
                     offsets,
-                    s - logit_global_start,
+                    response_offset + s - logit_global_start,
                     s - chunk_start,
                     e - s,
                     vocab_start,
@@ -378,9 +394,17 @@ def _build_topp_keep_mask(
     for ids, offsets, total_length, response_length in zip(
         top_p_token_ids, top_p_token_offsets, total_lengths, response_lengths, strict=False
     ):
-        end = offset + total_length
-        start = end - response_length
-        _fill_topp_mask_rows(keep, ids, offsets, 0, start - 1, response_length, vocab_start, vocab_end)
+        logit_start, logit_end, response_offset = _response_logit_bounds(offset, total_length, response_length)
+        _fill_topp_mask_rows(
+            keep,
+            ids,
+            offsets,
+            response_offset,
+            logit_start,
+            logit_end - logit_start,
+            vocab_start,
+            vocab_end,
+        )
         offset += total_length
 
     return keep
@@ -437,9 +461,9 @@ def _extract_per_sample(
 
         seq_start = 0
         for total_length, response_length in zip(total_lengths, response_lengths, strict=False):
-            prompt_length = total_length - response_length
-            logit_global_start = seq_start + prompt_length - 1
-            logit_global_end = seq_start + total_length - 1
+            logit_global_start, logit_global_end, response_offset = _response_logit_bounds(
+                seq_start, total_length, response_length
+            )
 
             s = max(logit_global_start, chunk_start)
             e = min(logit_global_end, chunk_end)
@@ -457,11 +481,14 @@ def _extract_per_sample(
         # cp1
         offset = 0
         for total_length, response_length in zip(total_lengths, response_lengths, strict=False):
-            end = offset + total_length
-            start = end - response_length
-            log_probs_list.append(log_prob_full[start - 1 : end - 1])
+            logit_start, logit_end, response_offset = _response_logit_bounds(offset, total_length, response_length)
+            log_probs_list.append(
+                _pad_missing_response_prefix(log_prob_full[logit_start:logit_end], response_length, response_offset)
+            )
             if entropy_full is not None:
-                entropy_list.append(entropy_full[start - 1 : end - 1])
+                entropy_list.append(
+                    _pad_missing_response_prefix(entropy_full[logit_start:logit_end], response_length, response_offset)
+                )
             offset += total_length
 
     return log_probs_list, entropy_list
@@ -695,7 +722,9 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     if args.kl_coef == 0 or not log_probs:
         # when kl_coef is 0, we won't compute ref_log_prob
-        xs = log_probs or rollout_log_probs or values
+        xs = log_probs or rollout_log_probs or values or loss_masks
+        if xs is None:
+            raise ValueError("Cannot build zero KL without log_probs, rollout_log_probs, values, or loss_masks.")
         kl = [torch.zeros_like(x, dtype=torch.float32, device=x.device) for x in xs]
     else:
         kl = [
@@ -909,6 +938,23 @@ def policy_loss_function(
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
+    pg_loss_masks = batch["policy_loss_masks"] if batch.get("policy_loss_masks") is not None else batch["loss_masks"]
+    pg_rollout_mask_sums = (
+        batch["policy_rollout_mask_sums"]
+        if batch.get("policy_rollout_mask_sums") is not None
+        else batch["rollout_mask_sums"]
+    )
+    pg_sum_of_sample_mean = (
+        get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            pg_loss_masks,
+            pg_rollout_mask_sums,
+            args.calculate_per_token_loss,
+        )
+        if pg_loss_masks is not batch["loss_masks"] or pg_rollout_mask_sums is not batch["rollout_mask_sums"]
+        else sum_of_sample_mean
+    )
 
     _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -953,7 +999,7 @@ def policy_loss_function(
             full_log_probs=full_log_probs,
             full_old_log_probs=full_old_log_probs,
             advantages=batch["advantages"],
-            loss_masks=batch["loss_masks"],
+            loss_masks=pg_loss_masks,
         )
 
     # Compute KL divergence (GSPO uses sequence-level KL, others use per-token KL)
@@ -962,7 +1008,7 @@ def policy_loss_function(
             full_log_probs=full_log_probs,
             full_old_log_probs=full_old_log_probs,
             local_log_probs=log_probs,
-            loss_masks=batch["loss_masks"],
+            loss_masks=pg_loss_masks,
         )
         old_log_probs = torch.cat(old_log_probs, dim=0)
         log_probs = torch.cat(log_probs, dim=0)
@@ -999,7 +1045,7 @@ def policy_loss_function(
             "pg_loss": pg_loss,
             "train_log_probs": train_log_probs_for_tis,
             "rollout_log_probs": batch["rollout_log_probs"],
-            "loss_masks": batch["loss_masks"],
+            "loss_masks": pg_loss_masks,
             "total_lengths": total_lengths,
             "response_lengths": response_lengths,
         }
@@ -1020,29 +1066,30 @@ def policy_loss_function(
             total_lengths,
             response_lengths,
             modified_response_masks,
-            batch["rollout_mask_sums"],
+            pg_rollout_mask_sums,
             args.calculate_per_token_loss,
         )
+        pg_sum_of_sample_mean = sum_of_sample_mean
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
     if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
         custom_pg_loss_reducer_func = load_function(args.custom_pg_loss_reducer_function_path)
         # Determine which loss_masks to use for pg_loss reducer
-        pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+        reducer_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else pg_loss_masks
         pg_loss_reducer = custom_pg_loss_reducer_func(
-            total_lengths, response_lengths, pg_loss_masks, args.calculate_per_token_loss
+            total_lengths, response_lengths, reducer_masks, args.calculate_per_token_loss
         )
     else:
-        pg_loss_reducer = sum_of_sample_mean
+        pg_loss_reducer = pg_sum_of_sample_mean
 
     pg_loss = pg_loss_reducer(pg_loss)
-    pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
-    ppo_kl = sum_of_sample_mean(ppo_kl)
+    pg_clipfrac = pg_sum_of_sample_mean(pg_clipfrac)
+    ppo_kl = pg_sum_of_sample_mean(ppo_kl)
 
     # entropy loss
     entropy = log_probs_and_entropy["entropy"]
     entropy = torch.cat(entropy, dim=0)
-    entropy_loss = sum_of_sample_mean(entropy)
+    entropy_loss = pg_sum_of_sample_mean(entropy)
 
     loss = pg_loss - args.entropy_coef * entropy_loss
 
@@ -1058,7 +1105,7 @@ def policy_loss_function(
             kl_loss_type=args.kl_loss_type,
             importance_ratio=importance_ratio,
         )
-        kl_loss = sum_of_sample_mean(kl)
+        kl_loss = pg_sum_of_sample_mean(kl)
 
         loss = loss + args.kl_loss_coef * kl_loss
 
@@ -1069,7 +1116,7 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        train_rollout_logprob_abs_diff = pg_sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
 
     reported_loss = {
         "loss": loss.clone().detach(),
@@ -1078,6 +1125,9 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
+    if "policy_loss_masks" in batch:
+        policy_tokens = sum(mask.sum() for mask in pg_loss_masks)
+        reported_loss["policy_loss_tokens"] = policy_tokens.float().clone().detach()
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
@@ -1246,7 +1296,12 @@ def loss_function(
         - `logging_dict` has keys "keys" (list of str metric names) and
           "values" (1D tensor: [count, metric1, metric2, ...]).
     """
-    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
+    loss_masks_for_token_count = (
+        batch["policy_loss_masks"]
+        if args.loss_type == "policy_loss" and batch.get("policy_loss_masks") is not None
+        else batch["loss_masks"]
+    )
+    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in loss_masks_for_token_count])
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],

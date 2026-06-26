@@ -21,6 +21,10 @@ from __future__ import annotations
 # in sys.modules first. pytest's prepend importmode puts this file's
 # directory (``tests/``) on sys.path, which is what makes the bare-name
 # import work without an ``__init__.py``.
+from argparse import Namespace
+import sys
+import types
+
 import _cp_dist_helpers  # noqa: F401
 import pytest
 import torch
@@ -200,6 +204,52 @@ def test_rollout_report_matches_train_report_in_single_step(dp_partition):
     """
     rollout_report = _simulate_rollout_report(dp_partition)
     assert rollout_report == pytest.approx(_EXPECTED_PER_ROLLOUT_MEAN_REPORT)
+
+
+@pytest.mark.unit
+def test_log_rollout_data_skips_policy_masks(monkeypatch):
+    """Credit-assignment policy masks are integer training internals, not metrics."""
+    from megatron.core import mpu as _mpu
+
+    packed_seq_params_mod = types.ModuleType("megatron.core.packed_seq_params")
+    packed_seq_params_mod.PackedSeqParams = type("PackedSeqParams", (), {})
+    monkeypatch.setitem(sys.modules, "megatron.core.packed_seq_params", packed_seq_params_mod)
+
+    from slime.backends.megatron_utils import data as data_mod
+
+    monkeypatch.setattr(_mpu, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(_mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+    monkeypatch.setattr(_mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(_mpu, "get_data_parallel_world_size", lambda with_context_parallel=False: 1, raising=False)
+
+    captured = {}
+
+    def fake_gather_log_data(metric_name, args, rollout_id, log_dict):
+        captured.update(log_dict)
+        return {f"{metric_name}/{key}": value[0] / value[1] for key, value in log_dict.items()}
+
+    monkeypatch.setattr(data_mod, "gather_log_data", fake_gather_log_data)
+
+    rollout_data = {
+        "tokens": [torch.tensor([1, 2, 3], dtype=torch.long)],
+        "loss_masks": [torch.tensor([1, 1], dtype=torch.int)],
+        "policy_loss_masks": [torch.tensor([0, 1], dtype=torch.int)],
+        "rollout_mask_sums": torch.tensor([2.0]),
+        "policy_rollout_mask_sums": torch.tensor([1.0]),
+        "response_lengths": [2],
+        "total_lengths": [3],
+        "global_batch_sizes": [1],
+        "num_microbatches": 1,
+        "micro_batch_indices": [[0]],
+        "rewards": [1.0],
+    }
+
+    args = Namespace(ci_test=False, log_multi_turn=False, log_passrate=False, log_correct_samples=False)
+    data_mod.log_rollout_data(0, args, rollout_data)
+
+    assert "policy_loss_masks" not in captured
+    assert "policy_rollout_mask_sums" not in captured
+    assert captured["rewards"] == pytest.approx((1.0, 1))
 
 
 @pytest.mark.unit

@@ -8,6 +8,11 @@ from pathlib import Path
 import ray
 import torch
 import torch.distributed as dist
+
+from slime.utils.logging_utils import suppress_known_training_warnings
+
+suppress_known_training_warnings()
+
 from megatron.core import mpu
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
@@ -235,10 +240,18 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_data["loss_masks"] = [
             t.to(device=device, dtype=torch.int, non_blocking=True) for t in rollout_data["loss_masks"]
         ]
+        if "policy_loss_masks" in rollout_data:
+            rollout_data["policy_loss_masks"] = [
+                t.to(device=device, dtype=torch.int, non_blocking=True) for t in rollout_data["policy_loss_masks"]
+            ]
         if "rollout_mask_sums" in rollout_data:
             # Promote precomputed per-rollout mask totals to GPU tensors here
             # (matching loss_masks) so the loss reducer can just divide.
             rollout_data["rollout_mask_sums"] = rollout_data["rollout_mask_sums"].to(
+                device=device, dtype=torch.float32, non_blocking=True
+            )
+        if "policy_rollout_mask_sums" in rollout_data:
+            rollout_data["policy_rollout_mask_sums"] = rollout_data["policy_rollout_mask_sums"].to(
                 device=device, dtype=torch.float32, non_blocking=True
             )
         if "multimodal_train_inputs" in rollout_data:
@@ -430,6 +443,7 @@ class MegatronTrainRayActor(TrainRayActor):
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
         global_batch_sizes = rollout_data["global_batch_sizes"]
+        rollout_metrics = rollout_data.get("rollout_metrics")
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
@@ -504,7 +518,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
-                compute_advantages_and_returns(self.args, rollout_data)
+                with timer("adv"):
+                    compute_advantages_and_returns(self.args, rollout_data)
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
@@ -527,6 +542,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_iterator,
                     num_microbatches,
                     global_batch_sizes,
+                    rollout_data=rollout_data,
+                    train_metrics_table_extra=rollout_metrics,
                 )
 
             self.prof.step(rollout_id=rollout_id)
@@ -582,10 +599,9 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
-        if self.args.use_fault_tolerance:
-            if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.recover_updatable_engines.remote())
-            dist.barrier(group=get_gloo_group())
+        if dist.get_rank() == 0:
+            ray.get(self.rollout_manager.recover_updatable_engines.remote())
+        dist.barrier(group=get_gloo_group())
 
         rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
             self.rollout_manager.get_updatable_engines_and_lock.remote()

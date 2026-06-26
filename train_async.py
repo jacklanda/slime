@@ -2,7 +2,7 @@ import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
-from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
+from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, suppress_known_training_warnings
 from slime.utils.misc import should_run_periodic_action
 
 
@@ -43,10 +43,12 @@ def train(args):
             value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
             if actor_trains_this_step:
                 ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
+                ray.get(rollout_manager.save_rllm_episodes.remote(rollout_id))
             else:
                 ray.get(value_refs)
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+            ray.get(rollout_manager.save_rllm_episodes.remote(rollout_id))
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             if (not args.use_critic) or rollout_id >= args.num_critic_only_steps:
@@ -76,5 +78,6 @@ def train(args):
 
 
 if __name__ == "__main__":
+    suppress_known_training_warnings()
     args = parse_args()
     train(args)

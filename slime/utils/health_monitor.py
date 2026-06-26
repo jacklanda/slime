@@ -158,20 +158,4 @@ class RolloutHealthMonitor:
             logger.debug(f"Health check passed for rollout engine {rollout_engine_id}")
 
     def _kill_engine(self, rollout_engine_id: int):
-        logger.info(f"Killing server group {rollout_engine_id}...")
-        for i in range(
-            rollout_engine_id * self._server_group.nodes_per_engine,
-            (rollout_engine_id + 1) * self._server_group.nodes_per_engine,
-        ):
-            engine = self._server_group.all_engines[i]
-            if engine:
-                logger.info(f"Shutting down and killing engine at index {i}")
-                try:
-                    ray.get(engine.shutdown.remote())
-                    ray.kill(engine)
-                    logger.info(f"Successfully killed engine at index {i}")
-                except Exception as e:
-                    logger.warning(f"Fail to kill engine at index {i} (e: {e})")
-            else:
-                logger.info(f"Engine at index {i} is already None")
-            self._server_group.all_engines[i] = None
+        self._server_group.mark_engine_group_dead(rollout_engine_id)

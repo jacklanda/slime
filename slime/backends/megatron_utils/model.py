@@ -29,6 +29,7 @@ except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.visualization import print_metrics_table
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
@@ -77,6 +78,331 @@ def _with_rollout_top_p_token_keys(args: Namespace, keys: Sequence[str]) -> list
     if args.rollout_top_p == 1.0:
         return list(keys)
     return [*keys, *ROLLOUT_TOP_P_TOKEN_KEYS]
+
+
+def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
+    if not rollout_data:
+        return {}
+    metrics_data = rollout_data.get("episode_metrics_data")
+    if not metrics_data:
+        return {}
+
+    samples = []
+    raw_rewards = rollout_data.get("raw_reward", metrics_data.get("raw_rewards", []))
+    metadata_list = metrics_data.get("metadata", [])
+    group_indices = metrics_data.get("group_indices", [])
+    rollout_ids = metrics_data.get("rollout_ids", [])
+    sample_indices = metrics_data.get("sample_indices", [])
+    remove_sample = metrics_data.get("remove_sample", [])
+    loss_mask_sums = metrics_data.get("loss_mask_sums", [])
+    prompt_lengths = metrics_data.get("prompt_lengths", [])
+    response_lengths = metrics_data.get("response_lengths", [])
+    statuses = metrics_data.get("statuses", [])
+    num_samples = len(raw_rewards)
+
+    valid_indices = []
+    for i in range(num_samples):
+        if i < len(remove_sample) and remove_sample[i]:
+            continue
+        if i < len(loss_mask_sums) and loss_mask_sums[i] == 0:
+            continue
+        valid_indices.append(i)
+        metadata = metadata_list[i] if i < len(metadata_list) and isinstance(metadata_list[i], dict) else {}
+        if "fused_task_type" not in metadata:
+            continue
+        group_id = group_indices[i] if i < len(group_indices) else None
+        if group_id is None:
+            group_id = rollout_ids[i] if i < len(rollout_ids) else None
+        if group_id is None:
+            group_id = sample_indices[i] if i < len(sample_indices) else i
+        samples.append(
+            {
+                "group_id": group_id,
+                "reward": float(raw_rewards[i]),
+                "metadata": metadata,
+            }
+        )
+
+    metrics = _response_metrics_for_actor_update(valid_indices, response_lengths, statuses)
+    metrics.update(
+        {
+            "episode/num": 0.0,
+            "episode/reward/mean": 0.0,
+            "episode/pass@1": 0.0,
+            "episode/correct": 0.0,
+        }
+    )
+    if not valid_indices:
+        return metrics
+
+    group_rewards: dict[object, list[float]] = {}
+    group_task_types: dict[object, str] = {}
+    group_terminations: dict[object, str] = {}
+    group_termination_rewards: dict[object, float] = {}
+    workflow_values: dict[str, list[float]] = {}
+    group_steps: dict[object, float] = {}
+    group_tool_call_turns: dict[object, float] = {}
+    group_prompt_tokens: dict[object, int] = {}
+    group_response_tokens: dict[object, int] = {}
+
+    for sample in samples:
+        metadata = sample["metadata"]
+        group_id = sample["group_id"]
+        reward = sample["reward"]
+        group_rewards.setdefault(group_id, []).append(reward)
+        task_type = str(metadata.get("fused_task_type") or metadata.get("task_type") or metadata.get("data_source") or "unknown")
+        group_task_types.setdefault(group_id, task_type)
+
+        if group_id not in group_steps:
+            steps = _coerce_finite_float(metadata.get("fused_traj_steps") or metadata.get("traj_steps"))
+            if steps is not None:
+                group_steps[group_id] = steps
+        if group_id not in group_tool_call_turns:
+            tool_call_turns = _coerce_finite_float(
+                metadata.get("fused_tool_call_turns")
+                or metadata.get("tool_call_turns")
+                or metadata.get("tool_call_turn")
+            )
+            if tool_call_turns is not None:
+                group_tool_call_turns[group_id] = tool_call_turns
+
+        termination = metadata.get("fused_termination") or metadata.get("termination_reason")
+        if termination:
+            termination = str(termination)
+            previous_reward = group_termination_rewards.get(group_id)
+            if (
+                previous_reward is None
+                or reward > previous_reward
+                or (
+                    reward == previous_reward
+                    and _termination_priority(termination) > _termination_priority(group_terminations[group_id])
+                )
+            ):
+                group_terminations[group_id] = termination
+                group_termination_rewards[group_id] = reward
+
+        rllm_episode = metadata.get("rllm_episode")
+        rllm_metrics = rllm_episode.get("metrics") if isinstance(rllm_episode, dict) else None
+        if isinstance(rllm_metrics, dict):
+            for key, value in rllm_metrics.items():
+                if isinstance(value, bool):
+                    value = int(value)
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    workflow_values.setdefault(str(key), []).append(float(value))
+
+        reward_debug = metadata.get("fused_reward_debug")
+        if isinstance(reward_debug, dict):
+            for key, value in reward_debug.items():
+                if isinstance(value, bool):
+                    value = int(value)
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    workflow_values.setdefault(key, []).append(float(value))
+
+    for i in valid_indices:
+        metadata = metadata_list[i] if i < len(metadata_list) and isinstance(metadata_list[i], dict) else {}
+        group_id = group_indices[i] if i < len(group_indices) else None
+        if group_id is None:
+            group_id = rollout_ids[i] if i < len(rollout_ids) else None
+        if group_id is None:
+            group_id = sample_indices[i] if i < len(sample_indices) else i
+        group_prompt_tokens[group_id] = group_prompt_tokens.get(group_id, 0) + int(prompt_lengths[i] if i < len(prompt_lengths) else 0)
+        group_response_tokens[group_id] = group_response_tokens.get(group_id, 0) + int(
+            response_lengths[i] if i < len(response_lengths) else 0
+        )
+        reward_debug = metadata.get("fused_reward_debug")
+        for key in _RLLM_EPISODE_TOOL_KEYS:
+            value = _metric_value_from_metadata(metadata, reward_debug, key)
+            if value is not None:
+                workflow_values.setdefault(key, []).append(value)
+
+    if not samples:
+        return metrics
+
+    episode_rewards = []
+    episode_solved = []
+    episode_rewards_by_source: dict[str, list[float]] = {}
+    episode_solved_by_source: dict[str, list[float]] = {}
+    episode_turn_values: dict[str, list[float]] = {}
+    episode_prompt_tokens = []
+    episode_response_tokens = []
+    for group_id, rewards in group_rewards.items():
+        task_type = group_task_types[group_id]
+        suffix = _metric_task_suffix(task_type)
+        reward = max(rewards)
+        solved = float(any(r > 0 for r in rewards))
+        episode_rewards.append(reward)
+        episode_solved.append(solved)
+        episode_rewards_by_source.setdefault(task_type, []).append(reward)
+        episode_solved_by_source.setdefault(task_type, []).append(solved)
+        episode_prompt_tokens.append(group_prompt_tokens.get(group_id, 0))
+        episode_response_tokens.append(group_response_tokens.get(group_id, 0))
+        if group_id in group_steps:
+            steps = group_steps[group_id]
+            episode_turn_values.setdefault("traj/steps", []).append(steps)
+            episode_turn_values.setdefault(f"traj/steps/{suffix}", []).append(steps)
+        if group_id in group_tool_call_turns:
+            tool_call_turns = group_tool_call_turns[group_id]
+            episode_turn_values.setdefault("turn/tool_call_turn", []).append(tool_call_turns)
+            episode_turn_values.setdefault(f"turn/tool_call_turn/{suffix}", []).append(tool_call_turns)
+
+    metrics.update({
+        "episode/num": float(len(group_rewards)),
+        "episode/reward/mean": float(sum(episode_rewards) / len(episode_rewards)),
+        "episode/pass@1": float(sum(episode_solved) / len(episode_solved)),
+        "episode/correct": float(sum(episode_solved) / len(episode_solved)),
+    })
+    if episode_prompt_tokens:
+        metrics["episode/prompt_tokens"] = float(sum(episode_prompt_tokens) / len(episode_prompt_tokens))
+    if episode_response_tokens:
+        metrics["episode/response_tokens"] = float(sum(episode_response_tokens) / len(episode_response_tokens))
+    for source, rewards in episode_rewards_by_source.items():
+        metrics[f"episode/reward/{source}/mean"] = float(sum(rewards) / len(rewards))
+    for source, solved in episode_solved_by_source.items():
+        metrics[f"episode/{source}/pass@1"] = float(sum(solved) / len(solved))
+    termination_counts = {reason: 0 for reason in _RLLM_TERMINATION_REASONS}
+    for group_id in group_rewards:
+        termination_counts[_normalize_termination_reason(group_terminations.get(group_id, "unknown"))] += 1
+    total_terminations = sum(termination_counts.values())
+    for termination, count in termination_counts.items():
+        metrics[f"episode/termination_reason/{termination}"] = count / total_terminations
+    for key, values in workflow_values.items():
+        mean_value = float(sum(values) / len(values))
+        metrics[f"episode/{key}"] = mean_value
+    for key, values in episode_turn_values.items():
+        metrics[f"episode/{key}"] = float(sum(values) / len(values))
+    if "episode/traj/steps" in metrics:
+        metrics["episode/num_turns"] = metrics["episode/traj/steps"]
+    return metrics
+
+
+def _response_metrics_for_actor_update(valid_indices: list[int], response_lengths: list, statuses: list) -> dict[str, float]:
+    metrics = {}
+    response_length_values = [float(response_lengths[i]) for i in valid_indices if i < len(response_lengths)]
+    if response_length_values:
+        metrics["response_length/mean"] = float(sum(response_length_values) / len(response_length_values))
+        metrics["response_length/min"] = float(min(response_length_values))
+        metrics["response_length/max"] = float(max(response_length_values))
+        max_response_len = getattr(get_args(), "rollout_max_response_len", None)
+        if max_response_len:
+            metrics["response_length/clip_ratio"] = sum(v >= max_response_len for v in response_length_values) / len(
+                response_length_values
+            )
+    status_values = [statuses[i] for i in valid_indices if i < len(statuses)]
+    if status_values:
+        metrics["response/aborted_ratio"] = sum(status == "aborted" for status in status_values) / len(status_values)
+    return metrics
+
+
+_RLLM_EPISODE_TOOL_KEYS = (
+    "tools/search_summary_failures",
+    "tools/search_summary_retries",
+    "tools/search_summary_fallbacks",
+    "tools/search_summary_elapsed_s",
+    "tools/search_retrieve_elapsed_s",
+    "tools/search_retrieve_retries",
+    "tools/search_retrieve_failures",
+    "tools/search_lexrank_summary",
+    "tools/mcp_tool_elapsed_s",
+    "tools/mcp_failures_per_step",
+    "tools/mcp_failures",
+)
+
+_RLLM_TERMINATION_REASONS = (
+    "unknown",
+    "timeout",
+    "max_turns_exceeded",
+    "max_response_length_exceeded",
+    "max_prompt_length_exceeded",
+    "error",
+    "env_done",
+)
+
+
+def _metric_value_from_metadata(metadata: dict, reward_debug, key: str) -> float | None:
+    for source in (reward_debug, metadata):
+        if not isinstance(source, dict) or key not in source:
+            continue
+        value = source[key]
+        if isinstance(value, bool):
+            value = int(value)
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            return float(value)
+    return None
+
+
+def _normalize_termination_reason(reason: str) -> str:
+    normalized = reason.lower().replace("-", "_")
+    aliases = {
+        "max_response_len_exceeded": "max_response_length_exceeded",
+        "step_token_budget_exhausted": "max_response_length_exceeded",
+        "truncation": "max_response_length_exceeded",
+        "max_context_len_exceeded": "max_prompt_length_exceeded",
+        "prompt_truncation": "max_prompt_length_exceeded",
+        "env_timeout": "timeout",
+        "abnormal_parse_error": "error",
+        "invalid_react_structure": "error",
+        "invalid_final_step": "error",
+        "abnormal_tool_burst": "error",
+        "abnormal_direct_submit_without_tool": "error",
+        "abnormal_repeated_query": "error",
+        "abnormal_ngram_repetition": "error",
+        "abnormal_search_bypass": "error",
+        "tail_guard_early_stop": "error",
+        "env_init_error": "error",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in _RLLM_TERMINATION_REASONS:
+        return "unknown"
+    return normalized
+
+
+def _termination_priority(reason: str) -> int:
+    order = {
+        "env_done": 5,
+        "max_response_length_exceeded": 4,
+        "max_prompt_length_exceeded": 3,
+        "max_turns_exceeded": 2,
+        "timeout": 1,
+        "error": 0,
+        "unknown": -1,
+    }
+    return order[_normalize_termination_reason(reason)]
+
+
+def _coerce_finite_float(value) -> float | None:
+    if isinstance(value, bool):
+        value = int(value)
+    if not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def _metric_task_suffix(task_type: str) -> str:
+    normalized = task_type.lower().replace(" ", "_").replace("-", "_")
+    if normalized in {"web_search", "search", "webqa"}:
+        return "webqa"
+    if normalized in {"mcp", "cli"}:
+        return normalized
+    if normalized in {"et", "endless_terminal", "endless_terminals", "swe"}:
+        return "cli"
+    return normalized or "unknown"
+
+
+def _charts_metrics_for_actor_update(train_metrics: dict[str, float]) -> dict[str, float]:
+    metrics = {}
+    key_map = {
+        "train/grad_norm": "Charts/grad_norm",
+        "train/loss": "Charts/loss",
+        "train/pg_loss": "Charts/loss",
+        "train/lr-pg_0": "Charts/lr",
+    }
+    for src, dst in key_map.items():
+        if dst not in metrics and src in train_metrics:
+            metrics[dst] = train_metrics[src]
+    return metrics
 
 
 def _iter_critic_output_layers(model: Sequence[DDP]):
@@ -631,6 +957,8 @@ def train(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     global_batch_sizes: Sequence[int],
+    rollout_data: dict | None = None,
+    train_metrics_table_extra: dict | None = None,
 ) -> None:
     """Run training over a rollout consisting of multiple steps.
 
@@ -650,6 +978,12 @@ def train(
             ``num_microbatches``; consumed by ``train_one_step`` for loss
             scaling and LR scheduler increments. Equals per-step sample count
             in the common case (1 rollout = 1 sample).
+        rollout_data (dict | None): Full rollout batch, used only for
+            actor-update-scoped metrics that must be computed after train-side
+            filters and postprocess hooks have run.
+        train_metrics_table_extra (dict | None): Additional metrics to include
+            in the printed train metrics table. These are display-only; normal
+            train logging still uses the per-step train metrics.
     """
     args = get_args()
 
@@ -809,6 +1143,9 @@ def train(
             # Per-step gbs — uneven step sizes are easy to miss without this.
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
             log_dict["train/step"] = accumulated_step_id
+            if role == "actor":
+                log_dict.update(_episode_metrics_for_actor_update(rollout_data))
+                log_dict.update(_charts_metrics_for_actor_update(log_dict))
             logging_utils.log(args, log_dict, step_key="train/step")
 
             if args.ci_test and "train/train_rollout_logprob_abs_diff" in log_dict:
@@ -829,6 +1166,9 @@ def train(
                     assert log_dict["train/kl_loss"] < 1e-8, f"{log_dict=}"
 
             logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict}")
+            if role == "actor" and getattr(args, "print_train_metrics_table", False):
+                table_log_dict = {**(train_metrics_table_extra or {}), **log_dict}
+                print_metrics_table(table_log_dict, accumulated_step_id, title=f"Actor Update {accumulated_step_id}")
 
             if args.ci_save_grad_norm is not None:
                 ci_save_grad_norm_path = args.ci_save_grad_norm.format(

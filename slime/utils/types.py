@@ -31,6 +31,10 @@ class Sample:
     label: str | None = None
     reward: float | dict[str, Any] | None = None
     loss_mask: list[int] | None = None
+    # Optional response-aligned mask for policy-gradient contribution. When
+    # unset, policy loss uses loss_mask. This lets a sample participate in
+    # reward/advantage computation while suppressing selected token gradients.
+    policy_loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     # Ragged top-p nucleus token ids replayed from rollout sampling. For response

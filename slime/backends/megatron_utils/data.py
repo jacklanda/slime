@@ -25,6 +25,35 @@ from .cp_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _normalize_response_loss_mask(loss_mask: torch.Tensor, total_length: int, response_length: int) -> torch.Tensor:
+    if loss_mask.size(0) != response_length:
+        raise ValueError(
+            f"loss_mask length ({loss_mask.size(0)}) must match response_length ({response_length})."
+        )
+    if total_length < response_length:
+        raise ValueError(f"total_length ({total_length}) must be >= response_length ({response_length}).")
+
+    prompt_length = total_length - response_length
+    if prompt_length == 0 and response_length > 0:
+        loss_mask = loss_mask.clone()
+        loss_mask[0] = 0
+    return loss_mask
+
+
+def _align_response_loss_mask(loss_mask: torch.Tensor, total_length: int, response_length: int) -> torch.Tensor:
+    loss_mask = _normalize_response_loss_mask(loss_mask, total_length, response_length)
+    prompt_length = total_length - response_length
+    if prompt_length == 0:
+        if response_length == 0:
+            return loss_mask
+        aligned = F.pad(loss_mask[1:], (0, 1), value=0)
+    else:
+        aligned = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
+
+    assert aligned.size(0) == total_length, f"aligned mask length {aligned.size(0)} != total_length {total_length}"
+    return aligned
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -118,6 +147,16 @@ def get_batch(
     batch["packed_seq_params"] = packed_seq_params
 
     # loss masks
+    batch["loss_masks"] = [
+        _normalize_response_loss_mask(loss_mask, total_length, response_length)
+        for loss_mask, total_length, response_length in zip(
+            batch["loss_masks"],
+            batch["total_lengths"],
+            batch["response_lengths"],
+            strict=True,
+        )
+    ]
+
     loss_masks = []
     for loss_mask, total_length, response_length in zip(
         batch["loss_masks"],
@@ -125,9 +164,9 @@ def get_batch(
         batch["response_lengths"],
         strict=True,
     ):
-        prompt_length = total_length - response_length
-        # Align mask to token stream positions (prompt_length-1 left pad, 1 right pad)
-        loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
+        # Align response masks to logits at token-stream positions. With an empty
+        # prompt, the first response token has no preceding token to predict it.
+        loss_mask = _align_response_loss_mask(loss_mask, total_length, response_length)
         if allgather_cp:
             loss_masks.append(loss_mask)
             continue
@@ -281,15 +320,19 @@ def log_rollout_data(
                 "tokens",
                 "multimodal_train_inputs",
                 "loss_masks",
+                "policy_loss_masks",
                 "sample_indices",
                 "rollout_ids",
                 "rollout_mask_sums",
+                "policy_rollout_mask_sums",
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
                 "global_batch_sizes",
                 "num_microbatches",
                 "micro_batch_indices",
+                "episode_metrics_data",
+                "rollout_metrics",
             ]:
                 continue
             # Emit (sum, count) so gather_log_data can do a weighted average across

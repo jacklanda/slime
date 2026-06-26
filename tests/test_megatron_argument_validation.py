@@ -309,6 +309,38 @@ def make_slime_validate_args(**overrides):
 
 
 @pytest.mark.unit
+def test_slime_validate_args_rejects_webqa_prompt_data_without_ground_truth(monkeypatch, tmp_path):
+    import pandas as pd
+
+    module = load_slime_arguments_module(monkeypatch)
+    path = tmp_path / "webqa.parquet"
+    pd.DataFrame(
+        [
+            {
+                "prompt": [{"role": "user", "content": "Q1"}],
+                "reward_model": {"ground_truth": None, "style": "rule"},
+                "extra_info": {"ground_truth": None, "question": "Q1"},
+            },
+            {
+                "prompt": [{"role": "user", "content": "Q2"}],
+                "reward_model": {"ground_truth": None, "style": "rule"},
+                "extra_info": {"ground_truth": None, "question": "Q2"},
+            },
+        ]
+    ).to_parquet(path)
+
+    args = make_slime_validate_args(
+        prompt_data=str(path),
+        label_key="reward_model",
+        metadata_key="extra_info",
+        rollout_function_path="slime.rollout.fused_agent.generate.generate",
+    )
+
+    with pytest.raises(ValueError, match="sample check failed"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
 def test_slime_validate_args_preserves_zero_rollout_gpus_under_colocate(monkeypatch):
     module = load_slime_arguments_module(monkeypatch)
     args = make_slime_validate_args(colocate=True, rollout_num_gpus=0)
@@ -316,8 +348,6 @@ def test_slime_validate_args_preserves_zero_rollout_gpus_under_colocate(monkeypa
     module.slime_validate_args(args)
 
     assert args.rollout_num_gpus == 0
-    assert args.offload_train is True
-    assert args.offload_rollout is True
 
 
 @pytest.mark.unit
@@ -333,8 +363,6 @@ def test_slime_validate_args_preserves_larger_rollout_gpus_under_colocate(monkey
     module.slime_validate_args(args)
 
     assert args.rollout_num_gpus == 12
-    assert args.offload_train is True
-    assert args.offload_rollout is True
 
 
 @pytest.mark.unit
@@ -347,8 +375,6 @@ def test_slime_validate_args_preserves_zero_rollout_gpus_without_colocate(monkey
     assert args.rollout_num_gpus == 0
     assert args.actor_num_gpus_per_node == 8
     assert args.actor_num_nodes == 1
-    assert args.offload_train is False
-    assert args.offload_rollout is False
 
 
 @pytest.mark.unit

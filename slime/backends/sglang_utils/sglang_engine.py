@@ -98,6 +98,32 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
             time.sleep(2)
 
 
+def remove_worker_from_router(worker_url: str, router_ip: str | None, router_port: int | None) -> None:
+    if not router_ip or not router_port:
+        return
+
+    response = None
+    if parse(sglang_router.__version__) <= parse("0.2.1"):
+        response = requests.post(f"http://{router_ip}:{router_port}/remove_worker?url={worker_url}")
+    elif parse(sglang_router.__version__) < parse("0.3.0"):
+        encoded_worker_url = quote(worker_url, safe="")
+        response = requests.delete(f"http://{router_ip}:{router_port}/workers/{encoded_worker_url}")
+    else:
+        try:
+            all_workers = requests.get(f"http://{router_ip}:{router_port}/workers").json()["workers"]
+            for worker in all_workers:
+                if worker["url"] == worker_url:
+                    response = requests.delete(f"http://{router_ip}:{router_port}/workers/{worker['id']}")
+                    break
+            else:
+                logger.warning(f"Worker {worker_url} not found in router.")
+        except Exception as e:
+            logger.warning(f"Failed to fetch workers list or remove worker: {e}")
+
+    if response is not None:
+        response.raise_for_status()
+
+
 class SGLangEngine(RayActor):
     def __init__(
         self,
@@ -217,7 +243,7 @@ class SGLangEngine(RayActor):
                 )
             response.raise_for_status()
 
-    def _make_request(self, endpoint: str, payload: dict | None = None):
+    def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
         """Make a POST request to the specified endpoint with the given payload.
 
         Args:
@@ -231,11 +257,14 @@ class SGLangEngine(RayActor):
             return
 
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
         try:
+            response = requests.post(url, json=payload or {}, timeout=timeout)
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
             e.add_note(f"{response.text=}")
+            raise
+        except requests.exceptions.RequestException as e:
+            e.add_note(f"SGLang engine request failed: endpoint={endpoint!r}, url={url!r}")
             raise
         return response.json()
 
@@ -318,32 +347,11 @@ class SGLangEngine(RayActor):
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         if self.worker_type != "encoder" and self.node_rank == 0:
-            worker_url = f"http://{self.server_host}:{self.server_port}"
-            response = None
-            if parse(sglang_router.__version__) <= parse("0.2.1"):
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
-                )
-            elif parse(sglang_router.__version__) < parse("0.3.0"):
-                worker_url = quote(worker_url, safe="")
-                response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_url}")
-            else:
-                try:
-                    all_workers = requests.get(f"http://{self.router_ip}:{self.router_port}/workers").json()["workers"]
-                    for worker in all_workers:
-                        if worker["url"] == worker_url:
-                            worker_id = worker["id"]
-                            response = requests.delete(
-                                f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}"
-                            )
-                            break
-                    else:
-                        logger.warning(f"Worker {worker_url} not found in router during shutdown.")
-                except Exception as e:
-                    logger.warning(f"Failed to fetch workers list or remove worker: {e}")
-
-            if response is not None:
-                response.raise_for_status()
+            remove_worker_from_router(
+                f"http://{self.server_host}:{self.server_port}",
+                self.router_ip,
+                self.router_port,
+            )
         kill_process_tree(self.process.pid)
 
     def get_weight_version(self):
@@ -378,6 +386,13 @@ class SGLangEngine(RayActor):
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
+
+    def _generation_control_timeout(self) -> float:
+        return getattr(
+            self.args,
+            "rollout_generation_control_timeout",
+            getattr(self.args, "rollout_health_check_timeout", 30.0),
+        )
 
     def update_weights_from_disk(
         self,
@@ -469,14 +484,16 @@ class SGLangEngine(RayActor):
         )
 
     def pause_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={})
-        response.raise_for_status()
-        return response
+        return self._make_request(
+            "pause_generation",
+            timeout=self._generation_control_timeout(),
+        )
 
     def continue_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={})
-        response.raise_for_status()
-        return response
+        return self._make_request(
+            "continue_generation",
+            timeout=self._generation_control_timeout(),
+        )
 
     def post_process_weights(
         self,
@@ -589,6 +606,19 @@ def _compute_server_args(
         # is available for external scraping.
         "enable_metrics": True,
     }
+    if not getattr(args, "show_sglang_server_logs", False):
+        access_log_exclude_prefixes = list(getattr(args, "sglang_uvicorn_access_log_exclude_prefixes", []) or [])
+        if "/generate" not in access_log_exclude_prefixes:
+            access_log_exclude_prefixes.append("/generate")
+        kwargs.update(
+            {
+                "log_level": "warning",
+                "log_level_http": "warning",
+                "log_requests": False,
+                "enable_request_time_stats_logging": False,
+                "uvicorn_access_log_exclude_prefixes": access_log_exclude_prefixes,
+            }
+        )
 
     if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"

@@ -6,6 +6,16 @@ import torch.nn.functional as F
 from megatron.core import mpu
 
 
+def _response_logit_bounds(total_length: int, response_length: int) -> tuple[int, int, int]:
+    prompt_length = total_length - response_length
+    if prompt_length < 0:
+        raise ValueError(f"total_length ({total_length}) must be >= response_length ({response_length}).")
+    response_offset = 1 if prompt_length == 0 and response_length > 0 else 0
+    logit_start = prompt_length + response_offset - 1
+    logit_end = total_length - 1
+    return logit_start, logit_end, response_offset
+
+
 def get_logits_and_tokens_offset_with_cp(
     total_length: int,
     response_length: int,
@@ -17,7 +27,7 @@ def get_logits_and_tokens_offset_with_cp(
     cp_size = mpu.get_context_parallel_world_size()
     assert cp_size > 1
 
-    prompt_length = total_length - response_length
+    logit_start, logit_end, _ = _response_logit_bounds(total_length, response_length)
     chunk_size = (total_length + 2 * cp_size - 1) // (2 * cp_size)
 
     # the offset of 2 chunks
@@ -25,8 +35,8 @@ def get_logits_and_tokens_offset_with_cp(
     chunk_1 = ((2 * cp_size - cp_rank - 1) * chunk_size, (2 * cp_size - cp_rank) * chunk_size)
 
     # the offset of 2 logits, note that the logits need a "-1".
-    logits_0 = (max(chunk_0[0], prompt_length - 1), min(chunk_0[1], total_length - 1))
-    logits_1 = (max(chunk_1[0], prompt_length - 1), min(chunk_1[1], total_length - 1))
+    logits_0 = (max(chunk_0[0], logit_start), min(chunk_0[1], logit_end))
+    logits_1 = (max(chunk_1[0], logit_start), min(chunk_1[1], logit_end))
 
     # when the sequence is empty, make an empty slice to continue the gradient flow.
     if logits_0[0] < logits_0[1]:
@@ -94,6 +104,8 @@ def get_sum_of_sample_mean(
 
         for total_length, response_length, loss_mask in zip(total_lengths, response_lengths, loss_masks, strict=False):
             prompt_length = total_length - response_length
+            if prompt_length < 0:
+                raise ValueError(f"total_length ({total_length}) must be >= response_length ({response_length}).")
             _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(total_length, response_length)
             loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
             loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
@@ -244,8 +256,7 @@ def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length:
         return tensor
 
     _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length)
-
-    prompt_length = total_length - response_length
+    logit_start, _logit_end, response_offset = _response_logit_bounds(total_length, response_length)
 
     chunk_0 = tensor[: logits_offset[0][1] - logits_offset[0][0]]
     chunk_1 = tensor[logits_offset[0][1] - logits_offset[0][0] :]
@@ -259,24 +270,24 @@ def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length:
             requires_grad=True,
         )
 
-    # logprob should be within the range of [prompt_length - 1, total_length - 1]
+    # logprob should be within the predictable response-logit range.
     if chunk_0.shape[0] == 0 and chunk_1.shape[0] == 0:
         # all empty
         full_tensor = zero(response_length)
     elif chunk_0.shape[0] != 0 and chunk_1.shape[0] == 0:
         # only first chunk
-        left = zero(logits_offset[0][0] - (prompt_length - 1))
-        right = zero(total_length - 1 - logits_offset[0][1])
+        left = zero(response_offset + logits_offset[0][0] - logit_start)
+        right = zero(response_length - (response_offset + logits_offset[0][1] - logit_start))
         full_tensor = torch.cat([left, chunk_0, right], dim=0)
     elif chunk_0.shape[0] == 0 and chunk_1.shape[0] != 0:
         # only second chunk
-        left = zero(logits_offset[1][0] - (prompt_length - 1))
-        right = zero(total_length - 1 - logits_offset[1][1])
+        left = zero(response_offset + logits_offset[1][0] - logit_start)
+        right = zero(response_length - (response_offset + logits_offset[1][1] - logit_start))
         full_tensor = torch.cat([left, chunk_1, right], dim=0)
     else:
-        left = zero(logits_offset[0][0] - (prompt_length - 1))
+        left = zero(response_offset + logits_offset[0][0] - logit_start)
         mid = zero(logits_offset[1][0] - logits_offset[0][1])
-        right = zero(total_length - 1 - logits_offset[1][1])
+        right = zero(response_length - (response_offset + logits_offset[1][1] - logit_start))
         full_tensor = torch.cat([left, chunk_0, mid, chunk_1, right], dim=0)
 
     assert full_tensor.shape[0] == response_length, f"Expected {response_length}, got {full_tensor.shape}"
@@ -332,11 +343,15 @@ def slice_log_prob_with_cp(
     if cp_size == 1:
         return log_prob
 
-    prompt_length = total_length - response_length
+    logit_start, _logit_end, response_offset = _response_logit_bounds(total_length, response_length)
     _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length)
 
-    chunk_1 = log_prob[logits_offset[0][0] - (prompt_length - 1) : logits_offset[0][1] - (prompt_length - 1)]
-    chunk_2 = log_prob[logits_offset[1][0] - (prompt_length - 1) : logits_offset[1][1] - (prompt_length - 1)]
+    chunk_1 = log_prob[
+        response_offset + logits_offset[0][0] - logit_start : response_offset + logits_offset[0][1] - logit_start
+    ]
+    chunk_2 = log_prob[
+        response_offset + logits_offset[1][0] - logit_start : response_offset + logits_offset[1][1] - logit_start
+    ]
 
     if isinstance(log_prob, list):
         return chunk_1 + chunk_2

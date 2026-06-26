@@ -169,7 +169,9 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
     def __init__(self, args):
         super().__init__(args)
         self.buffer = []
-        if self.args.buffer_filter_path is None:
+        if self.args.buffer_filter_path is None and getattr(self.args, "enable_quota_bucket_sampling", False):
+            self.buffer_filter = load_function("slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps")
+        elif self.args.buffer_filter_path is None:
             self.buffer_filter = pop_first
         else:
             self.buffer_filter = load_function(self.args.buffer_filter_path)

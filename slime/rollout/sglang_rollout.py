@@ -30,6 +30,7 @@ from slime.utils.processing_utils import (
 )
 from slime.utils.trace_utils import build_sglang_meta_trace_attrs, trace_function, trace_span
 from slime.utils.types import Sample
+from slime.utils.visualization import maybe_print_rollout_group
 
 from .rm_hub import async_rm, batched_async_rm
 
@@ -530,6 +531,7 @@ async def generate_rollout_async(
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
+                maybe_print_rollout_group(args, group, group_id=len(data))
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
 

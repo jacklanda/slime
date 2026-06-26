@@ -285,6 +285,177 @@ class TestZeroGpuRolloutConfig:
         assert ray_get_calls == [["encoder-init-0"], ["encoder-url-ref"]]
 
 
+class TestRolloutServerRecovery:
+    def test_recover_updatable_engines_probes_without_fault_tolerance(self, monkeypatch):
+        from slime.ray import rollout as rollout_module
+
+        recover_calls = []
+        server = rollout_module.RolloutServer(server_groups=[], update_weights=True)
+
+        def fake_recover(health_check_timeout=None):
+            recover_calls.append(health_check_timeout)
+
+        monkeypatch.setattr(server, "recover", fake_recover)
+        manager_cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
+        manager = object.__new__(manager_cls)
+        manager.args = Namespace(rollout_health_check_timeout=7.0)
+        manager.servers = {"default": server}
+        manager.rollout_id = 3
+        manager.rollout_engine_lock = "lock"
+        manager._health_monitors = []
+
+        engines, lock, num_new, gpu_counts, gpu_offsets = manager.recover_updatable_engines()
+
+        assert recover_calls == [7.0]
+        assert engines == []
+        assert lock == "lock"
+        assert num_new == 0
+        assert gpu_counts == []
+        assert gpu_offsets == []
+
+    def test_recover_updatable_engines_skips_probe_before_first_rollout(self):
+        from slime.ray import rollout as rollout_module
+
+        class FakeServer:
+            update_weights = True
+            engines = ["engine"]
+            engine_gpu_counts = [1]
+            engine_gpu_offsets = [0]
+            num_new_engines = 0
+
+            def recover(self, health_check_timeout=None):
+                raise AssertionError("initial weight sync should not probe or restart rollout engines")
+
+        manager_cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
+        manager = object.__new__(manager_cls)
+        manager.args = Namespace(rollout_health_check_timeout=7.0)
+        manager.servers = {"default": FakeServer()}
+        manager.rollout_id = -1
+        manager.rollout_engine_lock = "lock"
+        manager._health_monitors = []
+
+        engines, lock, num_new, gpu_counts, gpu_offsets = manager.recover_updatable_engines()
+
+        assert engines == ["engine"]
+        assert lock == "lock"
+        assert num_new == 0
+        assert gpu_counts == [1]
+        assert gpu_offsets == [0]
+
+    def test_recover_marks_unhealthy_actor_for_restart(self, monkeypatch):
+        from slime.ray import rollout as rollout_module
+
+        events = []
+
+        class FakeRemoteMethod:
+            def __init__(self, value=None, exc=None):
+                self.value = value
+                self.exc = exc
+
+            def remote(self, **kwargs):
+                if self.exc is not None:
+                    return self.exc
+                return self.value
+
+        class FakeEngine:
+            def __init__(self):
+                self.health_generate = FakeRemoteMethod(exc=RuntimeError("connection refused"))
+                self.shutdown = FakeRemoteMethod("shutdown-ref")
+
+        def fake_ray_get(refs):
+            if isinstance(refs, RuntimeError):
+                raise refs
+            events.append(("ray_get", refs))
+
+        def fake_ray_kill(engine):
+            events.append(("ray_kill", engine))
+
+        def fake_remove_worker_from_router(worker_url, router_ip, router_port):
+            events.append(("remove", worker_url, router_ip, router_port))
+
+        def fake_start_engines(self, port_cursors=None):
+            events.append(("start",))
+            self.all_engines[0] = object()
+            self.num_new_engines = 1
+            self.engine_urls[0] = "http://10.0.0.2:15002"
+            return ["init-ref"], port_cursors or {}
+
+        old_engine = FakeEngine()
+
+        monkeypatch.setattr(rollout_module.ray, "get", fake_ray_get)
+        monkeypatch.setattr(rollout_module.ray, "kill", fake_ray_kill)
+        monkeypatch.setattr(rollout_module, "remove_worker_from_router", fake_remove_worker_from_router)
+        monkeypatch.setattr(rollout_module.ServerGroup, "start_engines", fake_start_engines)
+
+        group = rollout_module.ServerGroup(
+            args=Namespace(num_gpus_per_node=1, rollout_num_gpus_per_engine=1),
+            pg=(None, [], []),
+            all_engines=[old_engine],
+            num_gpus_per_engine=1,
+            num_new_engines=0,
+            worker_type="regular",
+            router_ip="127.0.0.1",
+            router_port=3000,
+            engine_urls=["http://10.0.0.1:15002"],
+        )
+        server = rollout_module.RolloutServer(server_groups=[group])
+
+        server.recover(health_check_timeout=0.1)
+
+        assert events == [
+            ("ray_get", "shutdown-ref"),
+            ("ray_kill", old_engine),
+            ("remove", "http://10.0.0.1:15002", "127.0.0.1", 3000),
+            ("start",),
+            ("ray_get", ["init-ref"]),
+        ]
+
+    def test_recover_removes_stale_router_worker_before_restart(self, monkeypatch):
+        from slime.ray import rollout as rollout_module
+
+        events = []
+
+        def fake_remove_worker_from_router(worker_url, router_ip, router_port):
+            events.append(("remove", worker_url, router_ip, router_port))
+
+        def fake_start_engines(self, port_cursors=None):
+            events.append(("start",))
+            self.all_engines[0] = object()
+            self.num_new_engines = 1
+            self.engine_urls[0] = "http://10.0.0.2:15002"
+            return ["init-ref"], port_cursors or {}
+
+        ray_get_calls = []
+
+        def fake_ray_get(refs):
+            ray_get_calls.append(refs)
+
+        monkeypatch.setattr(rollout_module, "remove_worker_from_router", fake_remove_worker_from_router)
+        monkeypatch.setattr(rollout_module.ServerGroup, "start_engines", fake_start_engines)
+        monkeypatch.setattr(rollout_module.ray, "get", fake_ray_get)
+
+        group = rollout_module.ServerGroup(
+            args=Namespace(num_gpus_per_node=1, rollout_num_gpus_per_engine=1),
+            pg=(None, [], []),
+            all_engines=[None],
+            num_gpus_per_engine=1,
+            num_new_engines=0,
+            worker_type="regular",
+            router_ip="127.0.0.1",
+            router_port=3000,
+            engine_urls=["http://10.0.0.1:15002"],
+        )
+        server = rollout_module.RolloutServer(server_groups=[group])
+
+        server.recover()
+
+        assert events == [
+            ("remove", "http://10.0.0.1:15002", "127.0.0.1", 3000),
+            ("start",),
+        ]
+        assert ray_get_calls == [["init-ref"]]
+
+
 class TestGetModelUrl:
     def test_get_model_url_basic(self):
         """get_model_url should return the correct URL for a named model."""

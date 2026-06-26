@@ -163,19 +163,15 @@ def compute_score_em(
     format_score=0,
     score=1.0,
 ):
-    """The scoring function for exact match (EM).
+    """Binary exact-match reward.
 
     Args:
         solution_str: the solution text
         ground_truth: the ground truth
         method: the method to extract the solution, choices are 'strict' and 'flexible'
-        format_score: the score for the format
+        format_score: deprecated; format-only rewards are intentionally disabled
         score: the score for the correct answer
     """
-    is_valid_format, _ = is_valid_sequence(solution_str)
-    retrieval_correct = False
-    if is_valid_format:
-        retrieval_correct = is_retrieval_correct(solution_str, ground_truth["target"])
     answer = extract_solution(solution_str=solution_str)
     do_print = random.randint(1, 64) == 1
 
@@ -185,24 +181,6 @@ def compute_score_em(
         print(f"Extracted answer: {answer}")
         print(f"Solution string: {solution_str}")
 
-    if answer is None:
-        if is_valid_format:
-            if retrieval_correct:
-                return structure_format_score + retrieval_score  # 0.3
-            else:
-                return structure_format_score  # 0.2
-        else:
-            return 0
-    else:
-        if em_check(answer, ground_truth["target"]):
-            if is_valid_format:
-                return score  # 1
-            else:
-                return score - structure_format_score  # 0.8
-        elif is_valid_format:
-            if retrieval_correct:
-                return structure_format_score + retrieval_score  # 0.3
-            else:
-                return structure_format_score  # 0.2
-        else:
-            return final_format_score  # 0.1
+    if answer is not None and em_check(answer, ground_truth["target"]):
+        return score
+    return 0

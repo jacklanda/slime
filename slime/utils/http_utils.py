@@ -174,6 +174,8 @@ async def _post(client, url, payload, max_retries=60, headers=None):
                 output = json.loads(content)
             except json.JSONDecodeError:
                 output = content.decode() if isinstance(content, bytes) else content
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             retry_count += 1
 

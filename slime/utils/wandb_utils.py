@@ -1,10 +1,13 @@
 import logging
 import os
+import warnings
 from copy import deepcopy
 
 import wandb
 
 logger = logging.getLogger(__name__)
+
+_WANDB_SHARED_MODE_WARNING = "The `shared` mode feature is experimental and may change."
 
 
 def _is_offline_mode(args) -> bool:
@@ -17,6 +20,18 @@ def _is_offline_mode(args) -> bool:
     if args.wandb_mode:
         return args.wandb_mode == "offline"
     return os.environ.get("WANDB_MODE") == "offline"
+
+
+def _configure_wandb_credentials(args) -> None:
+    if args.wandb_key is not None:
+        os.environ["WANDB_API_KEY"] = args.wandb_key
+    if args.wandb_host is not None:
+        os.environ["WANDB_BASE_URL"] = args.wandb_host
+
+
+def _wandb_settings(**kwargs):
+    kwargs.setdefault("show_warnings", False)
+    return wandb.Settings(**kwargs)
 
 
 def init_wandb_primary(args):
@@ -35,10 +50,8 @@ def init_wandb_primary(args):
             logger.info("W&B online mode enabled. Data will be uploaded to cloud.")
 
     offline = _is_offline_mode(args)
-
-    # Only perform explicit login when NOT offline
-    if (not offline) and args.wandb_key is not None:
-        wandb.login(key=args.wandb_key, host=args.wandb_host)
+    if not offline:
+        _configure_wandb_credentials(args)
 
     # Prepare wandb init parameters
     # add random 6 length string with characters
@@ -60,9 +73,9 @@ def init_wandb_primary(args):
 
     # Configure settings based on offline/online mode
     if offline:
-        init_kwargs["settings"] = wandb.Settings(mode="offline")
+        init_kwargs["settings"] = _wandb_settings(mode="offline")
     else:
-        init_kwargs["settings"] = wandb.Settings(mode="shared", x_primary=True)
+        init_kwargs["settings"] = _wandb_settings(mode="shared", x_primary=True)
 
     # Add custom directory if specified
     if args.wandb_dir:
@@ -130,9 +143,8 @@ def init_wandb_secondary(args, role=None):
         os.environ["WANDB_MODE"] = args.wandb_mode
 
     offline = _is_offline_mode(args)
-
-    if (not offline) and args.wandb_key is not None:
-        wandb.login(key=args.wandb_key, host=args.wandb_host)
+    if not offline:
+        _configure_wandb_credentials(args)
 
     # Configure settings based on offline/online mode
     if offline:
@@ -150,8 +162,8 @@ def init_wandb_secondary(args, role=None):
         "project": args.wandb_project,
         "config": _compute_secondary_config_for_logging(args, role=role),
         "resume": "allow",
-        "reinit": True,
-        "settings": wandb.Settings(**settings_kwargs),
+        "reinit": "finish_previous",
+        "settings": _wandb_settings(**settings_kwargs),
     }
 
     # Add custom directory if specified
@@ -165,12 +177,24 @@ def init_wandb_secondary(args, role=None):
 
 
 def _init_wandb_common():
-    wandb.define_metric("train/step")
-    wandb.define_metric("train/*", step_metric="train/step")
-    wandb.define_metric("rollout/step")
-    wandb.define_metric("rollout/*", step_metric="rollout/step")
-    wandb.define_metric("multi_turn/*", step_metric="rollout/step")
-    wandb.define_metric("passrate/*", step_metric="rollout/step")
-    wandb.define_metric("eval/step")
-    wandb.define_metric("eval/*", step_metric="eval/step")
-    wandb.define_metric("perf/*", step_metric="rollout/step")
+    if wandb.run is None:
+        logger.debug("Skipping W&B metric definitions because wandb.init did not create an active run.")
+        return
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=_WANDB_SHARED_MODE_WARNING)
+        wandb.define_metric("train/step")
+        wandb.define_metric("train/*", step_metric="train/step")
+        wandb.define_metric("episode/*", step_metric="train/step")
+        wandb.define_metric("Charts/*", step_metric="train/step")
+        wandb.define_metric("rollout/step")
+        wandb.define_metric("rollout/*", step_metric="rollout/step")
+        wandb.define_metric("multi_turn/*", step_metric="rollout/step")
+        wandb.define_metric("passrate/*", step_metric="rollout/step")
+        wandb.define_metric("eval/step")
+        wandb.define_metric("eval/*", step_metric="eval/step")
+        wandb.define_metric("perf/*", step_metric="rollout/step")
+        wandb.define_metric("timing_s/*", step_metric="rollout/step")
+        wandb.define_metric("timing_per_token_ms/*", step_metric="rollout/step")
+        wandb.define_metric("response_length/*", step_metric="train/step")
+        wandb.define_metric("response/*", step_metric="train/step")

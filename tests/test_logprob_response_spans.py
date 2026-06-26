@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from megatron.core import mpu
-from slime.backends.megatron_utils.loss import _build_topp_keep_mask
+from slime.backends.megatron_utils.loss import _build_topp_keep_mask, _extract_per_sample
 
 
 NUM_GPUS = 0
@@ -85,6 +85,41 @@ def test_top_p_mask_aligns_with_cp1_response_rows(monkeypatch):
 
     masked_rows = {row: _kept_ids(keep[row]) for row in range(keep.size(0)) if not keep[row].all()}
     assert masked_rows == {2: [13], 3: [14], 5: [21], 6: [22], 7: [23]}
+
+
+@pytest.mark.unit
+def test_top_p_mask_skips_unpredictable_first_response_token_without_prompt(monkeypatch):
+    _set_cp(monkeypatch, size=1, rank=0)
+    keep = _build_topp_keep_mask(
+        3,
+        30,
+        torch.device("cpu"),
+        top_p_token_ids=[[11, 12, 13]],
+        top_p_token_offsets=[[0, 1, 2, 3]],
+        total_lengths=[3],
+        response_lengths=[3],
+        allgather_cp=False,
+    )
+
+    masked_rows = {row: _kept_ids(keep[row]) for row in range(keep.size(0)) if not keep[row].all()}
+    assert masked_rows == {0: [12], 1: [13]}
+
+
+@pytest.mark.unit
+def test_extract_per_sample_pads_unpredictable_first_response_token_without_prompt(monkeypatch):
+    _set_cp(monkeypatch, size=1, rank=0)
+    log_prob_full = torch.tensor([-2.0, -3.0, 99.0])
+
+    log_probs, entropy = _extract_per_sample(
+        log_prob_full,
+        entropy_full=None,
+        total_lengths=[3],
+        response_lengths=[3],
+        allgather_cp=False,
+    )
+
+    torch.testing.assert_close(log_probs[0], torch.tensor([0.0, -2.0, -3.0]))
+    assert entropy == []
 
 
 if __name__ == "__main__":

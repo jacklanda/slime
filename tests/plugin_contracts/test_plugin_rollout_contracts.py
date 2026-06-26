@@ -25,6 +25,7 @@ DEFAULT_ROLLOUT_FUNCTION_PATH = "slime.rollout.sglang_rollout.generate_rollout"
 REFERENCE_ROLLOUT_FUNCTION_PATH = "plugin_contracts.test_plugin_rollout_contracts.valid_rollout_function"
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, call_rollout_fn
+from slime.ray.rollout import _flatten_rollout_samples
 from slime.rollout.sglang_rollout import generate_rollout as default_generate_rollout
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
@@ -174,6 +175,12 @@ def test_default_rollout_compat_wrapper_stability():
     eval_output = call_rollout_fn(legacy_rollout_function, None, 1, data_source, evaluation=True)
     assert_train_rollout_contract(train_output, n_samples_per_prompt=1)
     assert_eval_rollout_contract(eval_output)
+
+
+def test_rollout_sample_flattening_supports_mixed_nested_groups():
+    samples = [make_sample(i) for i in range(4)]
+
+    assert _flatten_rollout_samples([[samples[0], samples[1]], samples[2], [[samples[3]]]]) == samples
 
 
 def test_local_rollout_plugin_aligns_with_default_input_output_format():

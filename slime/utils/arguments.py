@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import os
+from pathlib import Path
 import warnings
 from typing import Any
 
@@ -11,6 +12,7 @@ import yaml
 from slime.backends.sglang_utils.arguments import sglang_parse_args
 from slime.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from slime.backends.sglang_utils.external import apply_external_engine_info_to_args
+from slime.utils.data import read_file
 from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from slime.utils.logging_utils import configure_logger
 
@@ -428,6 +430,25 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "You could use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
                 ),
             )
+            parser.add_argument(
+                "--fully-async-filter-relax-after-groups",
+                type=int,
+                default=0,
+                help=(
+                    "For fully-async rollout, accept dynamically filtered groups after this many "
+                    "completed groups. 0 disables relaxation."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-task-family-quotas",
+                type=str,
+                default=None,
+                help=(
+                    "Optional comma-separated task family quotas for rollout batches, "
+                    "for example `webqa=0.4,mcp=0.4,cli=0.2`. Currently applied by "
+                    "the fully-async rollout collector after dynamic filtering."
+                ),
+            )
 
             # partial rollout
             parser.add_argument(
@@ -487,6 +508,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Path to the buffer filter function. "
                     "It should be able to select the samples in the buffer. "
                     "The function should take list[list[Sample]] and return list[list[Sample]]."
+                ),
+            )
+            parser.add_argument(
+                "--enable-quota-bucket-sampling",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable quota-based bucket sampling in the rollout buffer. "
+                    "The stock fused-agent buffer filter reserves fixed quotas for short/mid/long "
+                    "trajectories by fused trajectory steps."
                 ),
             )
             # update weight
@@ -558,6 +589,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=30.0,
                 help="Timeout in seconds to wait for a rollout engine /health_generate response before killing it.",
+            )
+            parser.add_argument(
+                "--rollout-generation-control-timeout",
+                type=float,
+                default=300.0,
+                help=(
+                    "Timeout in seconds for rollout engine lifecycle control requests such as "
+                    "/pause_generation and /continue_generation during weight updates."
+                ),
             )
             parser.add_argument(
                 "--rollout-health-check-first-wait",
@@ -1045,6 +1085,48 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Path to a custom reducer function for pg_loss only. When set, pg_loss will use this custom reducer while other metrics (pg_clipfrac, ppo_kl, entropy_loss, etc.) still use the default sum_of_sample_mean.",
             )
+            parser.add_argument(
+                "--credit-assignment-enable",
+                action="store_true",
+                default=False,
+                help="Enable metadata-driven partial credit assignment policy masks.",
+            )
+            parser.add_argument(
+                "--credit-assignment-tool-parser-error",
+                action="store_true",
+                default=False,
+                help="Mask policy-gradient tokens to the abnormal action span for tool parser errors.",
+            )
+            parser.add_argument(
+                "--credit-assignment-repeated-search-query",
+                action="store_true",
+                default=False,
+                help="Mask policy-gradient tokens to the abnormal action span for repeated search queries.",
+            )
+            parser.add_argument(
+                "--credit-assignment-too-many-tool-calls",
+                action="store_true",
+                default=False,
+                help="Mask policy-gradient tokens to the abnormal action span for excessive tool calls.",
+            )
+            parser.add_argument(
+                "--credit-assignment-ngram-repetition",
+                action="store_true",
+                default=False,
+                help="Mask policy-gradient tokens to the abnormal action span for turn-level n-gram repetition.",
+            )
+            parser.add_argument(
+                "--credit-assignment-search-bypass",
+                action="store_true",
+                default=False,
+                help="Keep full action-token policy mask for search-bypass penalties.",
+            )
+            parser.add_argument(
+                "--credit-assignment-mixed-tool-and-answer",
+                action="store_true",
+                default=False,
+                help="Mask policy-gradient tokens to the abnormal turn when a tool call and answer appear together.",
+            )
 
             parser.add_argument(
                 "--use-routing-replay",
@@ -1168,6 +1250,55 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help="Whether to turn on passrate logging, which will log the pass@n of the responses in the rollout.",
+            )
+            parser.add_argument(
+                "--show-sglang-server-logs",
+                action="store_true",
+                default=False,
+                help=(
+                    "Show SGLang engine/server INFO logs in the console, including Prefill/Decode batch lines "
+                    'and HTTP "POST /generate" access logs. Disabled by default to keep training logs readable.'
+                ),
+            )
+            parser.add_argument(
+                "--print-rollout-trajectory",
+                action="store_true",
+                default=False,
+                help=(
+                    "Print one trajectory from each accepted rollout group. "
+                    "The response is split into masked and unmasked action text using loss_mask."
+                ),
+            )
+            parser.add_argument(
+                "--print-rollout-trajectory-width",
+                type=int,
+                default=88,
+                help=(
+                    "Maximum terminal columns used by rollout trajectory visualization. "
+                    "The effective width is capped by the current terminal width after reserving prefix columns."
+                ),
+            )
+            parser.add_argument(
+                "--print-rollout-trajectory-prefix-width",
+                type=int,
+                default=32,
+                help=(
+                    "Terminal columns reserved for log prefixes such as Ray actor pid labels before drawing rollout "
+                    "trajectory boxes. Increase this when large fonts or long log prefixes wrap box borders."
+                ),
+            )
+            parser.add_argument(
+                "--no-print-rollout-trajectory-color",
+                dest="print_rollout_trajectory_color",
+                action="store_false",
+                default=True,
+                help="Disable ANSI color output for rollout trajectory visualization.",
+            )
+            parser.add_argument(
+                "--print-train-metrics-table",
+                action="store_true",
+                default=False,
+                help="Print actor train metrics as a table after each actor update.",
             )
             parser.add_argument(
                 "--log-reward-category",
@@ -1824,6 +1955,53 @@ def slime_validate_args(args):
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+
+    _validate_webqa_ground_truths(args)
+
+
+def _validate_webqa_ground_truths(args):
+    prompt_data = getattr(args, "prompt_data", None)
+    if not prompt_data:
+        return
+    rollout_path = str(getattr(args, "rollout_function_path", "") or "")
+    custom_generate = str(getattr(args, "custom_generate_function_path", "") or "")
+    if "webqa" not in prompt_data.lower() and "webqa" not in rollout_path.lower() and "fused_agent" not in custom_generate.lower():
+        return
+
+    label_key = getattr(args, "label_key", None)
+    metadata_key = getattr(args, "metadata_key", "metadata")
+
+    sampled = 0
+    missing = 0
+    sample_limit = int(os.environ.get("FUSED_WEBQA_GROUND_TRUTH_SAMPLE_LIMIT", "64"))
+    for row in read_file(prompt_data):
+        sampled += 1
+        label = row.get(label_key) if label_key is not None else row.get("reward_model")
+        if isinstance(label, dict):
+            gt = label.get("ground_truth") or label.get("target") or label.get("answer") or label.get("answers")
+        else:
+            gt = label
+        if gt is None or (isinstance(gt, str) and not gt.strip()):
+            extra = row.get(metadata_key) or {}
+            if isinstance(extra, dict):
+                gt = extra.get("ground_truth") or extra.get("target") or extra.get("answer") or extra.get("answers")
+        if gt is None or (isinstance(gt, str) and not gt.strip()):
+            missing += 1
+        if sampled >= sample_limit:
+            break
+
+    if sampled > 0 and missing == sampled:
+        raise ValueError(
+            f"webqa prompt-data sample check failed: {sampled}/{sampled} rows missing ground_truth. "
+            "Expected a usable ground_truth in reward_model or extra_info."
+        )
+    if sampled > 0 and missing > 0:
+        logger.warning(
+            "webqa prompt-data sample check: %s/%s sampled rows are missing ground_truth; "
+            "reward will be zero for those rows.",
+            missing,
+            sampled,
+        )
 
     if args.get_mismatch_metrics:
         assert (

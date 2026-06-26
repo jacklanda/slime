@@ -40,6 +40,7 @@ def log_perf_data_raw(
         if log_dict["perf/actor_train_time"] > 0:
             log_dict["perf/actor_train_tflops"] = 3 * total_fwd_flops / log_dict["perf/actor_train_time"]
             log_dict["perf/actor_train_tok_per_s"] = sum(timer_instance.seq_lens) / log_dict["perf/actor_train_time"]
+            log_dict["Charts/mfu"] = log_dict["perf/actor_train_tflops"]
 
     if "perf/train_wait_time" in log_dict and "perf/train_time" in log_dict:
         total_time = log_dict["perf/train_wait_time"] + log_dict["perf/train_time"]
@@ -47,8 +48,32 @@ def log_perf_data_raw(
             log_dict["perf/step_time"] = total_time
             log_dict["perf/wait_time_ratio"] = log_dict["perf/train_wait_time"] / total_time
 
+    log_dict.update(_compute_rllm_timing_metrics(log_dict, timer_instance.seq_lens))
+
     logger.info(f"perf {rollout_id}: {log_dict}")
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step")
+
+
+def _compute_rllm_timing_metrics(log_dict: dict, seq_lens: list[int]) -> dict[str, float]:
+    timer_to_timing = {
+        "perf/update_weights_time": "update_weights",
+        "perf/actor_train_time": "update_actor",
+        "perf/step_time": "step",
+        "perf/log_probs_time": "old_log_probs",
+        "perf/adv_time": "adv",
+    }
+    metrics = {}
+    for src, name in timer_to_timing.items():
+        if src in log_dict:
+            metrics[f"timing_s/{name}"] = log_dict[src]
+
+    num_tokens = sum(seq_lens)
+    if num_tokens > 0:
+        for name in ("update_actor", "adv"):
+            timing_key = f"timing_s/{name}"
+            if timing_key in metrics:
+                metrics[f"timing_per_token_ms/{name}"] = metrics[timing_key] * 1000 / num_tokens
+    return metrics

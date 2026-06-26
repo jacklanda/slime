@@ -176,5 +176,36 @@ def test_cp_chunking_preserves_per_rollout_mean_report(monkeypatch):
     assert cp_total == pytest.approx(baseline)
 
 
+@pytest.mark.unit
+def test_cp_offsets_skip_unpredictable_first_response_token_without_prompt(monkeypatch):
+    from megatron.core import mpu as _mpu
+
+    monkeypatch.setattr(_mpu, "get_context_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(_mpu, "get_context_parallel_rank", lambda: 0)
+
+    _, _, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(total_length=3, response_length=3)
+
+    assert logits_offset[0] == (0, 1)
+    assert tokens_offset[0] == (1, 2)
+
+
+@pytest.mark.unit
+def test_slice_log_prob_with_cp_keeps_zero_prompt_placeholder(monkeypatch):
+    from megatron.core import mpu as _mpu
+    from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
+
+    log_prob = torch.tensor([0.0, -2.0, -3.0])
+
+    monkeypatch.setattr(_mpu, "get_context_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(_mpu, "get_context_parallel_rank", lambda: 0)
+    rank0 = slice_log_prob_with_cp(log_prob, total_length=3, response_length=3)
+
+    monkeypatch.setattr(_mpu, "get_context_parallel_rank", lambda: 1)
+    rank1 = slice_log_prob_with_cp(log_prob, total_length=3, response_length=3)
+
+    torch.testing.assert_close(rank0, torch.tensor([-2.0]))
+    torch.testing.assert_close(rank1, torch.tensor([-3.0]))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

@@ -35,6 +35,11 @@ class TurnRecord:
     output_ids: list[int]
     finish_reason: str
     output_log_probs: list[float] = dataclasses.field(default_factory=list)
+    loss_mask: list[int] | None = None
+    policy_loss_mask: list[int] | None = None
+    prompt_context_start_idx: int | None = None
+    rollout_top_p_token_ids: list[int] | None = None
+    rollout_top_p_token_offsets: list[int] | None = None
 
 
 # ===========================================================================
@@ -128,7 +133,7 @@ def _common_prefix_len(a: list[int], b: list[int], chunk: int = 4096) -> int:
 
 class DriftKind(enum.Enum):
     CLEAN = "clean"  # drift == 0: prompt_ids exactly extends held tokens; append the tail beyond them
-    REALIGN = "realign"  # drift inside the most-recent response span and short incoming response; replace that span (loss_mask=0)
+    REALIGN = "realign"  # drift inside the most-recent response span and short incoming response; adopt replay tokens while preserving generated response mask
     FORK = "fork"  # everything else: close this builder, open a fresh one as a fork
 
 
@@ -149,7 +154,8 @@ class _SampleBuilder:
 
     * **CLEAN** -- no drift; append the prompt tail beyond what we hold.
     * **REALIGN** -- a short divergence inside the most-recent response span;
-      overwrite that span from the prompt as loss_mask=0 and keep accumulating.
+      adopt the replayed token ids for prefix continuity while keeping the
+      already-generated response span trainable.
     * **FORK** -- divergence too large or too early to absorb; this builder is
       rejected and the caller closes it and opens a fresh one. That boundary is
       the "fork".
@@ -161,7 +167,10 @@ class _SampleBuilder:
         self._fork_threshold = fork_threshold
         self.tokens: list[int] = []
         self.loss_mask: list[int] = []
+        self.policy_loss_mask: list[int] = []
         self.logprobs: list[float] = []
+        self.top_p_token_ids: list[int] | None = None
+        self.top_p_token_offsets: list[int] | None = None
         self.last_response_start_idx: int | None = None
         self.leading_prompt_len: int = 0
 
@@ -191,41 +200,145 @@ class _SampleBuilder:
 
     def append_turn(self, turn: TurnRecord, kind: DriftKind, *, trained: bool = True) -> None:
         """Append one turn into this SampleBuilder, branching on ``kind``: for REALIGN
-        we overwrite the already-saved response span, for CLEAN we just append this
-        turn's prompt tail."""
+        we preserve the already-saved response mask over the replayed assistant span,
+        for CLEAN we just append this turn's prompt tail."""
         assert kind is not DriftKind.FORK, "append_turn called on a builder that would fork"
 
         is_first_turn = self.last_response_start_idx is None
 
         # --- append this turn's prompt tail (loss_mask=0) ---
         if kind is DriftKind.REALIGN:
-            self._align_to_prompt(turn.prompt_ids)  # drop the drifted tail, re-append from prompt
+            self._realign_to_prompt_preserving_response_mask(turn)
         else:  # CLEAN: held tokens are an exact prefix of prompt_ids; append the tail beyond them
             self._append_tokens(turn.prompt_ids[len(self.tokens) :], loss_mask=0)
 
         # --- append this turn's generated response (loss_mask=1 unless re-emitted as context) ---
         self.last_response_start_idx = len(self.tokens)
-        self._append_tokens(
-            turn.output_ids, loss_mask=int(trained), logprobs=turn.output_log_probs if trained else None
-        )
+        if trained:
+            response_mask = turn.loss_mask if turn.loss_mask is not None else 1
+            policy_response_mask = turn.policy_loss_mask if turn.policy_loss_mask is not None else response_mask
+            self._append_tokens(
+                turn.output_ids,
+                loss_mask=response_mask,
+                policy_loss_mask=policy_response_mask,
+                logprobs=turn.output_log_probs,
+                top_p_token_ids=turn.rollout_top_p_token_ids,
+                top_p_token_offsets=turn.rollout_top_p_token_offsets,
+            )
+        else:
+            self._append_tokens(turn.output_ids, loss_mask=0)
 
         if is_first_turn:
             self.leading_prompt_len = len(turn.prompt_ids)
 
-    def _align_to_prompt(self, prompt_ids: list[int]) -> None:
-        """Heal REALIGN drift by overwriting the most-recent response span with
-        ``prompt_ids`` as loss_mask=0: the drifted tokens carry no signal, and re-appending
-        from the prompt keeps the builder contiguous. Earlier turns are untouched."""
-        response_start = self.last_response_start_idx
-        tail = prompt_ids[response_start:]
-        self.tokens[response_start:] = tail
-        self.loss_mask[response_start:] = [0] * len(tail)
-        self.logprobs[response_start:] = [0.0] * len(tail)
+    def _realign_to_prompt_preserving_response_mask(self, turn: TurnRecord) -> None:
+        """Heal REALIGN drift without erasing training signal from the generated turn.
 
-    def _append_tokens(self, ids: list[int], *, loss_mask: int, logprobs: list[float] | None = None) -> None:
+        The replayed prompt diverged inside the most recent assistant response.
+        Adopt the replayed assistant tokens so future turns prefix-match the
+        rendered chat template, but preserve the response mask/logprobs for the
+        part corresponding to the original generated action. Replay-only suffix
+        tokens, such as template end markers, stay masked as prompt context.
+        """
+        response_start = self.last_response_start_idx
+        assert response_start is not None
+        context_start = turn.prompt_context_start_idx
+        if context_start is None or context_start < response_start or context_start > len(turn.prompt_ids):
+            context_start = len(self.tokens)
+
+        old_mask = self.loss_mask[response_start:]
+        old_policy_mask = self.policy_loss_mask[response_start:]
+        old_logprobs = self.logprobs[response_start:]
+        old_top_p = self._top_p_slice(response_start, len(self.tokens))
+        replayed_response = turn.prompt_ids[response_start:context_start]
+        preserved = min(len(old_mask), len(replayed_response))
+
+        self.tokens[response_start:] = replayed_response
+        self.loss_mask[response_start:] = old_mask[:preserved] + [0] * (len(replayed_response) - preserved)
+        self.policy_loss_mask[response_start:] = old_policy_mask[:preserved] + [0] * (len(replayed_response) - preserved)
+        self.logprobs[response_start:] = old_logprobs[:preserved] + [0.0] * (len(replayed_response) - preserved)
+        self._truncate_top_p_tokens(response_start)
+        if old_top_p is not None:
+            token_ids, offsets = old_top_p
+            self._extend_top_p_tokens(
+                token_ids,
+                offsets[: preserved + 1],
+                expected_num_tokens=preserved,
+            )
+
+        context_tail = turn.prompt_ids[context_start:]
+        if context_tail:
+            self._append_tokens(context_tail, loss_mask=0)
+
+    def _append_tokens(
+        self,
+        ids: list[int],
+        *,
+        loss_mask: int | list[int],
+        policy_loss_mask: int | list[int] | None = None,
+        logprobs: list[float] | None = None,
+        top_p_token_ids: list[int] | None = None,
+        top_p_token_offsets: list[int] | None = None,
+    ) -> None:
         self.tokens.extend(ids)
-        self.loss_mask.extend([loss_mask] * len(ids))
+        if isinstance(loss_mask, list):
+            assert len(loss_mask) == len(ids), f"loss_mask length {len(loss_mask)} != ids length {len(ids)}"
+            self.loss_mask.extend(loss_mask)
+        else:
+            self.loss_mask.extend([loss_mask] * len(ids))
+        if policy_loss_mask is None:
+            policy_loss_mask = loss_mask
+        if isinstance(policy_loss_mask, list):
+            assert len(policy_loss_mask) == len(ids), (
+                f"policy_loss_mask length {len(policy_loss_mask)} != ids length {len(ids)}"
+            )
+            self.policy_loss_mask.extend(policy_loss_mask)
+        else:
+            self.policy_loss_mask.extend([policy_loss_mask] * len(ids))
         self.logprobs.extend(logprobs if logprobs else [0.0] * len(ids))
+        if top_p_token_ids is not None and top_p_token_offsets is not None:
+            self._extend_top_p_tokens(top_p_token_ids, top_p_token_offsets, expected_num_tokens=len(ids))
+        elif self.top_p_token_offsets is not None:
+            self.top_p_token_offsets.extend([self.top_p_token_offsets[-1]] * len(ids))
+
+    def _extend_top_p_tokens(
+        self,
+        token_ids: list[int],
+        offsets: list[int],
+        *,
+        expected_num_tokens: int,
+    ) -> None:
+        assert len(offsets) == expected_num_tokens + 1, (
+            f"top-p token offsets length {len(offsets)} != generated token count + 1 {expected_num_tokens + 1}"
+        )
+        assert offsets and offsets[0] == 0, f"top-p token offsets must start with 0, got {offsets[:1]}"
+        assert offsets[-1] == len(token_ids), (
+            f"top-p token offsets[-1] {offsets[-1]} != token ids length {len(token_ids)}"
+        )
+        if self.top_p_token_ids is None:
+            self.top_p_token_ids = []
+            prefix_len = len(self.tokens) - expected_num_tokens
+            self.top_p_token_offsets = [0] * (prefix_len + 1)
+        assert self.top_p_token_offsets is not None
+        base_offset = self.top_p_token_offsets[-1]
+        self.top_p_token_ids.extend(token_ids)
+        self.top_p_token_offsets.extend(base_offset + offset for offset in offsets[1:])
+
+    def _top_p_slice(self, start: int, end: int) -> tuple[list[int], list[int]] | None:
+        if self.top_p_token_ids is None or self.top_p_token_offsets is None:
+            return None
+        start_offset = self.top_p_token_offsets[start]
+        end_offset = self.top_p_token_offsets[end]
+        token_ids = self.top_p_token_ids[start_offset:end_offset]
+        offsets = [offset - start_offset for offset in self.top_p_token_offsets[start : end + 1]]
+        return token_ids, offsets
+
+    def _truncate_top_p_tokens(self, length: int) -> None:
+        if self.top_p_token_ids is None or self.top_p_token_offsets is None:
+            return
+        kept_token_count = self.top_p_token_offsets[length]
+        del self.top_p_token_ids[kept_token_count:]
+        del self.top_p_token_offsets[length + 1 :]
 
     def has_trained_response(self) -> bool:
         return any(self.loss_mask[self.leading_prompt_len :])
@@ -234,7 +347,7 @@ class _SampleBuilder:
         """Emit the accumulated tokens as one ``Sample``, stripping the first-turn
         prompt so loss_mask / logprobs cover only the response region."""
         start = self.leading_prompt_len  # first-turn prompt stripped; response region starts here
-        return Sample(
+        sample = Sample(
             index=base_sample.index,
             group_index=base_sample.group_index,
             rollout_id=base_sample.rollout_id if base_sample.rollout_id is not None else base_sample.index,
@@ -248,6 +361,13 @@ class _SampleBuilder:
             status=Sample.Status.COMPLETED,
             metadata=dict(extra_metadata or {}),
         )
+        policy_loss_mask = self.policy_loss_mask[start:]
+        if policy_loss_mask != sample.loss_mask:
+            sample.policy_loss_mask = policy_loss_mask
+        top_p_data = self._top_p_slice(start, len(self.tokens))
+        if top_p_data is not None:
+            sample.rollout_top_p_token_ids, sample.rollout_top_p_token_offsets = top_p_data
+        return sample
 
 
 # ===========================================================================
@@ -285,6 +405,22 @@ class TrajectoryManager:
             f"turn.output_log_probs length {len(turn.output_log_probs)} != "
             f"turn.output_ids length {len(turn.output_ids)}"
         )
+        assert turn.loss_mask is None or len(turn.loss_mask) == len(turn.output_ids), (
+            f"turn.loss_mask length {len(turn.loss_mask)} != "
+            f"turn.output_ids length {len(turn.output_ids)}"
+        )
+        assert turn.policy_loss_mask is None or len(turn.policy_loss_mask) == len(turn.output_ids), (
+            f"turn.policy_loss_mask length {len(turn.policy_loss_mask)} != "
+            f"turn.output_ids length {len(turn.output_ids)}"
+        )
+        assert (turn.rollout_top_p_token_ids is None) == (turn.rollout_top_p_token_offsets is None), (
+            "turn.rollout_top_p_token_ids and turn.rollout_top_p_token_offsets must be set together"
+        )
+        if turn.rollout_top_p_token_offsets is not None:
+            assert len(turn.rollout_top_p_token_offsets) == len(turn.output_ids) + 1, (
+                f"turn.rollout_top_p_token_offsets length {len(turn.rollout_top_p_token_offsets)} != "
+                f"turn.output_ids length + 1 {len(turn.output_ids) + 1}"
+            )
 
         root = self._trees.setdefault(sid, MessageNode())
 
@@ -300,6 +436,7 @@ class TrajectoryManager:
         base_sample: Sample,
         reward: float = 0.0,
         extra_metadata: dict[str, Any] | None = None,
+        allow_fully_masked: bool = False,
     ) -> list[Sample]:
         """Linearize this sid's routing tree into slime ``Sample`` objects and
         consume the session.
@@ -317,7 +454,14 @@ class TrajectoryManager:
             if routing_leaf.is_root:
                 continue
             chain = routing_leaf.path_from_root()
-            samples.extend(self._chain_to_samples(chain, base_sample=base_sample, extra_metadata=extra_metadata))
+            samples.extend(
+                self._chain_to_samples(
+                    chain,
+                    base_sample=base_sample,
+                    extra_metadata=extra_metadata,
+                    allow_fully_masked=allow_fully_masked,
+                )
+            )
 
         # TODO custom reward func
         per_sample_reward = (reward / len(samples)) if samples else 0.0
@@ -463,11 +607,12 @@ class TrajectoryManager:
         *,
         base_sample: Sample,
         extra_metadata: dict[str, Any] | None,
+        allow_fully_masked: bool = False,
     ) -> list[Sample]:
         return [
             builder.to_sample(base_sample, extra_metadata)
             for builder in self._split_chain_into_builders(chain)
-            if builder.has_trained_response()
+            if allow_fully_masked or builder.has_trained_response()
         ]
 
 

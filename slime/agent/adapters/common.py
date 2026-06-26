@@ -24,6 +24,7 @@ from aiohttp import web
 
 from slime.agent.parsing import parse_model_output
 from slime.agent.trajectory import TrajectoryManager, TurnRecord
+from slime.rollout.sglang_rollout import _extract_rollout_top_p_token_data
 
 
 __all__ = ["TurnRecord"]
@@ -464,6 +465,7 @@ async def call_sglang_generate(
         output_token_logprobs = meta.get("output_token_logprobs") or []
         output_ids = [x[1] for x in output_token_logprobs]
         output_log_probs = [float(x[0]) for x in output_token_logprobs]
+        top_p_data = _extract_rollout_top_p_token_data(meta, expected_num_tokens=len(output_ids))
         finish = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
     except (asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError) as e:
         # free the sglang slot eagerly on client cancel/timeout, else the
@@ -476,12 +478,15 @@ async def call_sglang_generate(
             pass
         raise
 
-    return TurnRecord(
+    turn = TurnRecord(
         prompt_ids=list(prompt_ids),
         output_ids=output_ids,
         finish_reason=finish,
         output_log_probs=output_log_probs,
     )
+    if top_p_data is not None:
+        turn.rollout_top_p_token_ids, turn.rollout_top_p_token_offsets = top_p_data
+    return turn
 
 
 async def _health(request: web.Request) -> web.Response:

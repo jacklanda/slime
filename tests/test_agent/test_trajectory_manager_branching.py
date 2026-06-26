@@ -682,15 +682,14 @@ def test_2_4_drift_case_B1_short_replaces():
     s0 = samples[0]
     L = _common_prefix_len(p1 + r1, p2)
     assert L == drift_idx
-    # replace: the drifted r:call response is no longer a faithful echo of what the
-    # model generated (its tail diverged), so the WHOLE surviving span is masked and
-    # re-supplied as loss=0 prompt context (the <DRIFT> token marks the divergence);
-    # only the new r:done trains.
+    # realign: the replayed prompt drifted inside r:call, but r:call was still a
+    # real generated action from the previous turn. Keep that action trainable
+    # and append only the replayed tool/gen tail as loss=0 context.
     assert goldens(samples) == [
-        "<sys> system:S </sys> <usr> user:u </usr> <gen> r:call <DRIFT> "
+        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:call] [<DRIFT>] "
         "<tul> tool:t </tul> <gen> [r:done] [</ast>]",
     ]
-    assert s0.rollout_log_probs == [0.0] * (len(p2) - len(p1)) + [-0.4] * len(r2)
+    assert s0.rollout_log_probs == [-0.5] * len(r1) + [0.0] * (len(p2) - len(p1) - len(r1)) + [-0.4] * len(r2)
     _check_invariants(samples)
     _record("2.4 drift case B1 (small) -> replace", mgr, sid, samples)
     print("PASS 2.4")
@@ -1216,6 +1215,35 @@ def test_4_5_mixed_logprobs_across_turns():
     print("PASS 4.5")
 
 
+def test_4_6_top_p_replay_fields_are_sliced_to_response_region():
+    mgr = TrajectoryManager()
+    sid = "4.6"
+    s, u = sys_msg("S"), usr_msg("u")
+    prompt_ids = render_prompt([s, u])
+    response_ids = render_response("top-p")
+    mgr.record_turn(
+        sid,
+        turn=TurnRecord(
+            prompt_ids=prompt_ids,
+            output_ids=response_ids,
+            finish_reason="stop",
+            output_log_probs=[-0.1] * len(response_ids),
+            rollout_top_p_token_ids=[100 + i for i in range(len(response_ids) * 2)],
+            rollout_top_p_token_offsets=[i * 2 for i in range(len(response_ids) + 1)],
+        ),
+        prompt_messages=messages([s, u]),
+        response_message={"role": "assistant", "content": "top-p"},
+    )
+
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+
+    assert len(samples) == 1
+    assert samples[0].response_length == len(response_ids)
+    assert samples[0].rollout_top_p_token_ids == [100 + i for i in range(len(response_ids) * 2)]
+    assert samples[0].rollout_top_p_token_offsets == [i * 2 for i in range(len(response_ids) + 1)]
+    _check_invariants(samples)
+
+
 def test_4_6_drift_B1_threshold_boundary():
     """case-B1 threshold compares the incoming turn's full ``output_ids`` length
     to ``fork_threshold`` (mirroring ``_try_merge_assistant_rewrite``): the gate
@@ -1263,10 +1291,9 @@ def test_4_6_drift_B1_threshold_boundary():
     # len(r2) < threshold -> replace: one coherent segment realigned to p2.
     replaced, p1b, r1b, p2b, r2b = run(threshold=3, new_resp_len=2)
     assert len(replaced) == 1, f"len(r2)<threshold must replace, got {len(replaced)}"
+    tail_start = len(p1b) + len(r1b)
     assert replaced[0].tokens == p2b + r2b
-    # the drifted r1 echo is not a faithful response anymore -> the WHOLE r1 span is
-    # masked (loss=0 prompt context), r2 trains.
-    assert replaced[0].loss_mask == [0] * (len(p2b) - len(p1b)) + [1] * len(r2b)
+    assert replaced[0].loss_mask == [1] * len(r1b) + [0] * (len(p2b) - tail_start) + [1] * len(r2b)
     _check_invariants(forked)
     _check_invariants(replaced)
     print("PASS 4.6")
