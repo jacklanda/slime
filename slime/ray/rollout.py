@@ -1570,8 +1570,14 @@ def compute_episode_metrics_from_samples(args, samples):
 
     if fused_stats["terminations"]:
         total = len(fused_stats["terminations"])
+        termination_counts: dict[str, int] = {}
         for termination, items in group_by(fused_stats["terminations"]).items():
-            metrics[f"episode/termination_reason/{_normalize_termination_reason(termination)}"] = len(items) / total
+            normalized = _normalize_termination_reason(termination)
+            termination_counts[normalized] = termination_counts.get(normalized, 0) + len(items)
+        for termination, count in termination_counts.items():
+            metrics[f"episode/termination_reason/{termination}"] = count / total
+        warning_count = sum(count for reason, count in termination_counts.items() if _is_warning_termination(reason))
+        metrics["episode/termination_warning/abnormal_or_limit"] = warning_count / total
 
     for key, values in fused_stats["workflow_values"].items():
         metrics[f"episode/{key}"] = float(np.mean(values))
@@ -1741,35 +1747,53 @@ def _metric_task_suffix(task_type: str) -> str:
 def _normalize_termination_reason(reason: str) -> str:
     normalized = str(reason).lower().replace("-", "_")
     aliases = {
-        "max_response_len_exceeded": "max_response_length_exceeded",
-        "step_token_budget_exhausted": "max_response_length_exceeded",
-        "truncation": "max_response_length_exceeded",
-        "max_context_len_exceeded": "max_prompt_length_exceeded",
-        "prompt_truncation": "max_prompt_length_exceeded",
+        "max_response_length_exceeded": "max_response_len_exceeded",
+        "step_token_budget_exhausted": "max_response_len_exceeded",
+        "truncation": "max_response_len_exceeded",
+        "max_prompt_length_exceeded": "max_context_len_exceeded",
+        "prompt_truncation": "max_context_len_exceeded",
         "env_timeout": "timeout",
-        "abnormal_parse_error": "error",
-        "invalid_react_structure": "error",
-        "invalid_final_step": "error",
-        "abnormal_tool_burst": "error",
-        "abnormal_direct_submit_without_tool": "error",
-        "abnormal_repeated_query": "error",
-        "abnormal_ngram_repetition": "error",
-        "abnormal_search_bypass": "error",
-        "tail_guard_early_stop": "error",
-        "env_init_error": "error",
     }
     normalized = aliases.get(normalized, normalized)
-    if normalized not in {
+    known_reasons = {
         "unknown",
         "timeout",
         "max_turns_exceeded",
-        "max_response_length_exceeded",
-        "max_prompt_length_exceeded",
+        "max_response_len_exceeded",
+        "max_context_len_exceeded",
+        "abnormal_parse_error",
+        "invalid_react_structure",
+        "invalid_final_step",
+        "abnormal_tool_burst",
+        "abnormal_direct_submit_without_tool",
+        "abnormal_repeated_query",
+        "abnormal_ngram_repetition",
+        "abnormal_search_bypass",
+        "abnormal_mixed_tool_and_answer",
+        "tail_guard_early_stop",
+        "env_init_error",
         "error",
         "env_done",
-    }:
+    }
+    if normalized not in known_reasons:
         return "unknown"
     return normalized
+
+
+def _is_warning_termination(reason: str) -> bool:
+    normalized = _normalize_termination_reason(reason)
+    return (
+        normalized.startswith("abnormal_")
+        or normalized in {
+            "invalid_react_structure",
+            "invalid_final_step",
+            "tail_guard_early_stop",
+            "env_init_error",
+            "error",
+            "max_context_len_exceeded",
+            "max_response_len_exceeded",
+        }
+    )
 
 
 def compute_perf_metrics_from_samples(args, samples, rollout_time):

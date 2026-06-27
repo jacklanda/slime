@@ -522,7 +522,7 @@ async def generate_rollout_async(
 
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
-            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
+            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group, rollout_id=rollout_id)
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 state.remaining_batch_size -= 1

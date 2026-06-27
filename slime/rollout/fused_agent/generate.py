@@ -39,6 +39,11 @@ from .prompts import (
 )
 
 logger = logging.getLogger(__name__)
+DEFAULT_SGLANG_CONTEXT_LENGTH_MARGIN = 256
+
+
+class SGLangContextLengthExceededError(ValueError):
+    pass
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -68,7 +73,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
     base_max_steps = int(os.environ.get("FUSED_MAX_STEPS", getattr(args, "fused_max_steps", "16")))
     per_step_max_tokens = int(os.environ.get("PER_STEP_MAX_TOKENS", str(sampling_params.get("max_new_tokens", 2048))))
     disable_thinking = _env_bool("FUSED_DISABLE_THINKING", True)
-    max_context_tokens = int(getattr(args, "rollout_max_context_len", 0) or 0)
+    max_context_tokens = _effective_sglang_context_limit(args)
     max_tool_calls_per_turn = int(os.environ.get("FUSED_MAX_TOOL_CALLS_PER_TURN", os.environ.get("MAX_TOOL_CALLS_PER_TURN", "4")))
     credit_assignment_enable = _env_bool("CREDIT_ASSIGNMENT_ENABLE", True)
     credit_assignment_tool_parser_error = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR", True)
@@ -122,7 +127,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
             prompt_ids = _render_prompt_ids(state.tokenizer, messages, disable_thinking=disable_thinking)
             if max_context_tokens and len(prompt_ids) >= max_context_tokens:
                 final_done = True
-                last_info = {"termination_reason": "max_context_len_exceeded"}
+                last_info = {
+                    "termination_reason": "max_context_len_exceeded",
+                    "prompt_tokens": len(prompt_ids),
+                    "max_context_tokens": max_context_tokens,
+                }
                 break
             step_sampling = dict(sampling_params)
             step_sampling["max_new_tokens"] = max(0, min(int(step_sampling.get("max_new_tokens", per_step_max_tokens)), per_step_max_tokens))
@@ -130,11 +139,26 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
                 step_sampling["max_new_tokens"] = min(step_sampling["max_new_tokens"], max_context_tokens - len(prompt_ids))
             if step_sampling["max_new_tokens"] <= 0:
                 final_done = True
-                last_info = {"termination_reason": "step_token_budget_exhausted"}
+                last_info = {
+                    "termination_reason": "max_context_len_exceeded",
+                    "prompt_tokens": len(prompt_ids),
+                    "max_context_tokens": max_context_tokens,
+                }
                 break
 
             llm_start = time.time()
-            output = await _call_sglang(args, prompt_ids, step_sampling, session_id=session_id)
+            try:
+                output = await _call_sglang(args, prompt_ids, step_sampling, session_id=session_id)
+            except SGLangContextLengthExceededError as exc:
+                final_done = True
+                last_info = {
+                    "termination_reason": "max_context_len_exceeded",
+                    "prompt_tokens": len(prompt_ids),
+                    "max_new_tokens": int(step_sampling.get("max_new_tokens", 0) or 0),
+                    "max_context_tokens": max_context_tokens,
+                    "error": str(exc),
+                }
+                break
             step_llm_time = time.time() - llm_start
             llm_time += step_llm_time
             output_ids = output["output_ids"]
@@ -1427,7 +1451,30 @@ def _max_steps_for_mode(task_type: str, default: int) -> int:
     return default
 
 
+def _effective_sglang_context_limit(args) -> int:
+    limits = [
+        int(value)
+        for value in (
+            getattr(args, "sglang_context_length", None),
+            getattr(args, "rollout_max_context_len", None),
+        )
+        if value
+    ]
+    if not limits:
+        return 0
+    margin = max(0, int(os.environ.get("SGLANG_CONTEXT_LENGTH_MARGIN", DEFAULT_SGLANG_CONTEXT_LENGTH_MARGIN)))
+    return max(0, min(limits) - margin)
+
+
 async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, Any], *, session_id: str) -> dict[str, Any]:
+    max_new_tokens = int(sampling_params.get("max_new_tokens", 0) or 0)
+    max_context_tokens = _effective_sglang_context_limit(args)
+    requested_tokens = len(prompt_ids) + max_new_tokens
+    if max_context_tokens and requested_tokens > max_context_tokens:
+        raise SGLangContextLengthExceededError(
+            f"SGLang request would use {requested_tokens} tokens "
+            f"({len(prompt_ids)} prompt + {max_new_tokens} new), exceeding local limit {max_context_tokens}."
+        )
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     rid = uuid.uuid4().hex
     payload = {

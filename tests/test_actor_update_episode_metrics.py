@@ -141,7 +141,7 @@ def test_actor_update_episode_metrics_only_uses_actor_update_valid_episodes(monk
     assert metrics["episode/traj/steps"] == 2.0
 
 
-def test_actor_update_episode_metrics_maps_fused_abnormal_terminations_to_error(monkeypatch):
+def test_actor_update_episode_metrics_logs_fused_abnormal_termination_details(monkeypatch):
     metrics_fn = _episode_metrics_for_actor_update(monkeypatch)
 
     metrics = metrics_fn(
@@ -163,8 +163,38 @@ def test_actor_update_episode_metrics_maps_fused_abnormal_terminations_to_error(
         }
     )
 
-    assert metrics["episode/termination_reason/error"] == 1.0
+    assert metrics["episode/termination_reason/abnormal_parse_error"] == pytest.approx(1 / 3)
+    assert metrics["episode/termination_reason/abnormal_tool_burst"] == pytest.approx(1 / 3)
+    assert metrics["episode/termination_reason/abnormal_repeated_query"] == pytest.approx(1 / 3)
+    assert metrics["episode/termination_warning/abnormal_or_limit"] == 1.0
+    assert metrics["episode/termination_reason/error"] == 0.0
     assert metrics["episode/termination_reason/unknown"] == 0.0
+
+
+def test_actor_update_episode_metrics_logs_context_and_response_limit_terminations(monkeypatch):
+    metrics_fn = _episode_metrics_for_actor_update(monkeypatch)
+
+    metrics = metrics_fn(
+        {
+            "episode_metrics_data": {
+                "raw_rewards": [0.0, 0.0],
+                "metadata": [
+                    {"fused_task_type": "webqa", "fused_termination": "max_context_len_exceeded"},
+                    {"fused_task_type": "webqa", "fused_termination": "max_response_len_exceeded"},
+                ],
+                "group_indices": [1, 2],
+                "remove_sample": [False, False],
+                "loss_mask_sums": [3, 3],
+                "prompt_lengths": [2, 2],
+                "response_lengths": [4, 4],
+                "statuses": ["completed", "completed"],
+            }
+        }
+    )
+
+    assert metrics["episode/termination_reason/max_context_len_exceeded"] == 0.5
+    assert metrics["episode/termination_reason/max_response_len_exceeded"] == 0.5
+    assert metrics["episode/termination_warning/abnormal_or_limit"] == 1.0
 
 
 def test_actor_update_episode_metrics_uses_best_sample_termination_per_group(monkeypatch):

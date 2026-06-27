@@ -1208,6 +1208,36 @@ def test_call_sglang_aborts_request_on_timeout(monkeypatch):
     )
 
 
+def test_effective_sglang_context_limit_uses_margin(monkeypatch):
+    monkeypatch.setenv("SGLANG_CONTEXT_LENGTH_MARGIN", "8")
+    args = SimpleNamespace(sglang_context_length=100, rollout_max_context_len=120)
+
+    assert fused_generate._effective_sglang_context_limit(args) == 92
+
+
+def test_call_sglang_rejects_over_context_before_http(monkeypatch):
+    calls = []
+
+    async def fake_post(url, payload, headers=None):
+        calls.append((url, payload, headers))
+        raise AssertionError("http post should not be called")
+
+    monkeypatch.setenv("SGLANG_CONTEXT_LENGTH_MARGIN", "2")
+    monkeypatch.setattr(fused_generate.http_utils, "post", fake_post)
+    args = SimpleNamespace(
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        router_policy=None,
+        sglang_context_length=10,
+        rollout_max_context_len=10,
+    )
+
+    with pytest.raises(fused_generate.SGLangContextLengthExceededError):
+        asyncio.run(fused_generate._call_sglang(args, [1, 2, 3, 4, 5, 6, 7], {"max_new_tokens": 2}, session_id="sid"))
+
+    assert calls == []
+
+
 def test_custom_generate_with_mocked_sglang(tmp_path: Path, monkeypatch=None):
     asset = tmp_path / "asset"
     asset.mkdir()

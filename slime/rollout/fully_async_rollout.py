@@ -243,7 +243,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
         for gid, group in worker.get_completed_groups():
             completed_groups += 1
             candidate_metric_groups.append(group)
-            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, _flatten_samples(group))
+            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, _flatten_samples(group), rollout_id=rollout_id)
             relax_filter = filter_relax_after > 0 and completed_groups >= filter_relax_after
             if not dynamic_filter_output.keep and not relax_filter:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)

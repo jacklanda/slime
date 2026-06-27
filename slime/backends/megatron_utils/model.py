@@ -265,6 +265,8 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
     total_terminations = sum(termination_counts.values())
     for termination, count in termination_counts.items():
         metrics[f"episode/termination_reason/{termination}"] = count / total_terminations
+    termination_warning_count = sum(count for reason, count in termination_counts.items() if _is_warning_termination(reason))
+    metrics["episode/termination_warning/abnormal_or_limit"] = termination_warning_count / total_terminations
     for key, values in workflow_values.items():
         mean_value = float(sum(values) / len(values))
         metrics[f"episode/{key}"] = mean_value
@@ -311,8 +313,19 @@ _RLLM_TERMINATION_REASONS = (
     "unknown",
     "timeout",
     "max_turns_exceeded",
-    "max_response_length_exceeded",
-    "max_prompt_length_exceeded",
+    "max_response_len_exceeded",
+    "max_context_len_exceeded",
+    "abnormal_parse_error",
+    "invalid_react_structure",
+    "invalid_final_step",
+    "abnormal_tool_burst",
+    "abnormal_direct_submit_without_tool",
+    "abnormal_repeated_query",
+    "abnormal_ngram_repetition",
+    "abnormal_search_bypass",
+    "abnormal_mixed_tool_and_answer",
+    "tail_guard_early_stop",
+    "env_init_error",
     "error",
     "env_done",
 )
@@ -333,22 +346,12 @@ def _metric_value_from_metadata(metadata: dict, reward_debug, key: str) -> float
 def _normalize_termination_reason(reason: str) -> str:
     normalized = reason.lower().replace("-", "_")
     aliases = {
-        "max_response_len_exceeded": "max_response_length_exceeded",
-        "step_token_budget_exhausted": "max_response_length_exceeded",
-        "truncation": "max_response_length_exceeded",
-        "max_context_len_exceeded": "max_prompt_length_exceeded",
-        "prompt_truncation": "max_prompt_length_exceeded",
+        "max_response_length_exceeded": "max_response_len_exceeded",
+        "step_token_budget_exhausted": "max_response_len_exceeded",
+        "truncation": "max_response_len_exceeded",
+        "max_prompt_length_exceeded": "max_context_len_exceeded",
+        "prompt_truncation": "max_context_len_exceeded",
         "env_timeout": "timeout",
-        "abnormal_parse_error": "error",
-        "invalid_react_structure": "error",
-        "invalid_final_step": "error",
-        "abnormal_tool_burst": "error",
-        "abnormal_direct_submit_without_tool": "error",
-        "abnormal_repeated_query": "error",
-        "abnormal_ngram_repetition": "error",
-        "abnormal_search_bypass": "error",
-        "tail_guard_early_stop": "error",
-        "env_init_error": "error",
     }
     normalized = aliases.get(normalized, normalized)
     if normalized not in _RLLM_TERMINATION_REASONS:
@@ -359,14 +362,35 @@ def _normalize_termination_reason(reason: str) -> str:
 def _termination_priority(reason: str) -> int:
     order = {
         "env_done": 5,
-        "max_response_length_exceeded": 4,
-        "max_prompt_length_exceeded": 3,
+        "max_response_len_exceeded": 4,
+        "max_context_len_exceeded": 3,
         "max_turns_exceeded": 2,
         "timeout": 1,
         "error": 0,
         "unknown": -1,
     }
-    return order[_normalize_termination_reason(reason)]
+    normalized = _normalize_termination_reason(reason)
+    if normalized in order:
+        return order[normalized]
+    if _is_warning_termination(normalized):
+        return 0
+    return order["unknown"]
+
+
+def _is_warning_termination(reason: str) -> bool:
+    normalized = _normalize_termination_reason(reason)
+    return (
+        normalized.startswith("abnormal_")
+        or normalized in {
+            "invalid_react_structure",
+            "invalid_final_step",
+            "tail_guard_early_stop",
+            "env_init_error",
+            "error",
+            "max_context_len_exceeded",
+            "max_response_len_exceeded",
+        }
+    )
 
 
 def _coerce_finite_float(value) -> float | None:
