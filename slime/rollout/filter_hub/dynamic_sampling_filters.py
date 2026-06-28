@@ -7,7 +7,6 @@ from slime.utils.types import Sample
 
 __all__ = [
     "check_reward_nonzero_std",
-    "check_reward_nonzero_std_agentic",
     "check_reward_nonzero_std_and_fused_steps",
 ]
 
@@ -18,23 +17,6 @@ def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
     return DynamicFilterOutput(
         keep=keep,
         reason=None if keep else f"zero_std_{round(rewards[0], 1)}",
-    )
-
-
-def check_reward_nonzero_std_agentic(args, samples: list[Sample], **kwargs):
-    flat_samples = list(_iter_samples(samples))
-    rewards = [sample.get_reward_value(args) for sample in flat_samples]
-    if torch.tensor(rewards, dtype=torch.float64).std() > 1e-6:
-        return DynamicFilterOutput(keep=True)
-
-    scores = [
-        _agentic_score(args, sample, rollout_id=kwargs.get("rollout_id"))
-        for sample in flat_samples
-    ]
-    keep = bool(torch.tensor(scores, dtype=torch.float64).std() > 1e-6)
-    return DynamicFilterOutput(
-        keep=keep,
-        reason=None if keep else f"zero_agentic_score_{_reason_value(scores[0] if scores else 0.0)}",
     )
 
 
@@ -107,33 +89,6 @@ def _is_abnormal(sample: Sample) -> bool:
         or "exceeded" in termination
         or termination in {"error", "timeout"}
     )
-
-
-def _agentic_score(args, sample: Sample, *, rollout_id: int | None = None) -> float:
-    reward = float(sample.get_reward_value(args))
-    if reward <= 0 or _is_abnormal(sample):
-        return reward
-
-    target_steps = _agentic_target_steps(rollout_id)
-    target_tool_calls = _float_env("FUSED_AGENTIC_FILTER_TARGET_TOOL_CALLS", max(1.0, target_steps - 1.0))
-    step_bonus = _float_env("FUSED_AGENTIC_FILTER_STEP_BONUS", 0.05)
-    tool_call_bonus = _float_env("FUSED_AGENTIC_FILTER_TOOL_CALL_BONUS", 0.03)
-    steps = _metadata_float(sample, "fused_traj_steps", "traj_steps")
-    tool_calls = _metadata_float(sample, "fused_tool_call_turns", "tool_call_turns", "tool_call_turn")
-    return reward + step_bonus * min(max(steps, 0.0) / target_steps, 1.0) + tool_call_bonus * min(
-        max(tool_calls, 0.0) / target_tool_calls,
-        1.0,
-    )
-
-
-def _agentic_target_steps(rollout_id: int | None) -> float:
-    start = _float_env("FUSED_AGENTIC_FILTER_TARGET_STEPS", 8.0)
-    end = _float_env("FUSED_AGENTIC_FILTER_TARGET_STEPS_END", start)
-    warmup_rollouts = _float_env("FUSED_AGENTIC_FILTER_TARGET_STEPS_WARMUP_ROLLOUTS", 0.0)
-    if warmup_rollouts <= 0 or rollout_id is None:
-        return max(1.0, start)
-    progress = min(max(float(rollout_id), 0.0) / warmup_rollouts, 1.0)
-    return max(1.0, start + (end - start) * progress)
 
 
 def _metadata_float(sample: Sample, *keys: str) -> float:
