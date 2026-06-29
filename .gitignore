@@ -195,5 +195,6 @@ _examples_synced/
 .DS_Store
 
 experiments/**
+!experiments/*.sh
 checkpoints/**
 submitted_result.json

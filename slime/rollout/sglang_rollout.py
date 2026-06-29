@@ -546,8 +546,11 @@ async def generate_rollout_async(
         f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
     )
 
-    # there are still some unfinished requests, abort them
-    aborted_samples = await abort(args, rollout_id)
+    # Abort only when this rollout still owns unfinished requests.  With the
+    # default over_sampling_batch_size == rollout_batch_size path, all submitted
+    # groups are normally consumed before we get here, so a full server abort is
+    # just noisy.
+    aborted_samples = await abort(args, rollout_id) if state.pendings else []
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)

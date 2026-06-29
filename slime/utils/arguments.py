@@ -1912,6 +1912,9 @@ def slime_validate_args(args):
         if args.opd_teacher_load is not None:
             raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
 
+    explicit_debug_rollout_load = args.debug_rollout_only and args.load is not None
+    explicit_debug_rollout_start = args.debug_rollout_only and args.start_rollout_id is not None
+
     if args.megatron_to_hf_mode == "bridge":
         if (
             args.load is not None
@@ -1924,7 +1927,8 @@ def slime_validate_args(args):
             if args.load is None:
                 args.load = args.ref_load or args.hf_checkpoint
             # If is a HF checkpoint, set start_rollout_id to 0 here.
-            args.start_rollout_id = 0
+            if not explicit_debug_rollout_start:
+                args.start_rollout_id = 0
     else:
         if (
             args.load is None
@@ -1934,10 +1938,12 @@ def slime_validate_args(args):
             args.no_load_optim = True
             args.no_load_rng = True
             args.finetune = True
-            args.load = args.ref_load
+            if not explicit_debug_rollout_load:
+                args.load = args.ref_load
             if args.ref_ckpt_step is not None:
                 args.ckpt_step = args.ref_ckpt_step
-            args.start_rollout_id = 0
+            if not explicit_debug_rollout_start:
+                args.start_rollout_id = 0
 
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
