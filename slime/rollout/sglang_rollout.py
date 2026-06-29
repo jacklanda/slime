@@ -522,7 +522,12 @@ async def generate_rollout_async(
 
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
-            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group, rollout_id=rollout_id)
+            dynamic_filter_output = call_dynamic_filter(
+                dynamic_filter,
+                args,
+                _flatten_samples(group),
+                rollout_id=rollout_id,
+            )
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 state.remaining_batch_size -= 1
@@ -706,3 +711,15 @@ def generate_rollout(
     if aborted_samples:
         data_source.add_samples(aborted_samples)
     return output
+
+
+def _flatten_samples(group) -> list[Sample]:
+    samples: list[Sample] = []
+    stack = list(group)
+    while stack:
+        item = stack.pop(0)
+        if isinstance(item, list):
+            stack[:0] = item
+        else:
+            samples.append(item)
+    return samples
