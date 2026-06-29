@@ -74,12 +74,23 @@ Options:
   --horizon-reward-target-steps X        Target steps for no horizon penalty. Default: 8.
   --horizon-reward-target-tool-calls X   Target tool calls for no horizon penalty. Default: target_steps - 1.
   --enable-dynamic-sampling-filter BOOL  Enable DAPO-style non-zero reward variance dynamic filtering. Default: true.
+  --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
+  --grm-model NAME                       OpenRouter judge model. Default: deepseek/deepseek-v4-flash.
+  --grm-concurrency N                    Max concurrent GRM requests. Default: 128.
+  --grm-timeout SECONDS                  GRM request timeout. Default: 60.
+  --grm-max-retries N                    GRM retry attempts. Default: 3.
+  --grm-max-trajectory-chars N           Trajectory chars sent to GRM. Default: 24000.
   --max-steps N                          Fused agent max steps.
   --mcp-max-steps N                      Fused MCP max steps. Default: 16.
   --web-search-max-steps N               Fused web-search max steps. Default: 4.
   --cli-max-steps N                      CLI fused agent max steps env.
   --trajectory-timeout N                 Fused trajectory timeout env.
   --eval-trajectory-timeout N            Fused eval trajectory timeout env.
+  --eval-interval N                      Run interval eval every N rollout steps.
+  --eval-config PATH                     Structured slime eval dataset config.
+  --eval-prompt-data NAME PATH [...]     Legacy eval dataset name/path pairs.
+  --val_before_train BOOL                Run one eval before training starts. Default: true.
+  --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
   --max-tool-output-length N             Fused max tool output length env.
   --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 64.
   --sglang-max-running-requests N        SGLang max running requests. Default: 256.
@@ -138,8 +149,26 @@ CLI_MAX_STEPS="${CLI_MAX_STEPS:-96}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-3600}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-3600}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-128}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-256}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-256}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
+EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
+N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
+EVAL_PROMPT_DATA=()
+ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
+GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
+GRM_MODEL="${GRM_MODEL:-deepseek/deepseek-v4-flash}"
+GRM_CONCURRENCY="${GRM_CONCURRENCY:-512}"
+GRM_MAX_CONNECTIONS="${GRM_MAX_CONNECTIONS:-128}"
+GRM_TIMEOUT="${GRM_TIMEOUT:-60}"
+GRM_MAX_RETRIES="${GRM_MAX_RETRIES:-4}"
+GRM_RETRY_BASE_DELAY="${GRM_RETRY_BASE_DELAY:-1}"
+GRM_RETRY_MAX_DELAY="${GRM_RETRY_MAX_DELAY:-16.0}"
+GRM_MAX_TRAJECTORY_CHARS="${GRM_MAX_TRAJECTORY_CHARS:-30000}"
+GRM_MAX_TOKENS="${GRM_MAX_TOKENS:-128}"
+GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.6}"
+GRM_FAILURE_REWARD="${GRM_FAILURE_REWARD:-0.0}"
 harness_explicit=false
 
 while [ "$#" -gt 0 ]; do
@@ -199,12 +228,36 @@ while [ "$#" -gt 0 ]; do
       --horizon-reward-target-steps) FUSED_HORIZON_REWARD_TARGET_STEPS="${2:?Missing value for --horizon-reward-target-steps}"; shift 2 ;;
       --horizon-reward-target-tool-calls) FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS="${2:?Missing value for --horizon-reward-target-tool-calls}"; shift 2 ;;
       --enable-dynamic-sampling-filter) ENABLE_DYNAMIC_SAMPLING_FILTER="${2:?Missing value for --enable-dynamic-sampling-filter}"; shift 2 ;;
+      --enable_use_grm_evals|--enable-use-grm-evals) ENABLE_USE_GRM_EVALS="${2:?Missing value for --enable_use_grm_evals}"; shift 2 ;;
+      --grm-model) GRM_MODEL="${2:?Missing value for --grm-model}"; shift 2 ;;
+      --grm-concurrency) GRM_CONCURRENCY="${2:?Missing value for --grm-concurrency}"; shift 2 ;;
+      --grm-max-connections) GRM_MAX_CONNECTIONS="${2:?Missing value for --grm-max-connections}"; shift 2 ;;
+      --grm-timeout) GRM_TIMEOUT="${2:?Missing value for --grm-timeout}"; shift 2 ;;
+      --grm-max-retries) GRM_MAX_RETRIES="${2:?Missing value for --grm-max-retries}"; shift 2 ;;
+      --grm-retry-base-delay) GRM_RETRY_BASE_DELAY="${2:?Missing value for --grm-retry-base-delay}"; shift 2 ;;
+      --grm-retry-max-delay) GRM_RETRY_MAX_DELAY="${2:?Missing value for --grm-retry-max-delay}"; shift 2 ;;
+      --grm-max-trajectory-chars) GRM_MAX_TRAJECTORY_CHARS="${2:?Missing value for --grm-max-trajectory-chars}"; shift 2 ;;
+      --grm-max-tokens) GRM_MAX_TOKENS="${2:?Missing value for --grm-max-tokens}"; shift 2 ;;
+      --grm-temperature) GRM_TEMPERATURE="${2:?Missing value for --grm-temperature}"; shift 2 ;;
+      --grm-failure-reward) GRM_FAILURE_REWARD="${2:?Missing value for --grm-failure-reward}"; shift 2 ;;
       --max-steps) MAX_STEPS="${2:?Missing value for --max-steps}"; shift 2 ;;
       --mcp-max-steps) MCP_MAX_STEPS="${2:?Missing value for --mcp-max-steps}"; shift 2 ;;
       --web-search-max-steps) WEB_SEARCH_MAX_STEPS="${2:?Missing value for --web-search-max-steps}"; shift 2 ;;
       --cli-max-steps) CLI_MAX_STEPS="${2:?Missing value for --cli-max-steps}"; shift 2 ;;
       --trajectory-timeout) TRAJECTORY_TIMEOUT="${2:?Missing value for --trajectory-timeout}"; shift 2 ;;
       --eval-trajectory-timeout) EVAL_TRAJECTORY_TIMEOUT="${2:?Missing value for --eval-trajectory-timeout}"; shift 2 ;;
+      --eval-interval) EVAL_INTERVAL="${2:?Missing value for --eval-interval}"; shift 2 ;;
+      --eval-config) EVAL_CONFIG="${2:?Missing value for --eval-config}"; shift 2 ;;
+      --val_before_train|--val-before-train) VAL_BEFORE_TRAIN="${2:?Missing value for --val_before_train}"; shift 2 ;;
+      --eval-prompt-data)
+         shift
+         EVAL_PROMPT_DATA=()
+         while [ "$#" -gt 0 ] && [[ "$1" != --* ]]; do
+            EVAL_PROMPT_DATA+=("$1")
+            shift
+         done
+         ;;
+      --n-samples-per-eval-prompt) N_SAMPLES_PER_EVAL_PROMPT="${2:?Missing value for --n-samples-per-eval-prompt}"; shift 2 ;;
       --max-tool-output-length) MAX_TOOL_OUTPUT_LENGTH="${2:?Missing value for --max-tool-output-length}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
@@ -236,8 +289,8 @@ BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 default_experiment_name() {
    #local prefix="fused-dapo-q3-4b-no_think-gem-async-dev"
-   #local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
-   local prefix="asearcher-dapo-q3-8b-no_think-gem-sync-dev"
+   local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
+   #local prefix="asearcher-dapo-q3-8b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-8b-no_think-gem-async-dev"
    #local prefix="webqa-dapo-q3-4b-no_think-gem-async-dev0"
    local max_dev=-1
@@ -263,17 +316,17 @@ elif [ "${SLIME_CLEANUP:-0}" = "1" ]; then
    echo "SLIME_CLEANUP=1 ignored because SLIME_CLEANUP_CONFIRM=1 is not set; preserving existing processes and artifacts."
 fi
 
-MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
+MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/checkpoints/FusedRL/${EXPERIMENT_NAME}}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
 LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/FusedRL/${EXPERIMENT_NAME}}"
-EPISODE_LOG_DIR="${EPISODE_LOG_DIR:-${LOG_ROOT}/episodes}"
+EPISODE_LOG_DIR="${EPISODE_LOG_DIR:-${LOG_ROOT}}"
 DUMP_DETAILS="${DUMP_DETAILS:-${LOG_ROOT}/debug}"
 
 # Current slime's stock RolloutDataSource takes one --prompt-data path. Mirror
@@ -458,7 +511,7 @@ CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}"
    --ref-load "${REF_LOAD}"
    --save "${SAVE_DIR}"
-   --save-interval "${SAVE_INTERVAL:-20}"
+   --save-interval "${SAVE_INTERVAL:-30}"
 )
 
 ROLLOUT_ARGS=(
@@ -519,8 +572,56 @@ if [ -n "${CUSTOM_RM_PATH}" ]; then
 elif [ -n "${RM_TYPE:-}" ]; then
    ROLLOUT_ARGS+=(--rm-type "${RM_TYPE}")
 fi
+if is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTOM_RM_PATH}" ]; then
+   ROLLOUT_ARGS+=(
+      --grm-custom-rm-path "${GRM_CUSTOM_RM_PATH}"
+      --grm-model "${GRM_MODEL}"
+      --grm-concurrency "${GRM_CONCURRENCY}"
+      --grm-max-connections "${GRM_MAX_CONNECTIONS}"
+      --grm-timeout "${GRM_TIMEOUT}"
+      --grm-max-retries "${GRM_MAX_RETRIES}"
+      --grm-retry-base-delay "${GRM_RETRY_BASE_DELAY}"
+      --grm-retry-max-delay "${GRM_RETRY_MAX_DELAY}"
+      --grm-max-trajectory-chars "${GRM_MAX_TRAJECTORY_CHARS}"
+      --grm-max-tokens "${GRM_MAX_TOKENS}"
+      --grm-temperature "${GRM_TEMPERATURE}"
+      --grm-failure-reward "${GRM_FAILURE_REWARD}"
+   )
+   if is_truthy "${ENABLE_USE_GRM_EVALS}"; then
+      ROLLOUT_ARGS+=(--enable-use-grm-evals)
+   fi
+   if [ -n "${GRM_BASE_URL:-}" ]; then
+      ROLLOUT_ARGS+=(--grm-base-url "${GRM_BASE_URL}")
+   fi
+   if [ -n "${OPENROUTER_SITE_URL:-}" ]; then
+      ROLLOUT_ARGS+=(--grm-openrouter-site-url "${OPENROUTER_SITE_URL}")
+   fi
+   if [ -n "${OPENROUTER_APP_NAME:-}" ]; then
+      ROLLOUT_ARGS+=(--grm-openrouter-app-name "${OPENROUTER_APP_NAME}")
+   fi
+   if [ -n "${GRM_SYSTEM_PROMPT:-}" ]; then
+      ROLLOUT_ARGS+=(--grm-system-prompt "${GRM_SYSTEM_PROMPT}")
+   fi
+fi
 if [ -n "${CUSTOM_REWARD_POST_PROCESS_PATH}" ]; then
    ROLLOUT_ARGS+=(--custom-reward-post-process-path "${CUSTOM_REWARD_POST_PROCESS_PATH}")
+fi
+
+EVAL_ARGS=()
+if [ -n "${EVAL_INTERVAL}" ]; then
+   EVAL_ARGS+=(--eval-interval "${EVAL_INTERVAL}")
+   if [ -n "${EVAL_CONFIG}" ]; then
+      EVAL_ARGS+=(--eval-config "${EVAL_CONFIG}")
+   elif [ "${#EVAL_PROMPT_DATA[@]}" -gt 0 ]; then
+      EVAL_ARGS+=(--eval-prompt-data "${EVAL_PROMPT_DATA[@]}")
+   else
+      echo "--eval-interval requires --eval-config or --eval-prompt-data." >&2
+      exit 2
+   fi
+   EVAL_ARGS+=(--n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}")
+   if ! is_truthy "${VAL_BEFORE_TRAIN}"; then
+      EVAL_ARGS+=(--skip-eval-before-train)
+   fi
 fi
 if [ -n "${DUMP_DETAILS}" ]; then
    ROLLOUT_ARGS+=(--dump-details "${DUMP_DETAILS}")
@@ -554,7 +655,7 @@ GRPO_ARGS=(
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF:-0.00}"
    --eps-clip "${EPS_CLIP:-0.2}"
-   --eps-clip-high "${EPS_CLIP_HIGH:-0.4}"
+   --eps-clip-high "${EPS_CLIP_HIGH:-0.28}"
 )
 
 # Rollout correction defaults:
@@ -579,7 +680,7 @@ fi
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr "${LR:-2e-6}"
+   --lr "${LR:-1e-6}"
    --lr-decay-style constant
    --weight-decay "${WEIGHT_DECAY:-0.05}"
    --adam-beta1 0.9
@@ -642,6 +743,7 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
 export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-10000000000}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
+export OPENROUTER_APP_NAME="${OPENROUTER_APP_NAME:-GRM}"
 
 # Fused-agent service knobs inherited from the rllm launcher. They are runtime
 # env only; current slime code consumes the subset used by selected generators.
@@ -650,7 +752,7 @@ export RLLM_RETRIEVAL_MODE="${RLLM_RETRIEVAL_MODE:-hybrid}"
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
 export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-${RLLM_RETRIEVAL_MAX_RESULTS:-4}}"
 export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-1}"
-export RLLM_RETRIEVAL_SUMMARIZE="${RLLM_RETRIEVAL_SUMMARIZE:-0}"
+export RLLM_RETRIEVAL_SUMMARIZE="${RLLM_RETRIEVAL_SUMMARIZE:-1}"
 export RLLM_RETRIEVAL_RETRY_BUDGET="${RLLM_RETRIEVAL_RETRY_BUDGET:-8}"
 export RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET="${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET:-32}"
 export RLLM_RETRIEVAL_LEXRANK_FALLBACK=0
@@ -726,6 +828,7 @@ RUNTIME_ENV_JSON=$(python3 - <<PY
 import json, os
 keys = (
     "HYDRA_FULL_ERROR", "NCCL_IB_DISABLE", "NCCL_TIMEOUT",
+    "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL", "OPENROUTER_APP_NAME",
     "SLIME_EPISODE_LOG_DIR",
     "RAY_WARN_BLOCKING_GET_INSIDE_ASYNC", "TOKENIZERS_PARALLELISM",
     "VLLM_ALLOW_LONG_MAX_MODEL_LEN", "VLLM_ENGINE_ITERATION_TIMEOUT_S",
@@ -784,7 +887,7 @@ echo "Prompt data: ${PROMPT_DATA}"
 echo "Train rows: ${TRAIN_NUM_ROWS}; rollout_batch_size=${ROLLOUT_BATCH_SIZE}; num_epoch=${NUM_EPOCH}; num_rollout=${NUM_ROLLOUT}"
 echo "Save dir: ${SAVE_DIR}"
 echo "Log root: ${LOG_ROOT}"
-echo "Episode log dir: ${EPISODE_LOG_DIR}"
+echo "Episode dump root: ${EPISODE_LOG_DIR} (train/ and evals/)"
 echo "Dump details dir: ${DUMP_DETAILS:-<disabled>}"
 echo "W&B enabled: ${USE_WANDB:-0}"
 echo "Custom generate: ${CUSTOM_GENERATE_FUNCTION_PATH:-<stock slime rollout>}"
@@ -796,6 +899,8 @@ echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_
 echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; micro_batch=${MICRO_BATCH_SIZE}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}"
 echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"
 echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, relax_after_groups=${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}"
+echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, val_before_train=${VAL_BEFORE_TRAIN}"
+echo "OpenRouter GRM evals: enable=${ENABLE_USE_GRM_EVALS}, model=${GRM_MODEL}, concurrency=${GRM_CONCURRENCY}, timeout=${GRM_TIMEOUT}, retries=${GRM_MAX_RETRIES}, custom_rm=${GRM_CUSTOM_RM_PATH}"
 echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING:-0}, path=${BUFFER_FILTER_PATH:-${ENABLE_QUOTA_BUCKET_SAMPLING:+slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps}}"
 echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}"
 echo "Horizon reward shaping: enable=${HORIZON_REWARD_SHAPING}, min_multiplier=${FUSED_HORIZON_REWARD_MIN_MULTIPLIER}, gamma=${FUSED_HORIZON_REWARD_GAMMA}, step_weight=${FUSED_HORIZON_REWARD_STEP_WEIGHT}, tool_call_weight=${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT}, target_steps=${FUSED_HORIZON_REWARD_TARGET_STEPS}, target_tool_calls=${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-target_steps-1}"
@@ -864,6 +969,7 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \
+   "${EVAL_ARGS[@]}" \
    "${OPTIMIZER_ARGS[@]}" \
    "${GRPO_ARGS[@]}" \
    "${PERF_ARGS[@]}" \

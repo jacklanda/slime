@@ -88,6 +88,10 @@ async def async_rm(args, sample: Sample, **kwargs):
         from .ifbench import compute_ifbench_reward
 
         return compute_ifbench_reward(response, label, metadata=metadata)
+    elif rm_type == "benchmark_verifier":
+        from .benchmark_verifier import reward_func
+
+        return await reward_func(args, sample, **kwargs)
     elif rm_type == "random":
         return random.randint(0, 1)
     elif rm_type:

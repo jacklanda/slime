@@ -15,7 +15,7 @@ def save_rllm_episode_batch(args, *, rollout_id: int, samples: list[Sample], mod
     if not episodes:
         return
 
-    log_dir = _episode_log_dir(args)
+    log_dir = _episode_log_dir(args, mode=mode)
     log_dir.mkdir(parents=True, exist_ok=True)
     file_path = log_dir / _batch_filename(rollout_id, mode, epoch)
     batch_data = {
@@ -48,18 +48,22 @@ def _collect_rllm_episodes(samples: list[Sample]) -> list[dict[str, Any]]:
     return episodes
 
 
-def _episode_log_dir(args) -> Path:
+def _episode_log_dir(args, mode: str = "train") -> Path:
     override = os.environ.get("SLIME_EPISODE_LOG_DIR")
     if override:
-        return Path(override)
+        root = Path(override)
+        if root.name in {"episodes", "train", "evals"}:
+            root = root.parent
+        return root / ("evals" if mode == "eval" else "train")
 
     project = _safe_path_part(getattr(args, "wandb_project", None) or "slime")
     group = _safe_path_part(getattr(args, "wandb_group", None) or getattr(args, "wandb_run_id", None) or "default")
-    return Path("experiments") / "logs" / project / group / "episodes"
+    subdir = "evals" if mode == "eval" else "train"
+    return Path("experiments") / "logs" / project / group / subdir
 
 
 def _batch_filename(step: int, mode: str, epoch: int) -> str:
-    if mode == "train":
+    if mode in {"train", "eval"}:
         return f"global_steps_{step}.json"
     return f"{mode}_global_steps_{step}_epoch_{epoch}.json"
 

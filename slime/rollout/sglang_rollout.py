@@ -137,6 +137,23 @@ def _append_rollout_top_p_token_data(
     )
 
 
+def _should_use_grm_eval(args: Namespace, evaluation: bool) -> bool:
+    return evaluation and bool(getattr(args, "enable_use_grm_evals", True))
+
+
+async def _score_eval_samples_with_grm(args: Namespace, samples: list[Sample]) -> None:
+    if not samples:
+        return
+    grm_path = getattr(args, "grm_custom_rm_path", None)
+    for sample in samples:
+        sample.custom_rm_path = grm_path
+        sample.reward = None
+    with trace_span(samples, "grm_eval_reward_model"):
+        rewards = await batched_async_rm(args, samples, evaluation=True)
+    for sample, reward in zip(samples, rewards, strict=False):
+        sample.reward = reward
+
+
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
     """Return the router URL for a named model.
 
@@ -328,6 +345,12 @@ async def generate_and_rm(
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
+    if _should_use_grm_eval(args, evaluation) and (
+        sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED
+    ):
+        await _score_eval_samples_with_grm(args, [sample])
+        return sample
+
     # For samples with existing response, check if they're complete
     if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
         assert sample.response is not None
@@ -366,19 +389,26 @@ async def generate_and_rm(
         if any(sample.status == Sample.Status.ABORTED for sample in samples):
             return samples
 
+        if _should_use_grm_eval(args, evaluation):
+            await _score_eval_samples_with_grm(args, samples)
+            return samples
+
         samples_need_reward = [sample for sample in samples if sample.reward is None]
         with trace_span(samples_need_reward, "reward_model"):
-            rewards = await batched_async_rm(args, samples_need_reward)
+            rewards = await batched_async_rm(args, samples_need_reward, evaluation=evaluation)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
         return samples
     else:
         if sample.status == Sample.Status.ABORTED:
             return sample
+        if _should_use_grm_eval(args, evaluation):
+            await _score_eval_samples_with_grm(args, [sample])
+            return sample
         # Some custom generate paths may have already filled the reward.
         if sample.reward is None:
             with trace_span(sample, "reward_model"):
-                sample.reward = await async_rm(args, sample)
+                sample.reward = await async_rm(args, sample, evaluation=evaluation)
 
     return sample
 
@@ -423,7 +453,7 @@ async def generate_and_rm_group(
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
         with trace_span(group, "group_reward_model"):
-            rewards = await batched_async_rm(args, group)
+            rewards = await batched_async_rm(args, group, evaluation=evaluation)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
 
@@ -644,6 +674,8 @@ async def eval_rollout_single_dataset(
             sample_index += 1
             sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
             sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
+            if getattr(args, "enable_use_grm_evals", True):
+                sample.custom_rm_path = getattr(args, "grm_custom_rm_path", None)
             sampling_params = base_sampling_params
             if getattr(args, "sglang_enable_deterministic_inference", False):
                 sampling_params = base_sampling_params.copy()

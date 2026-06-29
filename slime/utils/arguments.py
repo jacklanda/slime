@@ -1456,6 +1456,34 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--enable-use-grm-evals",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Whether interval eval rollouts should use OpenRouter GRM before rule-based fallback.",
+            )
+            parser.add_argument(
+                "--grm-custom-rm-path",
+                type=str,
+                default="slime.rollout.rm_hub.openrouter_grm.reward_func",
+                help="Custom RM path used for eval samples when --enable-use-grm-evals is enabled.",
+            )
+            parser.add_argument("--grm-base-url", type=str, default="https://openrouter.ai/api/v1")
+            parser.add_argument("--grm-model", type=str, default="deepseek/deepseek-v4-flash")
+            parser.add_argument("--grm-openrouter-api-key", type=str, default=None)
+            parser.add_argument("--grm-openrouter-site-url", type=str, default=None)
+            parser.add_argument("--grm-openrouter-app-name", type=str, default="GRM")
+            parser.add_argument("--grm-concurrency", type=int, default=128)
+            parser.add_argument("--grm-max-connections", type=int, default=128)
+            parser.add_argument("--grm-timeout", type=float, default=60.0)
+            parser.add_argument("--grm-max-retries", type=int, default=3)
+            parser.add_argument("--grm-retry-base-delay", type=float, default=0.5)
+            parser.add_argument("--grm-retry-max-delay", type=float, default=8.0)
+            parser.add_argument("--grm-max-trajectory-chars", type=int, default=24000)
+            parser.add_argument("--grm-max-tokens", type=int, default=128)
+            parser.add_argument("--grm-temperature", type=float, default=0.0)
+            parser.add_argument("--grm-failure-reward", type=float, default=0.0)
+            parser.add_argument("--grm-system-prompt", type=str, default=None)
+            parser.add_argument(
                 "--custom-reward-post-process-path",
                 type=str,
                 default=None,

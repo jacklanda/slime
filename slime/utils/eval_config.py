@@ -207,6 +207,12 @@ def build_eval_dataset_configs(
     datasets: list[EvalDatasetConfig] = []
     for cfg in raw_config:
         cfg_dict = dict(cfg or {})
+        default_metadata_overrides = defaults.get("metadata_overrides")
+        if default_metadata_overrides is not None or "metadata_overrides" in cfg_dict:
+            cfg_dict["metadata_overrides"] = {
+                **_ensure_metadata_overrides(default_metadata_overrides),
+                **_ensure_metadata_overrides(cfg_dict.get("metadata_overrides")),
+            }
         combined_specs = {**DATASET_RUNTIME_SPECS, **DATASET_SAMPLE_SPECS}
         _apply_dataset_field_overrides(args, cfg_dict, defaults, combined_specs)
         dataset = EvalDatasetConfig(**cfg_dict)

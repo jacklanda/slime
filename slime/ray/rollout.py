@@ -1485,9 +1485,11 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
             return
 
     log_dict = extra_metrics or {}
+    eval_pass_at_1_values = []
     for key in data.keys():
         rewards = data[key]["rewards"]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+        eval_pass_at_1_values.append(float(np.mean(np.asarray(rewards, dtype=float) == 1.0)))
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
         if "truncated" in data[key]:
@@ -1501,6 +1503,10 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
                 ),
                 f"eval/{key}-",
             )
+
+    if eval_pass_at_1_values:
+        log_dict["evals/pass@1/mean"] = float(np.mean(eval_pass_at_1_values))
+        log_dict["evals/pass@1/std"] = float(np.std(eval_pass_at_1_values))
 
     logger.info(f"eval {rollout_id}: {log_dict}")
 
