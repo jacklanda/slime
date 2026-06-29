@@ -37,7 +37,11 @@ async def _abort_server_once(url: str) -> None:
 
 
 async def _get_server_num_requests(url: str) -> int:
-    return num_requests_from_load(await get(f"{url}/v1/loads?include=core"))
+    try:
+        return num_requests_from_load(await get(f"{url}/v1/loads?include=core"))
+    except Exception as e:
+        logger.warning(f"Failed to get SGLang server load from {url} via /v1/loads: {e}; trying /get_load")
+        return num_requests_from_load(await get(f"{url}/get_load"))
 
 
 async def abort_server_until_idle(url: str, retry_interval: int = ABORT_RETRY_INTERVAL_SECONDS) -> None:
@@ -50,7 +54,9 @@ async def abort_server_until_idle(url: str, retry_interval: int = ABORT_RETRY_IN
             num_requests = await _get_server_num_requests(url)
         except Exception as e:
             logger.warning(f"Failed to get SGLang server load from {url}: {e}")
-            return
+            await asyncio.sleep(retry_interval)
+            attempt += 1
+            continue
 
         if num_requests <= 0:
             return
