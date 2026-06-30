@@ -62,6 +62,7 @@ def _run_generate_with_fake_sglang(
     calls: list[dict],
     env: dict[str, str] | None = None,
     *,
+    evaluation: bool = False,
     tokenizer=None,
 ):
     async def fake_call_sglang(args, prompt_ids, sampling_params, *, session_id):
@@ -89,6 +90,7 @@ def _run_generate_with_fake_sglang(
                 SimpleNamespace(rollout_max_context_len=100000, fused_harness="unified_gem"),
                 sample,
                 {"max_new_tokens": 1024, "temperature": 1.0, "top_p": 1.0},
+                evaluation=evaluation,
             )
         )
     finally:
@@ -1810,6 +1812,169 @@ def test_mixed_tool_and_submit_call_breaks_loop_and_masks_only_error_turn():
     assert mixed in _masked_text(sample)
     assert _policy_masked_text(sample) == mixed
     assert first in _policy_unmasked_text(sample)
+
+
+def test_eval_allows_mixed_tool_and_submit_call():
+    first = _search_call("first evidence")
+    tool = _search_call("second evidence")
+    submit = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"answer"}}</tool_call>'
+    mixed = tool + submit
+    final = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"answer"}}</tool_call>'
+
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Search before answer"}),
+        [{"text": first}, {"text": mixed}, {"text": final}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER": "True",
+        },
+        evaluation=True,
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.reward == 1.0
+    assert sample.metadata["credit_assignment_event"] is None
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["fused_traj_steps"] == 3
+    assert sample.metadata.get("mixed_tool_and_answer") is None
+    assert mixed in _masked_text(sample)
+    assert _policy_masked_text(sample) == first + mixed + final
+
+
+def test_eval_disables_direct_submit_abnormal_detection():
+    direct = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"answer"}}</tool_call>'
+
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Find evidence first"}),
+        [{"text": direct}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL": "True",
+        },
+        evaluation=True,
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["credit_assignment_event"] is None
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["reward_debug"]["insufficient_searches"] is True
+
+
+def test_eval_disables_repeated_search_abnormal_detection():
+    first = _search_call("same query")
+    repeated = _search_call("same query")
+    finish = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"answer"}}</tool_call>'
+
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Search twice"}),
+        [{"text": first}, {"text": repeated}, {"text": finish}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY": "True",
+            "FUSED_REPEATED_SEARCH_MAX_STRIKES": "1",
+        },
+        evaluation=True,
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.metadata["credit_assignment_event"] is None
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert "duplicate_search_detected" not in sample.metadata
+    assert "Repeated search query detected" not in _policy_unmasked_text(sample)
+
+
+def test_eval_disables_parser_error_abnormal_detection(tmp_path: Path):
+    bad = "I cannot produce a tool call here."
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Trigger parser error"),
+        [{"text": bad}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR": "True",
+        },
+        evaluation=True,
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.metadata["credit_assignment_event"] is None
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert "tool_parser_error_count" not in sample.metadata
+    assert sample.metadata["reward_debug"]["reward"] == 0.0
+
+
+def test_eval_disables_tool_burst_abnormal_detection(tmp_path: Path):
+    burst = "".join(_echo_call(f"burst{i}") for i in range(5))
+    finish = _finish_call()
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Trigger tool burst"),
+        [{"text": burst}, {"text": finish}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS": "True",
+            "FUSED_MAX_TOOL_CALLS_PER_TURN": "4",
+        },
+        evaluation=True,
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.reward == 1.0
+    assert sample.metadata["credit_assignment_event"] is None
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["fused_tool_call_turns"] == 1
+
+
+def test_eval_disables_ngram_repetition_abnormal_detection(tmp_path: Path):
+    reasoning = "<think>" + ("loop phrase " * 60) + "</think>\n"
+    action = _echo_call("after-repeat")
+    finish = _finish_call()
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Trigger ngram repetition"),
+        [{"text": reasoning + action}, {"text": finish}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_NGRAM_REPETITION": "True",
+            "CREDIT_ASSIGNMENT_NGRAM_REPETITION_N": "2",
+            "CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD": "0.20",
+            "CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS": "128",
+        },
+        evaluation=True,
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.reward == 1.0
+    assert sample.metadata["credit_assignment_event"] is None
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert "ngram_repetition_detected" not in sample.metadata
+
+
+def test_eval_disables_length_abnormal_detection(tmp_path: Path):
+    truncated = "plain truncated answer"
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Answer directly"),
+        [{"text": truncated, "finish_reason": "length"}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN": "True",
+        },
+        evaluation=True,
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.metadata["credit_assignment_event"] is None
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["reward_debug"]["reward"] == 0.0
 
 
 def test_boxed_text_inside_tool_arguments_is_not_mixed_answer():

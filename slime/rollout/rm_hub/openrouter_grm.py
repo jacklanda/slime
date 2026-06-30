@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import random
-import re
 from typing import Any
 
 import httpx
@@ -37,9 +36,29 @@ _FINISH_PARSER = QwenToolParser(valid_tools={"finish", "submit"})
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are a strict binary answer judge. Return only JSON: {\"score\": 0} or {\"score\": 1}. "
-    "Score 1 if the trajectory contains, implies, or finally answers the ground truth correctly. "
+    "Score 1 if the trajectory contains, explicitly implies, or finally answers the ground truth correctly. "
     "Score 0 otherwise. Ignore style, verbosity, and irrelevant intermediate mistakes if the final answer is correct."
 )
+
+_SCORE_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "binary_reward",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "score": {
+                    "type": "integer",
+                    "enum": [0, 1],
+                    "description": "Binary reward: 1 for a correct final answer, 0 otherwise.",
+                }
+            },
+            "required": ["score"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 async def reward_func(args, sample_or_samples: Sample | list[Sample], **kwargs):
@@ -133,7 +152,8 @@ def _build_payload(args, sample: Sample) -> dict[str, Any]:
         ],
         "temperature": float(getattr(args, "grm_temperature", 0.0)),
         "max_tokens": int(getattr(args, "grm_max_tokens", 16)),
-        "response_format": {"type": "json_object"},
+        "response_format": _SCORE_RESPONSE_FORMAT,
+        "provider": {"require_parameters": True},
     }
 
 
@@ -175,12 +195,47 @@ def _final_answer_step(sample: Sample) -> str:
     if boxed_span:
         return boxed_span
 
-    if isinstance(sample.metadata, dict):
-        for key in ("final_answer", "answer", "submitted_answer"):
-            if key in sample.metadata:
-                return _stringify(sample.metadata[key])
+    rllm_episode_answer = _rllm_episode_final_answer_step(sample)
+    if rllm_episode_answer:
+        return rllm_episode_answer
 
     return _last_nonempty_response_chunk(response)
+
+
+def _rllm_episode_final_answer_step(sample: Sample) -> str | None:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    episode = metadata.get("rllm_episode")
+    if not isinstance(episode, dict):
+        return None
+
+    for action in reversed(_rllm_episode_actions(episode)):
+        finish_call = _extract_last_finish_call(action)
+        if finish_call:
+            return finish_call
+        boxed_span = _extract_last_boxed_span(action)
+        if boxed_span:
+            return boxed_span
+    return None
+
+
+def _rllm_episode_actions(episode: dict[str, Any]) -> list[str]:
+    actions: list[str] = []
+    trajectories = episode.get("trajectories")
+    if not isinstance(trajectories, list):
+        return actions
+    for trajectory in trajectories:
+        if not isinstance(trajectory, dict):
+            continue
+        steps = trajectory.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            action = step.get("action")
+            if action:
+                actions.append(_stringify(action))
+    return actions
 
 
 def _extract_last_finish_call(text: str) -> str | None:
@@ -228,10 +283,7 @@ def _parse_reward(payload: dict[str, Any]) -> float:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"\b([01])\b", text)
-        if not match:
-            raise ValueError(f"GRM response did not contain a binary score: {text!r}")
-        return float(match.group(1))
+        raise ValueError(f"GRM response did not contain valid JSON: {text!r}") from None
     score = parsed.get("score")
     if score in (0, 1, 0.0, 1.0, "0", "1"):
         return float(score)

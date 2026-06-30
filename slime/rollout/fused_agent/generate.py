@@ -53,7 +53,7 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.lower() in {"1", "true", "yes", "y", "on"}
 
 
-async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
+async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False):
     """Run a fused-agent multi-turn workflow as a slime custom generate hook.
 
     This function is intentionally plugged into slime's stock
@@ -80,23 +80,18 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
     credit_assignment_repeated_search_query = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY", True)
     credit_assignment_too_many_tool_calls = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS", True)
     credit_assignment_search_bypass = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_SEARCH_BYPASS", True)
-    credit_assignment_direct_submit_without_tool = credit_assignment_enable and _env_bool(
-        "CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL", True
-    )
-    credit_assignment_mixed_tool_and_answer = credit_assignment_enable and _env_bool(
-        "CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER", True
-    )
+    credit_assignment_direct_submit_without_tool = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL", True)
+    credit_assignment_mixed_tool_and_answer = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER", True)
     credit_assignment_tail_guard_early_stop = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP", True)
     credit_assignment_ngram_repetition = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_NGRAM_REPETITION", True)
     credit_assignment_max_turns = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_MAX_TURNS", True)
     credit_assignment_max_response_len = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN", True)
-    credit_assignment_parser_error_token_window = int(
-        os.environ.get("CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR_TOKEN_WINDOW", "256")
-    )
+    credit_assignment_parser_error_token_window = int(os.environ.get("CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR_TOKEN_WINDOW", "256"))
     ngram_repetition_n = int(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_N", "8"))
     ngram_repetition_threshold = float(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD", "0.35"))
     ngram_repetition_min_tokens = int(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS", "128"))
     repeated_search_max_strikes = max(1, int(os.environ.get("FUSED_REPEATED_SEARCH_MAX_STRIKES", "2")))
+    detect_abnormal_trajectories = not evaluation
 
     tools = env.tools()
     messages = _initial_messages(harness, info.get("task_type", ""), observation, tools)
@@ -201,7 +196,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
             )
             messages.append(assistant_msg)
 
-            if finish_reason == "length":
+            if detect_abnormal_trajectories and finish_reason == "length":
                 final_done = True
                 last_info = {"termination_reason": "max_response_len_exceeded"}
                 trajectory_steps.append(
@@ -221,7 +216,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
 
             actions = parsed_actions
             if not actions:
-                if credit_assignment_tool_parser_error:
+                if detect_abnormal_trajectories and credit_assignment_tool_parser_error:
                     final_reward = 0.0
                     final_done = True
                     credit_event = "tool_parser_error"
@@ -257,7 +252,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
                     )
                     break
                 actions = [ToolCall("finish", {"command": "submit", "result": response})]
-            if max_tool_calls_per_turn > 0 and len(actions) > max_tool_calls_per_turn:
+            if detect_abnormal_trajectories and max_tool_calls_per_turn > 0 and len(actions) > max_tool_calls_per_turn:
                 final_reward = 0.0
                 final_done = True
                 if credit_assignment_too_many_tool_calls:
@@ -293,7 +288,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
                     )
                 )
                 break
-            if credit_assignment_mixed_tool_and_answer and _has_mixed_tool_and_answer(response, actions):
+            if detect_abnormal_trajectories and credit_assignment_mixed_tool_and_answer and _has_mixed_tool_and_answer(response, actions):
                 final_reward = 0.0
                 final_done = True
                 credit_event = "mixed_tool_and_answer"
@@ -328,12 +323,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
                     )
                 )
                 break
-            direct_submit_without_tool = (
-                not used_non_finish_tool
-                and _requires_non_finish_tool(tools)
-                and all(action.name == "finish" for action in actions)
-            )
-            if direct_submit_without_tool and (step_idx == 0 or credit_assignment_direct_submit_without_tool):
+            direct_submit_without_tool = not used_non_finish_tool and _requires_non_finish_tool(tools) and all(action.name == "finish" for action in actions)
+            if detect_abnormal_trajectories and direct_submit_without_tool and (step_idx == 0 or credit_assignment_direct_submit_without_tool):
                 final_reward = 0.0
                 final_done = True
                 credit_event = "direct_submit_without_tool"
@@ -360,7 +351,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
                 break
             repeated_action_span = _repeated_search_action_span(actions, seen_search_queries)
             repeated_query = _has_repeated_search_query(actions, seen_search_queries)
-            if repeated_query:
+            if detect_abnormal_trajectories and repeated_query:
                 repeated_search_strikes += 1
                 duplicate_search_info = {
                     "duplicate_search_detected": True,
@@ -368,10 +359,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
                     "duplicate_query_max_strikes": repeated_search_max_strikes,
                 }
                 if repeated_search_strikes < repeated_search_max_strikes:
-                    obs = (
-                        "Repeated search query detected. Use different keywords, split the question into a new "
-                        "sub-query, or submit only if the existing evidence is sufficient."
-                    )
+                    obs = "Repeated search query detected. Use different keywords, split the question into a new " "sub-query, or submit only if the existing evidence is sufficient."
                     formatted_obs = _format_tool_observation(actions[0].name, obs)
                     last_info = duplicate_search_info
                     trajectory_steps.append(
@@ -431,7 +419,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
                 min_tokens=ngram_repetition_min_tokens,
             )
             repeated_action_span = _actions_span(actions)
-            if repeated_output["score"] > ngram_repetition_threshold and repeated_action_span is not None:
+            if detect_abnormal_trajectories and repeated_output["score"] > ngram_repetition_threshold and repeated_action_span is not None:
                 final_reward = 0.0
                 final_done = True
                 if credit_assignment_ngram_repetition:
@@ -482,7 +470,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
             final_reward = float(reward)
             final_done = bool(done)
             last_info = dict(env_info or {})
-            if last_info.get("credit_assignment") == "reasoning_step_only":
+            if detect_abnormal_trajectories and last_info.get("credit_assignment") == "reasoning_step_only":
                 final_reward = 0.0
                 if last_info.get("termination_reason") == "ABNORMAL_SEARCH_BYPASS" and credit_assignment_search_bypass:
                     credit_event = "search_bypass"
@@ -490,14 +478,14 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
                 else:
                     credit_event = "reasoning_step_only"
                     credit_step_index = len(pending_turns) - 1
-            elif last_info.get("termination_reason") == "ABNORMAL_SEARCH_BYPASS" and credit_assignment_search_bypass:
+            elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_SEARCH_BYPASS" and credit_assignment_search_bypass:
                 final_reward = 0.0
                 credit_event = "search_bypass"
                 credit_step_index = len(pending_turns) - 1
-            elif last_info.get("termination_reason") in {"ABNORMAL_PARSE_ERROR", "INVALID_REACT_STRUCTURE", "INVALID_FINAL_STEP"} and credit_assignment_tool_parser_error:
+            elif detect_abnormal_trajectories and last_info.get("termination_reason") in {"ABNORMAL_PARSE_ERROR", "INVALID_REACT_STRUCTURE", "INVALID_FINAL_STEP"} and credit_assignment_tool_parser_error:
                 credit_event = "tool_parser_error"
                 credit_step_index = len(pending_turns) - 1
-            elif last_info.get("termination_reason") == "ABNORMAL_NESTED_FINISH_PAYLOAD" and credit_assignment_tool_parser_error:
+            elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_NESTED_FINISH_PAYLOAD" and credit_assignment_tool_parser_error:
                 credit_event = "tool_parser_error"
                 credit_step_index = len(pending_turns) - 1
                 _set_pending_turn_error_span(
@@ -510,16 +498,16 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
                     ),
                     output_len=len(output_ids),
                 )
-            elif last_info.get("termination_reason") == "ABNORMAL_TOOL_BURST" and credit_assignment_too_many_tool_calls:
+            elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_TOOL_BURST" and credit_assignment_too_many_tool_calls:
                 credit_event = "too_many_tool_calls"
                 credit_step_index = len(pending_turns) - 1
-            elif last_info.get("termination_reason") == "ABNORMAL_REPEATED_QUERY" and credit_assignment_repeated_search_query:
+            elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_REPEATED_QUERY" and credit_assignment_repeated_search_query:
                 credit_event = "repeated_search_query"
                 credit_step_index = len(pending_turns) - 1
-            elif last_info.get("termination_reason") == "ABNORMAL_NGRAM_REPETITION" and credit_assignment_ngram_repetition:
+            elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_NGRAM_REPETITION" and credit_assignment_ngram_repetition:
                 credit_event = "ngram_repetition"
                 credit_step_index = len(pending_turns) - 1
-            elif last_info.get("termination_reason") == "ABNORMAL_MIXED_TOOL_AND_ANSWER" and credit_assignment_mixed_tool_and_answer:
+            elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_MIXED_TOOL_AND_ANSWER" and credit_assignment_mixed_tool_and_answer:
                 credit_event = "mixed_tool_and_answer"
                 credit_step_index = len(pending_turns) - 1
             trajectory_steps.append(
@@ -541,7 +529,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
                 break
         else:
             last_info = {**last_info, "termination_reason": "max_turns_exceeded"}
-            if credit_assignment_max_turns and pending_turns:
+            if detect_abnormal_trajectories and credit_assignment_max_turns and pending_turns:
                 credit_event = "max_turns_exceeded"
                 credit_step_index = len(pending_turns) - 1
                 response = str(pending_turns[-1].get("raw_response", ""))
@@ -565,9 +553,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
         env.close()
 
     termination_reason = last_info.get("termination_reason", "env_done" if final_done else "unknown")
-    if termination_reason == "TAIL_GUARD_EARLY_STOP" and credit_assignment_tail_guard_early_stop:
+    if detect_abnormal_trajectories and termination_reason == "TAIL_GUARD_EARLY_STOP" and credit_assignment_tail_guard_early_stop:
         credit_event = "tail_guard_early_stop"
-    elif termination_reason == "max_response_len_exceeded" and credit_assignment_max_response_len and pending_turns:
+    elif detect_abnormal_trajectories and termination_reason == "max_response_len_exceeded" and credit_assignment_max_response_len and pending_turns:
         credit_event = "max_response_len_exceeded"
         credit_step_index = len(pending_turns) - 1
     if credit_event is not None and credit_step_index is not None:
@@ -822,37 +810,23 @@ def _normalize_search_query(query: Any) -> str:
 
 
 def _has_mixed_tool_and_answer(response: str, actions: list[ToolCall]) -> bool:
-    return any(action.name != "finish" for action in actions) and (
-        any(action.name == "finish" for action in actions) or _answer_span(response, excluded_spans=_actions_spans(actions)) is not None
-    )
+    return any(action.name != "finish" for action in actions) and (any(action.name == "finish" for action in actions) or _answer_span(response, excluded_spans=_actions_spans(actions)) is not None)
 
 
 def _mixed_tool_and_answer_span(response: str, actions: list[ToolCall]) -> tuple[int, int] | None:
-    spans = [
-        (action.start, action.end)
-        for action in actions
-        if action.start is not None and action.end is not None and action.name != "finish"
-    ]
+    spans = [(action.start, action.end) for action in actions if action.start is not None and action.end is not None and action.name != "finish"]
     answer_span = _answer_span(response, excluded_spans=_actions_spans(actions))
     if answer_span is not None:
         spans.append(answer_span)
     else:
-        spans.extend(
-            (action.start, action.end)
-            for action in actions
-            if action.start is not None and action.end is not None and action.name == "finish"
-        )
+        spans.extend((action.start, action.end) for action in actions if action.start is not None and action.end is not None and action.name == "finish")
     if not spans:
         return _actions_span(actions)
     return min(start for start, _ in spans), max(end for _, end in spans)
 
 
 def _actions_spans(actions: list[ToolCall]) -> list[tuple[int, int]]:
-    return [
-        (action.start, action.end)
-        for action in actions
-        if action.start is not None and action.end is not None
-    ]
+    return [(action.start, action.end) for action in actions if action.start is not None and action.end is not None]
 
 
 def _answer_span(response: str, *, excluded_spans: list[tuple[int, int]] | None = None) -> tuple[int, int] | None:
@@ -863,11 +837,7 @@ def _answer_span(response: str, *, excluded_spans: list[tuple[int, int]] | None 
             continue
         return match.start(), match.end()
     boxed_start, boxed_end = _boxed_answer_span(response or "")
-    if (
-        boxed_start is not None
-        and boxed_end is not None
-        and not _span_overlaps_any((boxed_start, boxed_end), excluded_spans)
-    ):
+    if boxed_start is not None and boxed_end is not None and not _span_overlaps_any((boxed_start, boxed_end), excluded_spans):
         return boxed_start, boxed_end
     return None
 
@@ -1288,7 +1258,7 @@ def _episode_step(
                 "end_timestamp": _utc_timestamp(),
                 "llm_time": llm_time,
                 "env_time": env_time,
-            }
+            },
         },
     }
 
@@ -1314,12 +1284,7 @@ def _format_action(action: ToolCall) -> str:
 
 def _format_tool_observation(tool_name: str, output: Any) -> str:
     output_text = _format_observation_output(tool_name, output)
-    return (
-        "<tool_response>\n"
-        f"Execution output of [{tool_name}]:\n"
-        f"{output_text}\n"
-        "</tool_response>"
-    )
+    return "<tool_response>\n" f"Execution output of [{tool_name}]:\n" f"{output_text}\n" "</tool_response>"
 
 
 def _format_observation_output(tool_name: str, output: Any) -> str:
@@ -1362,8 +1327,9 @@ def _rllm_episode_dict(
 ) -> dict[str, Any]:
     task_for_dump = _task_for_dump(task)
     episode_id = _episode_id(base_sample, task_for_dump)
+    benchmark = _benchmark_metric_name(task_for_dump, task_type)
     metrics = {
-        "default_traj_name_acc": float(reward > 0),
+        f"{benchmark}/pass@1": float(reward > 0),
         "traj/steps": float(total_steps),
         "turn/tool_call_turn": float(total_tool_call_turns),
     }
@@ -1377,7 +1343,7 @@ def _rllm_episode_dict(
             metrics[str(key)] = float(value)
     trajectory = {
         "uid": str(uuid.uuid4()),
-        "name": "default_traj_name_0",
+        "name": f"{benchmark}_0",
         "task": task_for_dump,
         "steps": steps,
         "reward": float(reward),
@@ -1423,6 +1389,16 @@ def _episode_id(sample: Sample, task: dict[str, Any]) -> str:
     if rollout_idx is None:
         rollout_idx = 0
     return f"{task_hash}:{rollout_idx}"
+
+
+def _benchmark_metric_name(task_for_dump: dict[str, Any], task_type: str) -> str:
+    """Metric/trajectory name keyed by benchmark source (e.g. ``medqa``).
+
+    Falls back to the normalized task_type suffix, then ``unknown``.
+    """
+    raw = task_for_dump.get("data_source") or task_for_dump.get("benchmark") or task_for_dump.get("dataset") or ""
+    normalized = str(raw).strip().lower().replace("-", "_").replace(" ", "_").replace("/", "_")
+    return normalized or _task_metric_suffix(task_type)
 
 
 def _task_metric_suffix(task_type: str) -> str:
@@ -1471,10 +1447,7 @@ async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, A
     max_context_tokens = _effective_sglang_context_limit(args)
     requested_tokens = len(prompt_ids) + max_new_tokens
     if max_context_tokens and requested_tokens > max_context_tokens:
-        raise SGLangContextLengthExceededError(
-            f"SGLang request would use {requested_tokens} tokens "
-            f"({len(prompt_ids)} prompt + {max_new_tokens} new), exceeding local limit {max_context_tokens}."
-        )
+        raise SGLangContextLengthExceededError(f"SGLang request would use {requested_tokens} tokens " f"({len(prompt_ids)} prompt + {max_new_tokens} new), exceeding local limit {max_context_tokens}.")
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     rid = uuid.uuid4().hex
     payload = {

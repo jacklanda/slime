@@ -65,6 +65,12 @@ def test_openrouter_grm_scores_batch(monkeypatch):
 
     assert rewards == [1.0, 1.0]
     assert client.calls == 2
+    response_format = client.requests[0]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["schema"]["properties"]["score"]["enum"] == [0, 1]
+    assert response_format["json_schema"]["schema"]["additionalProperties"] is False
+    assert client.requests[0]["provider"] == {"require_parameters": True}
 
 
 def test_openrouter_grm_uses_final_answer_step_only(monkeypatch):
@@ -81,6 +87,62 @@ def test_openrouter_grm_uses_final_answer_step_only(monkeypatch):
     assert "Final submitted answer step:" in prompt
     assert "\\boxed{42}" in prompt
     assert "question" not in prompt
+
+
+def test_openrouter_grm_does_not_use_metadata_answer_as_submission(monkeypatch):
+    args = Args()
+    client = FakeClient({"choices": [{"message": {"content": '{"score": 0}'}}]})
+    sample = Sample(
+        index=0,
+        prompt="question",
+        response="",
+        label="Lady Mary Henrietta Powlett",
+        status=Sample.Status.COMPLETED,
+        metadata={
+            "answer": "Lady Mary Henrietta Powlett",
+            "rllm_episode": {
+                "trajectories": [
+                    {
+                        "steps": [
+                            {
+                                "action": '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"Mary Montagu, Duchess of Montagu"}}</tool_call>'
+                            }
+                        ]
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", client)
+    monkeypatch.setattr(openrouter_grm, "_SEMAPHORE", None)
+
+    reward = asyncio.run(openrouter_grm.reward_func(args, sample, evaluation=True))
+
+    assert reward == 0.0
+    assert client.calls == 1
+    prompt = client.requests[0]["messages"][1]["content"]
+    assert "Mary Montagu, Duchess of Montagu" in prompt
+    assert "Final submitted answer step:\nLady Mary Henrietta Powlett" not in prompt
+
+
+def test_openrouter_grm_without_response_or_episode_submission_returns_failure_reward(monkeypatch):
+    args = Args()
+    client = FakeClient({"choices": [{"message": {"content": '{"score": 1}'}}]})
+    sample = Sample(
+        index=0,
+        prompt="question",
+        response="",
+        label="42",
+        status=Sample.Status.COMPLETED,
+        metadata={"answer": "42"},
+    )
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", client)
+    monkeypatch.setattr(openrouter_grm, "_SEMAPHORE", None)
+
+    reward = asyncio.run(openrouter_grm.reward_func(args, sample, evaluation=True))
+
+    assert reward == 0.0
+    assert client.calls == 0
 
 
 def test_openrouter_grm_failure_falls_back_to_rule_based(monkeypatch):

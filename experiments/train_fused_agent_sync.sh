@@ -74,7 +74,7 @@ Options:
   --horizon-reward-target-steps X        Target steps for no horizon penalty. Default: 8.
   --horizon-reward-target-tool-calls X   Target tool calls for no horizon penalty. Default: target_steps - 1.
   --enable-dynamic-sampling-filter BOOL  Enable DAPO-style non-zero reward variance dynamic filtering. Default: true.
-  --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
+  --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: false.
   --grm-model NAME                       OpenRouter judge model. Default: deepseek/deepseek-v4-flash.
   --grm-concurrency N                    Max concurrent GRM requests. Default: 128.
   --grm-timeout SECONDS                  GRM request timeout. Default: 60.
@@ -91,6 +91,7 @@ Options:
   --eval-prompt-data NAME PATH [...]     Legacy eval dataset name/path pairs.
   --val_before_train BOOL                Run one eval before training starts. Default: true.
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
+  --offload-train BOOL                   Offload trainer model between rollout/train phases. Default: true.
   --max-tool-output-length N             Fused max tool output length env.
   --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 64.
   --sglang-max-running-requests N        SGLang max running requests. Default: 256.
@@ -113,9 +114,9 @@ TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 COLOCATE="${COLOCATE:-true}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
-ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-16}"
+ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-2}"
 ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE:-16}}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE:-2}}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-1}}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 TAIL_GUARD="${TAIL_GUARD:-False}"
@@ -156,7 +157,8 @@ EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
-ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-false}}"
+OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-true}}"
+ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
 GRM_MODEL="${GRM_MODEL:-deepseek/deepseek-v4-flash}"
 GRM_CONCURRENCY="${GRM_CONCURRENCY:-512}"
@@ -258,6 +260,7 @@ while [ "$#" -gt 0 ]; do
          done
          ;;
       --n-samples-per-eval-prompt) N_SAMPLES_PER_EVAL_PROMPT="${2:?Missing value for --n-samples-per-eval-prompt}"; shift 2 ;;
+      --offload-train) OFFLOAD_TRAIN="${2:?Missing value for --offload-train}"; shift 2 ;;
       --max-tool-output-length) MAX_TOOL_OUTPUT_LENGTH="${2:?Missing value for --max-tool-output-length}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
@@ -290,6 +293,7 @@ BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 default_experiment_name() {
    #local prefix="fused-dapo-q3-4b-no_think-gem-async-dev"
    local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
+   #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-8b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-8b-no_think-gem-async-dev"
    #local prefix="webqa-dapo-q3-4b-no_think-gem-async-dev0"
@@ -513,6 +517,14 @@ CKPT_ARGS=(
    --save "${SAVE_DIR}"
    --save-interval "${SAVE_INTERVAL:-10}"
 )
+# Resume training state (model/optimizer/rng/step + rollout data state) from an
+# existing Megatron checkpoint dir. Defaults to SAVE_DIR so a re-launch with the
+# same EXPERIMENT_NAME continues from the latest saved iteration. Set LOAD=""
+# explicitly to force a fresh start from the HF/ref checkpoint.
+LOAD="${LOAD-${SAVE_DIR}}"
+if [ -n "${LOAD}" ]; then
+   CKPT_ARGS+=(--load "${LOAD}")
+fi
 
 ROLLOUT_ARGS=(
    --rollout-function-path "${ROLLOUT_FUNCTION_PATH}"
@@ -628,7 +640,7 @@ if [ -n "${DUMP_DETAILS}" ]; then
 fi
 
 PERF_ARGS=(
-   --tensor-model-parallel-size "${TP_SIZE:-4}"
+   --tensor-model-parallel-size "${TP_SIZE:-8}"
    --sequence-parallel
    --pipeline-model-parallel-size "${PP_SIZE:-1}"
    --context-parallel-size "${CP_SIZE:-1}"
@@ -642,6 +654,7 @@ PERF_ARGS=(
    --micro-batch-size "${MICRO_BATCH_SIZE}"
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
    --log-probs-max-tokens-per-gpu "${LOG_PROBS_MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
+   --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE:-256}"
 )
 
 if [ "${USE_DYNAMIC_BATCH_SIZE:-1}" = "1" ]; then
@@ -689,7 +702,7 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
-   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-${GPU_MEMORY_UTILIZATION:-0.8}}"
+   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-${GPU_MEMORY_UTILIZATION:-0.7}}"
    --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}"
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
    --sglang-context-length "${MAX_CONTEXT_LEN}"
@@ -705,6 +718,10 @@ if [ "${USE_WANDB:-1}" = "1" ]; then
       --wandb-group "${WANDB_GROUP:-${EXPERIMENT_NAME}}"
       --disable-wandb-random-suffix
    )
+   # Resume an existing wandb run (same curves) instead of creating a new one.
+   if [ -n "${WANDB_RUN_ID:-}" ]; then
+      WANDB_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")
+   fi
 fi
 
 MISC_ARGS=(
@@ -781,7 +798,7 @@ export FUSED_WEB_SEARCH_MAX_STEPS="${FUSED_WEB_SEARCH_MAX_STEPS:-${WEB_SEARCH_MA
 export FUSED_CLI_MAX_STEPS="${CLI_MAX_STEPS}"
 export FUSED_TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT}"
 export FUSED_EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT}"
-export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-1024}"
+export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-2048}"
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE}"
 export SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}"
@@ -876,6 +893,7 @@ env = {k: os.environ[k] for k in keys if k in os.environ}
 env["PYTHONPATH"] = f"{os.environ['MEGATRON_LM_PATH']}:{os.environ['REPO_ROOT']}:{os.environ['SCRIPT_DIR']}"
 env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 env["NCCL_NVLS_ENABLE"] = os.environ["HAS_NVLINK"]
+env["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"
 print(json.dumps({"env_vars": env}))
 PY
 )
@@ -958,6 +976,11 @@ CLUSTER_ARGS=(
 )
 if is_truthy "${COLOCATE}"; then
    CLUSTER_ARGS+=(--colocate)
+fi
+if is_truthy "${OFFLOAD_TRAIN}"; then
+   CLUSTER_ARGS+=(--offload-train)
+else
+   CLUSTER_ARGS+=(--no-offload-train)
 fi
 
 ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \

@@ -139,8 +139,8 @@ def _print_rllm_episode(
 
             console.print()
             console.rule("Episode Trajectory", style="cyan")
-            console.print(Panel(_episode_summary_table(sample, episode, group_id), title="Episode Trajectory", border_style="cyan"))
-            console.print(_text_panel("Task", _task_text(episode), "blue", max_chars=max_chars))
+            console.print(Panel(_episode_summary_table(sample, episode, group_id), title="Overview", border_style="cyan"))
+            console.print(_text_panel("Task", _task_text(episode), "orange1", max_chars=max_chars))
             if token_mask_view is not None:
                 console.print(Panel(Group(_token_mask_legend(), token_mask_view), title="Token Mask View", border_style="magenta"))
 
@@ -149,7 +149,7 @@ def _print_rllm_episode(
                 steps = [step for step in trajectory.get("steps", []) if isinstance(step, dict)]
                 title = _trajectory_title(trajectory, traj_idx, len(steps))
                 console.rule(title, style="green")
-                console.print(Panel(_trajectory_table(trajectory, len(steps)), title="Trajectory Summary", border_style="green"))
+                console.print(Panel(_trajectory_table(trajectory, len(steps)), title="Episode Summary", border_style="green"))
                 for step_idx, step in enumerate(steps):
                     _print_step(console, step, step_idx, len(steps), max_chars=max_chars)
             console.rule(style="cyan")
@@ -217,7 +217,7 @@ def _print_step(console, step: dict[str, Any], step_idx: int, num_steps: int, *,
     if thought or disable_thinking:
         console.print(_text_panel("Thinking", _strip_think_tags(thought), "yellow", max_chars=min(max_chars, 2000)))
     if response:
-        console.print(_text_panel("Action", response, "magenta", max_chars=min(max_chars, 2000)))
+        console.print(_text_panel("Actions", response, "magenta", max_chars=min(max_chars, 2000)))
 
 
 def _trajectory_console(args):
@@ -606,11 +606,7 @@ def _episode_summary_rows(sample: Sample, episode: dict[str, Any], group_id: int
     rows = []
     if group_id is not None:
         rows.append(("group", str(group_id)))
-    rows.extend(
-        (name, str(value))
-        for name in ("index", "group_index", "rollout_id")
-        if (value := getattr(sample, name, None)) is not None
-    )
+    rows.extend((name, str(value)) for name in ("index", "group_index", "rollout_id") if (value := getattr(sample, name, None)) is not None)
     task = _dict_or_empty(episode.get("task"))
     metrics = _dict_or_empty(episode.get("metrics"))
     rows.extend(
@@ -624,21 +620,18 @@ def _episode_summary_rows(sample: Sample, episode: dict[str, Any], group_id: int
             ("trajectories", str(len(episode.get("trajectories") or []))),
         ]
     )
-    for key in ("traj/steps", "turn/tool_call_turn", "default_traj_name_acc"):
+    for key in ("traj/steps", "turn/tool_call_turn"):
         if key in metrics:
+            rows.append((key, _format_metric_value(metrics[key])))
+    for key in sorted(metrics):
+        if key.endswith("/pass@1"):
             rows.append((key, _format_metric_value(metrics[key])))
     return rows
 
 
 def _episode_source(sample: Sample, task: dict[str, Any]) -> str:
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-    return str(
-        metadata.get("fused_task_type")
-        or task.get("data_source")
-        or task.get("task_type")
-        or metadata.get("data_source")
-        or "unknown"
-    )
+    return str(metadata.get("fused_task_type") or task.get("data_source") or task.get("task_type") or metadata.get("data_source") or "unknown")
 
 
 def _task_text(episode: dict[str, Any]) -> str:
@@ -905,15 +898,7 @@ def _format_json_observation_item(item: Any, idx: int) -> str:
 
     title = source.get("title") or source.get("name") or source.get("id") or item.get("id")
     url = source.get("url") or source.get("link")
-    body = (
-        source.get("chunk_text")
-        or source.get("summary")
-        or source.get("snippet")
-        or source.get("text")
-        or source.get("content")
-        or item.get("text")
-        or item.get("output")
-    )
+    body = source.get("chunk_text") or source.get("summary") or source.get("snippet") or source.get("text") or source.get("content") or item.get("text") or item.get("output")
 
     lines = []
     if title is not None:
@@ -966,17 +951,17 @@ def _compact_search_text(text: str) -> str:
 
 
 def _strip_urls(text: str) -> str:
-    text = re.sub(r'https?://\S+', "", text)
+    text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r'"url"\s*:\s*"[^"]*",?\s*', "", text)
     text = re.sub(r'"link"\s*:\s*"[^"]*",?\s*', "", text)
     return text
 
 
 def _strip_json_search_noise(text: str) -> str:
-    text = re.sub(r'^\s*\[\s*', "", text)
-    text = re.sub(r'\s*\]\s*$', "", text)
-    text = re.sub(r'^\s*\{\s*', "", text)
-    text = re.sub(r'\s*\}\s*$', "", text)
+    text = re.sub(r"^\s*\[\s*", "", text)
+    text = re.sub(r"\s*\]\s*$", "", text)
+    text = re.sub(r"^\s*\{\s*", "", text)
+    text = re.sub(r"\s*\}\s*$", "", text)
     text = re.sub(r'"id"\s*:\s*[^,\n]+,?\s*', "", text)
     text = re.sub(r'"content"\s*:\s*\{', "", text)
     text = re.sub(r'"(?:title|chunk_text|summary|snippet|text)"\s*:\s*', "", text)

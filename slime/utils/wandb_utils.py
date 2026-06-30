@@ -71,6 +71,15 @@ def init_wandb_primary(args):
         "config": _compute_config_for_logging(args),
     }
 
+    # Resume an existing run when an id is explicitly provided via --wandb-run-id.
+    # This keeps logging to the same run (same curves) instead of creating a new
+    # one. resume="must" makes wandb fail loudly if the id does not exist, rather
+    # than silently starting a fresh run.
+    if args.wandb_run_id:
+        init_kwargs["id"] = args.wandb_run_id
+        init_kwargs["resume"] = "must"
+        logger.info(f"Resuming W&B run id={args.wandb_run_id} (resume='must').")
+
     # Configure settings based on offline/online mode
     if offline:
         init_kwargs["settings"] = _wandb_settings(mode="offline")
@@ -193,7 +202,6 @@ def _init_wandb_common():
         wandb.define_metric("passrate/*", step_metric="rollout/step")
         wandb.define_metric("eval/step")
         wandb.define_metric("eval/*", step_metric="eval/step")
-        wandb.define_metric("evals/*", step_metric="eval/step")
         wandb.define_metric("perf/*", step_metric="rollout/step")
         wandb.define_metric("timing_s/*", step_metric="rollout/step")
         wandb.define_metric("timing_per_token_ms/*", step_metric="rollout/step")

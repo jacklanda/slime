@@ -1458,7 +1458,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--enable-use-grm-evals",
                 action=argparse.BooleanOptionalAction,
-                default=True,
+                default=False,
                 help="Whether interval eval rollouts should use OpenRouter GRM before rule-based fallback.",
             )
             parser.add_argument(

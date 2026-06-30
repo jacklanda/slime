@@ -138,7 +138,7 @@ def _append_rollout_top_p_token_data(
 
 
 def _should_use_grm_eval(args: Namespace, evaluation: bool) -> bool:
-    return evaluation and bool(getattr(args, "enable_use_grm_evals", True))
+    return evaluation and bool(getattr(args, "enable_use_grm_evals", False))
 
 
 async def _score_eval_samples_with_grm(args: Namespace, samples: list[Sample]) -> None:
@@ -531,7 +531,7 @@ async def generate_rollout_async(
     data = []
     all_data = []
     do_print = True
-    pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
+    pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Group collection")
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
@@ -573,7 +573,7 @@ async def generate_rollout_async(
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+        f"Finish group collection: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
     )
 
     # Abort only when this rollout still owns unfinished requests.  With the
@@ -674,7 +674,7 @@ async def eval_rollout_single_dataset(
             sample_index += 1
             sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
             sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
-            if getattr(args, "enable_use_grm_evals", True):
+            if getattr(args, "enable_use_grm_evals", False):
                 sample.custom_rm_path = getattr(args, "grm_custom_rm_path", None)
             sampling_params = base_sampling_params
             if getattr(args, "sglang_enable_deterministic_inference", False):
