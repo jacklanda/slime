@@ -117,9 +117,9 @@ TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 COLOCATE="${COLOCATE:-true}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
-ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-4}"
+ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-16}"
 ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE:-4}}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE:-16}}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-1}}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 TAIL_GUARD="${TAIL_GUARD:-False}"
@@ -160,7 +160,7 @@ EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
 EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-false}}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
 OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-true}}"
@@ -303,7 +303,8 @@ BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 default_experiment_name() {
    #local prefix="fused-dapo-q3-4b-no_think-gem-async-dev"
-   local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
+   #local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
+   local prefix="asearcher-dapo-q3.5-4b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-8b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-8b-no_think-gem-async-dev"
@@ -331,15 +332,15 @@ elif [ "${SLIME_CLEANUP:-0}" = "1" ]; then
    echo "SLIME_CLEANUP=1 ignored because SLIME_CLEANUP_CONFIRM=1 is not set; preserving existing processes and artifacts."
 fi
 
-MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
+#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
-#MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
+MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/checkpoints/FusedRL/${EXPERIMENT_NAME}}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
@@ -484,7 +485,7 @@ MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
-N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_EPOCH="${NUM_EPOCH:-100}"
 EFFECTIVE_GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT / NUM_STEPS_PER_ROLLOUT))}"
@@ -662,7 +663,12 @@ if [ -n "${DUMP_DETAILS}" ]; then
 fi
 
 PERF_ARGS=(
-   --tensor-model-parallel-size "${TP_SIZE:-8}"
+   # NOTE: gated attention (--attention-output-gate, qwen3.5) is broken in
+   # Megatron when num_query_groups < TP: the per-rank query head re-slice
+   # (attention.py step 4) is not mirrored on the gate tensor, so gate.view()
+   # fails with a size mismatch (factor = TP // num_query_groups). qwen3.5-4B
+   # has num_query_groups=4, so TP must be <= 4. Default to 4.
+   --tensor-model-parallel-size "${TP_SIZE:-4}"
    --sequence-parallel
    --pipeline-model-parallel-size "${PP_SIZE:-1}"
    --context-parallel-size "${CP_SIZE:-1}"
