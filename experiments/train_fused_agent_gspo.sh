@@ -81,6 +81,9 @@ Options:
   --eval-interval N                      Run interval eval every N rollout steps. Default: 10.
   --eval-config PATH                     Structured slime eval dataset config. Default: experiments/eval_fused_agent_benchmarks.yaml.
   --eval-prompt-data NAME PATH [...]     Legacy eval dataset name/path pairs.
+  --eval-max-response-len N              Eval-only max generated tokens. Default: 16384.
+  --eval-max-prompt-len N                Eval-only max prompt tokens. Default: 23616.
+  --eval-max-context-len N               Eval-only context length. Default: prompt + response.
   --val_before_train BOOL                Run one eval before training starts. Default: true.
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
   --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: false.
@@ -148,6 +151,9 @@ TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-3600}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-3600}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
+EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
+EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
+EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
@@ -232,6 +238,9 @@ while [ "$#" -gt 0 ]; do
       --eval-trajectory-timeout) EVAL_TRAJECTORY_TIMEOUT="${2:?Missing value for --eval-trajectory-timeout}"; shift 2 ;;
       --eval-interval) EVAL_INTERVAL="${2:?Missing value for --eval-interval}"; shift 2 ;;
       --eval-config) EVAL_CONFIG="${2:?Missing value for --eval-config}"; shift 2 ;;
+      --eval-max-response-len) EVAL_MAX_RESPONSE_LEN="${2:?Missing value for --eval-max-response-len}"; shift 2 ;;
+      --eval-max-prompt-len) EVAL_MAX_PROMPT_LEN="${2:?Missing value for --eval-max-prompt-len}"; shift 2 ;;
+      --eval-max-context-len) EVAL_MAX_CONTEXT_LEN="${2:?Missing value for --eval-max-context-len}"; shift 2 ;;
       --val_before_train|--val-before-train) VAL_BEFORE_TRAIN="${2:?Missing value for --val_before_train}"; shift 2 ;;
       --eval-prompt-data)
          shift
@@ -262,6 +271,8 @@ while [ "$#" -gt 0 ]; do
       *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
    esac
 done
+
+EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-$((EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN))}"
 
 # Keep the option/env name for compatibility with older launch commands, but do
 # not allow this launcher to enable LexRank-based retrieval summaries.
@@ -417,7 +428,11 @@ if shuffle and combined.num_rows:
     indices = pa.array(np.random.default_rng(seed).permutation(combined.num_rows), type=pa.int64())
     combined = combined.take(indices)
 
-pq.write_table(combined, output)
+# Write to a temp file then atomically rename. PROMPT_DATA may be the same path
+# as an input file, so a crash mid-write must never corrupt the source parquet.
+tmp_output = output.with_suffix(output.suffix + ".tmp")
+pq.write_table(combined, tmp_output)
+tmp_output.replace(output)
 print(f"Wrote fused train parquet: {output}")
 print(f"Rows: {combined.num_rows}")
 print("Inputs:")
@@ -609,6 +624,11 @@ if [ -n "${EVAL_INTERVAL}" ]; then
       exit 2
    fi
    EVAL_ARGS+=(--n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}")
+   EVAL_ARGS+=(
+      --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
+      --eval-max-prompt-len "${EVAL_MAX_PROMPT_LEN}"
+      --eval-max-context-len "${EVAL_MAX_CONTEXT_LEN}"
+   )
    if ! is_truthy "${VAL_BEFORE_TRAIN}"; then
       EVAL_ARGS+=(--skip-eval-before-train)
    fi
@@ -888,7 +908,7 @@ echo "SGLang concurrency: server=${SGLANG_SERVER_CONCURRENCY}, max_running_reque
 echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}"
 echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; async mini_batch=${ASYNC_MINI_BATCH_SIZE}, sync_interval=${ASYNC_TRIGGER_PARAMETER_SYNC_STEP}"
 echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"
-echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, val_before_train=${VAL_BEFORE_TRAIN}, grm=${ENABLE_USE_GRM_EVALS}"
+echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}, grm=${ENABLE_USE_GRM_EVALS}"
 echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, relax_after_groups=${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}"
 echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING:-0}, path=${BUFFER_FILTER_PATH:-${ENABLE_QUOTA_BUCKET_SAMPLING:+slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps}}"
 echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}"

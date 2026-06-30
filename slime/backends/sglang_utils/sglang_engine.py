@@ -42,10 +42,20 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     # If we're already getting local IDs, allow them
     if 0 <= physical_gpu_id < len(visible):
         return physical_gpu_id
-    raise RuntimeError(
-        f"GPU id {physical_gpu_id} is not valid under CUDA_VISIBLE_DEVICES={cvd}. "
-        f"Expected one of {visible} (physical) or 0..{len(visible)-1} (local)."
-    )
+    raise RuntimeError(f"GPU id {physical_gpu_id} is not valid under CUDA_VISIBLE_DEVICES={cvd}. " f"Expected one of {visible} (physical) or 0..{len(visible)-1} (local).")
+
+
+def _launch_server_with_suppression(server_args: ServerArgs) -> None:
+    # Runs in the spawned server process: install the trainer's noise filters
+    # (and the FastAPI ORJSONResponse deprecation filter) before importing the
+    # HTTP server, which is where that warning would otherwise be emitted.
+    from slime.utils.logging_utils import suppress_known_training_warnings
+
+    suppress_known_training_warnings()
+
+    from sglang.srt.entrypoints.http_server import launch_server
+
+    launch_server(server_args)
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
@@ -58,11 +68,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
             wait_for_server=True,
         )
 
-    from sglang.srt.entrypoints.http_server import launch_server
-
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
+    p = multiprocessing.Process(target=_launch_server_with_suppression, args=(server_args,))
     p.start()
 
     if getattr(server_args, "node_rank", 0) != 0:
@@ -200,9 +208,7 @@ class SGLangEngine(RayActor):
             for name in external_engine_need_check_fields:
                 expect_value = expect_server_args.get(name)
                 actual_value = actual_server_args.get(name)
-                assert (
-                    actual_value == expect_value
-                ), f"{name=} {expect_value=} {actual_value=} {expect_server_args=} {actual_server_args=}"
+                assert actual_value == expect_value, f"{name=} {expect_value=} {actual_value=} {expect_server_args=} {actual_server_args=}"
 
         actual_server_args = get_server_info(f"http://{self.server_host}:{self.server_port}")
         _sanity_check_server_args(actual_server_args, expect_server_args)
@@ -232,10 +238,7 @@ class SGLangEngine(RayActor):
                 if self.worker_type == "prefill":
                     bootstrap_port = server_args_dict.get("disaggregation_bootstrap_port")
                     if bootstrap_port is None:
-                        raise RuntimeError(
-                            f"Prefill worker {worker_url} does not have disaggregation_bootstrap_port; "
-                            "cannot register it to the PD router."
-                        )
+                        raise RuntimeError(f"Prefill worker {worker_url} does not have disaggregation_bootstrap_port; " "cannot register it to the PD router.")
                     payload["bootstrap_port"] = bootstrap_port
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/workers",
@@ -623,9 +626,7 @@ def _compute_server_args(
     if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"
         kwargs["load_balance_method"] = "follow_bootstrap_room"
-        assert (
-            disaggregation_bootstrap_port is not None
-        ), "disaggregation_bootstrap_port must be set for prefill worker"
+        assert disaggregation_bootstrap_port is not None, "disaggregation_bootstrap_port must be set for prefill worker"
         kwargs["disaggregation_bootstrap_port"] = disaggregation_bootstrap_port
     elif worker_type == "decode":
         kwargs["disaggregation_mode"] = "decode"
@@ -655,14 +656,9 @@ def _compute_server_args(
         for key, value in sglang_overrides.items():
             normalized_key = key.replace("-", "_")
             if normalized_key != key:
-                logger.warning(
-                    f"sglang_overrides key '{key}' normalized to '{normalized_key}' (rank={rank}). "
-                    "Please use underscore style in YAML overrides."
-                )
+                logger.warning(f"sglang_overrides key '{key}' normalized to '{normalized_key}' (rank={rank}). " "Please use underscore style in YAML overrides.")
             if normalized_key in kwargs:
-                logger.info(
-                    f"sglang_overrides: overriding {normalized_key}={kwargs[normalized_key]} -> {value} (rank={rank})"
-                )
+                logger.info(f"sglang_overrides: overriding {normalized_key}={kwargs[normalized_key]} -> {value} (rank={rank})")
             kwargs[normalized_key] = value
             if normalized_key in server_arg_field_names:
                 unused_keys.discard(normalized_key)

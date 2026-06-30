@@ -73,6 +73,12 @@ _SGLANG_DECODE_PERF_FIELDS = (
 )
 
 
+def _tags_enable_generation(tags: list[str] | None) -> bool:
+    return tags is None or (
+        GPU_MEMORY_TYPE_KV_CACHE in tags and GPU_MEMORY_TYPE_CUDA_GRAPH in tags
+    )
+
+
 def _cpu_tensor(value, dtype: torch.dtype | None = None) -> torch.Tensor:
     if isinstance(value, np.ndarray) and not value.flags.writeable:
         value = value.copy()
@@ -268,6 +274,7 @@ class ServerGroup:
     router_ip: str | None = None
     router_port: int | None = None
     engine_urls: list[str | None] = dataclasses.field(default_factory=list)
+    generation_health_check_enabled: bool = True
 
     @property
     def nodes_per_engine(self):
@@ -399,6 +406,13 @@ class ServerGroup:
 
     def mark_unhealthy_engines(self, timeout: float) -> None:
         """Probe node-0 engines and mark failed engine groups for restart."""
+        if not self.generation_health_check_enabled:
+            logger.info(
+                "Skipping generation health checks for worker_type=%s because engines are not generation-ready.",
+                self.worker_type,
+            )
+            return
+
         for rollout_engine_id, engine in enumerate(self.engines):
             if engine is None:
                 continue
@@ -578,18 +592,62 @@ class RolloutServer:
                 ray.get([engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]) for engine in all_resume_engines])
 
     def offload(self):
-        """Release memory occupation across all groups (concurrent)."""
+        """Release memory occupation across all groups (concurrent).
+
+        Pause each engine's scheduler before releasing its KV cache. Without
+        this, a colocated multi-turn rollout (e.g. fused-agent) can still have
+        generation requests queued in the SGLang scheduler when we release the
+        memory pool; the scheduler then tries to ``prepare_for_extend`` against
+        a pool that has already been moved to CPU and dies with a Triton
+        "Pointer argument ... cpu tensor" error, taking the engine down. Flush
+        is already part of ``release_memory_occupation``, so a pause here is
+        enough to stop new prefill before the pool disappears.
+        """
+        for g in self.server_groups:
+            if g.needs_offload:
+                g.generation_health_check_enabled = False
+
+        pause_handles = [
+            engine.pause_generation.remote()
+            for g in self.server_groups
+            if g.needs_offload
+            for engine in g.engines
+            if engine is not None
+        ]
+        if pause_handles:
+            logger.info("Pausing generation on %d offloaded SGLang engines before releasing memory.", len(pause_handles))
+            ray.get(pause_handles)
+
         handles = []
         for g in self.server_groups:
             handles.extend(g.offload())
         return ray.get(handles) if handles else []
+
+    def _continue_generation_for_offloaded_groups(self):
+        handles = [
+            engine.continue_generation.remote()
+            for g in self.server_groups
+            if g.needs_offload
+            for engine in g.engines
+            if engine is not None
+        ]
+        if handles:
+            logger.info("Continuing generation on %d offloaded SGLang engines after memory resume.", len(handles))
+            return ray.get(handles)
+        return []
 
     def onload(self, tags: list[str] | None = None):
         """Resume memory occupation across all groups (concurrent)."""
         handles = []
         for g in self.server_groups:
             handles.extend(g.onload(tags))
-        return ray.get(handles) if handles else []
+        result = ray.get(handles) if handles else []
+        if _tags_enable_generation(tags):
+            self._continue_generation_for_offloaded_groups()
+            for g in self.server_groups:
+                if g.needs_offload:
+                    g.generation_health_check_enabled = True
+        return result
 
     def onload_weights(self):
         """Restore weights for offloaded groups.
@@ -603,15 +661,26 @@ class RolloutServer:
         for g in self.server_groups:
             if not g.needs_offload:
                 continue
+            g.generation_health_check_enabled = False
             handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
-        return ray.get(handles) if handles else []
+        if handles:
+            logger.info("Onloading weights for %d offloaded SGLang engines; generation remains paused.", len(handles))
+            return ray.get(handles)
+        return []
 
     def onload_kv(self):
         """Resume KV cache and CUDA graphs for offloaded groups."""
         handles = []
         for g in self.server_groups:
             handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]))
-        return ray.get(handles) if handles else []
+        result = ray.get(handles) if handles else []
+        if handles:
+            logger.info("Onloaded KV cache/CUDA graphs for %d SGLang engines; resuming generation.", len(handles))
+        self._continue_generation_for_offloaded_groups()
+        for g in self.server_groups:
+            if g.needs_offload:
+                g.generation_health_check_enabled = True
+        return result
 
 
 @ray.remote

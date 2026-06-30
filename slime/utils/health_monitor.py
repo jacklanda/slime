@@ -147,6 +147,13 @@ class RolloutHealthMonitor:
             logger.info(f"Skipping health check for engine {rollout_engine_id} (None)")
             return
 
+        if not self._server_group.generation_health_check_enabled:
+            logger.info(
+                "Skipping health check for engine %s because its server group is not generation-ready",
+                rollout_engine_id,
+            )
+            return
+
         try:
             ray.get(engine.health_generate.remote(timeout=self._check_timeout))
         except Exception as e:

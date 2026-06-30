@@ -40,6 +40,7 @@ from .prompts import (
 
 logger = logging.getLogger(__name__)
 DEFAULT_SGLANG_CONTEXT_LENGTH_MARGIN = 256
+_LAST_SGLANG_REQUEST_LOG_TS = 0.0
 
 
 class SGLangContextLengthExceededError(ValueError):
@@ -1443,6 +1444,7 @@ def _effective_sglang_context_limit(args) -> int:
 
 
 async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, Any], *, session_id: str) -> dict[str, Any]:
+    global _LAST_SGLANG_REQUEST_LOG_TS
     max_new_tokens = int(sampling_params.get("max_new_tokens", 0) or 0)
     max_context_tokens = _effective_sglang_context_limit(args)
     requested_tokens = len(prompt_ids) + max_new_tokens
@@ -1462,6 +1464,18 @@ async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, A
         "return_logprob": True,
     }
     headers = {"X-SMG-Routing-Key": session_id} if getattr(args, "router_policy", None) == "consistent_hashing" else None
+    started = time.time()
+    now = started
+    should_log = now - _LAST_SGLANG_REQUEST_LOG_TS >= float(os.environ.get("SLIME_FUSED_SGLANG_LOG_INTERVAL", "10"))
+    if should_log:
+        _LAST_SGLANG_REQUEST_LOG_TS = now
+        logger.info(
+            "fused-agent sending SGLang generate request rid=%s prompt_tokens=%d max_new_tokens=%d url=%s",
+            rid,
+            len(prompt_ids),
+            max_new_tokens,
+            url,
+        )
     try:
         output = await http_utils.post(url, payload, headers=headers)
     except (asyncio.CancelledError, httpx.TimeoutException):
@@ -1480,6 +1494,14 @@ async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, A
     }
     if top_p_data is not None:
         result["rollout_top_p_token_ids"], result["rollout_top_p_token_offsets"] = top_p_data
+    if should_log:
+        logger.info(
+            "fused-agent received SGLang generate response rid=%s output_tokens=%d finish_reason=%s elapsed=%.2fs",
+            rid,
+            len(output_ids),
+            finish_reason,
+            time.time() - started,
+        )
     return result
 
 

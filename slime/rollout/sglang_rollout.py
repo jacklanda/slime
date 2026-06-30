@@ -2,6 +2,8 @@ import asyncio
 import copy
 import inspect
 import logging
+import os
+import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -224,21 +226,22 @@ class GenerateState(metaclass=SingletonMeta):
     def reset(self) -> None:
         self.remaining_batch_size = 0
         self.pendings = set()
+        self.pending_groups = {}
         self.aborted = False
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         for group in samples:
-            self.pendings.add(
-                asyncio.create_task(
-                    # submit a group of samples as a single task.
-                    generate_and_rm_group(
-                        self.args,
-                        group,
-                        sampling_params=self.sampling_params.copy(),
-                        evaluation=False,
-                    )
+            task = asyncio.create_task(
+                # submit a group of samples as a single task.
+                generate_and_rm_group(
+                    self.args,
+                    group,
+                    sampling_params=self.sampling_params.copy(),
+                    evaluation=False,
                 )
             )
+            self.pendings.add(task)
+            self.pending_groups[task] = group
         self.remaining_batch_size += len(samples)
 
 
@@ -448,7 +451,20 @@ async def generate_and_rm_group(
             asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
         )
 
-    group = await asyncio.gather(*tasks)
+    group_timeout = _rollout_group_timeout(args, evaluation=evaluation)
+    try:
+        group = await asyncio.wait_for(asyncio.gather(*tasks), timeout=group_timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Rollout group timed out after %.1fs; cancelling %s unfinished sample tasks.",
+            group_timeout,
+            sum(not task.done() for task in tasks),
+        )
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        group = [_task_result_or_timeout(task, sample, evaluation=evaluation) for sample, task in zip(group, tasks, strict=True)]
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
@@ -458,6 +474,49 @@ async def generate_and_rm_group(
             sample.reward = reward
 
     return group
+
+
+def _rollout_group_timeout(args: Namespace, *, evaluation: bool) -> float:
+    env_name = "SLIME_EVAL_ROLLOUT_GROUP_TIMEOUT" if evaluation else "SLIME_ROLLOUT_GROUP_TIMEOUT"
+    if value := os.environ.get(env_name):
+        return max(1.0, float(value))
+    if value := os.environ.get("SLIME_ROLLOUT_GROUP_TIMEOUT"):
+        return max(1.0, float(value))
+    fused_env = "FUSED_EVAL_TRAJECTORY_TIMEOUT" if evaluation else "FUSED_TRAJECTORY_TIMEOUT"
+    if value := os.environ.get(fused_env):
+        return max(1.0, float(value))
+    return float(getattr(args, "rollout_group_timeout", 3600.0))
+
+
+def _timeout_sample(sample: Sample, *, evaluation: bool) -> Sample:
+    timed_out = copy.deepcopy(sample)
+    timed_out.status = Sample.Status.FAILED
+    timed_out.reward = 0.0
+    timed_out.metadata = {
+        **dict(sample.metadata or {}),
+        "termination_reason": "timeout",
+        "fused_termination": "timeout",
+        "fused_error": "rollout_group_timeout",
+        "evaluation": evaluation,
+    }
+    return timed_out
+
+
+def _task_result_or_timeout(task: asyncio.Task, sample: Sample, *, evaluation: bool):
+    if task.cancelled():
+        return _timeout_sample(sample, evaluation=evaluation)
+    try:
+        result = task.result()
+    except Exception:
+        return _timeout_sample(sample, evaluation=evaluation)
+    return result
+
+
+def _group_has_trainable_response(group: list[Sample] | list[list[Sample]]) -> bool:
+    return any(
+        sample.status == Sample.Status.COMPLETED and sample.response_length > 0
+        for sample in _flatten_samples(group)
+    )
 
 
 async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
@@ -531,6 +590,11 @@ async def generate_rollout_async(
     data = []
     all_data = []
     do_print = True
+    filter_relax_after = int(getattr(args, "fully_async_filter_relax_after_groups", 0) or 0)
+    completed_groups = 0
+    dropped_groups = 0
+    started = time.time()
+    last_log = started
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Group collection")
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
@@ -539,9 +603,35 @@ async def generate_rollout_async(
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+        done, state.pendings = await asyncio.wait(
+            state.pendings,
+            timeout=_rollout_group_timeout(args, evaluation=False),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done and state.pendings:
+            task = next(iter(state.pendings))
+            logger.warning(
+                "Rollout collection timed out waiting for a finished group after %.1fs; cancelling one pending group.",
+                _rollout_group_timeout(args, evaluation=False),
+            )
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            state.pendings.remove(task)
+            done = {task}
+
         for task in done:
-            group: list[Sample] = task.result()
+            source_group = state.pending_groups.pop(task, None)
+            if not task.done():
+                if source_group is None:
+                    raise RuntimeError("Timed-out rollout task is missing its source group.")
+                group = [_timeout_sample(sample, evaluation=False) for sample in source_group]
+            else:
+                try:
+                    group: list[Sample] = task.result()
+                except (asyncio.CancelledError, Exception):
+                    if source_group is None:
+                        raise RuntimeError("Failed rollout task is missing its source group.")
+                    group = [_timeout_sample(sample, evaluation=False) for sample in source_group]
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
@@ -552,16 +642,25 @@ async def generate_rollout_async(
 
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
+            completed_groups += 1
             dynamic_filter_output = call_dynamic_filter(
                 dynamic_filter,
                 args,
                 _flatten_samples(group),
                 rollout_id=rollout_id,
             )
-            if not dynamic_filter_output.keep:
+            relax_filter = (
+                filter_relax_after > 0
+                and completed_groups >= filter_relax_after
+                and _group_has_trainable_response(group)
+            )
+            if not dynamic_filter_output.keep and not relax_filter:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                dropped_groups += 1
                 state.remaining_batch_size -= 1
                 continue
+            if not dynamic_filter_output.keep and relax_filter:
+                metric_gatherer.on_dynamic_filter_drop(reason=f"relaxed_{dynamic_filter_output.reason}")
 
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
@@ -569,6 +668,19 @@ async def generate_rollout_async(
                 maybe_print_rollout_group(args, group, group_id=len(data))
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
+        now = time.time()
+        if now - last_log > 30.0:
+            logger.info(
+                "sync rollout %d: collected %d/%d, dropped=%d/%d, pending=%d, elapsed=%.1fs",
+                rollout_id,
+                len(data),
+                target_data_size,
+                dropped_groups,
+                completed_groups,
+                len(state.pendings),
+                now - started,
+            )
+            last_log = now
 
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
@@ -599,7 +711,11 @@ async def generate_rollout_async(
         process_func = load_function(args.rollout_all_samples_process_path)
         process_func(args, all_samples, data_source)
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
+    metrics = metric_gatherer.collect()
+    metrics["rollout/dynamic_filter/completed_groups"] = completed_groups
+    metrics["rollout/dynamic_filter/dropped_groups"] = dropped_groups
+    metrics["rollout/dynamic_filter/kept_groups"] = len(data)
+    return RolloutFnTrainOutput(samples=data, metrics=metrics), aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}
