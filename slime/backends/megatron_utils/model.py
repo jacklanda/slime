@@ -41,11 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 def _disable_tqdm_for_non_main_rank() -> bool:
-    return not (
-        mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-        and mpu.get_tensor_model_parallel_rank() == 0
-        and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
-    )
+    return not (mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1)
 
 
 def _should_update_microbatch_pbar(model) -> bool:
@@ -97,7 +93,6 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
     loss_mask_sums = metrics_data.get("loss_mask_sums", [])
     prompt_lengths = metrics_data.get("prompt_lengths", [])
     response_lengths = metrics_data.get("response_lengths", [])
-    statuses = metrics_data.get("statuses", [])
     num_samples = len(raw_rewards)
 
     valid_indices = []
@@ -123,13 +118,15 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
             }
         )
 
-    metrics = _response_metrics_for_actor_update(valid_indices, response_lengths, statuses)
+    # response_length/*, prompt_length/* and response/aborted_ratio are logged
+    # on the rollout side (rollout.py::compute_metrics_from_samples) to avoid
+    # duplicating the same distribution under two prefixes.
+    metrics: dict[str, float] = {}
     metrics.update(
         {
             "episode/num": 0.0,
-            "episode/reward/mean": 0.0,
+            "episode/training_reward/mean": 0.0,
             "episode/pass@1": 0.0,
-            "episode/correct": 0.0,
         }
     )
     if not valid_indices:
@@ -158,11 +155,7 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
             if steps is not None:
                 group_steps[group_id] = steps
         if group_id not in group_tool_call_turns:
-            tool_call_turns = _coerce_finite_float(
-                metadata.get("fused_tool_call_turns")
-                or metadata.get("tool_call_turns")
-                or metadata.get("tool_call_turn")
-            )
+            tool_call_turns = _coerce_finite_float(metadata.get("fused_tool_call_turns") or metadata.get("tool_call_turns") or metadata.get("tool_call_turn"))
             if tool_call_turns is not None:
                 group_tool_call_turns[group_id] = tool_call_turns
 
@@ -170,14 +163,7 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
         if termination:
             termination = str(termination)
             previous_reward = group_termination_rewards.get(group_id)
-            if (
-                previous_reward is None
-                or reward > previous_reward
-                or (
-                    reward == previous_reward
-                    and _termination_priority(termination) > _termination_priority(group_terminations[group_id])
-                )
-            ):
+            if previous_reward is None or reward > previous_reward or (reward == previous_reward and _termination_priority(termination) > _termination_priority(group_terminations[group_id])):
                 group_terminations[group_id] = termination
                 group_termination_rewards[group_id] = reward
 
@@ -206,9 +192,7 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
         if group_id is None:
             group_id = sample_indices[i] if i < len(sample_indices) else i
         group_prompt_tokens[group_id] = group_prompt_tokens.get(group_id, 0) + int(prompt_lengths[i] if i < len(prompt_lengths) else 0)
-        group_response_tokens[group_id] = group_response_tokens.get(group_id, 0) + int(
-            response_lengths[i] if i < len(response_lengths) else 0
-        )
+        group_response_tokens[group_id] = group_response_tokens.get(group_id, 0) + int(response_lengths[i] if i < len(response_lengths) else 0)
         reward_debug = metadata.get("fused_reward_debug")
         for key in _RLLM_EPISODE_TOOL_KEYS:
             value = _metric_value_from_metadata(metadata, reward_debug, key)
@@ -218,7 +202,6 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
     if not samples:
         return metrics
 
-    episode_rewards = []
     episode_solved = []
     episode_rewards_by_source: dict[str, list[float]] = {}
     episode_solved_by_source: dict[str, list[float]] = {}
@@ -230,7 +213,6 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
         suffix = _metric_task_suffix(task_type)
         reward = max(rewards)
         solved = float(any(r > 0 for r in rewards))
-        episode_rewards.append(reward)
         episode_solved.append(solved)
         episode_rewards_by_source.setdefault(task_type, []).append(reward)
         episode_solved_by_source.setdefault(task_type, []).append(solved)
@@ -245,12 +227,17 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
             episode_turn_values.setdefault("turn/tool_call_turn", []).append(tool_call_turns)
             episode_turn_values.setdefault(f"turn/tool_call_turn/{suffix}", []).append(tool_call_turns)
 
-    metrics.update({
-        "episode/num": float(len(group_rewards)),
-        "episode/reward/mean": float(sum(episode_rewards) / len(episode_rewards)),
-        "episode/pass@1": float(sum(episode_solved) / len(episode_solved)),
-        "episode/correct": float(sum(episode_solved) / len(episode_solved)),
-    })
+    metrics.update(
+        {
+            "episode/num": float(len(group_rewards)),
+            # Sample-equal-weight mean: average over every individual sample's
+            # reward (flattened across groups), NOT the per-group max. The
+            # per-group-max variant saturates to ~1.0 under large
+            # n_samples_per_prompt because it effectively measures pass@n.
+            "episode/training_reward/mean": float(sum(r for rewards in group_rewards.values() for r in rewards) / sum(len(rewards) for rewards in group_rewards.values())),
+            "episode/pass@1": float(sum(episode_solved) / len(episode_solved)),
+        }
+    )
     if episode_prompt_tokens:
         metrics["episode/prompt_tokens"] = float(sum(episode_prompt_tokens) / len(episode_prompt_tokens))
     if episode_response_tokens:
@@ -272,26 +259,6 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
         metrics[f"episode/{key}"] = mean_value
     for key, values in episode_turn_values.items():
         metrics[f"episode/{key}"] = float(sum(values) / len(values))
-    if "episode/traj/steps" in metrics:
-        metrics["episode/num_turns"] = metrics["episode/traj/steps"]
-    return metrics
-
-
-def _response_metrics_for_actor_update(valid_indices: list[int], response_lengths: list, statuses: list) -> dict[str, float]:
-    metrics = {}
-    response_length_values = [float(response_lengths[i]) for i in valid_indices if i < len(response_lengths)]
-    if response_length_values:
-        metrics["response_length/mean"] = float(sum(response_length_values) / len(response_length_values))
-        metrics["response_length/min"] = float(min(response_length_values))
-        metrics["response_length/max"] = float(max(response_length_values))
-        max_response_len = getattr(get_args(), "rollout_max_response_len", None)
-        if max_response_len:
-            metrics["response_length/clip_ratio"] = sum(v >= max_response_len for v in response_length_values) / len(
-                response_length_values
-            )
-    status_values = [statuses[i] for i in valid_indices if i < len(statuses)]
-    if status_values:
-        metrics["response/aborted_ratio"] = sum(status == "aborted" for status in status_values) / len(status_values)
     return metrics
 
 
@@ -379,18 +346,15 @@ def _termination_priority(reason: str) -> int:
 
 def _is_warning_termination(reason: str) -> bool:
     normalized = _normalize_termination_reason(reason)
-    return (
-        normalized.startswith("abnormal_")
-        or normalized in {
-            "invalid_react_structure",
-            "invalid_final_step",
-            "tail_guard_early_stop",
-            "env_init_error",
-            "error",
-            "max_context_len_exceeded",
-            "max_response_len_exceeded",
-        }
-    )
+    return normalized.startswith("abnormal_") or normalized in {
+        "invalid_react_structure",
+        "invalid_final_step",
+        "tail_guard_early_stop",
+        "env_init_error",
+        "error",
+        "max_context_len_exceeded",
+        "max_response_len_exceeded",
+    }
 
 
 def _coerce_finite_float(value) -> float | None:
@@ -418,10 +382,9 @@ def _metric_task_suffix(task_type: str) -> str:
 def _charts_metrics_for_actor_update(train_metrics: dict[str, float]) -> dict[str, float]:
     metrics = {}
     key_map = {
-        "train/grad_norm": "Charts/grad_norm",
-        "train/loss": "Charts/loss",
-        "train/pg_loss": "Charts/loss",
-        "train/lr-pg_0": "Charts/lr",
+        "train/loss": "train/loss",
+        "train/pg_loss": "train/loss",
+        "train/lr-pg_0": "train/lr",
     }
     for src, dst in key_map.items():
         if dst not in metrics and src in train_metrics:
@@ -456,11 +419,7 @@ def _critic_output_layer_needs_reinit(args: Namespace, model: Sequence[DDP], rol
 
             param_name = f"output_layer.{name}"
             ckpt_tensor_metadata = next(
-                (
-                    tensor_metadata
-                    for key, tensor_metadata in checkpoint_metadata.items()
-                    if key == param_name or key.endswith(f".{param_name}")
-                ),
+                (tensor_metadata for key, tensor_metadata in checkpoint_metadata.items() if key == param_name or key.endswith(f".{param_name}")),
                 None,
             )
             expected_shape = tuple(param.shape)
@@ -468,11 +427,7 @@ def _critic_output_layer_needs_reinit(args: Namespace, model: Sequence[DDP], rol
             if checkpoint_shape == expected_shape:
                 continue
 
-            reason = (
-                "missing from checkpoint metadata"
-                if checkpoint_shape is None
-                else f"shape mismatch checkpoint={checkpoint_shape} runtime={expected_shape}"
-            )
+            reason = "missing from checkpoint metadata" if checkpoint_shape is None else f"shape mismatch checkpoint={checkpoint_shape} runtime={expected_shape}"
             logger.warning(
                 "Will reinitialize critic %s after checkpoint load because it is %s",
                 param_name,
@@ -663,9 +618,7 @@ def forward_only(
     if use_rollout_top_p_replay:
         batch_keys = _with_rollout_top_p_token_keys(args, batch_keys)
 
-    def forward_step(
-        data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
-    ) -> tuple[torch.Tensor, Callable[[torch.Tensor], dict[str, list[torch.Tensor]]]]:
+    def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[torch.Tensor, Callable[[torch.Tensor], dict[str, list[torch.Tensor]]]]:
         """Forward step used by Megatron's pipeline engine.
 
         Args:
@@ -829,7 +782,9 @@ def train_one_step(
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
-    def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[
+    def forward_step(
+        data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
+    ) -> tuple[
         torch.Tensor,
         Callable[[torch.Tensor], tuple[torch.Tensor, int, dict[str, torch.Tensor | list[str]]]],
     ]:
@@ -1011,10 +966,7 @@ def train(
     """
     args = get_args()
 
-    assert len(num_microbatches) == len(global_batch_sizes), (
-        f"num_microbatches and global_batch_sizes must have the same length, "
-        f"got {len(num_microbatches)} vs {len(global_batch_sizes)}"
-    )
+    assert len(num_microbatches) == len(global_batch_sizes), f"num_microbatches and global_batch_sizes must have the same length, " f"got {len(num_microbatches)} vs {len(global_batch_sizes)}"
 
     for iterator in data_iterator:
         iterator.reset()
@@ -1028,10 +980,7 @@ def train(
     config.grad_scale_func = optimizer.scale_loss
     config.timers = None
     if isinstance(model[0], DDP) and args.overlap_grad_reduce:
-        assert config.no_sync_func is None, (
-            "When overlap_grad_reduce is True, config.no_sync_func must be None; "
-            "a custom no_sync_func is not supported when overlapping grad-reduce"
-        )
+        assert config.no_sync_func is None, "When overlap_grad_reduce is True, config.no_sync_func must be None; " "a custom no_sync_func is not supported when overlapping grad-reduce"
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
@@ -1048,11 +997,7 @@ def train(
     pre_hook_enabled = False
 
     if args.reset_optimizer_states:
-        if (
-            mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-            and mpu.get_tensor_model_parallel_rank() == 0
-            and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
-        ):
+        if mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1:
             print("Reset optimizer states")
         for chained_optimizer in optimizer.chained_optimizers:
             for group in chained_optimizer.optimizer.param_groups:
@@ -1099,7 +1044,6 @@ def train(
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
-
         # Run training step.
         loss_dict, grad_norm = train_one_step(
             args,
@@ -1145,18 +1089,11 @@ def train(
                     check_mtp_loss(mtp_losses)
 
         # per train step log.
-        if (
-            mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-            and mpu.get_tensor_model_parallel_rank() == 0
-            and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
-        ):
+        if mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1:
             accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
             role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
-            log_dict = {
-                f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
-                for key, val in loss_dict.items()
-            }
+            log_dict = {f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val for key, val in loss_dict.items()}
             log_dict[f"train/{role_tag}grad_norm"] = grad_norm
             if args.enable_mtp_training:
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
@@ -1182,11 +1119,7 @@ def train(
                 # R3 replays rollout routing for the actor path, while ref
                 # log-probs are computed with normal routing. The initial
                 # actor/ref KL is therefore not expected to be exactly zero.
-                if (
-                    accumulated_step_id == 0
-                    and not getattr(args, "use_rollout_routing_replay", False)
-                    and "train/kl_loss" in log_dict
-                ):
+                if accumulated_step_id == 0 and not getattr(args, "use_rollout_routing_replay", False) and "train/kl_loss" in log_dict:
                     assert log_dict["train/kl_loss"] < 1e-8, f"{log_dict=}"
 
             logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict}")
@@ -1251,9 +1184,7 @@ def save(
         enable_forward_pre_hook(model)
 
 
-def initialize_model_and_optimizer(
-    args: Namespace, role: str = "actor"
-) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
+def initialize_model_and_optimizer(args: Namespace, role: str = "actor") -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
     """Initialize model(s), optimizer, scheduler, and load from checkpoint.
 
     Args:

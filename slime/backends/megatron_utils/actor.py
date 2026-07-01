@@ -85,9 +85,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
                 torch_memory_saver.memory_margin_bytes = x
 
-        self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
-            args, role
-        )
+        self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(args, role)
 
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
@@ -142,9 +140,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.vocab_size = hf_vocab if hf_vocab is not None else self.tokenizer.vocab_size
 
         if self.args.colocate:
-            assert (
-                self.args.update_weight_mode == "full"
-            ), "--update-weight-mode=delta is not supported with --colocate"
+            assert self.args.update_weight_mode == "full", "--update-weight-mode=delta is not supported with --colocate"
             update_weight_cls = UpdateWeightFromTensor
         elif self.args.update_weight_mode == "delta":
             # Lazy import: the delta module pulls DeltaEncoding/DeltaParam/DeltaSpec from
@@ -158,9 +154,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.update_weight_transport == "disk":
                 update_weight_cls = UpdateWeightFromDisk
             else:
-                assert (
-                    self.args.update_weight_mode == "full" and self.args.update_weight_transport == "nccl"
-                ), f"unsupported weight sync mode/transport: {self.args.update_weight_mode!r}/{self.args.update_weight_transport!r}"
+                assert self.args.update_weight_mode == "full" and self.args.update_weight_transport == "nccl", f"unsupported weight sync mode/transport: {self.args.update_weight_mode!r}/{self.args.update_weight_transport!r}"
                 update_weight_cls = UpdateWeightFromDistributed
         self.weight_updater = update_weight_cls(
             self.args,
@@ -196,16 +190,29 @@ class MegatronTrainRayActor(TrainRayActor):
 
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
-        if (
-            self.role == "actor"
-            and self.args.use_critic
-            and not self.args.colocate
-            and hasattr(self.weight_updater, "disconnect_rollout_engines")
-        ):
+        if self.role == "actor" and self.args.use_critic and not self.args.colocate and hasattr(self.weight_updater, "disconnect_rollout_engines"):
             self.weight_updater.disconnect_rollout_engines()
         destroy_process_groups()
 
-        torch_memory_saver.pause()
+        # torch_memory_saver.pause() walks the tracked CUDA allocations and unmaps
+        # them. If the CUDA context is already in a sticky-error state (e.g. after a
+        # bad rollout/onload cycle) the underlying cuMemUnmap fails with
+        # cudaErrorInvalidValue and the C++ layer only prints
+        #   [torch_memory_saver.cpp] cudaError error: 1 (invalid argument) func=pause
+        # before the worker dies with a bare SYSTEM_ERROR, taking the whole
+        # distributed group down with unhelpful TCPStore/NCCL noise. A synchronize
+        # here forces any pending async CUDA error to surface as a Python exception
+        # (attributable to this rank) rather than inside the opaque C++ pause path.
+        rank = dist.get_rank() if dist.is_initialized() else -1
+        try:
+            torch.cuda.synchronize()
+            torch_memory_saver.pause()
+        except Exception:
+            logging.error(
+                f"[rank {rank}] offload failed in torch_memory_saver.pause(); " "check for a preceding CUDA error (e.g. the [torch_memory_saver.cpp] " "cudaError line) — the CUDA context was likely already faulted.",
+                exc_info=True,
+            )
+            raise
 
         print_memory("after offload model")
 
@@ -234,39 +241,19 @@ class MegatronTrainRayActor(TrainRayActor):
         # TODO: this is ugly, move to somewhere else?
         # move tokens to GPU in advance
         device = torch.cuda.current_device()
-        rollout_data["tokens"] = [
-            t.to(device=device, dtype=torch.long, non_blocking=True) for t in rollout_data["tokens"]
-        ]
-        rollout_data["loss_masks"] = [
-            t.to(device=device, dtype=torch.int, non_blocking=True) for t in rollout_data["loss_masks"]
-        ]
+        rollout_data["tokens"] = [t.to(device=device, dtype=torch.long, non_blocking=True) for t in rollout_data["tokens"]]
+        rollout_data["loss_masks"] = [t.to(device=device, dtype=torch.int, non_blocking=True) for t in rollout_data["loss_masks"]]
         if "policy_loss_masks" in rollout_data:
-            rollout_data["policy_loss_masks"] = [
-                t.to(device=device, dtype=torch.int, non_blocking=True) for t in rollout_data["policy_loss_masks"]
-            ]
+            rollout_data["policy_loss_masks"] = [t.to(device=device, dtype=torch.int, non_blocking=True) for t in rollout_data["policy_loss_masks"]]
         if "rollout_mask_sums" in rollout_data:
             # Promote precomputed per-rollout mask totals to GPU tensors here
             # (matching loss_masks) so the loss reducer can just divide.
-            rollout_data["rollout_mask_sums"] = rollout_data["rollout_mask_sums"].to(
-                device=device, dtype=torch.float32, non_blocking=True
-            )
+            rollout_data["rollout_mask_sums"] = rollout_data["rollout_mask_sums"].to(device=device, dtype=torch.float32, non_blocking=True)
         if "policy_rollout_mask_sums" in rollout_data:
-            rollout_data["policy_rollout_mask_sums"] = rollout_data["policy_rollout_mask_sums"].to(
-                device=device, dtype=torch.float32, non_blocking=True
-            )
+            rollout_data["policy_rollout_mask_sums"] = rollout_data["policy_rollout_mask_sums"].to(device=device, dtype=torch.float32, non_blocking=True)
         if "multimodal_train_inputs" in rollout_data:
             # Move multimodal training tensors to GPU in advance
-            rollout_data["multimodal_train_inputs"] = [
-                (
-                    {
-                        key: value.to(device=device, non_blocking=True) if isinstance(value, torch.Tensor) else value
-                        for key, value in mm_dict.items()
-                    }
-                    if mm_dict is not None
-                    else None
-                )
-                for mm_dict in rollout_data["multimodal_train_inputs"]
-            ]
+            rollout_data["multimodal_train_inputs"] = [({key: value.to(device=device, non_blocking=True) if isinstance(value, torch.Tensor) else value for key, value in mm_dict.items()} if mm_dict is not None else None) for mm_dict in rollout_data["multimodal_train_inputs"]]
 
         for key in ["rollout_log_probs", "teacher_log_probs"]:
             if key not in rollout_data:
@@ -294,9 +281,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
-            raise ValueError(
-                "rollout_routed_experts is required in rollout_data when use_rollout_routing_replay is set."
-            )
+            raise ValueError("rollout_routed_experts is required in rollout_data when use_rollout_routing_replay is set.")
 
         from megatron.core.transformer.transformer_block import get_num_layers_to_build
         from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
@@ -376,7 +361,6 @@ class MegatronTrainRayActor(TrainRayActor):
         num_microbatches: list[int],
         store_prefix: str = "",
     ) -> dict[str, list[torch.Tensor]]:
-
         with timer(f"{store_prefix}log_probs"):
             return forward_only(
                 get_log_probs_and_entropy,
@@ -488,9 +472,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     and not self.args.use_routing_replay
                     and self.args.advantage_estimator != "gspo"
                 )
-                if (
-                    not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics
-                ) and not can_reuse_log_probs_in_loss:
+                if (not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics) and not can_reuse_log_probs_in_loss:
                     if self.args.use_routing_replay:
                         if self.args.use_rollout_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
@@ -557,11 +539,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.weights_backuper.backup("actor")
 
         # Update ref model if needed
-        if (
-            self.args.ref_update_interval is not None
-            and (rollout_id + 1) % self.args.ref_update_interval == 0
-            and "ref" in self.weights_backuper.backup_tags
-        ):
+        if self.args.ref_update_interval is not None and (rollout_id + 1) % self.args.ref_update_interval == 0 and "ref" in self.weights_backuper.backup_tags:
             with timer("ref_model_update"):
                 if is_megatron_main_rank():
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")
@@ -603,9 +581,7 @@ class MegatronTrainRayActor(TrainRayActor):
             ray.get(self.rollout_manager.recover_updatable_engines.remote())
         dist.barrier(group=get_gloo_group())
 
-        rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
-            self.rollout_manager.get_updatable_engines_and_lock.remote()
-        )
+        rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(self.rollout_manager.get_updatable_engines_and_lock.remote())
 
         reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
 
@@ -639,9 +615,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 engine = random.choice(rollout_engines)
                 engine_version = ray.get(engine.get_weight_version.remote())
                 if str(engine_version) != str(self.weight_updater.weight_version):
-                    raise RuntimeError(
-                        f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
-                    )
+                    raise RuntimeError(f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}")
 
             if getattr(self.args, "keep_old_actor", False):
                 if self.args.update_weights_interval == 1:

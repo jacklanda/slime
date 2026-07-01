@@ -74,9 +74,7 @@ _SGLANG_DECODE_PERF_FIELDS = (
 
 
 def _tags_enable_generation(tags: list[str] | None) -> bool:
-    return tags is None or (
-        GPU_MEMORY_TYPE_KV_CACHE in tags and GPU_MEMORY_TYPE_CUDA_GRAPH in tags
-    )
+    return tags is None or (GPU_MEMORY_TYPE_KV_CACHE in tags and GPU_MEMORY_TYPE_CUDA_GRAPH in tags)
 
 
 def _cpu_tensor(value, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -607,13 +605,7 @@ class RolloutServer:
             if g.needs_offload:
                 g.generation_health_check_enabled = False
 
-        pause_handles = [
-            engine.pause_generation.remote()
-            for g in self.server_groups
-            if g.needs_offload
-            for engine in g.engines
-            if engine is not None
-        ]
+        pause_handles = [engine.pause_generation.remote() for g in self.server_groups if g.needs_offload for engine in g.engines if engine is not None]
         if pause_handles:
             logger.info("Pausing generation on %d offloaded SGLang engines before releasing memory.", len(pause_handles))
             ray.get(pause_handles)
@@ -624,13 +616,7 @@ class RolloutServer:
         return ray.get(handles) if handles else []
 
     def _continue_generation_for_offloaded_groups(self):
-        handles = [
-            engine.continue_generation.remote()
-            for g in self.server_groups
-            if g.needs_offload
-            for engine in g.engines
-            if engine is not None
-        ]
+        handles = [engine.continue_generation.remote() for g in self.server_groups if g.needs_offload for engine in g.engines if engine is not None]
         if handles:
             logger.info("Continuing generation on %d offloaded SGLang engines after memory resume.", len(handles))
             return ray.get(handles)
@@ -1539,6 +1525,7 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
 
 def compute_metrics_from_samples(args, samples):
     response_lengths = [sample.effective_response_length for sample in samples]
+    prompt_lengths = [len(sample.tokens) - sample.response_length for sample in samples]
 
     log_dict = {}
     response_length_stats = compute_statistics(response_lengths)
@@ -1546,6 +1533,9 @@ def compute_metrics_from_samples(args, samples):
     if response_lengths:
         log_dict["response_length/clip_ratio"] = float(np.mean([length >= args.rollout_max_response_len for length in response_lengths]))
         log_dict["response/aborted_ratio"] = float(np.mean([sample.status == Sample.Status.ABORTED for sample in samples]))
+    log_dict |= dict_add_prefix(compute_statistics(prompt_lengths), "prompt_length/")
+    if prompt_lengths and args.rollout_max_prompt_len:
+        log_dict["prompt_length/clip_ratio"] = float(np.mean([length >= args.rollout_max_prompt_len for length in prompt_lengths]))
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)

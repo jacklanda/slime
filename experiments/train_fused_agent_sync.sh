@@ -114,7 +114,12 @@ is_truthy() {
 FULLY_ASYNC="${FULLY_ASYNC:-false}"
 PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
-COLOCATE="${COLOCATE:-true}"
+# Default to non-colocate: train and rollout live on separate GPUs so training
+# never runs the per-step torch_memory_saver offload/pause path. That pause path
+# (cudaError 1 "invalid argument" in torch_memory_saver.cpp func=pause) crashes
+# after ~20 offload cycles under colocate + enable_cpu_backup and has no upstream
+# fix (already on the latest torch_memory_saver; see slime issues #1786/#71).
+COLOCATE="${COLOCATE:-false}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
 ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-16}"
@@ -163,7 +168,11 @@ EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
-OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-true}}"
+# Offload only makes sense under colocate (train/rollout share GPUs and take
+# turns via torch_memory_saver). Under non-colocate they own separate GPUs, so
+# default offload off — this is the whole point of the split: skip the crashing
+# torch_memory_saver.pause() path entirely.
+OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-${COLOCATE}}}"
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
 GRM_MODEL="${GRM_MODEL:-deepseek/deepseek-v4-flash}"
@@ -303,8 +312,8 @@ BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 default_experiment_name() {
    #local prefix="fused-dapo-q3-4b-no_think-gem-async-dev"
-   #local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
-   local prefix="asearcher-dapo-q3.5-4b-no_think-gem-sync-dev"
+   local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
+   #local prefix="asearcher-dapo-q3.5-4b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-8b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-8b-no_think-gem-async-dev"
@@ -334,13 +343,40 @@ fi
 
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
-MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
+#MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
+MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
 
+# Default tensor-parallel size depends on the model. Gated attention
+# (--attention-output-gate, qwen3.5) is broken in Megatron when
+# num_query_groups < TP: the per-rank query head re-slice (attention.py step 4)
+# is not mirrored on the gate tensor, so gate.view() fails with a size mismatch
+# (factor = TP // num_query_groups). qwen3.5-4B has num_query_groups=4, so its TP
+# must be <= 4. Non-gated models (qwen3-4B, num_query_groups=8) keep TP=8.
+# NOTE: this is only the model-level cap; it is further clamped to ACTOR_GPUS
+# below (a non-colocate 4-GPU actor cannot run TP=8).
+if printf '%s\n' "${MODEL_ARGS[@]}" | grep -q -- "--attention-output-gate"; then
+   DEFAULT_TP_SIZE=4
+else
+   DEFAULT_TP_SIZE=8
+fi
+
+# Non-colocate split on a single 8-GPU node: 4 GPUs train, 4 GPUs rollout.
+# Defined here (before PERF_ARGS is built) so the TP clamp below actually takes
+# effect — bash arrays expand their values at definition time.
+ACTOR_GPUS="${ACTOR_GPUS:-4}"
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
+
+# TP cannot exceed the number of actor GPUs. Clamp the model-level default so a
+# 4-GPU non-colocate actor uses TP=4 instead of the colocate-era TP=8 default.
+if [ "${DEFAULT_TP_SIZE}" -gt "${ACTOR_GPUS}" ]; then
+   DEFAULT_TP_SIZE="${ACTOR_GPUS}"
+fi
+
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/checkpoints/FusedRL/${EXPERIMENT_NAME}}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
@@ -545,6 +581,16 @@ if [ -n "${LOAD}" ]; then
    CKPT_ARGS+=(--load "${LOAD}")
 fi
 
+# When resuming a checkpoint saved under a different TP (e.g. migrating a TP=8
+# colocate run to a TP=4 non-colocate layout), the DistributedOptimizer state
+# uses sharding type dp_reshardable which cannot be resharded across TP. Set
+# NO_LOAD_OPTIM=1 for that one migration launch to load only the (TP-reshardable)
+# model weights and reinit the optimizer/RNG. New checkpoints this run saves are
+# TP=4-native, so later resumes do NOT need this flag.
+if is_truthy "${NO_LOAD_OPTIM:-false}"; then
+   CKPT_ARGS+=(--no-load-optim --no-load-rng)
+fi
+
 ROLLOUT_ARGS=(
    --rollout-function-path "${ROLLOUT_FUNCTION_PATH}"
 
@@ -663,12 +709,8 @@ if [ -n "${DUMP_DETAILS}" ]; then
 fi
 
 PERF_ARGS=(
-   # NOTE: gated attention (--attention-output-gate, qwen3.5) is broken in
-   # Megatron when num_query_groups < TP: the per-rank query head re-slice
-   # (attention.py step 4) is not mirrored on the gate tensor, so gate.view()
-   # fails with a size mismatch (factor = TP // num_query_groups). qwen3.5-4B
-   # has num_query_groups=4, so TP must be <= 4. Default to 4.
-   --tensor-model-parallel-size "${TP_SIZE:-4}"
+   # See DEFAULT_TP_SIZE above: qwen3.5 gated attention requires TP <= 4.
+   --tensor-model-parallel-size "${TP_SIZE:-${DEFAULT_TP_SIZE}}"
    --sequence-parallel
    --pipeline-model-parallel-size "${PP_SIZE:-1}"
    --context-parallel-size "${CP_SIZE:-1}"
@@ -730,7 +772,7 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
-   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-${GPU_MEMORY_UTILIZATION:-0.7}}"
+   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-${GPU_MEMORY_UTILIZATION:-0.8}}"
    --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}"
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
    --sglang-context-length "${MAX_CONTEXT_LEN}"
@@ -771,8 +813,6 @@ export SCRIPT_DIR REPO_ROOT MEGATRON_LM_PATH HAS_NVLINK
 export SLIME_EPISODE_LOG_DIR="${EPISODE_LOG_DIR}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 
-ACTOR_GPUS="${ACTOR_GPUS:-8}"
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
 if is_truthy "${COLOCATE}"; then
    export NUM_GPUS="${NUM_GPUS:-${ACTOR_GPUS}}"
 else
