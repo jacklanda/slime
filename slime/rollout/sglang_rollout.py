@@ -676,7 +676,7 @@ async def generate_rollout_async(
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
         now = time.time()
-        if _env_bool("SLIME_FUSED_PROGRESS_LOGS", False) and now - last_log > 30.0:
+        if now - last_log > 30.0:
             logger.info(
                 "sync rollout %d: collected %d/%d, dropped=%d/%d, pending=%d, elapsed=%.1fs",
                 rollout_id,
