@@ -1554,14 +1554,10 @@ def compute_episode_metrics_from_samples(args, samples):
 
     metrics: dict[str, float] = {
         "episode/num": len(fused_stats["group_rewards"]),
-        "episode/reward/mean": float(np.mean(fused_stats["episode_rewards"])),
-        "episode/pass@1": float(np.mean(fused_stats["episode_solved"])),
     }
 
     for source, rewards in fused_stats["episode_rewards_by_source"].items():
         metrics[f"episode/reward/{source}/mean"] = float(np.mean(rewards))
-    for source, solved in fused_stats["episode_solved_by_source"].items():
-        metrics[f"episode/{source}/pass@1"] = float(np.mean(solved))
 
     if fused_stats["terminations"]:
         total = len(fused_stats["terminations"])
@@ -1595,18 +1591,13 @@ def _compute_fused_agent_metrics(args, all_samples: list[Sample]):
     groups_by_source = fused_stats["groups_by_source"]
 
     if group_rewards:
-        solve_none = solve_all = solve_partial = 0
+        solve_partial = 0
         for rewards in group_rewards.values():
-            correct = [reward > 0 for reward in rewards]
-            if not any(correct):
-                solve_none += 1
-            elif all(correct):
-                solve_all += 1
-            else:
+            has_correct = any(reward > 0 for reward in rewards)
+            has_incorrect = any(reward <= 0 for reward in rewards)
+            if has_correct and has_incorrect:
                 solve_partial += 1
         num_groups = len(group_rewards)
-        metrics["batch/solve_none"] = solve_none / num_groups
-        metrics["batch/solve_all"] = solve_all / num_groups
         metrics["batch/solve_partial"] = solve_partial / num_groups
         metrics["batch/num_tasks"] = num_groups
 
@@ -1677,20 +1668,13 @@ def _collect_fused_agent_stats(args, all_samples: list[Sample]):
     for group_id, task_type in group_task_types.items():
         groups_by_source.setdefault(task_type, []).append(group_id)
 
-    episode_rewards = []
-    episode_solved = []
     episode_rewards_by_source: dict[str, list[float]] = {}
-    episode_solved_by_source: dict[str, list[float]] = {}
     episode_turn_values: dict[str, list[float]] = {}
     for group_id, rewards in group_rewards.items():
         task_type = group_task_types[group_id]
         suffix = _metric_task_suffix(task_type)
         reward = max(rewards)
-        solved = float(any(r > 0 for r in rewards))
-        episode_rewards.append(reward)
-        episode_solved.append(solved)
         episode_rewards_by_source.setdefault(task_type, []).append(reward)
-        episode_solved_by_source.setdefault(task_type, []).append(solved)
         if group_id in group_steps:
             steps = group_steps[group_id]
             episode_turn_values.setdefault("traj/steps", []).append(steps)
@@ -1706,10 +1690,7 @@ def _collect_fused_agent_stats(args, all_samples: list[Sample]):
         "terminations": terminations,
         "workflow_values": workflow_values,
         "sample_rewards_by_source": sample_rewards_by_source,
-        "episode_rewards": episode_rewards,
-        "episode_solved": episode_solved,
         "episode_rewards_by_source": episode_rewards_by_source,
-        "episode_solved_by_source": episode_solved_by_source,
         "episode_turn_values": episode_turn_values,
     }
 

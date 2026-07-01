@@ -126,7 +126,6 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
         {
             "episode/num": 0.0,
             "episode/training_reward/mean": 0.0,
-            "episode/pass@1": 0.0,
         }
     )
     if not valid_indices:
@@ -202,22 +201,21 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
     if not samples:
         return metrics
 
-    episode_solved = []
     episode_rewards_by_source: dict[str, list[float]] = {}
-    episode_solved_by_source: dict[str, list[float]] = {}
     episode_turn_values: dict[str, list[float]] = {}
-    episode_prompt_tokens = []
-    episode_response_tokens = []
+    prompt_token_sum = 0
+    response_token_sum = 0
+    sample_reward_sum = 0.0
+    sample_count = 0
     for group_id, rewards in group_rewards.items():
         task_type = group_task_types[group_id]
         suffix = _metric_task_suffix(task_type)
         reward = max(rewards)
-        solved = float(any(r > 0 for r in rewards))
-        episode_solved.append(solved)
         episode_rewards_by_source.setdefault(task_type, []).append(reward)
-        episode_solved_by_source.setdefault(task_type, []).append(solved)
-        episode_prompt_tokens.append(group_prompt_tokens.get(group_id, 0))
-        episode_response_tokens.append(group_response_tokens.get(group_id, 0))
+        prompt_token_sum += group_prompt_tokens.get(group_id, 0)
+        response_token_sum += group_response_tokens.get(group_id, 0)
+        sample_reward_sum += sum(rewards)
+        sample_count += len(rewards)
         if group_id in group_steps:
             steps = group_steps[group_id]
             episode_turn_values.setdefault("traj/steps", []).append(steps)
@@ -227,25 +225,21 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
             episode_turn_values.setdefault("turn/tool_call_turn", []).append(tool_call_turns)
             episode_turn_values.setdefault(f"turn/tool_call_turn/{suffix}", []).append(tool_call_turns)
 
+    num_groups = len(group_rewards)
     metrics.update(
         {
-            "episode/num": float(len(group_rewards)),
+            "episode/num": float(num_groups),
             # Sample-equal-weight mean: average over every individual sample's
             # reward (flattened across groups), NOT the per-group max. The
             # per-group-max variant saturates to ~1.0 under large
             # n_samples_per_prompt because it effectively measures pass@n.
-            "episode/training_reward/mean": float(sum(r for rewards in group_rewards.values() for r in rewards) / sum(len(rewards) for rewards in group_rewards.values())),
-            "episode/pass@1": float(sum(episode_solved) / len(episode_solved)),
+            "episode/training_reward/mean": float(sample_reward_sum / sample_count),
+            "episode/prompt_tokens": float(prompt_token_sum / num_groups),
+            "episode/response_tokens": float(response_token_sum / num_groups),
         }
     )
-    if episode_prompt_tokens:
-        metrics["episode/prompt_tokens"] = float(sum(episode_prompt_tokens) / len(episode_prompt_tokens))
-    if episode_response_tokens:
-        metrics["episode/response_tokens"] = float(sum(episode_response_tokens) / len(episode_response_tokens))
     for source, rewards in episode_rewards_by_source.items():
         metrics[f"episode/reward/{source}/mean"] = float(sum(rewards) / len(rewards))
-    for source, solved in episode_solved_by_source.items():
-        metrics[f"episode/{source}/pass@1"] = float(sum(solved) / len(solved))
     termination_counts = {reason: 0 for reason in _RLLM_TERMINATION_REASONS}
     for group_id in group_rewards:
         termination_counts[_normalize_termination_reason(group_terminations.get(group_id, "unknown"))] += 1
