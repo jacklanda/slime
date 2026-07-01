@@ -259,7 +259,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
             await asyncio.sleep(0.05)
 
         now = time.time()
-        if now - last_log > LOG_EVERY:
+        if _env_bool("SLIME_FUSED_PROGRESS_LOGS", False) and now - last_log > LOG_EVERY:
             logger.info(
                 "fully-async rollout %d: collected %d/%d, dropped=%d/%d, queue=%d, elapsed=%.1fs",
                 rollout_id,
@@ -499,6 +499,13 @@ def _int_env(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _flatten_samples(group) -> list[Sample]:

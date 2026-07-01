@@ -45,6 +45,13 @@ _TOP_P_TOKEN_ID_META_KEYS = ("top_p_token_ids", "top_p_kept_token_ids")
 _TOP_P_TOKEN_OFFSET_META_KEYS = ("top_p_token_offsets", "top_p_kept_token_offsets")
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
     raw_multimodal_inputs = sample.multimodal_inputs or {}
     has_multimodal_inputs = any(value is not None for value in raw_multimodal_inputs.values())
@@ -669,7 +676,7 @@ async def generate_rollout_async(
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
         now = time.time()
-        if now - last_log > 30.0:
+        if _env_bool("SLIME_FUSED_PROGRESS_LOGS", False) and now - last_log > 30.0:
             logger.info(
                 "sync rollout %d: collected %d/%d, dropped=%d/%d, pending=%d, elapsed=%.1fs",
                 rollout_id,

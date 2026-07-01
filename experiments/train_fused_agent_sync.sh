@@ -26,6 +26,7 @@ Options:
   --partial-rollout / --no-partial-rollout
                                          Recycle partial rollouts during abort/sync.
   --terminal-log-style STYLE             progress, rollouts, or both. Stored in env for compatible fused code.
+  --show-rollout-progress-logs BOOL      Show periodic fused rollout request/progress logs. Default: false.
   --accepted-group-update-min-groups N   Maps to ROLLOUT_BATCH_SIZE by default.
   --accepted-group-update-max-groups N   Stored in env for compatible fused code.
   --micro-batch-size N                   Training micro-batch size.
@@ -114,6 +115,7 @@ is_truthy() {
 FULLY_ASYNC="${FULLY_ASYNC:-false}"
 PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
+SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 # Default to non-colocate: train and rollout live on separate GPUs so training
 # never runs the per-step torch_memory_saver offload/pause path. That pause path
 # (cudaError 1 "invalid argument" in torch_memory_saver.cpp func=pause) crashes
@@ -201,6 +203,7 @@ while [ "$#" -gt 0 ]; do
       --partial-rollout) PARTIAL_ROLLOUT=true; shift ;;
       --no-partial-rollout) PARTIAL_ROLLOUT=false; shift ;;
       --terminal-log-style) TERMINAL_LOG_STYLE="${2:?Missing value for --terminal-log-style}"; shift 2 ;;
+      --show-rollout-progress-logs) SHOW_ROLLOUT_PROGRESS_LOGS="${2:?Missing value for --show-rollout-progress-logs}"; shift 2 ;;
       --accepted-group-update-min-groups) ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${2:?Missing value for --accepted-group-update-min-groups}"; shift 2 ;;
       --accepted-group-update-max-groups) ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${2:?Missing value for --accepted-group-update-max-groups}"; shift 2 ;;
       --micro-batch-size) MICRO_BATCH_SIZE="${2:?Missing value for --micro-batch-size}"; shift 2 ;;
@@ -872,6 +875,7 @@ export FUSED_EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT}"
 export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-2048}"
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE}"
+export SLIME_FUSED_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS}"
 export SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}"
 export SLIME_FUSED_TAIL_GUARD="${TAIL_GUARD}"
 export SLIME_FUSED_TAIL_GUARD_TIME_GUARD="${TAIL_GUARD_TIME_GUARD}"
@@ -936,7 +940,7 @@ keys = (
     "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS", "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "SLIME_ROLLOUT_GROUP_TIMEOUT", "SLIME_EVAL_ROLLOUT_GROUP_TIMEOUT",
     "PER_STEP_MAX_TOKENS", "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH",
-    "SLIME_FUSED_TERMINAL_LOG_STYLE", "SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS",
+    "SLIME_FUSED_TERMINAL_LOG_STYLE", "SLIME_FUSED_PROGRESS_LOGS", "SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS",
     "SLIME_FUSED_TAIL_GUARD", "SLIME_FUSED_TAIL_GUARD_TIME_GUARD",
     "SLIME_FUSED_TAIL_GUARD_TIME_MULTIPLIER", "SLIME_FUSED_TAIL_GUARD_TIME_SLACK_SECONDS",
     "SLIME_FUSED_TAIL_GUARD_MIN_COMPLETION_RATIO",
@@ -985,7 +989,7 @@ echo "Custom reward post-process: ${CUSTOM_REWARD_POST_PROCESS_PATH:-<vanilla>}"
 echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
 echo "Actor GPUs: ${ACTOR_GPUS}, rollout GPUs: ${ROLLOUT_GPUS}, colocate=${COLOCATE}, ray GPUs=${NUM_GPUS}"
 echo "SGLang concurrency: server=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}"
-echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}"
+echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
 echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; micro_batch=${MICRO_BATCH_SIZE}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}"
 echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"
 echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, relax_after_groups=${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}"

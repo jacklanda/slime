@@ -26,6 +26,7 @@ Options:
   --partial-rollout / --no-partial-rollout
                                          Recycle partial rollouts during abort/sync.
   --terminal-log-style STYLE             progress, rollouts, or both. Stored in env for compatible fused code.
+  --show-rollout-progress-logs BOOL      Show periodic fused rollout request/progress logs. Default: false.
   --accepted-group-update-min-groups N   Maps to ROLLOUT_BATCH_SIZE by default.
   --accepted-group-update-max-groups N   Stored in env for compatible fused code.
   --async-mini-batch-size N              Maps to MICRO_BATCH_SIZE by default.
@@ -110,6 +111,7 @@ is_truthy() {
 FULLY_ASYNC="${FULLY_ASYNC:-true}"
 PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-true}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
+SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
 ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-128}"  # 128 for w/o group filtering
@@ -188,6 +190,7 @@ while [ "$#" -gt 0 ]; do
       --partial-rollout) PARTIAL_ROLLOUT=true; shift ;;
       --no-partial-rollout) PARTIAL_ROLLOUT=false; shift ;;
       --terminal-log-style) TERMINAL_LOG_STYLE="${2:?Missing value for --terminal-log-style}"; shift 2 ;;
+      --show-rollout-progress-logs) SHOW_ROLLOUT_PROGRESS_LOGS="${2:?Missing value for --show-rollout-progress-logs}"; shift 2 ;;
       --accepted-group-update-min-groups) ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${2:?Missing value for --accepted-group-update-min-groups}"; shift 2 ;;
       --accepted-group-update-max-groups) ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${2:?Missing value for --accepted-group-update-max-groups}"; shift 2 ;;
       --async-mini-batch-size) ASYNC_MINI_BATCH_SIZE="${2:?Missing value for --async-mini-batch-size}"; shift 2 ;;
@@ -789,6 +792,7 @@ export FUSED_EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT}"
 export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-1024}"
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE}"
+export SLIME_FUSED_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS}"
 export SLIME_FUSED_ASYNC_FWD_BWD_GROUP_SIZE="${ASYNC_FWD_BWD_GROUP_SIZE}"
 export SLIME_FUSED_ASYNC_STALENESS_THRESHOLD="${ASYNC_STALENESS_THRESHOLD}"
 export SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}"
@@ -854,7 +858,7 @@ keys = (
     "FUSED_HARNESS", "FUSED_UNIFIED_SYSTEM_PROMPT", "FUSED_DISABLE_THINKING",
     "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS", "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "PER_STEP_MAX_TOKENS", "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH",
-    "SLIME_FUSED_TERMINAL_LOG_STYLE", "SLIME_FUSED_ASYNC_FWD_BWD_GROUP_SIZE",
+    "SLIME_FUSED_TERMINAL_LOG_STYLE", "SLIME_FUSED_PROGRESS_LOGS", "SLIME_FUSED_ASYNC_FWD_BWD_GROUP_SIZE",
     "SLIME_FUSED_ASYNC_STALENESS_THRESHOLD", "SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS",
     "SLIME_FUSED_TAIL_GUARD", "SLIME_FUSED_TAIL_GUARD_TIME_GUARD",
     "SLIME_FUSED_TAIL_GUARD_TIME_MULTIPLIER", "SLIME_FUSED_TAIL_GUARD_TIME_SLACK_SECONDS",
@@ -903,7 +907,7 @@ echo "Custom reward post-process: ${CUSTOM_REWARD_POST_PROCESS_PATH:-<vanilla>}"
 echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
 echo "Actor GPUs: ${ACTOR_GPUS}, rollout GPUs: ${ROLLOUT_GPUS}"
 echo "SGLang concurrency: server=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}"
-echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}"
+echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
 echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; async mini_batch=${ASYNC_MINI_BATCH_SIZE}, sync_interval=${ASYNC_TRIGGER_PARAMETER_SYNC_STEP}"
 echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}, grm=${ENABLE_USE_GRM_EVALS}"

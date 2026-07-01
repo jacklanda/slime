@@ -1466,7 +1466,9 @@ async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, A
     headers = {"X-SMG-Routing-Key": session_id} if getattr(args, "router_policy", None) == "consistent_hashing" else None
     started = time.time()
     now = started
-    should_log = now - _LAST_SGLANG_REQUEST_LOG_TS >= float(os.environ.get("SLIME_FUSED_SGLANG_LOG_INTERVAL", "10"))
+    should_log = _env_bool("SLIME_FUSED_PROGRESS_LOGS", False) and now - _LAST_SGLANG_REQUEST_LOG_TS >= float(
+        os.environ.get("SLIME_FUSED_SGLANG_LOG_INTERVAL", "10")
+    )
     if should_log:
         _LAST_SGLANG_REQUEST_LOG_TS = now
         logger.info(
