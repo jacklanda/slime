@@ -115,7 +115,7 @@ is_truthy() {
 FULLY_ASYNC="${FULLY_ASYNC:-false}"
 PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
-SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
+SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-true}"
 # Default to non-colocate: train and rollout live on separate GPUs so training
 # never runs the per-step torch_memory_saver offload/pause path. That pause path
 # (cudaError 1 "invalid argument" in torch_memory_saver.cpp func=pause) crashes
@@ -166,8 +166,8 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # in-flight request counts so more trajectories overlap and cover those I/O waits.
 # 4B weights are tiny at mem_fraction=0.9, so KV headroom is ample; watch for KV
 # eviction only if 38k-context trajectories start getting preempted.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-768}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-1024}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-1536}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-1536}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-300}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
@@ -530,7 +530,8 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-38000}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-48}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_EPOCH="${NUM_EPOCH:-100}"
@@ -613,6 +614,7 @@ ROLLOUT_ARGS=(
 
    --num-rollout "${NUM_ROLLOUT}"
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
+   --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE}"
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
    --rollout-max-context-len "${MAX_CONTEXT_LEN}"
    --rollout-max-prompt-len "${MAX_PROMPT_LENGTH}"
@@ -790,7 +792,7 @@ SGLANG_ARGS=(
 )
 
 WANDB_ARGS=()
-if [ "${USE_WANDB:-1}" = "1" ]; then
+if [ "${USE_WANDB:-0}" = "1" ]; then
    WANDB_ARGS=(
       --use-wandb
       --wandb-mode "${WANDB_MODE:-online}"
@@ -810,6 +812,7 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
+   --train-env-vars '{"TMS_INIT_ENABLE_CPU_BACKUP":"0"}'
 )
 
 if [ "${PRINT_ROLLOUT_TRAJECTORY:-1}" = "1" ]; then
