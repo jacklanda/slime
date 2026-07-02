@@ -16,7 +16,7 @@ Usage:
   bash experiments/run_rejection_sampling.sh [options]
 
 Core rejection-sampling options:
-  --sample-n N                       Trajectories sampled per prompt. Default: 8
+  --sample-n N                       Trajectories sampled per prompt. Default: 32
   --max-trajectory-per-problem N     Accepted trajectories kept per problem. Default: 1
   --min-sample-trial N               Minimum sampled trajectories before saving a problem. Default: 1
   --reward-threshold X               Minimum reward accepted. Default: 0.6
@@ -40,12 +40,12 @@ Fused-agent options, aligned with train_fused_agent_sync.sh:
   --no-unified-system-prompt         Select gem harness unless --harness is set later.
   --model PATH                       HF model path.
   --disable-thinking BOOL            FUSED_DISABLE_THINKING. Default: true
-  --max-steps N                      Fused agent max steps. Default: 96
-  --mcp-max-steps N                  MCP max steps. Default: 96
-  --web-search-max-steps N           Web-search max steps. Default: 96
-  --cli-max-steps N                  CLI max steps. Default: 96
+  --max-steps N                      Fused agent max steps. Default: 128
+  --mcp-max-steps N                  MCP max steps. Default: 128
+  --web-search-max-steps N           Web-search max steps. Default: 128
+  --cli-max-steps N                  CLI max steps. Default: 128
   --trajectory-timeout N             Fused trajectory timeout. Default: 3600
-  --per-step-max-tokens N            Max tokens per model turn. Default: 1024
+  --per-step-max-tokens N            Max tokens per model turn. Default: 2048
   --max-tool-output-length N         Fused max tool output length. Default: 4096
   --terminal-log-style STYLE         progress, rollouts, or both. Default: both
 
@@ -55,10 +55,10 @@ Rollout/system options:
   --max-prompt-length N              Max prompt tokens. Default: 38000
   --max-response-length N            Max response tokens. Default: 2048
   --rollout-gpus N                   Rollout GPUs. Default: 8
-  --rollout-num-gpus-per-engine N    GPUs per SGLang engine. Default: 2
-  --gpu-memory-utilization X         SGLang memory fraction. Default: 0.8
-  --sglang-server-concurrency N      SGLang server concurrency. Default: 128
-  --sglang-max-running-requests N    SGLang max running requests. Default: 256
+  --rollout-num-gpus-per-engine N    GPUs per SGLang engine. Default: 1
+  --gpu-memory-utilization X         SGLang memory fraction. Default: 0.9
+  --sglang-server-concurrency N      SGLang server concurrency. Default: 4096
+  --sglang-max-running-requests N    SGLang max running requests. Default: 4096
   --ray-num-cpus N                   Ray CPU resources. Default: 64
   --ray-job-wait 0|1                 Wait for Ray job submit. Default: 1
   -h, --help                         Show this help.
@@ -120,17 +120,17 @@ SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
-DISABLE_THINKING="${DISABLE_THINKING:-false}"
+DISABLE_THINKING="${DISABLE_THINKING:-true}"
 FUSED_HARNESS="${FUSED_HARNESS:-gem}"
 harness_explicit=false
 
-MAX_STEPS="${MAX_STEPS:-96}"
-MCP_MAX_STEPS="${MCP_MAX_STEPS:-96}"
-WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-96}"
-CLI_MAX_STEPS="${CLI_MAX_STEPS:-96}"
+MAX_STEPS="${MAX_STEPS:-128}"
+MCP_MAX_STEPS="${MCP_MAX_STEPS:-128}"
+WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-128}"
+CLI_MAX_STEPS="${CLI_MAX_STEPS:-128}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-3600}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-3600}"
-PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-1024}"
+PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-2048}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-16}"

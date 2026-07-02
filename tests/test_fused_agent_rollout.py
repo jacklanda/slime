@@ -108,29 +108,21 @@ def _response_text(sample: Sample) -> str:
 
 
 def _masked_text(sample: Sample) -> str:
-    return "".join(
-        chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], sample.loss_mask, strict=False) if mask
-    )
+    return "".join(chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], sample.loss_mask, strict=False) if mask)
 
 
 def _unmasked_text(sample: Sample) -> str:
-    return "".join(
-        chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], sample.loss_mask, strict=False) if not mask
-    )
+    return "".join(chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], sample.loss_mask, strict=False) if not mask)
 
 
 def _policy_masked_text(sample: Sample) -> str:
     policy_mask = sample.policy_loss_mask if sample.policy_loss_mask is not None else sample.loss_mask
-    return "".join(
-        chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], policy_mask, strict=False) if mask
-    )
+    return "".join(chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], policy_mask, strict=False) if mask)
 
 
 def _policy_unmasked_text(sample: Sample) -> str:
     policy_mask = sample.policy_loss_mask if sample.policy_loss_mask is not None else sample.loss_mask
-    return "".join(
-        chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], policy_mask, strict=False) if not mask
-    )
+    return "".join(chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], policy_mask, strict=False) if not mask)
 
 
 def _visualized_text_by_style(sample: Sample, tokenizer, style: str) -> str:
@@ -246,9 +238,7 @@ def test_qwen_tool_parser_finish_and_answer_fallback():
     calls = parser.parse('<tool_call>{"name":"submit","arguments":{}}</tool_call>')
     assert calls[0].name == "finish"
 
-    calls = parser.parse(
-        '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"The answer is \\\\boxed{Fixed Answer}.}}</tool_call>'
-    )
+    calls = parser.parse('<tool_call>{"name":"finish","arguments":{"command":"submit","result":"The answer is \\\\boxed{Fixed Answer}.}}</tool_call>')
     assert calls[0].name == "finish"
     assert calls[0].arguments["result"] == "The answer is \\\\boxed{Fixed Answer}."
 
@@ -557,9 +547,85 @@ def test_disable_thinking_default_loss_mask_masks_leading_think_block():
             assert add_special_tokens is False
             return [ord(ch) for ch in text]
 
-    response = "<think>\nplan\n</think>\n<tool_call>{\"name\":\"finish\",\"arguments\":{\"command\":\"submit\",\"result\":\"x\"}}</tool_call>"
+    response = '<think>\nplan\n</think>\n<tool_call>{"name":"finish","arguments":{"command":"submit","result":"x"}}</tool_call>'
     mask = _default_response_loss_mask(FakeTokenizer(), response, output_len=len(response), disable_thinking=True)
 
+    split = response.index("<tool_call>")
+    assert mask == [0] * split + [1] * (len(response) - split)
+
+
+class _ThinkTokenizer:
+    """Minimal tokenizer exposing ``</think>`` as a single token id, like the
+    Qwen3 / Qwen3.5 tokenizers. ``close_id`` differs between the two families
+    (Qwen3=151668, Qwen3.5=248069); the exact value is irrelevant to the masking
+    logic, only that ``convert_tokens_to_ids('</think>')`` resolves to it."""
+
+    unk_token_id = 0
+
+    def __init__(self, close_id: int) -> None:
+        self._close_id = close_id
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return self._close_id if token == "</think>" else self.unk_token_id
+
+
+@pytest.mark.parametrize("close_id", [151668, 248069])
+def test_disable_thinking_loss_mask_token_domain_masks_through_close_think(close_id):
+    # Qwen3-shaped output_ids: <think>(open) reasoning... </think> \n\n answer...
+    # We only need the </think> id present; use distinct filler ids for the rest.
+    tokenizer = _ThinkTokenizer(close_id)
+    output_ids = [900, 901, 902, close_id, 271, 800, 801]  # </think> at index 3
+    mask = _default_response_loss_mask(tokenizer, "irrelevant", output_len=len(output_ids), disable_thinking=True, output_ids=output_ids)
+    # masked through </think> (index 3), answer (incl. trailing \n\n) trainable
+    assert mask == [0, 0, 0, 0, 1, 1, 1]
+
+
+@pytest.mark.parametrize("close_id", [151668, 248069])
+def test_disable_thinking_loss_mask_token_domain_qwen35_shape(close_id):
+    # Qwen3.5-shaped output_ids: reasoning starts immediately (<think> was
+    # injected into the prompt, not generated), </think> still inside output.
+    tokenizer = _ThinkTokenizer(close_id)
+    output_ids = [700, 701, close_id, 271, 800]  # </think> at index 2
+    mask = _default_response_loss_mask(tokenizer, "irrelevant", output_len=len(output_ids), disable_thinking=True, output_ids=output_ids)
+    assert mask == [0, 0, 0, 1, 1]
+
+
+@pytest.mark.parametrize("close_id", [151668, 248069])
+def test_disable_thinking_loss_mask_no_misfired_think_trains_full(close_id):
+    # Well-behaved disable-thinking response: empty shell lives in the prompt, so
+    # output_ids carry no </think> -> nothing to mask, full response trains.
+    tokenizer = _ThinkTokenizer(close_id)
+    output_ids = [800, 801, 802, 803]
+    mask = _default_response_loss_mask(tokenizer, "answer only", output_len=len(output_ids), disable_thinking=True, output_ids=output_ids)
+    assert mask == [1, 1, 1, 1]
+
+
+@pytest.mark.parametrize("close_id", [151668, 248069])
+def test_enable_thinking_loss_mask_trains_reasoning_and_answer(close_id):
+    # enable-thinking: reasoning IS the learning signal, so the whole response is
+    # trained regardless of model family or where </think> lands. None => all-ones
+    # in the builder.
+    tokenizer = _ThinkTokenizer(close_id)
+    output_ids = [900, 901, close_id, 271, 800]
+    mask = _default_response_loss_mask(tokenizer, "reason </think> answer", output_len=len(output_ids), disable_thinking=False, output_ids=output_ids)
+    assert mask is None
+
+
+def test_disable_thinking_loss_mask_falls_back_to_char_level_without_close_id():
+    # A tokenizer that cannot resolve </think> (returns unk) must fall back to the
+    # pre-existing character-level path rather than mis-masking.
+    class NoThinkTokenizer:
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, token):
+            return self.unk_token_id
+
+        def encode(self, text, add_special_tokens=False):
+            return [ord(ch) for ch in text]
+
+    response = "<think>\nplan\n</think>\n<tool_call>x</tool_call>"
+    output_ids = [ord(ch) for ch in response]
+    mask = _default_response_loss_mask(NoThinkTokenizer(), response, output_len=len(output_ids), disable_thinking=True, output_ids=output_ids)
     split = response.index("<tool_call>")
     assert mask == [0] * split + [1] * (len(response) - split)
 
@@ -600,12 +666,7 @@ def test_initial_messages_include_tool_prompt():
 def test_tool_observation_has_execution_output_header():
     observation = _format_tool_observation("web_search", "AHPL is a hardware description language.")
 
-    assert observation == (
-        "<tool_response>\n"
-        "Execution output of [web_search]:\n"
-        "AHPL is a hardware description language.\n"
-        "</tool_response>"
-    )
+    assert observation == ("<tool_response>\n" "Execution output of [web_search]:\n" "AHPL is a hardware description language.\n" "</tool_response>")
 
 
 def test_web_search_retrieval_formats_plain_text_without_json_or_urls():
@@ -645,12 +706,7 @@ def test_web_search_tool_observation_normalizes_structured_payload():
         ],
     )
 
-    assert observation == (
-        "<tool_response>\n"
-        "Execution output of [web_search]:\n"
-        "[1] XMLSpy: XMLSpy is an XML editor. Development started in 1999.\n"
-        "</tool_response>"
-    )
+    assert observation == ("<tool_response>\n" "Execution output of [web_search]:\n" "[1] XMLSpy: XMLSpy is an XML editor. Development started in 1999.\n" "</tool_response>")
 
 
 def test_web_search_tool_observation_normalizes_json_string_payload():
@@ -1067,9 +1123,7 @@ def test_web_search_summary_splits_oversized_requests(monkeypatch):
                 if total_words > 700:
                     return FakeResponse(
                         500,
-                        {
-                            "detail": "Summarization Error: ValueError('The decoder prompt (length 9000) is longer than the maximum model length of 8192. Make sure that `max_model_len` is no smaller than the number of text tokens.')"
-                        },
+                        {"detail": "Summarization Error: ValueError('The decoder prompt (length 9000) is longer than the maximum model length of 8192. Make sure that `max_model_len` is no smaller than the number of text tokens.')"},
                     )
                 return FakeResponse(200, {"summary": f"# Summary: summarized {total_words}"})
             raise AssertionError(url)
@@ -1641,11 +1695,7 @@ def test_direct_finish_without_tool_is_penalized_and_masked():
 
 
 def test_mcp_nested_finish_payload_is_rejected_and_masked(tmp_path: Path):
-    nested = (
-        '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"'
-        '\\u003ctool_call\\u003e{\\"name\\": \\"finish\\", \\"arguments\\": {}}\\u003c/tool_call\\u003e'
-        '"}}</tool_call>'
-    )
+    nested = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"' '\\u003ctool_call\\u003e{\\"name\\": \\"finish\\", \\"arguments\\": {}}\\u003c/tool_call\\u003e' '"}}</tool_call>'
 
     result = _run_generate_with_fake_sglang(
         _local_mcp_sample(tmp_path, question="Use tools before finish"),
@@ -2045,27 +2095,36 @@ def test_first_step_answer_tag_submit_is_penalized_and_masked():
 
 
 def test_direct_submit_credit_assignment_masks_all_tokens():
-    assert fused_generate._credit_assignment_loss_mask(
-        output_len=7,
-        turn_index=0,
-        credit_event="direct_submit_without_tool",
-        credit_step_index=0,
-    ) == [0] * 7
+    assert (
+        fused_generate._credit_assignment_loss_mask(
+            output_len=7,
+            turn_index=0,
+            credit_event="direct_submit_without_tool",
+            credit_step_index=0,
+        )
+        == [0] * 7
+    )
 
 
 def test_mixed_tool_and_answer_credit_assignment_masks_only_error_turn():
-    assert fused_generate._credit_assignment_loss_mask(
-        output_len=5,
-        turn_index=0,
-        credit_event="mixed_tool_and_answer",
-        credit_step_index=1,
-    ) == [0] * 5
-    assert fused_generate._credit_assignment_loss_mask(
-        output_len=5,
-        turn_index=1,
-        credit_event="mixed_tool_and_answer",
-        credit_step_index=1,
-    ) == [1] * 5
+    assert (
+        fused_generate._credit_assignment_loss_mask(
+            output_len=5,
+            turn_index=0,
+            credit_event="mixed_tool_and_answer",
+            credit_step_index=1,
+        )
+        == [0] * 5
+    )
+    assert (
+        fused_generate._credit_assignment_loss_mask(
+            output_len=5,
+            turn_index=1,
+            credit_event="mixed_tool_and_answer",
+            credit_step_index=1,
+        )
+        == [1] * 5
+    )
 
 
 def test_parser_error_credit_assignment_masks_only_error_turn_after_history(tmp_path: Path):
@@ -2145,10 +2204,7 @@ def test_tool_burst_credit_assignment_masks_only_burst_turn_after_history(tmp_pa
 
 def test_repeated_search_credit_assignment_after_many_prior_turns_masks_only_repeated_turn():
     prior_queries = [f"q{i:02d}" for i in range(12)]
-    prior_turns = [
-        f'<tool_call>{{"name":"web_search","arguments":{{"query":"{query}"}}}}</tool_call>'
-        for query in prior_queries
-    ]
+    prior_turns = [f'<tool_call>{{"name":"web_search","arguments":{{"query":"{query}"}}}}</tool_call>' for query in prior_queries]
     reasoning = "<think>Try the same query again.</think>\n"
     repeated = '<tool_call>{"name":"web_search","arguments":{"query":"q07"}}</tool_call>'
 
@@ -2246,18 +2302,24 @@ def test_search_bypass_credit_assignment_keeps_full_action_mask():
     first = '<tool_call>{"name":"web_search","arguments":{"query":"use search"}}</tool_call>'
     second = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"answer"}}</tool_call>'
 
-    assert fused_generate._credit_assignment_loss_mask(
-        output_len=len(first),
-        turn_index=0,
-        credit_event="search_bypass",
-        credit_step_index=1,
-    ) is None
-    assert fused_generate._credit_assignment_loss_mask(
-        output_len=len(second),
-        turn_index=1,
-        credit_event="search_bypass",
-        credit_step_index=1,
-    ) is None
+    assert (
+        fused_generate._credit_assignment_loss_mask(
+            output_len=len(first),
+            turn_index=0,
+            credit_event="search_bypass",
+            credit_step_index=1,
+        )
+        is None
+    )
+    assert (
+        fused_generate._credit_assignment_loss_mask(
+            output_len=len(second),
+            turn_index=1,
+            credit_event="search_bypass",
+            credit_step_index=1,
+        )
+        is None
+    )
 
 
 def test_tail_guard_credit_assignment_masks_all_actions():

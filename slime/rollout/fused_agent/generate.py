@@ -180,6 +180,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             response,
                             output_len=len(output_ids),
                             disable_thinking=disable_thinking,
+                            output_ids=output_ids,
                         ),
                         rollout_top_p_token_ids=output.get("rollout_top_p_token_ids"),
                         rollout_top_p_token_offsets=output.get("rollout_top_p_token_offsets"),
@@ -1041,12 +1042,38 @@ def _default_response_loss_mask(
     *,
     output_len: int,
     disable_thinking: bool,
+    output_ids: list[int] | None = None,
 ) -> list[int] | None:
     if output_len <= 0:
         return []
     if not disable_thinking:
+        # enable-thinking: train the whole response (reasoning + answer). The
+        # builder treats None as an all-ones mask.
         return None
 
+    # disable-thinking: the empty think shell "<think>\n\n</think>\n\n" lives in
+    # the prompt, so a well-behaved response carries no think block and trains in
+    # full. Only when the model *mis-fires* a leading <think>...</think> despite
+    # being told not to think do we mask that stray block out.
+    #
+    # Prefer locating </think> in token space: it is a single, non-mergeable
+    # added token in both Qwen3 and Qwen3.5 tokenizers, so scanning output_ids
+    # for its id gives an exact boundary and avoids the ±1 drift of re-encoding
+    # a character substring (_encode_len(response[:think_end])).
+    close_id = _think_close_token_id(tokenizer)
+    if output_ids is not None and close_id is not None:
+        try:
+            j = output_ids.index(close_id)
+        except ValueError:
+            return [1] * output_len
+        # Mask the mis-fired think block through </think> itself; the answer
+        # (everything after </think>) stays trainable. Any trailing "\n\n"
+        # separator sits in the trainable side but carries no real content.
+        start = min(j + 1, output_len)
+        return [0] * start + [1] * (output_len - start)
+
+    # Fallback for tokenizers without a resolvable </think> id: character-level
+    # boundary with the pre-existing ±1 re-encode behavior.
     think_end = _leading_think_block_end(response)
     if think_end is None:
         return [1] * output_len
@@ -1056,6 +1083,28 @@ def _default_response_loss_mask(
         start = min(max(0, think_end), output_len) if len(response) == output_len else output_len
     start = max(0, min(output_len, start))
     return [0] * start + [1] * (output_len - start)
+
+
+def _think_close_token_id(tokenizer) -> int | None:
+    """Resolve the single-token id of ``</think>`` for this tokenizer, or None.
+
+    Both Qwen3 (151668) and Qwen3.5 (248069) expose ``</think>`` as one added
+    token; other tokenizers may lack it or split it, in which case we return None
+    and callers fall back to character-level handling.
+    """
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if not callable(convert):
+        return None
+    try:
+        tid = convert("</think>")
+    except Exception:
+        return None
+    if tid is None:
+        return None
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if unk_id is not None and tid == unk_id:
+        return None
+    return tid
 
 
 def _leading_think_block_end(response: str) -> int | None:
@@ -1466,9 +1515,7 @@ async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, A
     headers = {"X-SMG-Routing-Key": session_id} if getattr(args, "router_policy", None) == "consistent_hashing" else None
     started = time.time()
     now = started
-    should_log = _env_bool("SLIME_FUSED_PROGRESS_LOGS", False) and now - _LAST_SGLANG_REQUEST_LOG_TS >= float(
-        os.environ.get("SLIME_FUSED_SGLANG_LOG_INTERVAL", "10")
-    )
+    should_log = _env_bool("SLIME_FUSED_PROGRESS_LOGS", False) and now - _LAST_SGLANG_REQUEST_LOG_TS >= float(os.environ.get("SLIME_FUSED_SGLANG_LOG_INTERVAL", "10"))
     if should_log:
         _LAST_SGLANG_REQUEST_LOG_TS = now
         logger.info(
