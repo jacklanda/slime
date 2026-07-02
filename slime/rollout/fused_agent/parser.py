@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import ast
 import json
+import logging
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -67,10 +72,7 @@ class QwenToolParser:
         return calls
 
     def _extract_payloads(self, text: str) -> list[tuple[str | tuple[str, str], int, int]]:
-        payloads = [
-            (match.group(1), match.start(), match.end())
-            for match in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", text, flags=re.DOTALL)
-        ]
+        payloads = [(match.group(1), match.start(), match.end()) for match in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", text, flags=re.DOTALL)]
         if payloads:
             return payloads
         # Accept a bare JSON tool call after reasoning.
@@ -129,7 +131,7 @@ class QwenToolParser:
         end = payload.rfind("</tool_call>")
         search_end = end if end >= start else len(payload)
         result_end = search_end
-        for marker in ('"}}', '"}}', '"}', '}'):
+        for marker in ('"}}', '"}}', '"}', "}"):
             idx = payload.rfind(marker, start, search_end)
             if idx >= start:
                 result_end = idx
@@ -218,3 +220,258 @@ def tool_schema(name: str, description: str, properties: dict[str, Any], require
             "parameters": {"type": "object", "properties": properties, "required": required or []},
         },
     }
+
+
+class Qwen3CoderToolParser(QwenToolParser):
+    """Parser for the Qwen3.5 / Qwen3-Coder XML tool-call format.
+
+    Qwen3 emits JSON inside ``<tool_call>`` tags; Qwen3.5/Qwen3-Coder emits
+    function and parameter blocks instead::
+
+        <tool_call>
+        <function=web_search>
+        <parameter=query>value</parameter>
+        </function>
+        </tool_call>
+
+    Ported from ``rllm.parser.tool_parser.Qwen3CoderToolParser`` and adapted to
+    slime's ``ToolCall`` (start/end offsets) and fallback chain: when no
+    ``<function=>`` call is present we defer to the shared ``<answer>`` /
+    ``\\boxed{}`` -> ``finish`` fallback so disable-thinking rollouts still submit.
+    """
+
+    _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL)
+    _FUNCTION_RE = re.compile(r"<function=([^>\n]+)>(.*?)(?:</function>|$)", re.DOTALL)
+    _PARAMETER_RE = re.compile(r"<parameter=([^>\n]+)>(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", re.DOTALL)
+
+    def __init__(self, valid_tools: set[str] | None = None):
+        super().__init__(valid_tools=valid_tools)
+        self.tool_call_prefix = "<function="
+        self._tool_parameter_config: dict[str, dict[str, dict[str, Any]]] = {}
+
+    def parse(self, model_response: str) -> list[ToolCall]:
+        text = model_response or ""
+        calls: list[ToolCall] = []
+        for inner, start, end in self._iter_tool_call_regions(text):
+            for function_name, parameters in self._FUNCTION_RE.findall(inner):
+                function_name = function_name.strip()
+                if not function_name:
+                    continue
+                parsed = self._parse_xml_function_call(function_name, parameters)
+                name = self._normalize_name(parsed["name"])
+                if not name:
+                    continue
+                calls.append(ToolCall(name=name, arguments=parsed["arguments"], start=start, end=end))
+        if not calls:
+            calls.extend(self._extract_answer_fallback(text))
+        return calls
+
+    def _iter_tool_call_regions(self, text: str) -> list[tuple[str, int, int]]:
+        regions = [(match.group(1) if match.group(1) is not None else (match.group(2) or ""), match.start(), match.end()) for match in self._TOOL_CALL_RE.finditer(text)]
+        if regions:
+            return regions
+        # No <tool_call> wrapper: accept bare <function=...></function> blocks, each
+        # its own region so start/end bound the function span for finish-call checks.
+        if self.tool_call_prefix in text:
+            return [(match.group(0), match.start(), match.end()) for match in self._FUNCTION_RE.finditer(text)]
+        return regions
+
+    @staticmethod
+    def _strip_outer_newline(value: str) -> str:
+        if value.startswith("\n"):
+            value = value[1:]
+        if value.endswith("\n"):
+            value = value[:-1]
+        return value
+
+    @staticmethod
+    def _iter_tool_schemas(tools_schema: str) -> list[dict[str, Any]]:
+        tools_schema = tools_schema.strip()
+        if not tools_schema:
+            return []
+        try:
+            loaded = json.loads(tools_schema)
+            if isinstance(loaded, list):
+                return [item for item in loaded if isinstance(item, dict)]
+            if isinstance(loaded, dict):
+                return [loaded]
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # The tool prompt concatenates several JSON objects separated by newlines;
+        # decode them one at a time.
+        decoder = json.JSONDecoder()
+        schemas: list[dict[str, Any]] = []
+        idx = 0
+        while idx < len(tools_schema):
+            while idx < len(tools_schema) and tools_schema[idx].isspace():
+                idx += 1
+            if idx >= len(tools_schema):
+                break
+            try:
+                obj, next_idx = decoder.raw_decode(tools_schema, idx)
+            except json.JSONDecodeError:
+                idx += 1
+                continue
+            if isinstance(obj, dict):
+                schemas.append(obj)
+            elif isinstance(obj, list):
+                schemas.extend(item for item in obj if isinstance(item, dict))
+            idx = next_idx
+        return schemas
+
+    @classmethod
+    def _extract_parameter_config(cls, tools_schema: str) -> dict[str, dict[str, dict[str, Any]]]:
+        config: dict[str, dict[str, dict[str, Any]]] = {}
+        for schema in cls._iter_tool_schemas(tools_schema):
+            function_schema = schema.get("function", schema)
+            if not isinstance(function_schema, dict):
+                continue
+            name = function_schema.get("name")
+            parameters = function_schema.get("parameters", {})
+            if not isinstance(name, str) or not isinstance(parameters, dict):
+                continue
+            properties = parameters.get("properties", {})
+            if isinstance(properties, dict):
+                config[name] = {str(k): v for k, v in properties.items() if isinstance(v, dict)}
+        return config
+
+    @staticmethod
+    def _convert_param_value(param_value: str, param_name: str, param_config: dict[str, dict[str, Any]], func_name: str) -> Any:
+        if param_value.lower() == "null":
+            return None
+        if param_name not in param_config:
+            if param_config:
+                logger.warning(
+                    "Parsed parameter '%s' is not defined in the tool parameters for tool '%s'; returning string value.",
+                    param_name,
+                    func_name,
+                )
+            return param_value
+
+        param_schema = param_config[param_name]
+        param_type = str(param_schema.get("type", "string")).strip().lower()
+
+        if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
+            return param_value
+        if param_type.startswith("int") or param_type.startswith("uint") or param_type.startswith("long") or param_type.startswith("short") or param_type.startswith("unsigned"):
+            try:
+                return int(param_value)
+            except Exception:
+                logger.warning(
+                    "Parsed value '%s' of parameter '%s' is not an integer in tool '%s'; returning string value.",
+                    param_value,
+                    param_name,
+                    func_name,
+                )
+                return param_value
+        if param_type.startswith("num") or param_type.startswith("float"):
+            try:
+                float_value = float(param_value)
+                return float_value if float_value - int(float_value) != 0 else int(float_value)
+            except Exception:
+                logger.warning(
+                    "Parsed value '%s' of parameter '%s' is not a float in tool '%s'; returning string value.",
+                    param_value,
+                    param_name,
+                    func_name,
+                )
+                return param_value
+        if param_type in ["boolean", "bool", "binary"]:
+            bool_value = param_value.lower()
+            if bool_value not in ["true", "false"]:
+                logger.warning(
+                    "Parsed value '%s' of parameter '%s' is not a boolean in tool '%s'; degenerating to false.",
+                    param_value,
+                    param_name,
+                    func_name,
+                )
+            return bool_value == "true"
+        if param_type in ["object", "array"] or param_type.startswith("dict") or param_type.startswith("list"):
+            try:
+                return json.loads(param_value)
+            except Exception:
+                logger.warning(
+                    "Parsed value '%s' of parameter '%s' is not valid JSON in tool '%s'; trying ast.literal_eval().",
+                    param_value,
+                    param_name,
+                    func_name,
+                )
+        try:
+            return ast.literal_eval(param_value)
+        except Exception:
+            logger.warning(
+                "Parsed value '%s' of parameter '%s' cannot be converted via ast.literal_eval() in tool '%s'; " "returning string value.",
+                param_value,
+                param_name,
+                func_name,
+            )
+            return param_value
+
+    def _parse_xml_function_call(self, function_name: str, parameters: str) -> dict[str, Any]:
+        param_config = self._tool_parameter_config.get(function_name, {})
+        arguments: dict[str, Any] = {}
+        for param_name, param_value in self._PARAMETER_RE.findall(parameters):
+            param_name = param_name.strip()
+            param_value = self._strip_outer_newline(str(param_value))
+            arguments[param_name] = self._convert_param_value(param_value, param_name, param_config, function_name)
+        return {"name": function_name.strip(), "arguments": arguments}
+
+    def get_tool_prompt(self, tools_schema: str) -> str:
+        # Cache the parameter types so parse() can coerce <parameter> strings.
+        self._tool_parameter_config = self._extract_parameter_config(tools_schema)
+        return (
+            "\n# Tools\n\n"
+            "You may call one or more functions to assist with the user query.\n\n"
+            "You are provided with function signatures within <tools></tools> XML tags:\n"
+            f"<tools>\n{tools_schema}\n</tools>\n\n"
+            "For each function call, return the function name and parameters within a pairwise "
+            "<tool_call></tool_call> XML block:\n"
+            "<tool_call>\n"
+            "<function=FUNCTION_NAME>\n"
+            "<parameter=PARAMETER_NAME>\n"
+            "PARAMETER_VALUE\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>\n\n"
+            "For multiple parameters, emit one <parameter=...></parameter> block per parameter "
+            "inside the same function block.\n"
+            "For multiple tool calls, emit multiple <tool_call></tool_call> blocks.\n"
+            "Do not put JSON tool-call objects inside <tool_call> for this model family."
+        )
+
+
+def make_tool_parser(model_name: str | None, valid_tools: set[str] | None = None) -> QwenToolParser:
+    """Select and build the tool parser for a model path/name.
+
+    Mirrors rllm's ``ToolParser.get_parser`` detection, narrowed to the two
+    families slime serves: Qwen3.5/Qwen3-Coder use the XML function/parameter
+    format; everything else (Qwen3) keeps the JSON ``<tool_call>`` format.
+    """
+    name = (model_name or "").lower()
+    parser_class = Qwen3CoderToolParser if any(x in name for x in ("qwen3.5", "qwen3-coder", "qwen3coder")) else QwenToolParser
+    return parser_class(valid_tools=valid_tools)
+
+
+@lru_cache(maxsize=None)
+def _cached_finish_parser(model_name: str | None, valid_tools: frozenset[str]) -> QwenToolParser:
+    return make_tool_parser(model_name, valid_tools=set(valid_tools))
+
+
+class ActiveFinishParser:
+    """Model-aware ``finish`` parser for the reward path.
+
+    ``reward_func`` runs several call-frames above the extraction helpers and a
+    training run serves a single policy model, so rather than thread the model
+    name through every signature, callers ``set()`` the active model once per
+    reward batch and the deep helpers read the cached parser via ``get()``.
+    """
+
+    def __init__(self, valid_tools: set[str]):
+        self._valid_tools = frozenset(valid_tools)
+        self._model_name: str | None = None
+
+    def set(self, model_name: str | None) -> None:
+        self._model_name = model_name
+
+    def get(self) -> QwenToolParser:
+        return _cached_finish_parser(self._model_name, self._valid_tools)

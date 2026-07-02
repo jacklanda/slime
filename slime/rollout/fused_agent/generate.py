@@ -19,7 +19,7 @@ from slime.utils import http_utils
 from slime.utils.types import Sample
 
 from .env import FusedEnvironment, _format_retrieval, normalize_task, resolve_task_mode
-from .parser import QwenToolParser, ToolCall
+from .parser import ToolCall, make_tool_parser
 from .prompts import (
     COT_SYSTEM_PROMPT,
     COT_USER_PROMPT,
@@ -95,9 +95,10 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     detect_abnormal_trajectories = not evaluation
 
     tools = env.tools()
-    messages = _initial_messages(harness, info.get("task_type", ""), observation, tools)
+    model_name = getattr(state.tokenizer, "name_or_path", None) or getattr(args, "hf_checkpoint", None)
+    messages = _initial_messages(harness, info.get("task_type", ""), observation, tools, model_name)
     max_steps = _max_steps_for_mode(env.mode, base_max_steps)
-    parser = QwenToolParser(valid_tools=_valid_tool_names(tools))
+    parser = make_tool_parser(model_name, valid_tools=_valid_tool_names(tools))
     manager = TrajectoryManager(fork_threshold_tokens=int(os.environ.get("SLIME_FUSED_FORK_THRESHOLD_TOKENS", "1024")))
     session_id = base_sample.session_id or uuid.uuid4().hex
     base_sample.session_id = session_id
@@ -693,7 +694,7 @@ def _sample_ground_truth(sample: Sample) -> Any:
     return _first_non_empty(list(sources))
 
 
-def _initial_messages(harness: str, task_type: str, observation: str, tools: list[dict]) -> list[dict[str, str]]:
+def _initial_messages(harness: str, task_type: str, observation: str, tools: list[dict], model_name: str | None = None) -> list[dict[str, str]]:
     if harness == "bare":
         return [{"role": "user", "content": observation}]
     if harness == "cot":
@@ -702,23 +703,23 @@ def _initial_messages(harness: str, task_type: str, observation: str, tools: lis
             {"role": "user", "content": COT_USER_PROMPT.format(problem_statement=observation)},
         ]
     if harness == "react":
-        system = build_system_prompt(REACT_SYSTEM_PROMPT, tools)
+        system = build_system_prompt(REACT_SYSTEM_PROMPT, tools, model_name)
         user = REACT_USER_PROMPT.format(problem_statement=observation)
     elif task_type == "mcp":
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_MCP_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools)
+        system = build_system_prompt(base, tools, model_name)
         user = FUSED_MCP_USER_PROMPT.format(problem_statement=observation)
     elif task_type == "cli":
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_CLI_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools)
+        system = build_system_prompt(base, tools, model_name)
         user = FUSED_CLI_USER_PROMPT.format(problem_statement=observation)
     elif task_type == "et":
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_ET_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools)
+        system = build_system_prompt(base, tools, model_name)
         user = FUSED_ET_USER_PROMPT.format(problem_statement=observation)
     else:
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_SEARCH_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools)
+        system = build_system_prompt(base, tools, model_name)
         user = FUSED_SEARCH_USER_PROMPT.format(problem_statement=observation)
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 

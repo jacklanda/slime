@@ -17,7 +17,18 @@ from slime.rollout.fused_agent.generate import (
     _default_response_loss_mask,
     _valid_tool_names,
 )
-from slime.rollout.fused_agent.parser import QwenToolParser, tool_schema
+from slime.rollout.fused_agent.parser import (
+    Qwen3CoderToolParser,
+    QwenToolParser,
+    make_tool_parser,
+    tool_schema,
+)
+from slime.rollout.fused_agent.prompts import (
+    FUSED_SEARCH_SYSTEM_PROMPT,
+    build_system_prompt,
+    finish_schema,
+    web_search_schema,
+)
 from slime.utils import visualization as rollout_visualization
 from slime.utils.types import Sample
 
@@ -270,6 +281,54 @@ def test_qwen_tool_parser_records_tool_call_span():
     action = parser.parse(raw)[0]
 
     assert raw[action.start : action.end] == '<tool_call>{"name":"web_search","arguments":{"query":"x"}}</tool_call>'
+
+
+def test_make_tool_parser_selects_by_model_name():
+    assert type(make_tool_parser("/share/nlp/share/plm/Qwen3.5-4B")) is Qwen3CoderToolParser
+    assert type(make_tool_parser("/models/Qwen3-Coder-30B")) is Qwen3CoderToolParser
+    # Qwen3 (and anything else) keeps the JSON parser unchanged.
+    assert type(make_tool_parser("/share/nlp/share/plm/Qwen3-4B")) is QwenToolParser
+    assert type(make_tool_parser(None)) is QwenToolParser
+
+
+def test_qwen3_coder_parser_parses_xml_calls_with_schema_coercion():
+    tools = [web_search_schema(), finish_schema()]
+    parser = make_tool_parser("Qwen3.5-4B", valid_tools={"web_search", "finish", "submit"})
+    # get_tool_prompt loads the parameter config used for type coercion.
+    parser.get_tool_prompt("\n".join(json.dumps(t, indent=0, ensure_ascii=False) for t in tools))
+
+    raw = "<tool_call>\n<function=web_search>\n" "<parameter=query>\nsenior comic artist\n</parameter>\n" "<parameter=max_results>\n4\n</parameter>\n" "</function>\n</tool_call>"
+    calls = parser.parse(raw)
+    assert len(calls) == 1
+    assert calls[0].name == "web_search"
+    # max_results is coerced to int per the schema; query stays a string.
+    assert calls[0].arguments == {"query": "senior comic artist", "max_results": 4}
+    # start/end bound the full <tool_call> span so verifier finish checks work.
+    assert raw[calls[0].start : calls[0].end].startswith("<tool_call>")
+
+
+def test_qwen3_coder_parser_normalizes_submit_and_keeps_boxed_fallback():
+    parser = make_tool_parser("qwen3-coder", valid_tools={"web_search", "finish", "submit"})
+
+    submit = parser.parse("<tool_call>\n<function=submit>\n" "<parameter=command>submit</parameter>\n" "<parameter=result>Milton Caniff</parameter>\n" "</function>\n</tool_call>")
+    assert submit[0].name == "finish"
+    assert submit[0].arguments["result"] == "Milton Caniff"
+
+    boxed = parser.parse("reasoning without any tool call\n\\boxed{42}")
+    assert boxed[0].name == "finish"
+    assert boxed[0].arguments["result"] == "42"
+
+
+def test_build_system_prompt_switches_tool_format_by_model():
+    tools = [web_search_schema(), finish_schema()]
+
+    coder = build_system_prompt(FUSED_SEARCH_SYSTEM_PROMPT, tools, "/share/nlp/share/plm/Qwen3.5-4B")
+    assert "<function=FUNCTION_NAME>" in coder
+    assert "<parameter=PARAMETER_NAME>" in coder
+
+    legacy = build_system_prompt(FUSED_SEARCH_SYSTEM_PROMPT, tools, "/share/nlp/share/plm/Qwen3-4B")
+    assert "<function=FUNCTION_NAME>" not in legacy
+    assert '{"name": <function-name>, "arguments": <args-json-object>}' in legacy
 
 
 def test_resolve_cli_and_et_modes_without_docker_reset():

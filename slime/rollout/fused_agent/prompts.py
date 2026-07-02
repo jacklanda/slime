@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from .parser import QwenToolParser, tool_schema
+from .parser import make_tool_parser, tool_schema
 
 
 FUSED_SEARCH_SYSTEM_PROMPT = """You are a research assistant that answers questions by searching for relevant information. You have access to a web_search tool for looking up facts, and a finish tool to submit your final answer.
@@ -29,9 +29,9 @@ CRITICAL RULES:
 1. You MUST use available non-finish tools to gather data before submitting.
 2. Plan your approach, then call tools step by step to collect evidence.
 3. Be precise in tool arguments and respect parameter types.
-4. Submit a valid JSON value using a <tool_call> block.
-5. If the task asks for multiple items, submit a JSON array directly, not wrapped in another object.
-6. The finish.result value must be a pure JSON string/value; never put another <tool_call> inside it.
+4. Emit tool calls exactly in the format shown in the Tools section below.
+5. Submit your final answer as a JSON value via the finish tool: a JSON array directly when the task asks for multiple items, not wrapped in another object.
+6. The finish result must be a pure JSON string/value; never embed another tool call inside it.
 """
 
 FUSED_MCP_USER_PROMPT = """Solve the following task using the available tools.
@@ -86,16 +86,17 @@ GENERAL RULES:
 
 TASK-SPECIFIC RULES:
 - MCP: use non-finish tools to retrieve the required data before submitting a JSON value.
-- MCP: finish.result must be pure JSON, never a nested <tool_call> payload.
+- MCP: the finish result must be pure JSON, never an embedded tool call.
 - CLI/SWE: explore the repository, make minimal edits, verify syntax, and run relevant tests before submitting.
 - Endless Terminal: inspect the filesystem, make the requested final-state changes, verify them, then submit.
-- Web Search QA: search until every claim is grounded, then submit a concise final answer."""
+- Web Search QA: search until every claim is grounded, then submit a concise final answer.
+- Emit tool calls exactly in the format shown in the Tools section below."""
 
 REACT_SYSTEM_PROMPT = """You are a helpful AI assistant that answers questions by reasoning and searching for relevant information. Use Thought/Action/Observation until ready, then call finish."""
 REACT_USER_PROMPT = """Task:
 {problem_statement}
 
-Use the ReAct loop and call available tools with <tool_call>."""
+Use the ReAct loop and call available tools in the format shown in the Tools section."""
 COT_SYSTEM_PROMPT = """Please reason step by step, and put your final answer within \\boxed{}."""
 COT_USER_PROMPT = "{problem_statement}"
 
@@ -124,9 +125,9 @@ def web_search_schema() -> dict:
     )
 
 
-def build_system_prompt(base_prompt: str, schemas: list[dict]) -> str:
+def build_system_prompt(base_prompt: str, schemas: list[dict], model_name: str | None = None) -> str:
     schemas_str = "\n".join(json.dumps(schema, indent=0, ensure_ascii=False) for schema in schemas)
-    return base_prompt.strip() + "\n" + QwenToolParser().get_tool_prompt(schemas_str)
+    return base_prompt.strip() + "\n" + make_tool_parser(model_name).get_tool_prompt(schemas_str)
 
 
 def normalize_harness(harness: str | None) -> str:

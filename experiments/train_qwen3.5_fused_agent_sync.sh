@@ -160,8 +160,14 @@ CLI_MAX_STEPS="${CLI_MAX_STEPS:-128}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-3600}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-3600}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-400}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-650}"
+# Rollout GPUs profiled at only ~46% util (duty ~50-60%) during sync rollout:
+# trajectories stall on retrieval round-trips between steps, so the decode batch
+# drains and the engine is underfed rather than overloaded. Raise per-engine
+# in-flight request counts so more trajectories overlap and cover those I/O waits.
+# 4B weights are tiny at mem_fraction=0.9, so KV headroom is ample; watch for KV
+# eviction only if 38k-context trajectories start getting preempted.
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-768}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-1024}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-300}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
@@ -310,13 +316,10 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 default_experiment_name() {
-   #local prefix="fused-dapo-q3-4b-no_think-gem-async-dev"
-   local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3.5-4b-no_think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3-8b-no_think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3-8b-no_think-gem-async-dev"
-   #local prefix="webqa-dapo-q3-4b-no_think-gem-async-dev0"
+   #local prefix="mcp-dapo-q3.5-4b-no_think-gem-async-dev"
+   #local prefix="webqa-dapo-q3.5-4b-no_think-gem-async-dev"
+   #local prefix="fused-dapo-q3.5-4b-no_think-gem-async-dev"
+   local prefix="asearcher-dapo-q3.5-4b-no_think-gem-sync-dev"
    local max_dev=-1
    local root base suffix
    for root in "${REPO_ROOT}/checkpoints/FusedRL" "${REPO_ROOT}/experiments/logs/FusedRL"; do
@@ -342,8 +345,8 @@ fi
 
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
-#MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
-MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
+MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
+#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
 
 # Default tensor-parallel size depends on the model. Gated attention
@@ -360,7 +363,15 @@ else
    DEFAULT_TP_SIZE=8
 fi
 
-# Non-colocate split on a single 8-GPU node: 4 GPUs train, 4 GPUs rollout.
+# Non-colocate split on a single 8-GPU node: 2 GPUs train, 6 GPUs rollout.
+# Profiling the sync loop showed the trainer GPUs idle ~99% of wall-clock (train
+# and rollout never overlap in sync mode and rollout dominates), while rollout is
+# the bottleneck. So shift two GPUs from the idle trainer to rollout: 6 rollout
+# GPUs at 2 GPUs/engine gives 3 SGLang engines instead of 2 (+50% rollout
+# capacity) for almost no trainer cost. Trainer TP auto-clamps to 2 below.
+# NOTE: a checkpoint saved under TP=4 (e.g. an earlier 4/4 run) cannot reshard its
+# optimizer state to TP=2 — resume such a run once with NO_LOAD_OPTIM=1 (see the
+# CKPT_ARGS note below). Fresh EXPERIMENT_NAMEs start from the HF ref and are fine.
 # Defined here (before PERF_ARGS is built) so the TP clamp below actually takes
 # effect — bash arrays expand their values at definition time.
 ACTOR_GPUS="${ACTOR_GPUS:-4}"
@@ -374,8 +385,8 @@ fi
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/checkpoints/FusedRL/${EXPERIMENT_NAME}}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
@@ -606,7 +617,7 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len "${MAX_CONTEXT_LEN}"
    --rollout-max-prompt-len "${MAX_PROMPT_LENGTH}"
    --rollout-max-response-len "${MAX_RESPONSE_LENGTH}"
-   --rollout-temperature "${TEMPERATURE:-1.0}"
+   --rollout-temperature "${TEMPERATURE:-0.8}"
    --rollout-top-p "${TOP_P:-1.0}"
 
    --global-batch-size "${EFFECTIVE_GLOBAL_BATCH_SIZE}"

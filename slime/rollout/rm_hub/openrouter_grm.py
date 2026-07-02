@@ -25,19 +25,18 @@ from slime.rollout.rm_hub.gpqa import compute_gpqa_reward
 from slime.rollout.rm_hub.math_dapo_utils import compute_score as compute_score_dapo
 from slime.rollout.rm_hub.math_utils import extract_answer as extract_boxed_answer
 from slime.rollout.rm_hub.math_utils import grade_answer_verl
-from slime.rollout.fused_agent.parser import QwenToolParser, _extract_boxed
+from slime.rollout.fused_agent.parser import ActiveFinishParser, _extract_boxed
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
 _CLIENT: httpx.AsyncClient | None = None
 _SEMAPHORE: asyncio.Semaphore | None = None
-_FINISH_PARSER = QwenToolParser(valid_tools={"finish", "submit"})
+_FINISH_PARSER = ActiveFinishParser(valid_tools={"finish", "submit"})
+
 
 _DEFAULT_SYSTEM_PROMPT = (
-    "You are a strict binary answer judge. Return only JSON: {\"score\": 0} or {\"score\": 1}. "
-    "Score 1 if the trajectory contains, explicitly implies, or finally answers the ground truth correctly. "
-    "Score 0 otherwise. Ignore style, verbosity, and irrelevant intermediate mistakes if the final answer is correct."
+    'You are a strict binary answer judge. Return only JSON: {"score": 0} or {"score": 1}. ' "Score 1 if the trajectory contains, explicitly implies, or finally answers the ground truth correctly. " "Score 0 otherwise. Ignore style, verbosity, and irrelevant intermediate mistakes if the final answer is correct."
 )
 
 _SCORE_RESPONSE_FORMAT: dict[str, Any] = {
@@ -62,6 +61,7 @@ _SCORE_RESPONSE_FORMAT: dict[str, Any] = {
 
 
 async def reward_func(args, sample_or_samples: Sample | list[Sample], **kwargs):
+    _FINISH_PARSER.set(getattr(args, "hf_checkpoint", None))
     samples = sample_or_samples if isinstance(sample_or_samples, list) else [sample_or_samples]
     evaluation = bool(kwargs.get("evaluation", False))
 
@@ -162,13 +162,7 @@ def _build_judge_prompt(args, sample: Sample) -> str:
     final_answer_step = _final_answer_step(sample)
     if len(final_answer_step) > max_chars:
         final_answer_step = final_answer_step[-max_chars:]
-    return (
-        "Ground truth:\n"
-        f"{_stringify(sample.label)}\n\n"
-        "Final submitted answer step:\n"
-        f"{final_answer_step}\n\n"
-        "Does this final submitted answer correctly answer the ground truth? Return only JSON."
-    )
+    return "Ground truth:\n" f"{_stringify(sample.label)}\n\n" "Final submitted answer step:\n" f"{final_answer_step}\n\n" "Does this final submitted answer correctly answer the ground truth? Return only JSON."
 
 
 def _sample_trajectory(sample: Sample) -> str:
@@ -239,7 +233,7 @@ def _rllm_episode_actions(episode: dict[str, Any]) -> list[str]:
 
 
 def _extract_last_finish_call(text: str) -> str | None:
-    calls = _FINISH_PARSER.parse(text)
+    calls = _FINISH_PARSER.get().parse(text)
     for call in reversed(calls):
         if call.name not in {"finish", "submit"}:
             continue

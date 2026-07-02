@@ -8,11 +8,11 @@ import re
 import string
 from typing import Any
 
-from slime.rollout.fused_agent.parser import QwenToolParser, _extract_boxed
+from slime.rollout.fused_agent.parser import ActiveFinishParser, _extract_boxed
 from slime.rollout.rm_hub.f1 import normalize_answer
 from slime.utils.types import Sample
 
-_FINISH_PARSER = QwenToolParser(valid_tools={"finish", "submit"})
+_FINISH_PARSER = ActiveFinishParser(valid_tools={"finish", "submit"})
 _OPTION_LETTERS = set(string.ascii_uppercase[:10])
 _UNIT_SUFFIX_PATTERN = re.compile(
     r"^\s*(-?\d[\d,\.\s]*)\s*"
@@ -75,6 +75,7 @@ class AnswerExtraction:
 
 
 async def reward_func(args, sample_or_samples: Sample | list[Sample], **kwargs):
+    _FINISH_PARSER.set(getattr(args, "hf_checkpoint", None))
     samples = sample_or_samples if isinstance(sample_or_samples, list) else [sample_or_samples]
     rewards = [_score_sample(sample) for sample in samples]
     return rewards if isinstance(sample_or_samples, list) else rewards[0]
@@ -315,7 +316,7 @@ def _extract_final_answer_with_source(response: str, *, allow_plain_text: bool) 
 
 
 def _extract_finish_result(text: str) -> str | None:
-    calls = _FINISH_PARSER.parse(text)
+    calls = _FINISH_PARSER.get().parse(text)
     for call in reversed(calls):
         if call.name not in {"finish", "submit"}:
             continue
@@ -368,14 +369,7 @@ def _strip_latex_wrappers(text: str) -> str:
             break
     if out.startswith("$") and out.endswith("$") and len(out) >= 2:
         out = out[1:-1].strip()
-    return (
-        out.replace("\\$", "$")
-        .replace("\\%", "%")
-        .replace("\\,", " ")
-        .replace("\\;", " ")
-        .replace("\\:", " ")
-        .strip()
-    )
+    return out.replace("\\$", "$").replace("\\%", "%").replace("\\,", " ").replace("\\;", " ").replace("\\:", " ").strip()
 
 
 def _matching_brace_end(text: str, start: int) -> int | None:
