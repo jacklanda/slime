@@ -118,7 +118,7 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
             }
         )
 
-    # response_length/*, prompt_length/* and response/aborted_ratio are logged
+    # response_length/* and prompt_length/* are logged
     # on the rollout side (rollout.py::compute_metrics_from_samples) to avoid
     # duplicating the same distribution under two prefixes.
     metrics: dict[str, float] = {}
@@ -371,19 +371,6 @@ def _metric_task_suffix(task_type: str) -> str:
     if normalized in {"et", "endless_terminal", "endless_terminals", "swe"}:
         return "cli"
     return normalized or "unknown"
-
-
-def _charts_metrics_for_actor_update(train_metrics: dict[str, float]) -> dict[str, float]:
-    metrics = {}
-    key_map = {
-        "train/loss": "train/loss",
-        "train/pg_loss": "train/loss",
-        "train/lr-pg_0": "train/lr",
-    }
-    for src, dst in key_map.items():
-        if dst not in metrics and src in train_metrics:
-            metrics[dst] = train_metrics[src]
-    return metrics
 
 
 def _iter_critic_output_layers(model: Sequence[DDP]):
@@ -1099,8 +1086,11 @@ def train(
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
             log_dict["train/step"] = accumulated_step_id
             if role == "actor":
+                if "train/loss" not in log_dict and "train/pg_loss" in log_dict:
+                    log_dict["train/loss"] = log_dict["train/pg_loss"]
+                if "train/lr" not in log_dict and "train/lr-pg_0" in log_dict:
+                    log_dict["train/lr"] = log_dict["train/lr-pg_0"]
                 log_dict.update(_episode_metrics_for_actor_update(rollout_data))
-                log_dict.update(_charts_metrics_for_actor_update(log_dict))
             logging_utils.log(args, log_dict, step_key="train/step")
 
             if args.ci_test and "train/train_rollout_logprob_abs_diff" in log_dict:

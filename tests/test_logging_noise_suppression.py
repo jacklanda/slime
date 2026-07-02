@@ -12,6 +12,8 @@ def load_logging_utils(monkeypatch):
     # wandb/tensorboard, which aren't needed for the stream-filter behavior here.
     wandb_mod = types.ModuleType("wandb")
     wandb_mod.run = None
+    wandb_mod.logged = []
+    wandb_mod.log = lambda metrics: wandb_mod.logged.append(metrics)
     wandb_utils_mod = types.ModuleType("slime.utils.wandb_utils")
     tb_mod = types.ModuleType("slime.utils.tensorboard_utils")
     tb_mod._TensorboardAdapter = object
@@ -76,6 +78,33 @@ def test_filtered_stream_mixed_batch_keeps_only_clean_lines(monkeypatch):
     batched = KEPT_LINES[0] + SUPPRESSED_LINES[0] + KEPT_LINES[1]
     stream.write(batched)
     assert sink.getvalue() == KEPT_LINES[0] + KEPT_LINES[1]
+
+
+def test_log_drops_untracked_metric_namespaces(monkeypatch):
+    mod = load_logging_utils(monkeypatch)
+    args = types.SimpleNamespace(use_wandb=True, use_tensorboard=False)
+
+    mod.log(
+        args,
+        {
+            "rollout/step": 3,
+            "rollout/candidate/steps/mean": 2.0,
+            "rollout/selected/termination/env_done": 1.0,
+            "rollout/batch/num_tasks": 8,
+            "episode/correct": 1.0,
+            "episode/pass@1": 1.0,
+            "episode/reward/mean": 1.0,
+            "episode/training_reward/mean": 0.5,
+        },
+        step_key="rollout/step",
+    )
+
+    assert sys.modules["wandb"].logged == [
+        {
+            "rollout/step": 3,
+            "episode/training_reward/mean": 0.5,
+        }
+    ]
 
 
 def test_suppress_is_idempotent_and_wraps_both_streams(monkeypatch):

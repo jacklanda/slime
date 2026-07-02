@@ -108,9 +108,10 @@ def test_actor_update_episode_metrics_logs_zero_when_no_valid_episode(monkeypatc
     )
 
     assert metrics["episode/num"] == 0.0
-    assert metrics["episode/reward/mean"] == 0.0
-    assert metrics["episode/pass@1"] == 0.0
-    assert metrics["episode/correct"] == 0.0
+    assert metrics["episode/training_reward/mean"] == 0.0
+    assert "episode/reward/mean" not in metrics
+    assert "episode/pass@1" not in metrics
+    assert "episode/correct" not in metrics
 
 
 def test_actor_update_episode_metrics_only_uses_actor_update_valid_episodes(monkeypatch):
@@ -136,8 +137,9 @@ def test_actor_update_episode_metrics_only_uses_actor_update_valid_episodes(monk
     )
 
     assert metrics["episode/num"] == 1.0
-    assert metrics["episode/reward/mean"] == 1.0
-    assert metrics["episode/pass@1"] == 1.0
+    assert metrics["episode/training_reward/mean"] == 1.0
+    assert metrics["episode/reward/webqa/mean"] == 1.0
+    assert "episode/pass@1" not in metrics
     assert metrics["episode/traj/steps"] == 2.0
 
 
@@ -218,7 +220,8 @@ def test_actor_update_episode_metrics_uses_best_sample_termination_per_group(mon
         }
     )
 
-    assert metrics["episode/pass@1"] == 1.0
+    assert metrics["episode/reward/webqa/mean"] == 1.0
+    assert "episode/pass@1" not in metrics
     assert metrics["episode/termination_reason/env_done"] == 1.0
     assert metrics["episode/termination_reason/error"] == 0.0
 

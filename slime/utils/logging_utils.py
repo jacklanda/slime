@@ -158,8 +158,29 @@ def finish_tracking(args):
         logging.getLogger(__name__).exception("Failed to finish wandb run")
 
 
+_DROPPED_TRACKING_PREFIXES = (
+    "rollout/candidate/",
+    "rollout/selected/",
+    "rollout/batch/",
+)
+_DROPPED_TRACKING_KEYS = {
+    "episode/correct",
+    "episode/pass@1",
+    "episode/reward/mean",
+}
+
+
+def _drop_untracked_metrics(metrics):
+    return {
+        key: value
+        for key, value in metrics.items()
+        if key not in _DROPPED_TRACKING_KEYS and not any(key.startswith(prefix) for prefix in _DROPPED_TRACKING_PREFIXES)
+    }
+
+
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str):
+    metrics = _drop_untracked_metrics(metrics)
     if args.use_wandb:
         wandb.log(metrics)
 

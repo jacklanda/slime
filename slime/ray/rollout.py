@@ -1532,7 +1532,6 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= dict_add_prefix(response_length_stats, "response_length/")
     if response_lengths:
         log_dict["response_length/clip_ratio"] = float(np.mean([length >= args.rollout_max_response_len for length in response_lengths]))
-        log_dict["response/aborted_ratio"] = float(np.mean([sample.status == Sample.Status.ABORTED for sample in samples]))
     log_dict |= dict_add_prefix(compute_statistics(prompt_lengths), "prompt_length/")
     if prompt_lengths and args.rollout_max_prompt_len:
         log_dict["prompt_length/clip_ratio"] = float(np.mean([length >= args.rollout_max_prompt_len for length in prompt_lengths]))
@@ -1584,32 +1583,8 @@ def _compute_fused_agent_metrics(args, all_samples: list[Sample]):
         return {}
 
     metrics: dict[str, float] = {}
-    group_rewards = fused_stats["group_rewards"]
-    terminations = fused_stats["terminations"]
     workflow_values = fused_stats["workflow_values"]
     rewards_by_source = fused_stats["sample_rewards_by_source"]
-    groups_by_source = fused_stats["groups_by_source"]
-
-    if group_rewards:
-        solve_partial = 0
-        for rewards in group_rewards.values():
-            has_correct = any(reward > 0 for reward in rewards)
-            has_incorrect = any(reward <= 0 for reward in rewards)
-            if has_correct and has_incorrect:
-                solve_partial += 1
-        num_groups = len(group_rewards)
-        metrics["batch/solve_partial"] = solve_partial / num_groups
-        metrics["batch/num_tasks"] = num_groups
-
-        for task_type, group_ids in groups_by_source.items():
-            source_solved = [any(reward > 0 for reward in group_rewards[group_id]) for group_id in group_ids]
-            max_group_size = max((len(group_rewards[group_id]) for group_id in group_ids), default=0)
-            metrics[f"batch/{task_type}/pass@{max_group_size}"] = float(np.mean(source_solved))
-
-    if terminations:
-        total = len(terminations)
-        for termination, items in group_by(terminations).items():
-            metrics[f"batch/termination/{termination}"] = len(items) / total
 
     for key, values in workflow_values.items():
         metrics[f"workflow/{key}"] = float(np.mean(values))
@@ -1664,10 +1639,6 @@ def _collect_fused_agent_stats(args, all_samples: list[Sample]):
                 if isinstance(value, (int, float)) and np.isfinite(value):
                     workflow_values.setdefault(key, []).append(float(value))
 
-    groups_by_source: dict[str, list[Any]] = {}
-    for group_id, task_type in group_task_types.items():
-        groups_by_source.setdefault(task_type, []).append(group_id)
-
     episode_rewards_by_source: dict[str, list[float]] = {}
     episode_turn_values: dict[str, list[float]] = {}
     for group_id, rewards in group_rewards.items():
@@ -1686,7 +1657,6 @@ def _collect_fused_agent_stats(args, all_samples: list[Sample]):
 
     return {
         "group_rewards": group_rewards,
-        "groups_by_source": groups_by_source,
         "terminations": terminations,
         "workflow_values": workflow_values,
         "sample_rewards_by_source": sample_rewards_by_source,

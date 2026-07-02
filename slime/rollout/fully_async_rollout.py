@@ -227,7 +227,6 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
     )
 
     collected: dict[int, list[Sample]] = {}
-    candidate_metric_groups: list[list[Sample]] = []
     filter_relax_after = int(getattr(args, "fully_async_filter_relax_after_groups", 0) or 0)
     completed_groups = 0
     dropped_groups = 0
@@ -242,7 +241,6 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
         drained = 0
         for gid, group in worker.get_completed_groups():
             completed_groups += 1
-            candidate_metric_groups.append(group)
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, _flatten_samples(group), rollout_id=rollout_id)
             relax_filter = filter_relax_after > 0 and completed_groups >= filter_relax_after
             if not dynamic_filter_output.keep and not relax_filter:
@@ -310,8 +308,6 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
     metrics["rollout/dynamic_filter/completed_groups"] = completed_groups
     metrics["rollout/dynamic_filter/dropped_groups"] = dropped_groups
     metrics["rollout/dynamic_filter/kept_groups"] = len(out)
-    metrics.update(_fused_rollout_distribution_metrics("candidate", candidate_metric_groups))
-    metrics.update(_fused_rollout_distribution_metrics("selected", out))
     metrics["rollout/config/fused_webqa_min_unique_searches"] = _int_env("FUSED_WEBQA_MIN_UNIQUE_SEARCHES", 2)
     metrics["rollout/config/fused_repeated_search_max_strikes"] = _int_env("FUSED_REPEATED_SEARCH_MAX_STRIKES", 2)
     for family, count in candidate_family_counts.items():
@@ -436,48 +432,6 @@ def _sample_task_family(sample: Sample) -> str:
     if metadata.get("docker_image"):
         return "cli"
     return "webqa"
-
-
-def _fused_rollout_distribution_metrics(prefix: str, groups: list[list[Sample]]) -> dict[str, float]:
-    steps: list[float] = []
-    events: Counter[str] = Counter()
-    terminations: Counter[str] = Counter()
-    for group in groups:
-        samples = _flatten_samples(group)
-        if not samples:
-            continue
-        metadata = getattr(samples[0], "metadata", {}) or {}
-        value = metadata.get("fused_traj_steps") or metadata.get("traj_steps")
-        try:
-            if value is not None:
-                steps.append(float(value))
-        except (TypeError, ValueError):
-            pass
-        event = metadata.get("credit_assignment_event")
-        events[str(event if event is not None else "none")] += 1
-        termination = metadata.get("fused_termination") or metadata.get("termination_reason") or "unknown"
-        terminations[str(termination)] += 1
-
-    metrics: dict[str, float] = {}
-    if steps:
-        metrics[f"rollout/{prefix}/steps/mean"] = sum(steps) / len(steps)
-        metrics[f"rollout/{prefix}/steps/min"] = min(steps)
-        metrics[f"rollout/{prefix}/steps/max"] = max(steps)
-        for step, count in Counter(int(step) if float(step).is_integer() else step for step in steps).items():
-            metrics[f"rollout/{prefix}/steps/count_{step}"] = count
-    total_events = sum(events.values())
-    if total_events:
-        for event, count in events.items():
-            metrics[f"rollout/{prefix}/credit_assignment_event/{_metric_key_part(event)}"] = count / total_events
-    total_terminations = sum(terminations.values())
-    if total_terminations:
-        for termination, count in terminations.items():
-            metrics[f"rollout/{prefix}/termination/{_metric_key_part(termination)}"] = count / total_terminations
-    return metrics
-
-
-def _metric_key_part(value: str) -> str:
-    return str(value or "unknown").strip().lower().replace("/", "_").replace(" ", "_").replace("-", "_")
 
 
 def _normalize_task_family(value: str) -> str:

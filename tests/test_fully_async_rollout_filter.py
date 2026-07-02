@@ -74,7 +74,7 @@ def test_fully_async_dynamic_filter_keeps_nonzero_variance_groups(monkeypatch):
     assert worker.paused is True
 
 
-def test_fully_async_logs_candidate_and_selected_fused_distributions(monkeypatch):
+def test_fully_async_omits_candidate_and_selected_fused_distributions(monkeypatch):
     groups = [
         [
             _sample(0, 0.0, "web_search", steps=2, termination="ABNORMAL_REPEATED_QUERY", credit_event="repeated_search_query"),
@@ -102,13 +102,8 @@ def test_fully_async_logs_candidate_and_selected_fused_distributions(monkeypatch
     output = asyncio.run(fully_async._generate_rollout_async(args, rollout_id=0, data_buffer=None))
 
     assert output.samples == [groups[1]]
-    assert output.metrics["rollout/candidate/steps/mean"] == 3.0
-    assert output.metrics["rollout/candidate/steps/count_2"] == 1
-    assert output.metrics["rollout/candidate/steps/count_4"] == 1
-    assert output.metrics["rollout/candidate/credit_assignment_event/repeated_search_query"] == 0.5
-    assert output.metrics["rollout/candidate/termination/abnormal_repeated_query"] == 0.5
-    assert output.metrics["rollout/selected/steps/mean"] == 4.0
-    assert output.metrics["rollout/selected/credit_assignment_event/none"] == 1.0
+    assert not any(key.startswith("rollout/candidate/") for key in output.metrics)
+    assert not any(key.startswith("rollout/selected/") for key in output.metrics)
     assert output.metrics["rollout/config/fused_webqa_min_unique_searches"] == 3
     assert output.metrics["rollout/config/fused_repeated_search_max_strikes"] == 4
 
