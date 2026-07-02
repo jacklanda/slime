@@ -67,7 +67,7 @@ Options:
                                          Penalize turns that contain both a non-finish tool call and boxed/submit answer. Default: true.
   --credit-assignment-tail-guard-early-stop BOOL
                                          Stored in env for compatible fused code.
-  --horizon-reward-shaping BOOL         Enable bounded horizon penalty reward shaping. Default: true.
+  --horizon-reward-shaping BOOL         Enable bounded horizon penalty reward shaping. Default: false.
   --horizon-reward-min-multiplier X      Correct low-horizon reward multiplier floor. Default: 0.2.
   --horizon-reward-gamma X               Horizon progress exponent. Default: 1.0.
   --horizon-reward-step-weight X         Step progress weight. Default: 0.7.
@@ -75,15 +75,15 @@ Options:
   --horizon-reward-target-steps X        Target steps for no horizon penalty. Default: 8.
   --horizon-reward-target-tool-calls X   Target tool calls for no horizon penalty. Default: target_steps - 1.
   --enable-dynamic-sampling-filter BOOL  Enable DAPO-style non-zero reward variance dynamic filtering. Default: true.
-  --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: false.
+  --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
   --grm-model NAME                       OpenRouter judge model. Default: deepseek/deepseek-v4-flash.
-  --grm-concurrency N                    Max concurrent GRM requests. Default: 128.
+  --grm-concurrency N                    Max concurrent GRM requests. Default: 512.
   --grm-timeout SECONDS                  GRM request timeout. Default: 60.
-  --grm-max-retries N                    GRM retry attempts. Default: 3.
-  --grm-max-trajectory-chars N           Trajectory chars sent to GRM. Default: 24000.
-  --max-steps N                          Fused agent max steps.
-  --mcp-max-steps N                      Fused MCP max steps. Default: 16.
-  --web-search-max-steps N               Fused web-search max steps. Default: 4.
+  --grm-max-retries N                    GRM retry attempts. Default: 4.
+  --grm-max-trajectory-chars N           Trajectory chars sent to GRM. Default: 30000.
+  --max-steps N                          Fused agent max steps. Default: 96.
+  --mcp-max-steps N                      Fused MCP max steps. Default: 96.
+  --web-search-max-steps N               Fused web-search max steps. Default: 96.
   --cli-max-steps N                      CLI fused agent max steps env.
   --trajectory-timeout N                 Fused trajectory timeout env.
   --eval-trajectory-timeout N            Fused eval trajectory timeout env.
@@ -95,11 +95,11 @@ Options:
   --eval-max-context-len N               Eval-only context length. Default: prompt + response.
   --val_before_train BOOL                Run one eval before training starts. Default: true.
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
-  --offload-train BOOL                   Offload trainer model between rollout/train phases. Default: true.
+  --offload-train BOOL                   Offload trainer model between rollout/train phases. Default: matches --colocate.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 64.
-  --sglang-max-running-requests N        SGLang max running requests. Default: 256.
-  --colocate / --no-colocate             Share trainer and rollout GPUs with offload. Default: enabled.
+  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 400.
+  --sglang-max-running-requests N        SGLang max running requests. Default: 512.
+  --colocate / --no-colocate             Share trainer and rollout GPUs with offload. Default: disabled.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
 EOF
@@ -153,21 +153,21 @@ FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
 FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT="${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT:-0.3}"
 FUSED_HORIZON_REWARD_TARGET_STEPS="${FUSED_HORIZON_REWARD_TARGET_STEPS:-8}"
 FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS="${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-}"
-MAX_STEPS="${MAX_STEPS:-96}"
-MCP_MAX_STEPS="${MCP_MAX_STEPS:-96}"
-WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-96}"
-CLI_MAX_STEPS="${CLI_MAX_STEPS:-96}"
+MAX_STEPS="${MAX_STEPS:-128}"
+MCP_MAX_STEPS="${MCP_MAX_STEPS:-128}"
+WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-128}"
+CLI_MAX_STEPS="${CLI_MAX_STEPS:-128}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-3600}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-3600}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-256}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-512}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-400}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-650}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-300}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
 EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-false}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
 # Offload only makes sense under colocate (train/rollout share GPUs and take
@@ -216,7 +216,7 @@ while [ "$#" -gt 0 ]; do
       --retrieval-max-words) RLLM_RETRIEVAL_MAX_WORDS="${2:?Missing value for --retrieval-max-words}"; shift 2 ;;
       --retrieval-retry-budget) RLLM_RETRIEVAL_RETRY_BUDGET="${2:?Missing value for --retrieval-retry-budget}"; shift 2 ;;
       --retrieval-summary-retry-budget) RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET="${2:?Missing value for --retrieval-summary-retry-budget}"; shift 2 ;;
-      --retrieval-lexrank-fallback) RLLM_RETRIEVAL_LEXRANK_FALLBACK="${2:?Missing value for --retrieval-lexrank-fallback}"; shift 2 ;;
+      --retrieval-lexrank-fallback) : "${2:?Missing value for --retrieval-lexrank-fallback}"; shift 2 ;;
       --retrieval-lexrank-max-words) RLLM_RETRIEVAL_LEXRANK_MAX_WORDS="${2:?Missing value for --retrieval-lexrank-max-words}"; shift 2 ;;
       --retrieval-lexrank-max-sentences) RLLM_RETRIEVAL_LEXRANK_MAX_SENTENCES="${2:?Missing value for --retrieval-lexrank-max-sentences}"; shift 2 ;;
       --retrieval-lexrank-max-input-sentences) RLLM_RETRIEVAL_LEXRANK_MAX_INPUT_SENTENCES="${2:?Missing value for --retrieval-lexrank-max-input-sentences}"; shift 2 ;;
@@ -294,10 +294,6 @@ while [ "$#" -gt 0 ]; do
 done
 
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-$((EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN))}"
-
-# Keep the option/env name for compatibility with older launch commands, but do
-# not allow this launcher to enable LexRank-based retrieval summaries.
-RLLM_RETRIEVAL_LEXRANK_FALLBACK=0
 
 case "${TERMINAL_LOG_STYLE}" in
    progress|rollouts|both) ;;
@@ -846,6 +842,8 @@ export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-1}"
 export RLLM_RETRIEVAL_SUMMARIZE="${RLLM_RETRIEVAL_SUMMARIZE:-0}"
 export RLLM_RETRIEVAL_RETRY_BUDGET="${RLLM_RETRIEVAL_RETRY_BUDGET:-8}"
 export RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET="${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET:-32}"
+# LexRank fallback option/env name is kept for compatibility with older launch
+# commands, but this launcher never enables LexRank-based retrieval summaries.
 export RLLM_RETRIEVAL_LEXRANK_FALLBACK=0
 export RLLM_RETRIEVAL_LEXRANK_MAX_WORDS="${RLLM_RETRIEVAL_LEXRANK_MAX_WORDS:-512}"
 export RLLM_RETRIEVAL_LEXRANK_MAX_SENTENCES="${RLLM_RETRIEVAL_LEXRANK_MAX_SENTENCES:-32}"
@@ -894,15 +892,6 @@ export CREDIT_ASSIGNMENT_SEARCH_BYPASS="${CREDIT_ASSIGNMENT_SEARCH_BYPASS}"
 export CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL}"
 export CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER}"
 export CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_ENABLE="${CREDIT_ASSIGNMENT_ENABLE}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR="${CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY="${CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS="${CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_NGRAM_REPETITION="${CREDIT_ASSIGNMENT_NGRAM_REPETITION}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_SEARCH_BYPASS="${CREDIT_ASSIGNMENT_SEARCH_BYPASS}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP}"
 export FUSED_FILTER_MIN_MEAN_STEPS="${FUSED_FILTER_MIN_MEAN_STEPS:-0}"
 export FUSED_FILTER_MIN_MCP_MEAN_STEPS="${FUSED_FILTER_MIN_MCP_MEAN_STEPS:-0}"
 export FUSED_FILTER_MAX_ABNORMAL_RATIO="${FUSED_FILTER_MAX_ABNORMAL_RATIO:-0}"
@@ -950,14 +939,6 @@ keys = (
     "CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD", "CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS",
     "CREDIT_ASSIGNMENT_SEARCH_BYPASS", "CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL",
     "CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER", "CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_ENABLE", "SLIME_FUSED_CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_NGRAM_REPETITION",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_SEARCH_BYPASS",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP",
     "FUSED_FILTER_MIN_MEAN_STEPS", "FUSED_FILTER_MIN_MCP_MEAN_STEPS",
     "FUSED_FILTER_MAX_ABNORMAL_RATIO",
     "FUSED_HORIZON_REWARD_MIN_MULTIPLIER", "FUSED_HORIZON_REWARD_GAMMA",
