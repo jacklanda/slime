@@ -1,5 +1,5 @@
 #!/bin/bash
-# Synchronous fused-agent training launcher for current slime.
+# Fully-async fused-agent training launcher for current slime.
 #
 # This keeps the launch style of experiments/run-qwen3.5-9B-fully_async.sh:
 # array-based args, ray job submit, and a runtime PYTHONPATH rooted at this
@@ -13,7 +13,7 @@ export PYTHONUNBUFFERED=1
 usage() {
    cat <<'EOF'
 Usage:
-  bash experiments/train_qwen3_fused_agent_sync.sh [options]
+  bash experiments/train_qwen3.5_fused_agent_async.sh [options]
 
 Options:
   --harness NAME                         Fused prompt harness: bare, cot, react, gem, unified_gem.
@@ -22,19 +22,17 @@ Options:
   --mcp-disable-step-penalty BOOL        MCP verifier step-penalty env.
   --unified-system-prompt                Select unified_gem harness unless --harness is set later.
   --no-unified-system-prompt             Select gem harness unless --harness is set later.
-  --fully-async / --no-fully-async       Select fully-async rollout function. Default: disabled.
+  --fully-async / --no-fully-async       Select fully-async rollout function. Default: fully-async.
   --partial-rollout / --no-partial-rollout
                                          Recycle partial rollouts during abort/sync.
   --terminal-log-style STYLE             progress, rollouts, or both. Stored in env for compatible fused code.
   --show-rollout-progress-logs BOOL      Show periodic fused rollout request/progress logs. Default: false.
   --accepted-group-update-min-groups N   Maps to ROLLOUT_BATCH_SIZE by default.
   --accepted-group-update-max-groups N   Stored in env for compatible fused code.
-  --micro-batch-size N                   Training micro-batch size.
-  --update-weights-interval N            Rollout weight update interval. Default: 1.
-  --async-mini-batch-size N              Deprecated alias for --micro-batch-size.
-  --async-trigger-parameter-sync-step N  Deprecated alias for --update-weights-interval.
-  --async-fwd-bwd-group-size N           Deprecated no-op compatibility option.
-  --async-staleness-threshold X          Deprecated no-op compatibility option.
+  --async-mini-batch-size N              Maps to MICRO_BATCH_SIZE by default.
+  --async-fwd-bwd-group-size N           Stored in env for compatible fused code.
+  --async-staleness-threshold X          Stored in env for compatible fused code.
+  --async-trigger-parameter-sync-step N  Maps to UPDATE_WEIGHTS_INTERVAL by default.
   --retrieval-mode MODE                  Retrieval mode env.
   --retrieval-max-words N                Retrieval max words env.
   --retrieval-retry-budget N             Retrieval retry env.
@@ -112,8 +110,8 @@ is_truthy() {
    esac
 }
 
-FULLY_ASYNC="${FULLY_ASYNC:-false}"
-PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
+FULLY_ASYNC="${FULLY_ASYNC:-true}"
+PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-true}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 # Default to non-colocate: train and rollout live on separate GPUs so training
@@ -126,8 +124,12 @@ UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
 ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-16}"
 ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE:-16}}"
-UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-1}}"
+ASYNC_MINI_BATCH_SIZE="${ASYNC_MINI_BATCH_SIZE:-128}"
+ASYNC_FWD_BWD_GROUP_SIZE="${ASYNC_FWD_BWD_GROUP_SIZE:-128}"
+ASYNC_STALENESS_THRESHOLD="${ASYNC_STALENESS_THRESHOLD:-1.0}"
+ASYNC_TRIGGER_PARAMETER_SYNC_STEP="${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-1}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE}}"
+UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-${ASYNC_TRIGGER_PARAMETER_SYNC_STEP}}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 TAIL_GUARD="${TAIL_GUARD:-False}"
 TAIL_GUARD_TIME_GUARD="${TAIL_GUARD_TIME_GUARD:-True}"
@@ -166,8 +168,8 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # in-flight request counts so more trajectories overlap and cover those I/O waits.
 # 4B weights are tiny at mem_fraction=0.9, so KV headroom is ample; watch for KV
 # eviction only if 38k-context trajectories start getting preempted.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-2048}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-2048}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-3072}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-3072}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-300}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
@@ -212,12 +214,10 @@ while [ "$#" -gt 0 ]; do
       --show-rollout-progress-logs) SHOW_ROLLOUT_PROGRESS_LOGS="${2:?Missing value for --show-rollout-progress-logs}"; shift 2 ;;
       --accepted-group-update-min-groups) ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${2:?Missing value for --accepted-group-update-min-groups}"; shift 2 ;;
       --accepted-group-update-max-groups) ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${2:?Missing value for --accepted-group-update-max-groups}"; shift 2 ;;
-      --micro-batch-size) MICRO_BATCH_SIZE="${2:?Missing value for --micro-batch-size}"; shift 2 ;;
-      --update-weights-interval) UPDATE_WEIGHTS_INTERVAL="${2:?Missing value for --update-weights-interval}"; shift 2 ;;
-      --async-mini-batch-size) MICRO_BATCH_SIZE="${2:?Missing value for --async-mini-batch-size}"; shift 2 ;;
-      --async-trigger-parameter-sync-step) UPDATE_WEIGHTS_INTERVAL="${2:?Missing value for --async-trigger-parameter-sync-step}"; shift 2 ;;
-      --async-fwd-bwd-group-size) : "${2:?Missing value for --async-fwd-bwd-group-size}"; shift 2 ;;
-      --async-staleness-threshold) : "${2:?Missing value for --async-staleness-threshold}"; shift 2 ;;
+      --async-mini-batch-size) ASYNC_MINI_BATCH_SIZE="${2:?Missing value for --async-mini-batch-size}"; MICRO_BATCH_SIZE="${ASYNC_MINI_BATCH_SIZE}"; shift 2 ;;
+      --async-fwd-bwd-group-size) ASYNC_FWD_BWD_GROUP_SIZE="${2:?Missing value for --async-fwd-bwd-group-size}"; shift 2 ;;
+      --async-staleness-threshold) ASYNC_STALENESS_THRESHOLD="${2:?Missing value for --async-staleness-threshold}"; shift 2 ;;
+      --async-trigger-parameter-sync-step) ASYNC_TRIGGER_PARAMETER_SYNC_STEP="${2:?Missing value for --async-trigger-parameter-sync-step}"; UPDATE_WEIGHTS_INTERVAL="${ASYNC_TRIGGER_PARAMETER_SYNC_STEP}"; shift 2 ;;
       --retrieval-mode) RLLM_RETRIEVAL_MODE="${2:?Missing value for --retrieval-mode}"; shift 2 ;;
       --retrieval-max-words) RLLM_RETRIEVAL_MAX_WORDS="${2:?Missing value for --retrieval-max-words}"; shift 2 ;;
       --retrieval-retry-budget) RLLM_RETRIEVAL_RETRY_BUDGET="${2:?Missing value for --retrieval-retry-budget}"; shift 2 ;;
@@ -316,13 +316,10 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 default_experiment_name() {
-   #local prefix="fused-dapo-q3-4b-no_think-gem-async-dev"
-   local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3.5-4b-no_think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3-8b-no_think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3-8b-no_think-gem-async-dev"
-   #local prefix="webqa-dapo-q3-4b-no_think-gem-async-dev0"
+   #local prefix="mcp-dapo-q3.5-4b-no_think-gem-async-dev"
+   #local prefix="webqa-dapo-q3.5-4b-no_think-gem-async-dev"
+   #local prefix="fused-dapo-q3.5-4b-no_think-gem-async-dev"
+   local prefix="asearcher-dapo-q3.5-4b-no_think-gem-async-dev"
    local max_dev=-1
    local root base suffix
    for root in "${REPO_ROOT}/checkpoints/FusedRL" "${REPO_ROOT}/experiments/logs/FusedRL"; do
@@ -348,8 +345,8 @@ fi
 
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
-#MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
-MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
+MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
+#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
 
 # Default tensor-parallel size depends on the model. Gated attention
@@ -366,7 +363,15 @@ else
    DEFAULT_TP_SIZE=8
 fi
 
-# Non-colocate split on a single 8-GPU node: 4 GPUs train, 4 GPUs rollout.
+# Non-colocate split on a single 8-GPU node: 2 GPUs train, 6 GPUs rollout.
+# Profiling the sync loop showed the trainer GPUs idle ~99% of wall-clock (train
+# and rollout never overlap in sync mode and rollout dominates), while rollout is
+# the bottleneck. So shift two GPUs from the idle trainer to rollout: 6 rollout
+# GPUs at 2 GPUs/engine gives 3 SGLang engines instead of 2 (+50% rollout
+# capacity) for almost no trainer cost. Trainer TP auto-clamps to 2 below.
+# NOTE: a checkpoint saved under TP=4 (e.g. an earlier 4/4 run) cannot reshard its
+# optimizer state to TP=2 — resume such a run once with NO_LOAD_OPTIM=1 (see the
+# CKPT_ARGS note below). Fresh EXPERIMENT_NAMEs start from the HF ref and are fine.
 # Defined here (before PERF_ARGS is built) so the TP clamp below actually takes
 # effect — bash arrays expand their values at definition time.
 ACTOR_GPUS="${ACTOR_GPUS:-4}"
@@ -380,8 +385,8 @@ fi
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/checkpoints/FusedRL/${EXPERIMENT_NAME}}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
@@ -525,8 +530,8 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-38000}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-64}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-96}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_EPOCH="${NUM_EPOCH:-100}"
@@ -614,7 +619,7 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len "${MAX_CONTEXT_LEN}"
    --rollout-max-prompt-len "${MAX_PROMPT_LENGTH}"
    --rollout-max-response-len "${MAX_RESPONSE_LENGTH}"
-   --rollout-temperature "${TEMPERATURE:-1.0}"
+   --rollout-temperature "${TEMPERATURE:-0.8}"
    --rollout-top-p "${TOP_P:-1.0}"
 
    --global-batch-size "${EFFECTIVE_GLOBAL_BATCH_SIZE}"
@@ -883,6 +888,8 @@ export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-2048}"
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE}"
 export SLIME_FUSED_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS}"
+export SLIME_FUSED_ASYNC_FWD_BWD_GROUP_SIZE="${ASYNC_FWD_BWD_GROUP_SIZE}"
+export SLIME_FUSED_ASYNC_STALENESS_THRESHOLD="${ASYNC_STALENESS_THRESHOLD}"
 export SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}"
 export SLIME_FUSED_TAIL_GUARD="${TAIL_GUARD}"
 export SLIME_FUSED_TAIL_GUARD_TIME_GUARD="${TAIL_GUARD_TIME_GUARD}"
@@ -938,7 +945,8 @@ keys = (
     "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS", "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "SLIME_ROLLOUT_GROUP_TIMEOUT", "SLIME_EVAL_ROLLOUT_GROUP_TIMEOUT",
     "PER_STEP_MAX_TOKENS", "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH",
-    "SLIME_FUSED_TERMINAL_LOG_STYLE", "SLIME_FUSED_PROGRESS_LOGS", "SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS",
+    "SLIME_FUSED_TERMINAL_LOG_STYLE", "SLIME_FUSED_PROGRESS_LOGS", "SLIME_FUSED_ASYNC_FWD_BWD_GROUP_SIZE",
+    "SLIME_FUSED_ASYNC_STALENESS_THRESHOLD", "SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS",
     "SLIME_FUSED_TAIL_GUARD", "SLIME_FUSED_TAIL_GUARD_TIME_GUARD",
     "SLIME_FUSED_TAIL_GUARD_TIME_MULTIPLIER", "SLIME_FUSED_TAIL_GUARD_TIME_SLACK_SECONDS",
     "SLIME_FUSED_TAIL_GUARD_MIN_COMPLETION_RATIO",
@@ -980,7 +988,7 @@ echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
 echo "Actor GPUs: ${ACTOR_GPUS}, rollout GPUs: ${ROLLOUT_GPUS}, colocate=${COLOCATE}, ray GPUs=${NUM_GPUS}"
 echo "SGLang concurrency: server=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}"
 echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
-echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; micro_batch=${MICRO_BATCH_SIZE}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}"
+echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; async mini_batch=${ASYNC_MINI_BATCH_SIZE}, sync_interval=${ASYNC_TRIGGER_PARAMETER_SYNC_STEP}"
 echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"
 echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, relax_after_groups=${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}"
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}"

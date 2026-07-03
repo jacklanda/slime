@@ -973,7 +973,11 @@ class RolloutManager:
             rollout_log_probs := _collect_optional_sample_attr(
                 samples,
                 "rollout_log_probs",
-                required=getattr(self.args, "use_rollout_logprobs", False),
+                required=(
+                    getattr(self.args, "use_rollout_logprobs", False)
+                    or getattr(self.args, "use_tis", False)
+                    or getattr(self.args, "get_mismatch_metrics", False)
+                ),
             )
         ) is not None:
             train_data["rollout_log_probs"] = rollout_log_probs

@@ -499,6 +499,7 @@ def _timeout_sample(sample: Sample, *, evaluation: bool) -> Sample:
     timed_out = copy.deepcopy(sample)
     timed_out.status = Sample.Status.FAILED
     timed_out.reward = 0.0
+    timed_out.rollout_log_probs = [0.0] * timed_out.response_length
     timed_out.metadata = {
         **dict(sample.metadata or {}),
         "termination_reason": "timeout",

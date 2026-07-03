@@ -13,7 +13,7 @@ export PYTHONUNBUFFERED=1
 usage() {
    cat <<'EOF'
 Usage:
-  bash experiments/train_fused_agent_sync.sh [options]
+  bash experiments/train_qwen3.5_fused_agent_sync.sh [options]
 
 Options:
   --harness NAME                         Fused prompt harness: bare, cot, react, gem, unified_gem.
@@ -115,13 +115,13 @@ is_truthy() {
 FULLY_ASYNC="${FULLY_ASYNC:-false}"
 PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
-SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-true}"
+SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 # Default to non-colocate: train and rollout live on separate GPUs so training
 # never runs the per-step torch_memory_saver offload/pause path. That pause path
 # (cudaError 1 "invalid argument" in torch_memory_saver.cpp func=pause) crashes
 # after ~20 offload cycles under colocate + enable_cpu_backup and has no upstream
 # fix (already on the latest torch_memory_saver; see slime issues #1786/#71).
-COLOCATE="${COLOCATE:-false}"
+COLOCATE="${COLOCATE:-true}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
 ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-16}"
@@ -157,8 +157,8 @@ MAX_STEPS="${MAX_STEPS:-128}"
 MCP_MAX_STEPS="${MCP_MAX_STEPS:-128}"
 WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-128}"
 CLI_MAX_STEPS="${CLI_MAX_STEPS:-128}"
-TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-3600}"
-EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-3600}"
+TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
+EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-7200}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Rollout GPUs profiled at only ~46% util (duty ~50-60%) during sync rollout:
 # trajectories stall on retrieval round-trips between steps, so the decode batch
@@ -166,8 +166,8 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # in-flight request counts so more trajectories overlap and cover those I/O waits.
 # 4B weights are tiny at mem_fraction=0.9, so KV headroom is ample; watch for KV
 # eviction only if 38k-context trajectories start getting preempted.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-1536}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-1536}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-3072}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-3072}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-300}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
@@ -374,14 +374,15 @@ fi
 # CKPT_ARGS note below). Fresh EXPERIMENT_NAMEs start from the HF ref and are fine.
 # Defined here (before PERF_ARGS is built) so the TP clamp below actually takes
 # effect — bash arrays expand their values at definition time.
-ACTOR_GPUS="${ACTOR_GPUS:-4}"
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
+ACTOR_GPUS="${ACTOR_GPUS:-8}"
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
 
 # TP cannot exceed the number of actor GPUs. Clamp the model-level default so a
 # 4-GPU non-colocate actor uses TP=4 instead of the colocate-era TP=8 default.
 if [ "${DEFAULT_TP_SIZE}" -gt "${ACTOR_GPUS}" ]; then
    DEFAULT_TP_SIZE="${ACTOR_GPUS}"
 fi
+DEFAULT_TP_SIZE=8
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
@@ -531,7 +532,7 @@ MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-48}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-96}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_EPOCH="${NUM_EPOCH:-100}"
@@ -792,7 +793,7 @@ SGLANG_ARGS=(
 )
 
 WANDB_ARGS=()
-if [ "${USE_WANDB:-0}" = "1" ]; then
+if [ "${USE_WANDB:-1}" = "1" ]; then
    WANDB_ARGS=(
       --use-wandb
       --wandb-mode "${WANDB_MODE:-online}"
@@ -834,7 +835,7 @@ fi
 
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
-export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
+export NCCL_TIMEOUT="${NCCL_TIMEOUT:-7200}"
 export RAY_WARN_BLOCKING_GET_INSIDE_ASYNC="${RAY_WARN_BLOCKING_GET_INSIDE_ASYNC:-0}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"

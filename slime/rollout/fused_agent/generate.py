@@ -629,6 +629,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             label=base_sample.label,
             reward=0.0,
             status=Sample.Status.FAILED,
+            rollout_log_probs=[],
             metadata={
                 **dict(base_sample.metadata or {}),
                 "fused_error": "empty_trajectory",
