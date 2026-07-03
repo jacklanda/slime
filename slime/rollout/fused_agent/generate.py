@@ -121,7 +121,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     credit_step_index: int | None = None
     try:
         for step_idx in range(max_steps):
-            prompt_ids = _render_prompt_ids(state.tokenizer, messages, disable_thinking=disable_thinking)
+            # Run the chat-template render off the event loop. The HF fast
+            # tokenizer releases the GIL during tokenize, so offloading lets the
+            # many concurrent trajectory coroutines actually overlap instead of
+            # serializing on the single rollout event-loop thread (which
+            # otherwise saturates one core and starves the SGLang engines).
+            prompt_ids = await asyncio.to_thread(_render_prompt_ids, state.tokenizer, messages, disable_thinking=disable_thinking)
             if max_context_tokens and len(prompt_ids) >= max_context_tokens:
                 final_done = True
                 last_info = {
@@ -160,7 +165,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             llm_time += step_llm_time
             output_ids = output["output_ids"]
             output_logprobs = output["output_logprobs"]
-            raw_response = state.tokenizer.decode(output_ids, skip_special_tokens=False) if output_ids else ""
+            raw_response = await asyncio.to_thread(state.tokenizer.decode, output_ids, skip_special_tokens=False) if output_ids else ""
             response = _strip_trailing_chat_template_stop(raw_response)
             finish_reason = output["finish_reason"]
             total_steps += 1
@@ -169,6 +174,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 total_tool_call_turns += 1
 
             assistant_msg = {"role": "assistant", "content": response}
+            # Offload the second (no-generation-prompt) render off the event loop
+            # for the same GIL-release reason as the line-124 render above.
+            prompt_context_start_idx = await asyncio.to_thread(_last_assistant_context_start_idx, state.tokenizer, messages, disable_thinking=disable_thinking)
             pending_turns.append(
                 {
                     "turn": TurnRecord(
@@ -185,11 +193,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         ),
                         rollout_top_p_token_ids=output.get("rollout_top_p_token_ids"),
                         rollout_top_p_token_offsets=output.get("rollout_top_p_token_offsets"),
-                        prompt_context_start_idx=_last_assistant_context_start_idx(
-                            state.tokenizer,
-                            messages,
-                            disable_thinking=disable_thinking,
-                        ),
+                        prompt_context_start_idx=prompt_context_start_idx,
                     ),
                     "prompt_messages": list(messages),
                     "response_message": assistant_msg,
