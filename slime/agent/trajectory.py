@@ -3,8 +3,9 @@
 The :class:`TrajectoryManager` builds one trajectory per session. ``record_turn``
 feeds in each turn (prompt messages + the served model's sglang snapshot),
 routing it into a per-sid message tree; ``get_trajectory`` then linearizes that
-tree into a ``list[Sample]`` of loss-masked training rows, tolerating TITO
-re-tokenization drift via fork/replace.
+tree into a ``list[Sample]`` of loss-masked training rows. When adapters provide
+strict TITO evidence, the manager concatenates per-turn context deltas and
+generated outputs without re-tokenizing or replacing historical tokens.
 """
 
 from __future__ import annotations
@@ -37,6 +38,10 @@ class TurnRecord:
     output_log_probs: list[float] = dataclasses.field(default_factory=list)
     loss_mask: list[int] | None = None
     policy_loss_mask: list[int] | None = None
+    context_delta_ids: list[int] | None = None
+    tito_boundary_before: bool = False
+    tito_model_type: str | None = None
+    disable_thinking: bool | None = None
     prompt_context_start_idx: int | None = None
     rollout_top_p_token_ids: list[int] | None = None
     rollout_top_p_token_offsets: list[int] | None = None
@@ -105,11 +110,13 @@ class MessageNode:
         return chain
 
     def leaves(self) -> Iterator[MessageNode]:
-        if not self.children:
-            yield self
-            return
-        for c in self.children:
-            yield from c.leaves()
+        stack = [self]
+        while stack:
+            node = stack.pop()
+            if not node.children:
+                yield node
+                continue
+            stack.extend(reversed(node.children))
 
 
 # ===========================================================================
@@ -132,9 +139,8 @@ def _common_prefix_len(a: list[int], b: list[int], chunk: int = 4096) -> int:
 
 
 class DriftKind(enum.Enum):
-    CLEAN = "clean"  # drift == 0: prompt_ids exactly extends held tokens; append the tail beyond them
-    REALIGN = "realign"  # drift inside the most-recent response span and short incoming response; adopt replay tokens while preserving generated response mask
-    FORK = "fork"  # everything else: close this builder, open a fresh one as a fork
+    CLEAN = "clean"  # prompt_ids exactly extends held tokens, or strict context_delta_ids is present
+    FORK = "fork"  # close this builder, open a fresh one as a segment boundary
 
 
 # ===========================================================================
@@ -145,20 +151,17 @@ class DriftKind(enum.Enum):
 class _SampleBuilder:
     """Accumulates a chain's turns into the token sequence of one ``Sample``.
 
-    A chain of turns is appended one at a time via :meth:`append_turn`. Ideally
-    each turn's prompt exactly extends the tokens we already hold, but a replayed
-    turn rarely re-tokenizes byte-for-byte: TITO round-trips and chat-template
-    re-rendering both perturb the ids of content we've already seen. The builder
-    handles this drift in a source-agnostic way, classified by where and how far
-    the prompt diverges from the held tokens (see :meth:`classify_token_drift`):
+    A chain of turns is appended one at a time via :meth:`append_turn`. Strict
+    TITO adapters provide ``context_delta_ids``: the exact non-trainable prompt
+    tokens added since the previous generated output. In that mode the builder
+    never inspects or rewrites historical prompt tokens; it just concatenates
+    the delta and the generated response evidence. Older adapters without
+    ``context_delta_ids`` fall back to exact-prefix prompt extension.
 
-    * **CLEAN** -- no drift; append the prompt tail beyond what we hold.
-    * **REALIGN** -- a short divergence inside the most-recent response span;
-      adopt the replayed token ids for prefix continuity while keeping the
-      already-generated response span trainable.
-    * **FORK** -- divergence too large or too early to absorb; this builder is
-      rejected and the caller closes it and opens a fresh one. That boundary is
-      the "fork".
+    * **CLEAN** -- append the strict context delta, or append the prompt tail when
+      prompt_ids exactly extends held tokens.
+    * **FORK** -- any unproven drift or explicit TITO boundary. The caller closes
+      the current builder and opens a fresh one.
 
     Each surviving builder yields one Sample.
     """
@@ -177,38 +180,34 @@ class _SampleBuilder:
     def classify_token_drift(self, turn: TurnRecord) -> DriftKind:
         """Decide how this builder should absorb ``turn``'s prompt.
 
-        The incoming turn's prompt is expected to match the tokens this builder
-        already holds as an exact prefix. When token drift has occurred -- the
-        prompt diverges from the held tokens -- we decide whether to REALIGN
-        (heal a short divergence inside the most-recent response span) or to FORK
-        (``len(turn.output_ids) >= fork_threshold``, or the divergence sits too
-        early to absorb). With no drift the turn is handled the CLEAN way -- a
-        plain prefix extension.
+        Strict TITO turns carry their own context delta. They are appendable unless
+        the adapter explicitly marks a boundary before the turn. Legacy turns are
+        appendable only when their prompt exactly extends the held tokens; any
+        drift forks instead of realigning, so old rollout logprobs are never
+        attached to replay-mutated token ids.
         """
+        if turn.tito_boundary_before:
+            return DriftKind.FORK
+        if turn.context_delta_ids is not None:
+            return DriftKind.CLEAN
+
         realign_at = _common_prefix_len(self.tokens, turn.prompt_ids)
         drift = len(self.tokens) - realign_at
 
         if drift == 0:
             return DriftKind.CLEAN
 
-        # REALIGN only heals drift that falls inside the most-recent response span
-        # (and is short); divergence anywhere earlier, or an empty builder, forks.
-        start = self.last_response_start_idx
-        if start is not None and realign_at >= start and len(turn.output_ids) < self._fork_threshold:
-            return DriftKind.REALIGN
         return DriftKind.FORK
 
     def append_turn(self, turn: TurnRecord, kind: DriftKind, *, trained: bool = True) -> None:
-        """Append one turn into this SampleBuilder, branching on ``kind``: for REALIGN
-        we preserve the already-saved response mask over the replayed assistant span,
-        for CLEAN we just append this turn's prompt tail."""
+        """Append one turn into this SampleBuilder."""
         assert kind is not DriftKind.FORK, "append_turn called on a builder that would fork"
 
         is_first_turn = self.last_response_start_idx is None
 
         # --- append this turn's prompt tail (loss_mask=0) ---
-        if kind is DriftKind.REALIGN:
-            self._realign_to_prompt_preserving_response_mask(turn)
+        if turn.context_delta_ids is not None:
+            self._append_tokens(turn.context_delta_ids, loss_mask=0)
         else:  # CLEAN: held tokens are an exact prefix of prompt_ids; append the tail beyond them
             self._append_tokens(turn.prompt_ids[len(self.tokens) :], loss_mask=0)
 
@@ -217,11 +216,12 @@ class _SampleBuilder:
         if trained:
             response_mask = turn.loss_mask if turn.loss_mask is not None else 1
             policy_response_mask = turn.policy_loss_mask if turn.policy_loss_mask is not None else response_mask
+            response_logprobs = self._masked_logprobs(turn.output_log_probs, response_mask, len(turn.output_ids))
             self._append_tokens(
                 turn.output_ids,
                 loss_mask=response_mask,
                 policy_loss_mask=policy_response_mask,
-                logprobs=turn.output_log_probs,
+                logprobs=response_logprobs,
                 top_p_token_ids=turn.rollout_top_p_token_ids,
                 top_p_token_offsets=turn.rollout_top_p_token_offsets,
             )
@@ -229,46 +229,7 @@ class _SampleBuilder:
             self._append_tokens(turn.output_ids, loss_mask=0)
 
         if is_first_turn:
-            self.leading_prompt_len = len(turn.prompt_ids)
-
-    def _realign_to_prompt_preserving_response_mask(self, turn: TurnRecord) -> None:
-        """Heal REALIGN drift without erasing training signal from the generated turn.
-
-        The replayed prompt diverged inside the most recent assistant response.
-        Adopt the replayed assistant tokens so future turns prefix-match the
-        rendered chat template, but preserve the response mask/logprobs for the
-        part corresponding to the original generated action. Replay-only suffix
-        tokens, such as template end markers, stay masked as prompt context.
-        """
-        response_start = self.last_response_start_idx
-        assert response_start is not None
-        context_start = turn.prompt_context_start_idx
-        if context_start is None or context_start < response_start or context_start > len(turn.prompt_ids):
-            context_start = len(self.tokens)
-
-        old_mask = self.loss_mask[response_start:]
-        old_policy_mask = self.policy_loss_mask[response_start:]
-        old_logprobs = self.logprobs[response_start:]
-        old_top_p = self._top_p_slice(response_start, len(self.tokens))
-        replayed_response = turn.prompt_ids[response_start:context_start]
-        preserved = min(len(old_mask), len(replayed_response))
-
-        self.tokens[response_start:] = replayed_response
-        self.loss_mask[response_start:] = old_mask[:preserved] + [0] * (len(replayed_response) - preserved)
-        self.policy_loss_mask[response_start:] = old_policy_mask[:preserved] + [0] * (len(replayed_response) - preserved)
-        self.logprobs[response_start:] = old_logprobs[:preserved] + [0.0] * (len(replayed_response) - preserved)
-        self._truncate_top_p_tokens(response_start)
-        if old_top_p is not None:
-            token_ids, offsets = old_top_p
-            self._extend_top_p_tokens(
-                token_ids,
-                offsets[: preserved + 1],
-                expected_num_tokens=preserved,
-            )
-
-        context_tail = turn.prompt_ids[context_start:]
-        if context_tail:
-            self._append_tokens(context_tail, loss_mask=0)
+            self.leading_prompt_len = self.last_response_start_idx
 
     def _append_tokens(
         self,
@@ -300,6 +261,26 @@ class _SampleBuilder:
             self._extend_top_p_tokens(top_p_token_ids, top_p_token_offsets, expected_num_tokens=len(ids))
         elif self.top_p_token_offsets is not None:
             self.top_p_token_offsets.extend([self.top_p_token_offsets[-1]] * len(ids))
+        self._pad_top_p_offsets_to_tokens()
+
+    @staticmethod
+    def _masked_logprobs(
+        logprobs: list[float],
+        loss_mask: int | list[int],
+        token_count: int,
+    ) -> list[float]:
+        if not logprobs:
+            return [0.0] * token_count
+        values = list(logprobs)
+        if len(values) < token_count:
+            values.extend([0.0] * (token_count - len(values)))
+        else:
+            values = values[:token_count]
+        if isinstance(loss_mask, list):
+            return [float(value) if int(mask) == 1 else 0.0 for value, mask in zip(values, loss_mask, strict=True)]
+        if int(loss_mask) == 0:
+            return [0.0] * token_count
+        return [float(value) for value in values]
 
     def _extend_top_p_tokens(
         self,
@@ -327,11 +308,19 @@ class _SampleBuilder:
     def _top_p_slice(self, start: int, end: int) -> tuple[list[int], list[int]] | None:
         if self.top_p_token_ids is None or self.top_p_token_offsets is None:
             return None
+        self._pad_top_p_offsets_to_tokens()
         start_offset = self.top_p_token_offsets[start]
         end_offset = self.top_p_token_offsets[end]
         token_ids = self.top_p_token_ids[start_offset:end_offset]
         offsets = [offset - start_offset for offset in self.top_p_token_offsets[start : end + 1]]
         return token_ids, offsets
+
+    def _pad_top_p_offsets_to_tokens(self) -> None:
+        if self.top_p_token_offsets is None:
+            return
+        target_len = len(self.tokens) + 1
+        if len(self.top_p_token_offsets) < target_len:
+            self.top_p_token_offsets.extend([self.top_p_token_offsets[-1]] * (target_len - len(self.top_p_token_offsets)))
 
     def _truncate_top_p_tokens(self, length: int) -> None:
         if self.top_p_token_ids is None or self.top_p_token_offsets is None:
@@ -413,6 +402,11 @@ class TrajectoryManager:
             f"turn.policy_loss_mask length {len(turn.policy_loss_mask)} != "
             f"turn.output_ids length {len(turn.output_ids)}"
         )
+        if turn.context_delta_ids is not None:
+            assert len(turn.context_delta_ids) <= len(turn.prompt_ids), (
+                f"turn.context_delta_ids length {len(turn.context_delta_ids)} exceeds "
+                f"turn.prompt_ids length {len(turn.prompt_ids)}"
+            )
         assert (turn.rollout_top_p_token_ids is None) == (turn.rollout_top_p_token_offsets is None), (
             "turn.rollout_top_p_token_ids and turn.rollout_top_p_token_offsets must be set together"
         )

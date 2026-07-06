@@ -25,7 +25,13 @@ from slime.utils.episode_dump import save_rllm_episode_batch
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
-from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
+from slime.utils.metric_utils import (
+    compute_pass_at_k_and_pass_all,
+    compute_pass_rate,
+    compute_rollout_step,
+    compute_statistics,
+    dict_add_prefix,
+)
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.types import Sample
 
@@ -204,6 +210,7 @@ def convert_samples_to_train_data(
         if sample.remove_sample:
             policy_mask = [0] * sample.response_length
         assert len(policy_mask) == sample.response_length, f"policy loss mask length {len(policy_mask)} != response length {sample.response_length}"
+        policy_mask = [int(policy) & int(base) for policy, base in zip(policy_mask, loss_mask, strict=True)]
         policy_loss_masks.append(policy_mask)
         credit_assignment_events.append(event)
     if has_explicit_policy_mask:
@@ -1490,22 +1497,133 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
+        group_size = _eval_dataset_group_size(args, key)
+        log_dict |= dict_add_prefix(
+            compute_pass_at_k_and_pass_all(
+                flat_rewards=rewards,
+                group_size=group_size,
+            ),
+            f"eval/{key}/",
+        )
         if args.log_passrate:
             log_dict |= dict_add_prefix(
                 compute_pass_rate(
                     flat_rewards=rewards,
-                    group_size=args.n_samples_per_eval_prompt,
+                    group_size=group_size,
                 ),
                 f"eval/{key}-",
             )
+        if samples is not None:
+            log_dict |= dict_add_prefix(
+                _compute_eval_source_metrics(samples, rewards, group_size),
+                f"eval/{key}/",
+            )
 
-    logger.info(f"eval {rollout_id}: {log_dict}")
+    logger.info(f"eval {rollout_id}: {_format_eval_log_dict_for_display(log_dict)}")
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["eval/step"] = step
     logging_utils.log(args, log_dict, step_key="eval/step")
 
     return log_dict
+
+
+def _format_eval_log_dict_for_display(log_dict: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: round(float(value) * 100, 1) if _is_eval_percentage_metric(key, value) else value
+        for key, value in log_dict.items()
+    }
+
+
+def _is_eval_percentage_metric(key: str, value: Any) -> bool:
+    if not key.startswith("eval/") or isinstance(value, bool) or not isinstance(value, (int, float, np.floating)):
+        return False
+    if not np.isfinite(value) or value < 0 or value > 1:
+        return False
+    if key.count("/") == 1:
+        return True
+
+    percentage_markers = (
+        "pass@",
+        "pass^",
+        "ratio",
+        "rate",
+        "reward",
+        "rewards/",
+        "exact_match",
+    )
+    return any(marker in key for marker in percentage_markers)
+
+
+def _eval_dataset_group_size(args, dataset_name: str) -> int:
+    for dataset_cfg in getattr(args, "eval_datasets", []) or []:
+        if getattr(dataset_cfg, "name", None) == dataset_name:
+            return int(getattr(dataset_cfg, "n_samples_per_eval_prompt", 1))
+    return int(getattr(args, "n_samples_per_eval_prompt", 1))
+
+
+def _compute_eval_source_metrics(samples: list[Sample], rewards: list[float], group_size: int) -> dict[str, float]:
+    if len(samples) != len(rewards):
+        return {}
+
+    metrics: dict[str, float] = {}
+    indices_by_source: dict[str, list[int]] = {}
+    for i, sample in enumerate(samples):
+        source = _eval_source_from_sample(sample)
+        if source is None:
+            continue
+        indices_by_source.setdefault(source, []).append(i)
+
+    for source, indices in indices_by_source.items():
+        source_rewards = [rewards[i] for i in indices]
+        metrics[f"{source}/num_episdoes"] = len(source_rewards)
+        metrics[f"{source}/num_problems"] = len(source_rewards) // group_size
+        if len(source_rewards) % group_size != 0:
+            logger.warning(
+                "Skip pass metrics for eval source %s because %s rewards are not divisible by group size %s",
+                source,
+                len(source_rewards),
+                group_size,
+            )
+            continue
+        metrics |= dict_add_prefix(
+            compute_pass_at_k_and_pass_all(
+                flat_rewards=source_rewards,
+                group_size=group_size,
+            ),
+            f"{source}/",
+        )
+    return metrics
+
+
+def _eval_source_from_sample(sample: Sample) -> str | None:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    candidates = [
+        _nested_get(metadata, ("tools_kwargs", "search", "create_kwargs", "data_source")),
+        _nested_get(metadata, ("rllm_episode", "task", "tools_kwargs", "search", "create_kwargs", "data_source")),
+        metadata.get("benchmark"),
+        metadata.get("source"),
+    ]
+    for value in candidates:
+        if value:
+            return _normalize_eval_source_name(value)
+    return None
+
+
+def _nested_get(data: Any, keys: tuple[str, ...]) -> Any:
+    current = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _normalize_eval_source_name(value: Any) -> str:
+    source = str(value).strip()
+    if source.lower().startswith("searchr1_"):
+        source = source[len("searchR1_") :]
+    return source.lower().replace("-", "_").replace(" ", "_").replace("/", "_")
 
 
 def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_time):

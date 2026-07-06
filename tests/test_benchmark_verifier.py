@@ -369,5 +369,33 @@ def test_gpqa_ignores_tentative_choice_commitment():
 
 
 @pytest.mark.unit
+def test_frontierscience_olympiad_scores_short_final_answer():
+    sample = _sample(
+        response="Derivation omitted.\nFINAL ANSWER: \\(2.31 \\times 10^6 K\\)",
+        label="`\\( 2.31 \\times 10^6 K\\)`",
+        metadata={"data_source": "frontierscience_olympiad"},
+    )
+
+    assert asyncio.run(reward_func(None, sample)) == 1.0
+
+
+@pytest.mark.unit
+def test_frontierscience_research_scores_long_answer_with_rouge_l():
+    reference = "Preselect the initial state. Postselect a nearly orthogonal final state. The amplification factor follows from the weak value."
+    sample = _sample(
+        response=(
+            '<tool_call>{"name":"finish","arguments":{"command":"submit",'
+            '"result":"Preselect the initial state, then postselect a nearly orthogonal final state."}}</tool_call>'
+        ),
+        label=reference,
+        metadata={"data_source": "frontierscience_research"},
+    )
+
+    reward = asyncio.run(reward_func(None, sample))
+
+    assert 0.0 < reward < 1.0
+
+
+@pytest.mark.unit
 def test_extract_final_answer_supports_nested_boxed_braces():
     assert _extract_final_answer("Final: \\boxed{answer {with braces}}") == "answer {with braces}"

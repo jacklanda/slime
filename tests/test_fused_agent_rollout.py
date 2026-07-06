@@ -722,6 +722,39 @@ def test_initial_messages_include_tool_prompt():
     assert messages[1]["role"] == "user"
 
 
+def test_cot_initial_messages_do_not_include_fused_tool_prompt():
+    schemas = [web_search_schema(), finish_schema()]
+
+    messages = _initial_messages("cot", "web search", "Who?", schemas)
+
+    assert messages[0]["role"] == "system"
+    assert "<tools>" not in messages[0]["content"]
+    assert "web_search" not in messages[0]["content"]
+    assert "general agent" not in messages[0]["content"]
+    assert "research assistant" not in messages[0]["content"]
+
+
+def test_cot_generate_ignores_tool_calls_and_scores_as_reasoning_only(monkeypatch):
+    async def fail_step(self, action):
+        raise AssertionError(f"cot harness must not execute tools: {action}")
+
+    monkeypatch.setattr(FusedEnvironment, "step", fail_step)
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Find evidence"}),
+        [{"text": "\\boxed{answer}\n<tool_call>{\"name\":\"web_search\",\"arguments\":{\"query\":\"x\"}}</tool_call>"}],
+        {
+            "FUSED_HARNESS": "cot",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
+    )
+
+    sample = result[0]
+    assert sample.reward == 1.0
+    assert sample.metadata["fused_termination"] == "reasoning_only"
+    assert sample.metadata["fused_tool_call_turns"] == 0
+    assert sample.metadata["fused_reward_debug"]["tool_calls"] == 0
+
+
 def test_tool_observation_has_execution_output_header():
     observation = _format_tool_observation("web_search", "AHPL is a hardware description language.")
 
@@ -1395,6 +1428,39 @@ def verify(tools, answer):
     assert result[0].reward == 1.0
     assert result[0].response_length > 0
     assert any(result[0].loss_mask)
+
+
+def test_eval_generate_defers_reward_to_benchmark_verifier():
+    sample = Sample(
+        prompt="placeholder",
+        label="B",
+        metadata={
+            "question": "Which option is correct?",
+            "data_source": "gpqa_diamond",
+            "rm_type": "benchmark_verifier",
+            "choices": ["wrong", "right"],
+            "correct_letter": "B",
+        },
+    )
+
+    response = "After checking the choices, the final answer is B."
+    result = _run_generate_with_fake_sglang(
+        sample,
+        [{"text": response}],
+        {"FUSED_HARNESS": "cot"},
+        evaluation=True,
+    )
+
+    assert isinstance(result, list)
+    assert result[0].response == response
+    assert result[0].reward == 0.0
+
+    from slime.rollout import sglang_rollout
+    from slime.rollout.rm_hub.benchmark_verifier import reward_func
+
+    assert sglang_rollout._should_rescore_eval_sample(SimpleNamespace(rm_type=""), result[0], evaluation=True)
+
+    assert asyncio.run(reward_func(SimpleNamespace(hf_checkpoint=None), result[0], evaluation=True)) == 1.0
 
 
 def test_repeated_search_credit_assignment_masks_only_repeated_turn():
@@ -2184,6 +2250,219 @@ def test_mixed_tool_and_answer_credit_assignment_masks_only_error_turn():
         )
         == [1] * 5
     )
+
+
+def test_credit_assignment_policy_mask_never_unmasks_base_loss_mask_tokens():
+    base_loss_mask = [0, 0, 1, 1, 0, 1, 0]
+
+    assert fused_generate._credit_assignment_loss_mask(
+        output_len=len(base_loss_mask),
+        turn_index=0,
+        credit_event="mixed_tool_and_answer",
+        credit_step_index=0,
+        base_loss_mask=base_loss_mask,
+    ) == base_loss_mask
+
+    assert fused_generate._credit_assignment_loss_mask(
+        output_len=len(base_loss_mask),
+        turn_index=0,
+        credit_event="tool_parser_error",
+        credit_step_index=0,
+        parser_error_token_window=5,
+        base_loss_mask=base_loss_mask,
+    ) == [0, 0, 1, 1, 0, 1, 0]
+
+    assert fused_generate._credit_assignment_loss_mask(
+        output_len=len(base_loss_mask),
+        turn_index=0,
+        credit_event="too_many_tool_calls",
+        credit_step_index=0,
+        action_span=(1, 6),
+        base_loss_mask=base_loss_mask,
+    ) == [0, 0, 1, 1, 0, 1, 0]
+
+
+def test_record_pending_turns_credit_assignment_intersects_response_loss_mask():
+    manager = fused_generate.TrajectoryManager()
+    sid = "masked-thinking-credit"
+    output_ids = [101, 102, 103, 104, 105]
+    pending_turns = [
+        {
+            "turn": fused_generate.TurnRecord(
+                prompt_ids=[1, 2],
+                context_delta_ids=[1, 2],
+                output_ids=output_ids,
+                output_log_probs=[-0.1] * len(output_ids),
+                loss_mask=[0, 1, 0, 1, 1],
+                finish_reason="stop",
+            ),
+            "prompt_messages": [{"role": "user", "content": "x"}],
+            "response_message": {"role": "assistant", "content": "y"},
+            "metadata": {"sid": sid, "step": 0},
+            "credit_assignment_action_span": (1, 4),
+        }
+    ]
+
+    fused_generate._record_pending_turns(
+        manager,
+        session_id=sid,
+        pending_turns=pending_turns,
+        credit_event="tool_parser_error",
+        credit_step_index=0,
+        parser_error_token_window=256,
+    )
+    samples = manager.get_trajectory(sid, base_sample=Sample(index=0, prompt=""), reward=0.0)
+
+    assert len(samples) == 1
+    assert samples[0].loss_mask == [0, 1, 0, 1, 1]
+    assert samples[0].policy_loss_mask == [0, 1, 0, 1, 0]
+    assert samples[0].rollout_log_probs == [0.0, -0.1, 0.0, -0.1, -0.1]
+
+
+def test_record_pending_turns_credit_assignment_with_tito_context_masks_only_error_action():
+    manager = fused_generate.TrajectoryManager()
+    sid = "multi-turn-tito-action-span-credit"
+    first_output = [101, 102, 103]
+    context_delta = [201, 202, 203, 204]
+    second_output = [301, 302, 303, 304, 305, 306]
+    pending_turns = [
+        {
+            "turn": fused_generate.TurnRecord(
+                prompt_ids=[1, 2],
+                context_delta_ids=[1, 2],
+                output_ids=first_output,
+                output_log_probs=[-0.1] * len(first_output),
+                loss_mask=[1, 1, 1],
+                finish_reason="tool_calls",
+            ),
+            "prompt_messages": [{"role": "user", "content": "u"}],
+            "response_message": {"role": "assistant", "content": "a1"},
+            "metadata": {"sid": sid, "step": 0},
+        },
+        {
+            "turn": fused_generate.TurnRecord(
+                prompt_ids=[1, 2, *first_output, *context_delta],
+                context_delta_ids=context_delta,
+                output_ids=second_output,
+                output_log_probs=[-0.2] * len(second_output),
+                loss_mask=[1, 0, 1, 1, 0, 1],
+                finish_reason="stop",
+            ),
+            "prompt_messages": [
+                {"role": "user", "content": "u"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "tool", "content": "tool-observation"},
+            ],
+            "response_message": {"role": "assistant", "content": "a2"},
+            "metadata": {"sid": sid, "step": 1},
+            "credit_assignment_action_span": (1, 5),
+        },
+    ]
+
+    fused_generate._record_pending_turns(
+        manager,
+        session_id=sid,
+        pending_turns=pending_turns,
+        credit_event="repeated_search_query",
+        credit_step_index=1,
+        parser_error_token_window=256,
+    )
+    samples = manager.get_trajectory(
+        sid,
+        base_sample=Sample(index=0, prompt="", rollout_id=99),
+        reward=0.0,
+        extra_metadata={"credit_assignment_event": "repeated_search_query"},
+    )
+
+    assert len(samples) == 1
+    assert samples[0].loss_mask == [1, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1]
+    assert samples[0].policy_loss_mask == [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0]
+    assert samples[0].metadata["credit_assignment_event"] == "repeated_search_query"
+    assert samples[0].rollout_log_probs == [
+        -0.1,
+        -0.1,
+        -0.1,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -0.2,
+        0.0,
+        -0.2,
+        -0.2,
+        0.0,
+        -0.2,
+    ]
+
+
+def test_record_pending_turns_long_horizon_tito_credit_assignment_is_iterative_and_aligned():
+    manager = fused_generate.TrajectoryManager()
+    sid = "long-horizon-record-pending-turns"
+    pending_turns = []
+    expected_loss_mask = []
+    expected_logprobs = []
+    prompt_messages = [{"role": "user", "content": "u"}]
+    total_turns = 1005
+    for idx in range(total_turns):
+        context_delta = [10_000 + idx]
+        output_ids = [20_000 + idx * 3, 20_001 + idx * 3, 20_002 + idx * 3]
+        loss_mask = [1, 0, 1] if idx % 17 == 0 else [1, 1, 1]
+        if idx > 0:
+            expected_loss_mask.extend([0])
+            expected_logprobs.extend([0.0])
+        expected_loss_mask.extend(loss_mask)
+        expected_logprobs.extend([-0.5 if mask else 0.0 for mask in loss_mask])
+        response_message = {"role": "assistant", "content": f"a{idx}"}
+        pending_turns.append(
+            {
+                "turn": fused_generate.TurnRecord(
+                    prompt_ids=[1, 2, *context_delta],
+                    context_delta_ids=context_delta,
+                    output_ids=output_ids,
+                    output_log_probs=[-0.5] * len(output_ids),
+                    loss_mask=loss_mask,
+                    finish_reason="tool_calls" if idx + 1 < total_turns else "stop",
+                ),
+                "prompt_messages": list(prompt_messages),
+                "response_message": response_message,
+                "metadata": {"sid": sid, "step": idx},
+                "credit_assignment_action_span": (1, 3) if idx + 1 == total_turns else None,
+            }
+        )
+        prompt_messages.extend(
+            [
+                response_message,
+                {"role": "tool", "content": f"obs{idx}"},
+            ]
+        )
+
+    fused_generate._record_pending_turns(
+        manager,
+        session_id=sid,
+        pending_turns=pending_turns,
+        credit_event="max_turns_exceeded",
+        credit_step_index=total_turns - 1,
+        parser_error_token_window=256,
+    )
+    samples = manager.get_trajectory(
+        sid,
+        base_sample=Sample(index=0, prompt="", rollout_id=1005),
+        reward=0.0,
+        extra_metadata={"credit_assignment_event": "max_turns_exceeded"},
+    )
+
+    assert len(samples) == 1
+    sample = samples[0]
+    assert sample.response_length == len(expected_loss_mask)
+    assert sample.loss_mask == expected_loss_mask
+    assert sample.rollout_log_probs == expected_logprobs
+    assert sum(sample.policy_loss_mask) == 2
+    expected_policy_mask = [0] * sample.response_length
+    final_response_start = sample.response_length - len(pending_turns[-1]["turn"].output_ids)
+    expected_policy_mask[final_response_start + 1] = 1
+    expected_policy_mask[final_response_start + 2] = 1
+    assert sample.policy_loss_mask == expected_policy_mask
+    assert sample.metadata["credit_assignment_event"] == "max_turns_exceeded"
 
 
 def test_parser_error_credit_assignment_masks_only_error_turn_after_history(tmp_path: Path):

@@ -124,9 +124,9 @@ SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 COLOCATE="${COLOCATE:-false}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
-ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-16}"
+ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-8}"
 ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE:-16}}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE:-8}}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-1}}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 TAIL_GUARD="${TAIL_GUARD:-False}"
@@ -317,7 +317,12 @@ BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 default_experiment_name() {
    #local prefix="fused-dapo-q3-4b-no_think-gem-async-dev"
-   local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
+   #local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
+   #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
+   #local prefix="webqa-dapo-q3-4b-no_think-gem-sync-dev"
+   local prefix="webqa-dapo-q3-4b-think-gem-sync-dev"
+   #local prefix="webqa-dapo-q3.5-4b-no_think-gem-sync-dev"
+   #local prefix="mcp-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3.5-4b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-8b-no_think-gem-sync-dev"
@@ -346,10 +351,10 @@ elif [ "${SLIME_CLEANUP:-0}" = "1" ]; then
    echo "SLIME_CLEANUP=1 ignored because SLIME_CLEANUP_CONFIRM=1 is not set; preserving existing processes and artifacts."
 fi
 
-#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
+MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
-MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
+#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
 
 # Default tensor-parallel size depends on the model. Gated attention
@@ -394,15 +399,17 @@ DUMP_DETAILS="${DUMP_DETAILS:-${LOG_ROOT}/debug}"
 # one shuffled parquet before launching slime.
 DEFAULT_TRAIN_FILES=(
    #"${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
-   #"${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
-   "${SCRIPT_DIR}/artifacts/asearcher.parquet"
+   "${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
+   #"${SCRIPT_DIR}/artifacts/asearcher.parquet"
 )
 TRAIN_FILE_PATHS=("${DEFAULT_TRAIN_FILES[@]}")
 if [ -n "${TRAIN_FILES:-}" ]; then
    IFS=',' read -r -a TRAIN_FILE_PATHS <<< "${TRAIN_FILES}"
 fi
 #PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet}"
-PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/asearcher.parquet}"
+PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/search_data_final/train.parquet}"
+#PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet}"
+#PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/asearcher.parquet}"
 SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 
@@ -525,7 +532,7 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-38000}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-64}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"

@@ -29,6 +29,8 @@ Options:
   --show-rollout-progress-logs BOOL      Show periodic fused rollout request/progress logs. Default: false.
   --accepted-group-update-min-groups N   Maps to ROLLOUT_BATCH_SIZE by default.
   --accepted-group-update-max-groups N   Stored in env for compatible fused code.
+  --micro-batch-size N                   Training micro-batch size.
+  --update-weights-interval N            Rollout weight update interval. Default: 1.
   --async-mini-batch-size N              Maps to MICRO_BATCH_SIZE by default.
   --async-fwd-bwd-group-size N           Stored in env for compatible fused code.
   --async-staleness-threshold X          Stored in env for compatible fused code.
@@ -65,7 +67,7 @@ Options:
                                          Penalize turns that contain both a non-finish tool call and boxed/submit answer. Default: true.
   --credit-assignment-tail-guard-early-stop BOOL
                                          Stored in env for compatible fused code.
-  --horizon-reward-shaping BOOL         Enable bounded horizon penalty reward shaping. Default: true.
+  --horizon-reward-shaping BOOL         Enable bounded horizon penalty reward shaping. Default: false.
   --horizon-reward-min-multiplier X      Correct low-horizon reward multiplier floor. Default: 0.2.
   --horizon-reward-gamma X               Horizon progress exponent. Default: 1.0.
   --horizon-reward-step-weight X         Step progress weight. Default: 0.7.
@@ -73,29 +75,29 @@ Options:
   --horizon-reward-target-steps X        Target steps for no horizon penalty. Default: 8.
   --horizon-reward-target-tool-calls X   Target tool calls for no horizon penalty. Default: target_steps - 1.
   --enable-dynamic-sampling-filter BOOL  Enable DAPO-style non-zero reward variance dynamic filtering. Default: true.
-  --max-steps N                          Fused agent max steps.
-  --mcp-max-steps N                      Fused MCP max steps. Default: 16.
-  --web-search-max-steps N               Fused web-search max steps. Default: 4.
+  --max-steps N                          Fused agent max steps. Default: 128.
+  --mcp-max-steps N                      Fused MCP max steps. Default: 128.
+  --web-search-max-steps N               Fused web-search max steps. Default: 128.
   --cli-max-steps N                      CLI fused agent max steps env.
   --trajectory-timeout N                 Fused trajectory timeout env.
   --eval-trajectory-timeout N            Fused eval trajectory timeout env.
-  --eval-interval N                      Run interval eval every N rollout steps. Default: 10.
+  --eval-interval N                      Run interval eval every N rollout steps. Default: 300.
   --eval-config PATH                     Structured slime eval dataset config. Default: experiments/eval_fused_agent_benchmarks.yaml.
   --eval-prompt-data NAME PATH [...]     Legacy eval dataset name/path pairs.
   --eval-max-response-len N              Eval-only max generated tokens. Default: 16384.
   --eval-max-prompt-len N                Eval-only max prompt tokens. Default: 23616.
   --eval-max-context-len N               Eval-only context length. Default: prompt + response.
-  --val_before_train BOOL                Run one eval before training starts. Default: true.
+  --val_before_train BOOL                Run one eval before training starts. Default: false.
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
-  --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: false.
+  --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
   --grm-model NAME                       OpenRouter judge model. Default: deepseek/deepseek-v4-flash.
-  --grm-concurrency N                    Max concurrent GRM requests. Default: 128.
+  --grm-concurrency N                    Max concurrent GRM requests. Default: 512.
   --grm-timeout SECONDS                  GRM request timeout. Default: 60.
-  --grm-max-retries N                    GRM retry attempts. Default: 3.
-  --grm-max-trajectory-chars N           Trajectory chars sent to GRM. Default: 24000.
+  --grm-max-retries N                    GRM retry attempts. Default: 4.
+  --grm-max-trajectory-chars N           Trajectory chars sent to GRM. Default: 30000.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 64.
-  --sglang-max-running-requests N        SGLang max running requests. Default: 256.
+  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 2048.
+  --sglang-max-running-requests N        SGLang max running requests. Default: 2048.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
 EOF
@@ -120,6 +122,8 @@ ASYNC_MINI_BATCH_SIZE="${ASYNC_MINI_BATCH_SIZE:-128}"
 ASYNC_FWD_BWD_GROUP_SIZE="${ASYNC_FWD_BWD_GROUP_SIZE:-128}"
 ASYNC_STALENESS_THRESHOLD="${ASYNC_STALENESS_THRESHOLD:-1.0}"
 ASYNC_TRIGGER_PARAMETER_SYNC_STEP="${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-1}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE}}"
+UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-${ASYNC_TRIGGER_PARAMETER_SYNC_STEP}}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 TAIL_GUARD="${TAIL_GUARD:-False}"
 TAIL_GUARD_TIME_GUARD="${TAIL_GUARD_TIME_GUARD:-True}"
@@ -138,43 +142,43 @@ CREDIT_ASSIGNMENT_SEARCH_BYPASS="${CREDIT_ASSIGNMENT_SEARCH_BYPASS:-True}"
 CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL:-True}"
 CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER:-True}"
 CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP:-False}"
-HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-true}"
+HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
 FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT="${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT:-0.3}"
 FUSED_HORIZON_REWARD_TARGET_STEPS="${FUSED_HORIZON_REWARD_TARGET_STEPS:-8}"
 FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS="${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-}"
-MAX_STEPS="${MAX_STEPS:-64}"
-MCP_MAX_STEPS="${MCP_MAX_STEPS:-64}"
-WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-64}"
-CLI_MAX_STEPS="${CLI_MAX_STEPS:-96}"
+MAX_STEPS="${MAX_STEPS:-128}"
+MCP_MAX_STEPS="${MCP_MAX_STEPS:-128}"
+WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-128}"
+CLI_MAX_STEPS="${CLI_MAX_STEPS:-128}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-7200}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-300}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
 EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-false}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
-ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-false}}"
+ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
 GRM_MODEL="${GRM_MODEL:-deepseek/deepseek-v4-flash}"
-GRM_CONCURRENCY="${GRM_CONCURRENCY:-128}"
+GRM_CONCURRENCY="${GRM_CONCURRENCY:-512}"
 GRM_MAX_CONNECTIONS="${GRM_MAX_CONNECTIONS:-128}"
 GRM_TIMEOUT="${GRM_TIMEOUT:-60}"
-GRM_MAX_RETRIES="${GRM_MAX_RETRIES:-3}"
-GRM_RETRY_BASE_DELAY="${GRM_RETRY_BASE_DELAY:-0.5}"
-GRM_RETRY_MAX_DELAY="${GRM_RETRY_MAX_DELAY:-8.0}"
-GRM_MAX_TRAJECTORY_CHARS="${GRM_MAX_TRAJECTORY_CHARS:-24000}"
+GRM_MAX_RETRIES="${GRM_MAX_RETRIES:-4}"
+GRM_RETRY_BASE_DELAY="${GRM_RETRY_BASE_DELAY:-1}"
+GRM_RETRY_MAX_DELAY="${GRM_RETRY_MAX_DELAY:-16.0}"
+GRM_MAX_TRAJECTORY_CHARS="${GRM_MAX_TRAJECTORY_CHARS:-30000}"
 GRM_MAX_TOKENS="${GRM_MAX_TOKENS:-128}"
-GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.0}"
+GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.6}"
 GRM_FAILURE_REWARD="${GRM_FAILURE_REWARD:-0.0}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-64}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-256}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-2048}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-2048}"
 harness_explicit=false
 
 while [ "$#" -gt 0 ]; do
@@ -193,10 +197,12 @@ while [ "$#" -gt 0 ]; do
       --show-rollout-progress-logs) SHOW_ROLLOUT_PROGRESS_LOGS="${2:?Missing value for --show-rollout-progress-logs}"; shift 2 ;;
       --accepted-group-update-min-groups) ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${2:?Missing value for --accepted-group-update-min-groups}"; shift 2 ;;
       --accepted-group-update-max-groups) ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${2:?Missing value for --accepted-group-update-max-groups}"; shift 2 ;;
-      --async-mini-batch-size) ASYNC_MINI_BATCH_SIZE="${2:?Missing value for --async-mini-batch-size}"; shift 2 ;;
+      --micro-batch-size) MICRO_BATCH_SIZE="${2:?Missing value for --micro-batch-size}"; shift 2 ;;
+      --update-weights-interval) UPDATE_WEIGHTS_INTERVAL="${2:?Missing value for --update-weights-interval}"; shift 2 ;;
+      --async-mini-batch-size) ASYNC_MINI_BATCH_SIZE="${2:?Missing value for --async-mini-batch-size}"; MICRO_BATCH_SIZE="${ASYNC_MINI_BATCH_SIZE}"; shift 2 ;;
       --async-fwd-bwd-group-size) ASYNC_FWD_BWD_GROUP_SIZE="${2:?Missing value for --async-fwd-bwd-group-size}"; shift 2 ;;
       --async-staleness-threshold) ASYNC_STALENESS_THRESHOLD="${2:?Missing value for --async-staleness-threshold}"; shift 2 ;;
-      --async-trigger-parameter-sync-step) ASYNC_TRIGGER_PARAMETER_SYNC_STEP="${2:?Missing value for --async-trigger-parameter-sync-step}"; shift 2 ;;
+      --async-trigger-parameter-sync-step) ASYNC_TRIGGER_PARAMETER_SYNC_STEP="${2:?Missing value for --async-trigger-parameter-sync-step}"; UPDATE_WEIGHTS_INTERVAL="${ASYNC_TRIGGER_PARAMETER_SYNC_STEP}"; shift 2 ;;
       --retrieval-mode) RLLM_RETRIEVAL_MODE="${2:?Missing value for --retrieval-mode}"; shift 2 ;;
       --retrieval-max-words) RLLM_RETRIEVAL_MAX_WORDS="${2:?Missing value for --retrieval-max-words}"; shift 2 ;;
       --retrieval-retry-budget) RLLM_RETRIEVAL_RETRY_BUDGET="${2:?Missing value for --retrieval-retry-budget}"; shift 2 ;;
@@ -325,6 +331,27 @@ fi
 
 MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
+NUM_GPUS="${NUM_GPUS:-8}"
+
+# Default tensor-parallel size depends on the model. Gated attention
+# (--attention-output-gate, qwen3.5) is broken in Megatron when
+# num_query_groups < TP: the per-rank query head re-slice (attention.py step 4)
+# is not mirrored on the gate tensor, so gate.view() fails with a size mismatch
+# (factor = TP // num_query_groups). qwen3.5-4B has num_query_groups=4, so its TP
+# must be <= 4. Non-gated models (qwen3-4B, num_query_groups=8) keep TP=8.
+if printf '%s\n' "${MODEL_ARGS[@]}" | grep -q -- "--attention-output-gate"; then
+   DEFAULT_TP_SIZE=4
+else
+   DEFAULT_TP_SIZE=8
+fi
+
+ACTOR_GPUS="${ACTOR_GPUS:-4}"
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-$((NUM_GPUS - ACTOR_GPUS))}"
+
+# TP cannot exceed the number of actor GPUs.
+if [ "${DEFAULT_TP_SIZE}" -gt "${ACTOR_GPUS}" ]; then
+   DEFAULT_TP_SIZE="${ACTOR_GPUS}"
+fi
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
 MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
@@ -354,6 +381,7 @@ SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 
 CUSTOM_GENERATE_FUNCTION_PATH="${CUSTOM_GENERATE_FUNCTION_PATH:-slime.rollout.fused_agent.generate.generate}"
+EVAL_FUNCTION_PATH="${EVAL_FUNCTION_PATH:-slime.rollout.sglang_rollout.generate_rollout}"
 CUSTOM_RM_PATH="${CUSTOM_RM_PATH:-}"
 CUSTOM_REWARD_POST_PROCESS_PATH="${CUSTOM_REWARD_POST_PROCESS_PATH:-}"
 if is_truthy "${HORIZON_REWARD_SHAPING}" && [ -z "${CUSTOM_REWARD_POST_PROCESS_PATH}" ]; then
@@ -473,11 +501,12 @@ MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
-N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-64}"
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
-NUM_EPOCH="${NUM_EPOCH:-10}"
+NUM_EPOCH="${NUM_EPOCH:-100}"
 EFFECTIVE_GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT / NUM_STEPS_PER_ROLLOUT))}"
-ENABLE_DYNAMIC_SAMPLING_FILTER="${ENABLE_DYNAMIC_SAMPLING_FILTER:-false}"
+ENABLE_DYNAMIC_SAMPLING_FILTER="${ENABLE_DYNAMIC_SAMPLING_FILTER:-true}"
 DYNAMIC_SAMPLING_FILTER_PATH="${DYNAMIC_SAMPLING_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
 FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS="${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS:-8192}"
 if ! is_truthy "${ENABLE_DYNAMIC_SAMPLING_FILTER}"; then
@@ -522,8 +551,26 @@ CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}"
    --ref-load "${REF_LOAD}"
    --save "${SAVE_DIR}"
-   --save-interval "${SAVE_INTERVAL:-500}"
+   --save-interval "${SAVE_INTERVAL:-10}"
 )
+# Resume training state (model/optimizer/rng/step + rollout data state) from an
+# existing Megatron checkpoint dir. Defaults to SAVE_DIR so a re-launch with the
+# same EXPERIMENT_NAME continues from the latest saved iteration. Set LOAD=""
+# explicitly to force a fresh start from the HF/ref checkpoint.
+LOAD="${LOAD-${SAVE_DIR}}"
+if [ -n "${LOAD}" ]; then
+   CKPT_ARGS+=(--load "${LOAD}")
+fi
+
+# When resuming a checkpoint saved under a different TP (e.g. migrating a TP=8
+# colocate run to a TP=4 non-colocate layout), the DistributedOptimizer state
+# uses sharding type dp_reshardable which cannot be resharded across TP. Set
+# NO_LOAD_OPTIM=1 for that one migration launch to load only the (TP-reshardable)
+# model weights and reinit the optimizer/RNG. New checkpoints this run saves are
+# TP=4-native, so later resumes do NOT need this flag.
+if is_truthy "${NO_LOAD_OPTIM:-false}"; then
+   CKPT_ARGS+=(--no-load-optim --no-load-rng)
+fi
 
 ROLLOUT_ARGS=(
    --rollout-function-path "${ROLLOUT_FUNCTION_PATH}"
@@ -537,6 +584,7 @@ ROLLOUT_ARGS=(
 
    --num-rollout "${NUM_ROLLOUT}"
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
+   --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE}"
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
    --rollout-max-context-len "${MAX_CONTEXT_LEN}"
    --rollout-max-prompt-len "${MAX_PROMPT_LENGTH}"
@@ -617,7 +665,7 @@ if [ -n "${CUSTOM_REWARD_POST_PROCESS_PATH}" ]; then
 fi
 EVAL_ARGS=()
 if [ -n "${EVAL_INTERVAL}" ]; then
-   EVAL_ARGS+=(--eval-interval "${EVAL_INTERVAL}")
+   EVAL_ARGS+=(--eval-interval "${EVAL_INTERVAL}" --eval-function-path "${EVAL_FUNCTION_PATH}")
    if [ -n "${EVAL_CONFIG}" ]; then
       EVAL_ARGS+=(--eval-config "${EVAL_CONFIG}")
    elif [ "${#EVAL_PROMPT_DATA[@]}" -gt 0 ]; then
@@ -641,7 +689,7 @@ if [ -n "${DUMP_DETAILS}" ]; then
 fi
 
 PERF_ARGS=(
-   --tensor-model-parallel-size "${TP_SIZE:-4}"
+   --tensor-model-parallel-size "${TP_SIZE:-${DEFAULT_TP_SIZE}}"
    --sequence-parallel
    --pipeline-model-parallel-size "${PP_SIZE:-1}"
    --context-parallel-size "${CP_SIZE:-1}"
@@ -652,9 +700,10 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   --micro-batch-size "${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE}}"
+   --micro-batch-size "${MICRO_BATCH_SIZE}"
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
    --log-probs-max-tokens-per-gpu "${LOG_PROBS_MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
+   --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE:-512}"
 )
 
 if [ "${USE_DYNAMIC_BATCH_SIZE:-1}" = "1" ]; then
@@ -693,7 +742,7 @@ fi
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr "${LR:-1e-6}"
+   --lr "${LR:-2e-6}"
    --lr-decay-style constant
    --weight-decay "${WEIGHT_DECAY:-0.05}"
    --adam-beta1 0.9
@@ -718,6 +767,10 @@ if [ "${USE_WANDB:-1}" = "1" ]; then
       --wandb-group "${WANDB_GROUP:-${EXPERIMENT_NAME}}"
       --disable-wandb-random-suffix
    )
+   # Resume an existing wandb run (same curves) instead of creating a new one.
+   if [ -n "${WANDB_RUN_ID:-}" ]; then
+      WANDB_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")
+   fi
 fi
 
 MISC_ARGS=(
@@ -726,6 +779,7 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
+   --train-env-vars '{"TMS_INIT_ENABLE_CPU_BACKUP":"0"}'
 )
 
 if [ "${PRINT_ROLLOUT_TRAJECTORY:-1}" = "1" ]; then
@@ -738,10 +792,7 @@ fi
 export SCRIPT_DIR REPO_ROOT MEGATRON_LM_PATH HAS_NVLINK
 export SLIME_EPISODE_LOG_DIR="${EPISODE_LOG_DIR}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-export NUM_GPUS="${NUM_GPUS:-8}"
-
-ACTOR_GPUS="${ACTOR_GPUS:-4}"
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-$((NUM_GPUS - ACTOR_GPUS))}"
+export NUM_GPUS
 
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
@@ -752,6 +803,7 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
 export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-10000000000}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
+export OPENROUTER_APP_NAME="${OPENROUTER_APP_NAME:-GRM}"
 
 # Fused-agent service knobs inherited from the rllm launcher. They are runtime
 # env only; current slime code consumes the subset used by selected generators.
@@ -789,7 +841,7 @@ export FUSED_WEB_SEARCH_MAX_STEPS="${FUSED_WEB_SEARCH_MAX_STEPS:-${WEB_SEARCH_MA
 export FUSED_CLI_MAX_STEPS="${CLI_MAX_STEPS}"
 export FUSED_TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT}"
 export FUSED_EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT}"
-export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-1024}"
+export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-2048}"
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE}"
 export SLIME_FUSED_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS}"
@@ -857,7 +909,8 @@ keys = (
     "RLLM_MCP_MAX_ACTIVE_SERVERS", "RLLM_MCP_PREFILTER_WORKERS", "RLLM_MCP_DISABLE_STEP_PENALTY",
     "FUSED_HARNESS", "FUSED_UNIFIED_SYSTEM_PROMPT", "FUSED_DISABLE_THINKING",
     "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS", "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
-    "FUSED_EVAL_TRAJECTORY_TIMEOUT", "PER_STEP_MAX_TOKENS", "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH",
+    "FUSED_EVAL_TRAJECTORY_TIMEOUT", "SLIME_ROLLOUT_GROUP_TIMEOUT", "SLIME_EVAL_ROLLOUT_GROUP_TIMEOUT",
+    "PER_STEP_MAX_TOKENS", "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH",
     "SLIME_FUSED_TERMINAL_LOG_STYLE", "SLIME_FUSED_PROGRESS_LOGS", "SLIME_FUSED_ASYNC_FWD_BWD_GROUP_SIZE",
     "SLIME_FUSED_ASYNC_STALENESS_THRESHOLD", "SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS",
     "SLIME_FUSED_TAIL_GUARD", "SLIME_FUSED_TAIL_GUARD_TIME_GUARD",
@@ -888,6 +941,7 @@ env = {k: os.environ[k] for k in keys if k in os.environ}
 env["PYTHONPATH"] = f"{os.environ['MEGATRON_LM_PATH']}:{os.environ['REPO_ROOT']}:{os.environ['SCRIPT_DIR']}"
 env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 env["NCCL_NVLS_ENABLE"] = os.environ["HAS_NVLINK"]
+env["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"
 print(json.dumps({"env_vars": env}))
 PY
 )
@@ -905,10 +959,11 @@ echo "W&B enabled: ${USE_WANDB:-0}"
 echo "Custom generate: ${CUSTOM_GENERATE_FUNCTION_PATH:-<stock slime rollout>}"
 echo "Custom reward post-process: ${CUSTOM_REWARD_POST_PROCESS_PATH:-<vanilla>}"
 echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
+echo "Eval function: ${EVAL_FUNCTION_PATH}"
 echo "Actor GPUs: ${ACTOR_GPUS}, rollout GPUs: ${ROLLOUT_GPUS}"
 echo "SGLang concurrency: server=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}"
 echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
-echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; async mini_batch=${ASYNC_MINI_BATCH_SIZE}, sync_interval=${ASYNC_TRIGGER_PARAMETER_SYNC_STEP}"
+echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; micro_batch=${MICRO_BATCH_SIZE}, async_fwd_bwd_group_size=${ASYNC_FWD_BWD_GROUP_SIZE}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}, async_staleness=${ASYNC_STALENESS_THRESHOLD}"
 echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}, grm=${ENABLE_USE_GRM_EVALS}"
 echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, relax_after_groups=${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}"
@@ -969,7 +1024,7 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node "${ACTOR_GPUS}" \
    --rollout-num-gpus "${ROLLOUT_GPUS}" \
-   --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL:-${ASYNC_TRIGGER_PARAMETER_SYNC_STEP}}" \
+   --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL}" \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \

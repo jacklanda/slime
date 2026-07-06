@@ -666,8 +666,8 @@ def test_2_3_drift_case_A_forks():
     print("PASS 2.3")
 
 
-def test_2_4_drift_case_B1_short_replaces():
-    """Small drift inside the most-recent response span -> replace."""
+def test_2_4_drift_case_B1_short_forks():
+    """Drift inside the most-recent response span forks instead of realigning."""
     mgr = TrajectoryManager()  # default threshold 1024
     sid = "2.4"
     s, u, a1, t = sys_msg("S"), usr_msg("u"), asst_msg("call"), tool_msg("t")
@@ -678,20 +678,19 @@ def test_2_4_drift_case_B1_short_replaces():
     p2 = drift_replace(p2_honest, drift_idx)
     p2, r2 = append(mgr, sid, [s, u, a1, t], "done", prompt_ids=p2, logprobs=[-0.4] * 2)
     samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
-    assert len(samples) == 1
-    s0 = samples[0]
-    L = _common_prefix_len(p1 + r1, p2)
-    assert L == drift_idx
-    # realign: the replayed prompt drifted inside r:call, but r:call was still a
-    # real generated action from the previous turn. Keep that action trainable
-    # and append only the replayed tool/gen tail as loss=0 context.
+    assert len(samples) == 2
+    # Strict TITO does not adopt replay-mutated assistant tokens while preserving
+    # the old response logprobs. Without explicit context_delta_ids, unproven
+    # prompt drift becomes a segment boundary.
     assert goldens(samples) == [
-        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:call] [<DRIFT>] "
+        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:call] [</ast>]",
+        "<sys> system:S </sys> <usr> user:u </usr> <gen> r:call <DRIFT> "
         "<tul> tool:t </tul> <gen> [r:done] [</ast>]",
     ]
-    assert s0.rollout_log_probs == [-0.5] * len(r1) + [0.0] * (len(p2) - len(p1) - len(r1)) + [-0.4] * len(r2)
+    assert samples[0].rollout_log_probs == [-0.5] * len(r1)
+    assert samples[1].rollout_log_probs == [-0.4] * len(r2)
     _check_invariants(samples)
-    _record("2.4 drift case B1 (small) -> replace", mgr, sid, samples)
+    _record("2.4 drift case B1 (small) -> fork", mgr, sid, samples)
     print("PASS 2.4")
 
 
@@ -1244,12 +1243,13 @@ def test_4_6_top_p_replay_fields_are_sliced_to_response_region():
     _check_invariants(samples)
 
 
-def test_4_6_drift_B1_threshold_boundary():
-    """case-B1 threshold compares the incoming turn's full ``output_ids`` length
-    to ``fork_threshold`` (mirroring ``_try_merge_assistant_rewrite``): the gate
-    is exclusive, so ``len(r2) == threshold`` forks and ``len(r2) < threshold``
-    replaces. Drift-tail length is not part of the gate -- only its position
-    (inside the most-recent response span) keeps REALIGN physically applicable."""
+def test_4_6_drift_B1_always_forks_without_strict_delta():
+    """Prompt drift without context_delta_ids always forks.
+
+    ``fork_threshold`` still gates assistant-message rewrite merging, but no
+    longer permits token-level REALIGN. This keeps rollout logprobs attached only
+    to the exact generated token ids that produced them.
+    """
 
     def run(threshold, new_resp_len):
         mgr = TrajectoryManager(fork_threshold_tokens=threshold)
@@ -1288,12 +1288,13 @@ def test_4_6_drift_B1_threshold_boundary():
     assert forked[0].loss_mask == [1] * len(r1)
     assert forked[1].tokens == p2 + r2
     assert forked[1].loss_mask == [1] * len(r2)
-    # len(r2) < threshold -> replace: one coherent segment realigned to p2.
+    # len(r2) < threshold used to replace. Strict TITO now forks here too.
     replaced, p1b, r1b, p2b, r2b = run(threshold=3, new_resp_len=2)
-    assert len(replaced) == 1, f"len(r2)<threshold must replace, got {len(replaced)}"
-    tail_start = len(p1b) + len(r1b)
-    assert replaced[0].tokens == p2b + r2b
-    assert replaced[0].loss_mask == [1] * len(r1b) + [0] * (len(p2b) - tail_start) + [1] * len(r2b)
+    assert len(replaced) == 2, f"prompt drift without context_delta_ids must fork, got {len(replaced)}"
+    assert replaced[0].tokens == p1b + r1b
+    assert replaced[0].loss_mask == [1] * len(r1b)
+    assert replaced[1].tokens == p2b + r2b
+    assert replaced[1].loss_mask == [1] * len(r2b)
     _check_invariants(forked)
     _check_invariants(replaced)
     print("PASS 4.6")
@@ -1379,7 +1380,7 @@ _CASES = [
     test_2_1_single_turn_linearize,
     test_2_2_clean_multiturn_linearize,
     test_2_3_drift_case_A_forks,
-    test_2_4_drift_case_B1_short_replaces,
+    test_2_4_drift_case_B1_short_forks,
     test_2_5_drift_case_B1_long_forks,
     test_2_6_drift_case_B1_threshold_zero_forks,
     test_2_7_drift_case_B2_earlier_turn_forks,
@@ -1400,7 +1401,7 @@ _CASES = [
     test_4_3_empty_prompt_messages_skipped,
     test_4_4_default_base_sample,
     test_4_5_mixed_logprobs_across_turns,
-    test_4_6_drift_B1_threshold_boundary,
+    test_4_6_drift_B1_always_forks_without_strict_delta,
 ]
 
 

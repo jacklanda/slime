@@ -127,6 +127,46 @@ def test_split_with_per_mb_denom_would_be_wrong():
 
 
 @pytest.mark.unit
+def test_policy_rollout_denom_handles_zero_policy_sibling():
+    """A sibling sample can be kept for reward/advantage while contributing no
+    policy tokens. The policy reducer must normalize by the rollout's policy
+    token total, not by response/loss tokens from the zero-policy sibling."""
+    total_lengths = [7, 7]
+    response_lengths = [3, 3]
+    policy_masks = [
+        torch.tensor([0, 0, 0], dtype=torch.float32),
+        torch.tensor([1, 0, 1], dtype=torch.float32),
+    ]
+    policy_denoms = _denoms(2, 2)
+    x = torch.tensor([10.0, 20.0, 30.0, 1.0, 100.0, 3.0])
+
+    reducer = get_sum_of_sample_mean(total_lengths, response_lengths, policy_masks, policy_denoms)
+
+    assert reducer(x).item() == pytest.approx((1.0 + 3.0) / 2.0)
+
+
+@pytest.mark.unit
+def test_policy_rollout_denom_all_zero_is_finite_zero():
+    """Direct-submit/tail-guard style rollouts may carry zero policy tokens.
+    The clamp-min denominator keeps the reducer finite, while the all-zero
+    policy mask keeps the contribution exactly zero."""
+    total_lengths = [6, 6]
+    response_lengths = [2, 2]
+    policy_masks = [
+        torch.tensor([0, 0], dtype=torch.float32),
+        torch.tensor([0, 0], dtype=torch.float32),
+    ]
+    policy_denoms = _denoms(0, 0)
+    x = torch.tensor([10.0, 20.0, 30.0, 40.0])
+
+    reducer = get_sum_of_sample_mean(total_lengths, response_lengths, policy_masks, policy_denoms)
+    value = reducer(x)
+
+    assert torch.isfinite(value)
+    assert value.item() == pytest.approx(0.0)
+
+
+@pytest.mark.unit
 def test_cp_chunking_preserves_per_rollout_mean_report(monkeypatch):
     """Turning CP on must not change the reducer's output.
 

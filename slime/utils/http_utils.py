@@ -9,7 +9,46 @@ import socket
 
 import httpx
 
+try:
+    import orjson
+except ImportError:  # pragma: no cover - optional fast path
+    orjson = None
+
 logger = logging.getLogger(__name__)
+
+# Responses at least this large (e.g. SGLang generate payloads carrying
+# per-token logprobs) are JSON-decoded in a worker thread so a wave of
+# concurrent responses cannot monopolize the event loop and stall request
+# dispatch for every other in-flight call.
+_JSON_OFFLOAD_MIN_BYTES = int(os.environ.get("SLIME_HTTP_JSON_OFFLOAD_MIN_BYTES", "32768"))
+
+
+def _json_dumps_bytes(payload) -> bytes:
+    # Pre-serializing the request body (instead of httpx's json=) matters on
+    # the rollout event loop: a fused-agent generate payload carries up to
+    # ~38k input_ids and stdlib-json serialization inside httpx costs ~1.6ms
+    # per request on the loop thread, vs ~0.2ms via orjson.
+    if orjson is not None:
+        try:
+            return orjson.dumps(payload)
+        except (TypeError, ValueError):
+            # orjson is stricter than stdlib json (non-str dict keys,
+            # out-of-range ints, ...); fall back so any payload stdlib
+            # accepted before is still accepted.
+            pass
+    return json.dumps(payload).encode()
+
+
+def _json_loads(content):
+    if orjson is not None:
+        try:
+            return orjson.loads(content)
+        except Exception:
+            # orjson is stricter than stdlib json (e.g. rejects NaN/Infinity
+            # literals), so fall back to keep accepted payloads identical.
+            pass
+    return json.loads(content)
+
 
 SLIME_HOST_IP_ENV = "SLIME_HOST_IP"
 
@@ -163,15 +202,22 @@ def _next_actor():
 
 
 async def _post(client, url, payload, max_retries=60, headers=None):
+    body = _json_dumps_bytes(payload or {})
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
     retry_count = 0
     while retry_count < max_retries:
         response = None
         try:
-            response = await client.post(url, json=payload or {}, headers=headers)
+            response = await client.post(url, content=body, headers=request_headers)
             response.raise_for_status()
             content = await response.aread()
             try:
-                output = json.loads(content)
+                if len(content) >= _JSON_OFFLOAD_MIN_BYTES:
+                    output = await asyncio.to_thread(_json_loads, content)
+                else:
+                    output = _json_loads(content)
             except json.JSONDecodeError:
                 output = content.decode() if isinstance(content, bytes) else content
         except asyncio.CancelledError:
@@ -184,9 +230,7 @@ async def _post(client, url, payload, max_retries=60, headers=None):
             else:
                 response_text = None
 
-            logger.info(
-                f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
-            )
+            logger.info(f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})")
             if retry_count >= max_retries:
                 logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
                 raise e
@@ -315,5 +359,5 @@ async def get(url):
     response = await _http_client.get(url)
     response.raise_for_status()
     content = await response.aread()
-    output = json.loads(content)
+    output = _json_loads(content)
     return output

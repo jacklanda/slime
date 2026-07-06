@@ -92,6 +92,12 @@ def _score_sample(sample: Sample) -> float:
             ground_truth = {"metric": "token_f1", "target": ground_truth}
         return _score_search_r1_like(sample.response, ground_truth)
 
+    if data_source == "frontierscience_research":
+        ground_truth = _reward_ground_truth(label, metadata)
+        if not isinstance(ground_truth, dict):
+            ground_truth = {"metric": "rouge_l", "target": ground_truth}
+        return _score_search_r1_like(sample.response, ground_truth)
+
     if data_source in {"gpqa_diamond", "gpqa"}:
         return _score_choice_letter(sample.response, label, metadata=_gpqa_metadata(metadata, label))
 

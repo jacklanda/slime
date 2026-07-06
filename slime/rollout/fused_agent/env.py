@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import inspect
 import json
@@ -21,6 +22,27 @@ from .parser import ToolCall, tool_schema
 from .prompts import finish_schema, web_search_schema
 
 logger = logging.getLogger(__name__)
+
+# One keepalive HTTP session per event loop for retrieval/summarize calls.
+# The previous per-call ClientSession forced a fresh TCP handshake for every
+# web_search; under a wave of hundreds of concurrent searches that both
+# multiplied connection churn and, with a starved event loop, left hundreds
+# of half-set-up connections whose request bodies were never sent.
+_shared_http_session: aiohttp.ClientSession | None = None
+_shared_http_session_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_shared_http_session() -> aiohttp.ClientSession:
+    global _shared_http_session, _shared_http_session_loop
+    loop = asyncio.get_running_loop()
+    if _shared_http_session is None or getattr(_shared_http_session, "closed", False) or _shared_http_session_loop is not loop:
+        _shared_http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=120),
+            connector=aiohttp.TCPConnector(limit=0, ttl_dns_cache=300),
+        )
+        _shared_http_session_loop = loop
+    return _shared_http_session
+
 
 WEB_SEARCH_OBSERVATION_MAX_WORDS = 256
 _RETRIEVAL_CHUNK_WORD_BUDGET = 256
@@ -214,19 +236,37 @@ def _coerce_kwargs(fn: Callable[..., Any], arguments: dict[str, Any]) -> dict[st
 
 
 class FusedEnvironment:
-    def __init__(self, task: dict[str, Any], *, retrieval_url: str | None = None, retrieval_max_results: int = 5):
+    def __init__(
+        self,
+        task: dict[str, Any],
+        *,
+        retrieval_url: str | None = None,
+        retrieval_max_results: int = 5,
+        enable_tools: bool = True,
+    ):
         self.task = normalize_task(task)
         self.mode = resolve_task_mode(self.task)
         self.retrieval_url = retrieval_url or os.environ.get("RETRIEVAL_SERVER_URL", "http://127.0.0.1:65432")
         self.retrieval_max_results = retrieval_max_results
+        self.enable_tools = enable_tools
         self.answer = ""
         self.tool_calls = 0
         self.web_search_queries: set[str] = set()
         self.reward_debug: dict[str, Any] = {}
-        self.mcp_tools = LocalMCPToolset(self.task) if self.mode == "mcp" else None
-        self.docker_env = DockerTaskEnvironment(self.task, mode=self.mode) if self.mode in {"cli", "et"} else None
+        self.mcp_tools = LocalMCPToolset(self.task) if enable_tools and self.mode == "mcp" else None
+        self.docker_env = DockerTaskEnvironment(self.task, mode=self.mode) if enable_tools and self.mode in {"cli", "et"} else None
 
     def reset(self) -> tuple[str, dict[str, Any]]:
+        if not self.enable_tools:
+            question = (
+                self.task.get("question")
+                or self.task.get("query")
+                or self.task.get("input")
+                or self.task.get("problem_statement")
+                or self.task.get("prompt")
+                or self._question_from_environment()
+            )
+            return str(question), {"task_type": self.mode}
         if self.mode == "mcp":
             question = self.task.get("question") or self.task.get("problem_statement") or self._question_from_environment()
             info = {"task_type": "mcp", "tools_json": self.tools(), "difficulty": self.task.get("difficulty", "")}
@@ -252,6 +292,8 @@ class FusedEnvironment:
         return json.dumps(self.task.get("reward_model") or {}, ensure_ascii=False)
 
     def tools(self) -> list[dict]:
+        if not self.enable_tools:
+            return [finish_schema()]
         if self.mode == "mcp" and self.mcp_tools is not None:
             return self.mcp_tools.schemas()
         if self.mode in {"cli", "et"} and self.docker_env is not None:
@@ -293,10 +335,15 @@ class FusedEnvironment:
                 return f"Error: MCP tools failed to load: {self.mcp_tools.load_error}", 0.0, False, {"tools/load_error": 1}
             started_at = _now_monotonic()
             result = self.mcp_tools.call(name, args)
-            return result, 0.0, False, {
-                "tools/calls": self.tool_calls,
-                "tools/mcp_tool_elapsed_s": _now_monotonic() - started_at,
-            }
+            return (
+                result,
+                0.0,
+                False,
+                {
+                    "tools/calls": self.tool_calls,
+                    "tools/mcp_tool_elapsed_s": _now_monotonic() - started_at,
+                },
+            )
         if self.mode in {"cli", "et"} and self.docker_env is not None:
             return self.docker_env.step(name, args)
         return f"Error: tool {name} is not available for task mode {self.mode}", 0.0, False, {}
@@ -334,14 +381,13 @@ class FusedEnvironment:
         }
         retrieve_started_at = _now_monotonic()
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
-                data, retrieve_retries = await _post_json_with_retries(
-                    session,
-                    _normalize_retrieve_url(self.retrieval_url),
-                    payload,
-                    retry_budget=retrieve_retry_budget,
-                )
-                metrics["tools/search_retrieve_retries"] = retrieve_retries
+            data, retrieve_retries = await _post_json_with_retries(
+                _get_shared_http_session(),
+                _normalize_retrieve_url(self.retrieval_url),
+                payload,
+                retry_budget=retrieve_retry_budget,
+            )
+            metrics["tools/search_retrieve_retries"] = retrieve_retries
         except Exception as e:
             metrics["tools/search_failed"] = 1
             metrics["tools/search_retrieve_failures"] = 1
@@ -355,13 +401,12 @@ class FusedEnvironment:
         if use_summary_requested:
             summary_started_at = _now_monotonic()
             try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
-                    summary, summary_retries = await _summarize_with_retries(
-                        session,
-                        self.retrieval_url,
-                        documents,
-                        retry_budget=summary_retry_budget,
-                    )
+                summary, summary_retries = await _summarize_with_retries(
+                    _get_shared_http_session(),
+                    self.retrieval_url,
+                    documents,
+                    retry_budget=summary_retry_budget,
+                )
                 metrics["tools/search_summary_retries"] = summary_retries
                 if summary:
                     content = summary
@@ -369,9 +414,7 @@ class FusedEnvironment:
                 else:
                     metrics["tools/search_summary_failures"] = 1
                     metrics["tools/search_summary_fallbacks"] = 1
-                    logger.warning(
-                        "Summarize endpoint returned empty content; falling back to chunked docs for this request"
-                    )
+                    logger.warning("Summarize endpoint returned empty content; falling back to chunked docs for this request")
             except Exception as e:
                 metrics["tools/search_summary_retries"] = summary_retry_budget
                 metrics["tools/search_summary_failures"] = 1
@@ -397,8 +440,8 @@ class FusedEnvironment:
         word_budget = WEB_SEARCH_OBSERVATION_MAX_WORDS if summary_used else _RETRIEVAL_CHUNK_WORD_BUDGET
         return _limit_words(content, max_words=word_budget), 0.0, False, metrics
 
-    def compute_final_reward(self) -> float:
-        verifier_reward = self._compute_verifier_reward()
+    def compute_final_reward(self, *, require_tool_evidence: bool = True) -> float:
+        verifier_reward = self._compute_verifier_reward(require_tool_evidence=require_tool_evidence)
         if verifier_reward is not None:
             return verifier_reward
         if self.mode == "mcp" and self.mcp_tools is not None and self.mcp_tools.load_error:
@@ -421,7 +464,7 @@ class FusedEnvironment:
             }
             return 0.0
         min_unique_searches = int(os.environ.get("FUSED_WEBQA_MIN_UNIQUE_SEARCHES", "2"))
-        if self.mode == "web_search" and len(self.web_search_queries) < min_unique_searches:
+        if require_tool_evidence and self.mode == "web_search" and len(self.web_search_queries) < min_unique_searches:
             self.reward_debug = {
                 "type": self.mode,
                 "reward": 0.0,
@@ -446,11 +489,11 @@ class FusedEnvironment:
             self.reward_debug["min_unique_search_calls"] = min_unique_searches
         return float(reward)
 
-    def _compute_verifier_reward(self) -> float | None:
+    def _compute_verifier_reward(self, *, require_tool_evidence: bool = True) -> float | None:
         verifier = self.task.get("verifier")
         if not isinstance(verifier, dict) or not verifier.get("verification_code"):
             return None
-        if self.mode == "mcp" and self.tool_calls <= 0:
+        if require_tool_evidence and self.mode == "mcp" and self.tool_calls <= 0:
             self.reward_debug = {
                 "type": self.mode,
                 "reward": 0.0,
@@ -592,13 +635,7 @@ def _retrieval_title_and_content(row: Any) -> tuple[str, str]:
     content_obj = row.get("content")
     source = content_obj if isinstance(content_obj, dict) else row
     title = source.get("title") or row.get("title") or source.get("name") or row.get("name")
-    content = (
-        source.get("summary")
-        or source.get("chunk_text")
-        or source.get("snippet")
-        or source.get("text")
-        or source.get("original_text")
-    )
+    content = source.get("summary") or source.get("chunk_text") or source.get("snippet") or source.get("text") or source.get("original_text")
     if content is None and isinstance(content_obj, str):
         content = content_obj
     return _compact_text(str(title)) if title is not None else "", _compact_text(str(content)) if content is not None else ""
@@ -646,9 +683,7 @@ async def _summarize_with_retries(
 ) -> tuple[str | None, int]:
     request_budget = max(
         _MIN_SUMMARY_REQUEST_MAX_WORDS,
-        request_max_words
-        if request_max_words is not None
-        else int(os.environ.get("RLLM_RETRIEVAL_SUMMARY_MAX_WORDS_PER_REQUEST", str(_SUMMARY_REQUEST_MAX_WORDS))),
+        request_max_words if request_max_words is not None else int(os.environ.get("RLLM_RETRIEVAL_SUMMARY_MAX_WORDS_PER_REQUEST", str(_SUMMARY_REQUEST_MAX_WORDS))),
     )
     summary_url = _normalize_summary_url(retrieval_url)
     batches = _build_summary_batches(documents, max_words=request_budget)
@@ -669,11 +704,7 @@ async def _summarize_with_retries(
                 return None, retries_used
             partial_summaries.append(candidate)
     except Exception as e:
-        if (
-            reduction_round < _SUMMARY_MAX_REDUCTION_ROUNDS
-            and request_budget > _MIN_SUMMARY_REQUEST_MAX_WORDS
-            and _is_summary_length_error(e)
-        ):
+        if reduction_round < _SUMMARY_MAX_REDUCTION_ROUNDS and request_budget > _MIN_SUMMARY_REQUEST_MAX_WORDS and _is_summary_length_error(e):
             fallback_summary, fallback_retries = await _summarize_with_retries(
                 session,
                 retrieval_url,
@@ -761,9 +792,7 @@ def _format_retrieval_documents(data: Any, *, max_results: int) -> tuple[list[st
         content = _extract_retrieval_document_text(row)
         if not content:
             continue
-        signature = _normalize_retrieval_doc_signature(
-            " ".join(str(value) for value in (row.get("title") if isinstance(row, dict) else None, _extract_retrieval_document_url(row), content) if value)
-        )
+        signature = _normalize_retrieval_doc_signature(" ".join(str(value) for value in (row.get("title") if isinstance(row, dict) else None, _extract_retrieval_document_url(row), content) if value))
         if signature and signature in seen_signatures:
             duplicate_count += 1
             continue
@@ -778,10 +807,7 @@ def _format_retrieval_documents(data: Any, *, max_results: int) -> tuple[list[st
             break
 
     if not documents:
-        return [
-            "No usable evidence was found for this query. The returned passages were duplicates, too short, or too generic. "
-            "Do not submit an answer from this result. Rewrite the query with a specific title, quoted phrase, named entity, date, number, or one clue from the question, then search again."
-        ], {
+        return ["No usable evidence was found for this query. The returned passages were duplicates, too short, or too generic. " "Do not submit an answer from this result. Rewrite the query with a specific title, quoted phrase, named entity, date, number, or one clue from the question, then search again."], {
             "search_num_unique": 0,
             "search_num_duplicates": duplicate_count,
             "search_num_short_filtered": skipped_short,
@@ -817,11 +843,7 @@ def _extract_retrieval_document_text(row: Any) -> str:
 
     content = row.get("content")
     if isinstance(content, dict):
-        candidates = [
-            value
-            for key in ("original_text", "chunk_text", "text")
-            if isinstance((value := content.get(key)), str) and value.strip()
-        ]
+        candidates = [value for key in ("original_text", "chunk_text", "text") if isinstance((value := content.get(key)), str) and value.strip()]
         if candidates:
             return max(candidates, key=lambda text: len(text.split())).strip()
     elif isinstance(content, str) and content.strip():

@@ -26,6 +26,22 @@ _NGRAM_REPETITION_REASONS = {
     "ABNORMAL_NGRAM_REPETITION",
     "ngram_repetition",
 }
+_MIXED_TOOL_AND_ANSWER_REASONS = {
+    "ABNORMAL_MIXED_TOOL_AND_ANSWER",
+    "mixed_tool_and_answer",
+}
+_METADATA_CREDIT_EVENTS = {
+    "tool_parser_error",
+    "repeated_search_query",
+    "too_many_tool_calls",
+    "search_bypass",
+    "direct_submit_without_tool",
+    "mixed_tool_and_answer",
+    "tail_guard_early_stop",
+    "ngram_repetition",
+    "max_turns_exceeded",
+    "max_response_len_exceeded",
+}
 
 
 @dataclass(frozen=True)
@@ -35,6 +51,7 @@ class CreditAssignmentConfig:
     repeated_search_query: bool = False
     too_many_tool_calls: bool = False
     search_bypass: bool = False
+    mixed_tool_and_answer: bool = False
     ngram_repetition: bool = False
 
     @classmethod
@@ -45,6 +62,7 @@ class CreditAssignmentConfig:
             repeated_search_query=getattr(args, "credit_assignment_repeated_search_query", False),
             too_many_tool_calls=getattr(args, "credit_assignment_too_many_tool_calls", False),
             search_bypass=getattr(args, "credit_assignment_search_bypass", False),
+            mixed_tool_and_answer=getattr(args, "credit_assignment_mixed_tool_and_answer", False),
             ngram_repetition=getattr(args, "credit_assignment_ngram_repetition", False),
         )
 
@@ -88,6 +106,10 @@ def enabled_credit_assignment_event(
     if not config.enable:
         return None
 
+    metadata_event = str((metadata or {}).get("credit_assignment_event") or "")
+    if metadata_event in _METADATA_CREDIT_EVENTS:
+        return metadata_event
+
     if config.tool_parser_error and (
         _metadata_flag(metadata, "tool_call_parse_error", "parse_error", "tool_parser_error", "parse_tool_args_error")
         or _metadata_int(metadata, "tool_parser_error_count", "total_parse_tool_args_error", "parse_tool_args_error")
@@ -116,6 +138,12 @@ def enabled_credit_assignment_event(
     ):
         return "ngram_repetition"
 
+    if config.mixed_tool_and_answer and (
+        _metadata_flag(metadata, "mixed_tool_and_answer")
+        or _reason_matches(metadata, _MIXED_TOOL_AND_ANSWER_REASONS)
+    ):
+        return "mixed_tool_and_answer"
+
     if config.search_bypass and (
         _metadata_flag(metadata, "search_bypass", "bypass_termination")
         or _metadata_int(metadata, "reward/bypass_termination")
@@ -143,6 +171,8 @@ def build_policy_loss_mask(
         return None, None
     if event == "search_bypass":
         return list(loss_mask), event
+    if event in {"direct_submit_without_tool", "tail_guard_early_stop"}:
+        return [0] * len(loss_mask), event
 
     start = _metadata_int(
         metadata,

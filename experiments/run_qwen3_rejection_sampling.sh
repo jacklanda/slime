@@ -57,8 +57,9 @@ Rollout/system options:
   --rollout-gpus N                   Rollout GPUs. Default: 8
   --rollout-num-gpus-per-engine N    GPUs per SGLang engine. Default: 1
   --gpu-memory-utilization X         SGLang memory fraction. Default: 0.9
-  --sglang-server-concurrency N      SGLang server concurrency. Default: 4096
+  --sglang-server-concurrency N      SGLang server concurrency. Default: 4096; auto-derived for fully_async unless explicitly set
   --sglang-max-running-requests N    SGLang max running requests. Default: 4096
+  --fully-async-group-concurrency N  Target in-flight prompt groups for fully_async rollout. Default: rollout-batch-size
   --ray-num-cpus N                   Ray CPU resources. Default: 64
   --ray-job-wait 0|1                 Wait for Ray job submit. Default: 1
   -h, --help                         Show this help.
@@ -139,7 +140,7 @@ ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-16}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-38000}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-128}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-64}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-}"
 NUM_EPOCH="${NUM_EPOCH:-1}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
@@ -147,11 +148,17 @@ TOP_P="${TOP_P:-1.0}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
+SGLANG_SERVER_CONCURRENCY_EXPLICIT=0
+if [ -n "${SGLANG_SERVER_CONCURRENCY+x}" ]; then
+   SGLANG_SERVER_CONCURRENCY_EXPLICIT=1
+fi
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-4096}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-4096}"
+FULLY_ASYNC_GROUP_CONCURRENCY="${FULLY_ASYNC_GROUP_CONCURRENCY:-}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 RAY_JOB_WAIT="${RAY_JOB_WAIT:-1}"
 
+ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.fully_async_rollout.generate_rollout_fully_async}"
 CUSTOM_GENERATE_FUNCTION_PATH="${CUSTOM_GENERATE_FUNCTION_PATH:-slime.rollout.fused_agent.generate.generate}"
 
 while [ "$#" -gt 0 ]; do
@@ -205,8 +212,9 @@ while [ "$#" -gt 0 ]; do
       --rollout-gpus) ROLLOUT_GPUS="${2:?Missing value for --rollout-gpus}"; shift 2 ;;
       --rollout-num-gpus-per-engine) ROLLOUT_NUM_GPUS_PER_ENGINE="${2:?Missing value for --rollout-num-gpus-per-engine}"; shift 2 ;;
       --gpu-memory-utilization) GPU_MEMORY_UTILIZATION="${2:?Missing value for --gpu-memory-utilization}"; shift 2 ;;
-      --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
+      --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; SGLANG_SERVER_CONCURRENCY_EXPLICIT=1; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
+      --fully-async-group-concurrency) FULLY_ASYNC_GROUP_CONCURRENCY="${2:?Missing value for --fully-async-group-concurrency}"; shift 2 ;;
       --ray-num-cpus) RAY_NUM_CPUS="${2:?Missing value for --ray-num-cpus}"; shift 2 ;;
       --ray-job-wait) RAY_JOB_WAIT="${2:?Missing value for --ray-job-wait}"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
@@ -231,6 +239,33 @@ if [ ! -d "${MEGATRON_LM_PATH}" ]; then
 fi
 
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
+
+FULLY_ASYNC_GROUP_CONCURRENCY="${FULLY_ASYNC_GROUP_CONCURRENCY:-${ROLLOUT_BATCH_SIZE}}"
+case "${ROLLOUT_FUNCTION_PATH}" in
+   *fully_async_rollout.generate_rollout_fully_async)
+      if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -le 0 ]; then
+         echo "Invalid ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE}; expected positive integer." >&2
+         exit 2
+      fi
+      ROLLOUT_NUM_ENGINES="$(( (ROLLOUT_GPUS + ROLLOUT_NUM_GPUS_PER_ENGINE - 1) / ROLLOUT_NUM_GPUS_PER_ENGINE ))"
+      if [ "${ROLLOUT_NUM_ENGINES}" -le 0 ]; then
+         echo "Invalid rollout engine count from rollout_gpus=${ROLLOUT_GPUS}, rollout_num_gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}." >&2
+         exit 2
+      fi
+      if [ "${SGLANG_SERVER_CONCURRENCY_EXPLICIT}" = "0" ]; then
+         # fully_async_rollout treats sglang_server_concurrency * num_engines as
+         # in-flight prompt-group concurrency. Keep the group window bounded.
+         SGLANG_SERVER_CONCURRENCY="$(( (FULLY_ASYNC_GROUP_CONCURRENCY + ROLLOUT_NUM_ENGINES - 1) / ROLLOUT_NUM_ENGINES ))"
+         if [ "${SGLANG_SERVER_CONCURRENCY}" -lt 1 ]; then
+            SGLANG_SERVER_CONCURRENCY=1
+         fi
+      fi
+      ;;
+   *)
+      ROLLOUT_NUM_ENGINES="$(( (ROLLOUT_GPUS + ROLLOUT_NUM_GPUS_PER_ENGINE - 1) / ROLLOUT_NUM_GPUS_PER_ENGINE ))"
+      ;;
+esac
+FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY="$((SGLANG_SERVER_CONCURRENCY * ROLLOUT_NUM_ENGINES))"
 
 RESOLVED_TRAIN_FILES=()
 for train_file in "${TRAIN_FILE_PATHS[@]}"; do
@@ -413,6 +448,7 @@ export RLLM_MCP_TOOL_TIMEOUT="${RLLM_MCP_TOOL_TIMEOUT:-8}"
 export RLLM_MCP_MAX_ACTIVE_SERVERS="${RLLM_MCP_MAX_ACTIVE_SERVERS:-128}"
 export RLLM_MCP_PREFILTER_WORKERS="${RLLM_MCP_PREFILTER_WORKERS:-8}"
 export RLLM_MCP_DISABLE_STEP_PENALTY="${RLLM_MCP_DISABLE_STEP_PENALTY:-True}"
+export FUSED_HARNESS="${FUSED_HARNESS}"
 export FUSED_UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT}"
 export FUSED_DISABLE_THINKING="${DISABLE_THINKING}"
 export FUSED_MAX_STEPS="${FUSED_MAX_STEPS:-${MAX_STEPS}}"
@@ -496,6 +532,11 @@ python3 - "${RUN_CONFIG}" \
    min_sample_trial="${MIN_SAMPLE_TRIAL}" reward_threshold="${REWARD_THRESHOLD}" \
    min_steps="${MIN_STEPS}" certainty_filter="${CERTAINTY_FILTER}" model="${MODEL_DIR}" \
    fused_harness="${FUSED_HARNESS}" unified_system_prompt="${UNIFIED_SYSTEM_PROMPT}" \
+   rollout_function_path="${ROLLOUT_FUNCTION_PATH}" \
+   fully_async_group_concurrency="${FULLY_ASYNC_GROUP_CONCURRENCY}" \
+   fully_async_effective_group_concurrency="${FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY}" \
+   sglang_server_concurrency="${SGLANG_SERVER_CONCURRENCY}" \
+   sglang_server_concurrency_explicit="${SGLANG_SERVER_CONCURRENCY_EXPLICIT}" \
    custom_generate_function_path="${CUSTOM_GENERATE_FUNCTION_PATH}" num_rollout="${NUM_ROLLOUT}" \
    resume="${OFFLINE_RS_RESUME}" checkpointing="${OFFLINE_RS_CHECKPOINT_ENABLE}" \
    checkpoint_path="${OFFLINE_RS_CHECKPOINT_PATH}" start_rollout_id="${RESUME_START_ROLLOUT_ID}" \
@@ -510,7 +551,7 @@ PY
 
 ROLLOUT_ARGS=(
    --debug-rollout-only
-   --rollout-function-path slime.rollout.sglang_rollout.generate_rollout
+   --rollout-function-path "${ROLLOUT_FUNCTION_PATH}"
    --prompt-data "${PROMPT_DATA}"
    --input-key "${INPUT_KEY:-prompt}"
    --label-key "${LABEL_KEY:-reward_model}"
@@ -571,6 +612,8 @@ MISC_ARGS=(
 echo "Experiment: ${EXPERIMENT_NAME}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Prompt data: ${PROMPT_DATA}; rows=${TRAIN_NUM_ROWS}; rollout_batch_size=${ROLLOUT_BATCH_SIZE}; sample_n=${SAMPLE_N}; num_rollout=${NUM_ROLLOUT}; start_rollout_id=${RESUME_START_ROLLOUT_ID}"
+echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
+echo "Rollout concurrency: fully_async_group_concurrency=${FULLY_ASYNC_GROUP_CONCURRENCY}; effective_group_concurrency=${FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY}; rollout_num_engines=${ROLLOUT_NUM_ENGINES}; sglang_server_concurrency=${SGLANG_SERVER_CONCURRENCY}; explicit_sglang_server_concurrency=${SGLANG_SERVER_CONCURRENCY_EXPLICIT}"
 echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${MAX_STEPS}, mcp_max_steps=${MCP_MAX_STEPS}, web_search_max_steps=${WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
 echo "Debug rollout dump: ${DUMP_DETAILS}/rollout_data/{rollout_id}.pt"
 echo "Per-batch trajectory shards: ${EPISODE_LOG_DIR}/global_steps_{rollout_id}.json"

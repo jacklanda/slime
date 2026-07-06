@@ -55,17 +55,13 @@ def _env_bool(name: str, default: bool) -> bool:
 def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
     raw_multimodal_inputs = sample.multimodal_inputs or {}
     has_multimodal_inputs = any(value is not None for value in raw_multimodal_inputs.values())
-    reuse_existing_input_ids = bool(sample.tokens) and (
-        sample.multimodal_train_inputs is not None or not has_multimodal_inputs
-    )
+    reuse_existing_input_ids = bool(sample.tokens) and (sample.multimodal_train_inputs is not None or not has_multimodal_inputs)
 
     if processor and has_multimodal_inputs and not reuse_existing_input_ids:
         processor_output = processor(text=sample.prompt, **build_processor_kwargs(raw_multimodal_inputs))
         prompt_ids = processor_output["input_ids"][0]
         if sample.multimodal_train_inputs is None:
-            sample.multimodal_train_inputs = {
-                k: v for k, v in processor_output.items() if k not in _PROCESSOR_PROMPT_KEYS
-            } or None
+            sample.multimodal_train_inputs = {k: v for k, v in processor_output.items() if k not in _PROCESSOR_PROMPT_KEYS} or None
         return prompt_ids
 
     if reuse_existing_input_ids:
@@ -107,14 +103,9 @@ def _extract_rollout_top_p_token_data(
     if not offsets or offsets[0] != 0:
         raise ValueError(f"SGLang top-p token offsets must start with 0, got {offsets[:1]}.")
     if offsets[-1] != len(token_ids):
-        raise ValueError(
-            f"SGLang top-p token ids/offsets mismatch: offsets[-1]={offsets[-1]}, len(token_ids)={len(token_ids)}."
-        )
+        raise ValueError(f"SGLang top-p token ids/offsets mismatch: offsets[-1]={offsets[-1]}, len(token_ids)={len(token_ids)}.")
     if expected_num_tokens is not None and len(offsets) != expected_num_tokens + 1:
-        raise ValueError(
-            "SGLang top-p token offsets length must equal generated token count + 1: "
-            f"len(offsets)={len(offsets)}, generated={expected_num_tokens}."
-        )
+        raise ValueError("SGLang top-p token offsets length must equal generated token count + 1: " f"len(offsets)={len(offsets)}, generated={expected_num_tokens}.")
     return token_ids, offsets
 
 
@@ -260,15 +251,11 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
-    assert (
-        sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
-    ), f"Sample status is {sample.status}"
+    assert sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED, f"Sample status is {sample.status}"
 
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
 
-    assert (
-        sampling_params["max_new_tokens"] >= 0
-    ), f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
+    assert sampling_params["max_new_tokens"] >= 0, f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
     if sampling_params["max_new_tokens"] == 0:
         sample.status = Sample.Status.TRUNCATED
         return sample
@@ -355,9 +342,7 @@ async def generate_and_rm(
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
-    if _should_use_grm_eval(args, evaluation) and (
-        sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED
-    ):
+    if _should_use_grm_eval(args, evaluation) and (sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED):
         await _score_eval_samples_with_grm(args, [sample])
         return sample
 
@@ -403,6 +388,9 @@ async def generate_and_rm(
             await _score_eval_samples_with_grm(args, samples)
             return samples
 
+        for sample in samples:
+            if _should_rescore_eval_sample(args, sample, evaluation):
+                sample.reward = None
         samples_need_reward = [sample for sample in samples if sample.reward is None]
         with trace_span(samples_need_reward, "reward_model"):
             rewards = await batched_async_rm(args, samples_need_reward, evaluation=evaluation)
@@ -415,6 +403,8 @@ async def generate_and_rm(
         if _should_use_grm_eval(args, evaluation):
             await _score_eval_samples_with_grm(args, [sample])
             return sample
+        if _should_rescore_eval_sample(args, sample, evaluation):
+            sample.reward = None
         # Some custom generate paths may have already filled the reward.
         if sample.reward is None:
             with trace_span(sample, "reward_model"):
@@ -423,14 +413,20 @@ async def generate_and_rm(
     return sample
 
 
+def _should_rescore_eval_sample(args: Namespace, sample: Sample, evaluation: bool) -> bool:
+    if not evaluation:
+        return False
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    rm_type = (metadata.get("rm_type") or args.rm_type or "").strip()
+    return rm_type == "benchmark_verifier"
+
+
 @trace_function(
     "generate_and_rm_group",
     target="group",
     attrs_getter=lambda args, group, sampling_params, evaluation=False: {"group_size": len(group)},
 )
-async def generate_and_rm_group(
-    args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
-) -> list[Sample] | list[list[Sample]]:
+async def generate_and_rm_group(args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False) -> list[Sample] | list[list[Sample]]:
     # ``generate_and_rm`` may return either a ``Sample`` or a ``list[Sample]``
     # depending on whether the ``--custom-generate-function-path`` callable
     # emits one trainable sample or several (e.g. multi-turn agent rollouts
@@ -454,9 +450,7 @@ async def generate_and_rm_group(
         if getattr(args, "sglang_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
-        )
+        tasks.append(asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation)))
 
     group_timeout = _rollout_group_timeout(args, evaluation=evaluation)
     try:
@@ -521,10 +515,7 @@ def _task_result_or_timeout(task: asyncio.Task, sample: Sample, *, evaluation: b
 
 
 def _group_has_trainable_response(group: list[Sample] | list[list[Sample]]) -> bool:
-    return any(
-        sample.status == Sample.Status.COMPLETED and sample.response_length > 0
-        for sample in _flatten_samples(group)
-    )
+    return any(sample.status == Sample.Status.COMPLETED and sample.response_length > 0 for sample in _flatten_samples(group))
 
 
 async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
@@ -566,9 +557,7 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     return aborted_samples
 
 
-async def generate_rollout_async(
-    args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
-) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
+async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
     Args:
@@ -586,9 +575,7 @@ async def generate_rollout_async(
     state = GenerateState(args)
 
     # instantiate data filters
-    dynamic_filter = (
-        load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
-    )
+    dynamic_filter = load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
 
     metric_gatherer = MetricGatherer()
 
@@ -657,11 +644,7 @@ async def generate_rollout_async(
                 _flatten_samples(group),
                 rollout_id=rollout_id,
             )
-            relax_filter = (
-                filter_relax_after > 0
-                and completed_groups >= filter_relax_after
-                and _group_has_trainable_response(group)
-            )
+            relax_filter = filter_relax_after > 0 and completed_groups >= filter_relax_after and _group_has_trainable_response(group)
             if not dynamic_filter_output.keep and not relax_filter:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 dropped_groups += 1
@@ -673,7 +656,11 @@ async def generate_rollout_async(
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
-                maybe_print_rollout_group(args, group, group_id=len(data))
+                # Rich-rendering a full episode (up to 128 step panels plus
+                # per-token mask views) is seconds of pure-Python work; keep it
+                # off the event loop so it cannot stall request dispatch for
+                # every in-flight trajectory.
+                await asyncio.to_thread(maybe_print_rollout_group, args, group, group_id=len(data))
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
         now = time.time()
@@ -704,9 +691,7 @@ async def generate_rollout_async(
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
-    all_samples = sorted(
-        all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
-    )
+    all_samples = sorted(all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
 
     # reset the global state to prevent effects on the next rollout or eval.
     state.reset()
@@ -742,9 +727,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     return RolloutFnEvalOutput(data=results), []
 
 
-async def eval_rollout_single_dataset(
-    args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
-) -> dict[str, dict[str, list[Any]]]:
+async def eval_rollout_single_dataset(args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig) -> dict[str, dict[str, list[Any]]]:
     """An example to implement the eval_rollout function for an rule based rm rollout generation.
 
     Args:
@@ -822,11 +805,7 @@ async def eval_rollout_single_dataset(
         sample = await coro
         if do_print:
             logged_sample = sample[0] if isinstance(sample, list) else sample
-            logger.info(
-                "eval_rollout_single_dataset example data: "
-                f"{[str(logged_sample.prompt) + logged_sample.response]} "
-                f"reward={logged_sample.reward}"
-            )
+            logger.info("eval_rollout_single_dataset example data: " f"{[str(logged_sample.prompt) + logged_sample.response]} " f"reward={logged_sample.reward}")
             do_print = False
         if isinstance(sample, list):
             data.extend(sample)
@@ -847,9 +826,7 @@ async def eval_rollout_single_dataset(
     }
 
 
-def generate_rollout(
-    args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False
-) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
+def generate_rollout(args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
     Args:

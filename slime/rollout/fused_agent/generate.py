@@ -64,13 +64,15 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     """
     state = GenerateState(args)
     task = _task_from_sample(base_sample)
+    harness = normalize_harness(os.environ.get("FUSED_HARNESS", getattr(args, "fused_harness", "gem")))
+    reasoning_only = harness in {"cot", "bare"}
     env = FusedEnvironment(
         task,
         retrieval_url=os.environ.get("RETRIEVAL_SERVER_URL"),
         retrieval_max_results=int(os.environ.get("RETRIEVAL_MAX_RESULTS", "5")),
+        enable_tools=not reasoning_only,
     )
     observation, info = env.reset()
-    harness = normalize_harness(os.environ.get("FUSED_HARNESS", getattr(args, "fused_harness", "unified_gem")))
     base_max_steps = int(os.environ.get("FUSED_MAX_STEPS", getattr(args, "fused_max_steps", "16")))
     per_step_max_tokens = int(os.environ.get("PER_STEP_MAX_TOKENS", str(sampling_params.get("max_new_tokens", 2048))))
     disable_thinking = _env_bool("FUSED_DISABLE_THINKING", True)
@@ -114,9 +116,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     llm_time = 0.0
     env_time = 0.0
     pending_turns: list[dict[str, Any]] = []
+    tito_prefix_ids: list[int] = []
     seen_search_queries: set[str] = set()
     repeated_search_strikes = 0
     used_non_finish_tool = False
+    final_response = ""
     credit_event: str | None = None
     credit_step_index: int | None = None
     try:
@@ -127,6 +131,19 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             # serializing on the single rollout event-loop thread (which
             # otherwise saturates one core and starves the SGLang engines).
             prompt_ids = await asyncio.to_thread(_render_prompt_ids, state.tokenizer, messages, disable_thinking=disable_thinking)
+            prompt_context_start_idx = await asyncio.to_thread(_last_assistant_context_start_idx, state.tokenizer, messages, disable_thinking=disable_thinking)
+            tito_boundary_before = bool(tito_prefix_ids) and not _has_token_prefix(prompt_ids, tito_prefix_ids)
+            if tito_boundary_before:
+                if prompt_context_start_idx is not None and 0 <= prompt_context_start_idx <= len(prompt_ids):
+                    context_delta_ids = list(prompt_ids[prompt_context_start_idx:])
+                    tito_boundary_before = False
+                    tito_context_reason = "assistant_replay_tail_delta"
+                else:
+                    context_delta_ids = list(prompt_ids)
+                    tito_context_reason = "prompt_prefix_mismatch"
+            else:
+                context_delta_ids = list(prompt_ids[len(tito_prefix_ids) :])
+                tito_context_reason = "initial" if not tito_prefix_ids else "append_delta"
             if max_context_tokens and len(prompt_ids) >= max_context_tokens:
                 final_done = True
                 last_info = {
@@ -165,18 +182,26 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             llm_time += step_llm_time
             output_ids = output["output_ids"]
             output_logprobs = output["output_logprobs"]
-            raw_response = await asyncio.to_thread(state.tokenizer.decode, output_ids, skip_special_tokens=False) if output_ids else ""
-            response = _strip_trailing_chat_template_stop(raw_response)
+            # Decode, tool-call parsing, and the default loss mask are pure-Python
+            # CPU work; bundle them into a single worker-thread hop so a wave of
+            # trajectories finishing an LLM turn together cannot monopolize the
+            # rollout event loop (which must stay free to dispatch env/LLM
+            # requests for every other in-flight trajectory).
+            decode_fn = _decode_step if reasoning_only else _decode_and_parse_step
+            response, parsed_actions, response_loss_mask = await asyncio.to_thread(
+                decode_fn,
+                state.tokenizer,
+                None if reasoning_only else parser,
+                output_ids,
+                disable_thinking=disable_thinking,
+            )
+            final_response = response
             finish_reason = output["finish_reason"]
             total_steps += 1
-            parsed_actions = parser.parse(response)
             if any(action.name != "finish" for action in parsed_actions):
                 total_tool_call_turns += 1
 
             assistant_msg = {"role": "assistant", "content": response}
-            # Offload the second (no-generation-prompt) render off the event loop
-            # for the same GIL-release reason as the line-124 render above.
-            prompt_context_start_idx = await asyncio.to_thread(_last_assistant_context_start_idx, state.tokenizer, messages, disable_thinking=disable_thinking)
             pending_turns.append(
                 {
                     "turn": TurnRecord(
@@ -184,13 +209,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         output_ids=output_ids,
                         finish_reason="tool_calls" if parsed_actions else finish_reason,
                         output_log_probs=output_logprobs,
-                        loss_mask=_default_response_loss_mask(
-                            state.tokenizer,
-                            response,
-                            output_len=len(output_ids),
-                            disable_thinking=disable_thinking,
-                            output_ids=output_ids,
-                        ),
+                        context_delta_ids=context_delta_ids,
+                        tito_boundary_before=tito_boundary_before,
+                        tito_model_type=_qwen_tito_model_type(model_name),
+                        disable_thinking=disable_thinking,
+                        loss_mask=response_loss_mask,
                         rollout_top_p_token_ids=output.get("rollout_top_p_token_ids"),
                         rollout_top_p_token_offsets=output.get("rollout_top_p_token_offsets"),
                         prompt_context_start_idx=prompt_context_start_idx,
@@ -198,9 +221,23 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     "prompt_messages": list(messages),
                     "response_message": assistant_msg,
                     "raw_response": response,
-                    "metadata": {"sid": session_id, "step": step_idx},
+                    "metadata": {
+                        "sid": session_id,
+                        "step": step_idx,
+                        "tito_context_reason": tito_context_reason,
+                        "tito_context_delta_tokens": len(context_delta_ids),
+                        "tito_boundary_before": tito_boundary_before,
+                        "disable_thinking": disable_thinking,
+                    },
                 }
             )
+            if tito_boundary_before:
+                tito_prefix_ids = context_delta_ids + list(output_ids)
+            else:
+                # Extend in place: rebuilding the full prefix each turn is an
+                # O(n^2) copy over the trajectory and runs on the event loop.
+                tito_prefix_ids.extend(context_delta_ids)
+                tito_prefix_ids.extend(output_ids)
             messages.append(assistant_msg)
 
             if detect_abnormal_trajectories and finish_reason == "length":
@@ -221,6 +258,26 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 )
                 break
 
+            if reasoning_only:
+                env.answer = response
+                final_reward = env.compute_final_reward(require_tool_evidence=False)
+                final_done = True
+                last_info = {"termination_reason": "reasoning_only", "reward_debug": env.reward_debug}
+                trajectory_steps.append(
+                    _episode_step(
+                        observation=observation,
+                        response=response,
+                        action="",
+                        reward=final_reward,
+                        done=True,
+                        messages=messages,
+                        llm_time=step_llm_time,
+                        env_time=0.0,
+                        disable_thinking=disable_thinking,
+                    )
+                )
+                break
+
             actions = parsed_actions
             if not actions:
                 if detect_abnormal_trajectories and credit_assignment_tool_parser_error:
@@ -228,14 +285,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     final_done = True
                     credit_event = "tool_parser_error"
                     credit_step_index = len(pending_turns) - 1
-                    _set_pending_turn_error_span(
+                    await _mark_pending_turn_error_span(
+                        state.tokenizer,
                         pending_turns[-1],
-                        _response_span_to_output_token_span(
-                            state.tokenizer,
-                            response,
-                            _parser_error_action_span(response),
-                            output_len=len(output_ids),
-                        ),
+                        response,
+                        _parser_error_action_span(response),
                         output_len=len(output_ids),
                     )
                     last_info = {
@@ -265,14 +319,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 if credit_assignment_too_many_tool_calls:
                     credit_event = "too_many_tool_calls"
                     credit_step_index = len(pending_turns) - 1
-                    _set_pending_turn_error_span(
+                    await _mark_pending_turn_error_span(
+                        state.tokenizer,
                         pending_turns[-1],
-                        _response_span_to_output_token_span(
-                            state.tokenizer,
-                            response,
-                            _actions_span(actions),
-                            output_len=len(output_ids),
-                        ),
+                        response,
+                        _actions_span(actions),
                         output_len=len(output_ids),
                     )
                 last_info = {
@@ -300,14 +351,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 final_done = True
                 credit_event = "mixed_tool_and_answer"
                 credit_step_index = len(pending_turns) - 1
-                _set_pending_turn_error_span(
+                await _mark_pending_turn_error_span(
+                    state.tokenizer,
                     pending_turns[-1],
-                    _response_span_to_output_token_span(
-                        state.tokenizer,
-                        response,
-                        _mixed_tool_and_answer_span(response, actions),
-                        output_len=len(output_ids),
-                    ),
+                    response,
+                    _mixed_tool_and_answer_span(response, actions),
                     output_len=len(output_ids),
                 )
                 last_info = {
@@ -390,14 +438,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 if credit_assignment_repeated_search_query:
                     credit_event = "repeated_search_query"
                     credit_step_index = len(pending_turns) - 1
-                    _set_pending_turn_error_span(
+                    await _mark_pending_turn_error_span(
+                        state.tokenizer,
                         pending_turns[-1],
-                        _response_span_to_output_token_span(
-                            state.tokenizer,
-                            response,
-                            repeated_action_span,
-                            output_len=len(output_ids),
-                        ),
+                        response,
+                        repeated_action_span,
                         output_len=len(output_ids),
                     )
                 last_info = {
@@ -420,7 +465,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     )
                 )
                 break
-            repeated_output = _ngram_repetition_stats(
+            repeated_output = await asyncio.to_thread(
+                _ngram_repetition_stats,
                 output_ids,
                 n=ngram_repetition_n,
                 min_tokens=ngram_repetition_min_tokens,
@@ -432,14 +478,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 if credit_assignment_ngram_repetition:
                     credit_event = "ngram_repetition"
                     credit_step_index = len(pending_turns) - 1
-                    _set_pending_turn_error_span(
+                    await _mark_pending_turn_error_span(
+                        state.tokenizer,
                         pending_turns[-1],
-                        _response_span_to_output_token_span(
-                            state.tokenizer,
-                            response,
-                            repeated_action_span,
-                            output_len=len(output_ids),
-                        ),
+                        response,
+                        repeated_action_span,
                         output_len=len(output_ids),
                     )
                 last_info = {
@@ -495,14 +538,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_NESTED_FINISH_PAYLOAD" and credit_assignment_tool_parser_error:
                 credit_event = "tool_parser_error"
                 credit_step_index = len(pending_turns) - 1
-                _set_pending_turn_error_span(
+                await _mark_pending_turn_error_span(
+                    state.tokenizer,
                     pending_turns[-1],
-                    _response_span_to_output_token_span(
-                        state.tokenizer,
-                        response,
-                        _actions_span(actions),
-                        output_len=len(output_ids),
-                    ),
+                    response,
+                    _actions_span(actions),
                     output_len=len(output_ids),
                 )
             elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_TOOL_BURST" and credit_assignment_too_many_tool_calls:
@@ -540,16 +580,13 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 credit_event = "max_turns_exceeded"
                 credit_step_index = len(pending_turns) - 1
                 response = str(pending_turns[-1].get("raw_response", ""))
-                action_span = _actions_span(parser.parse(response))
+                action_span = _actions_span(await asyncio.to_thread(parser.parse, response))
                 if action_span is not None:
-                    _set_pending_turn_error_span(
+                    await _mark_pending_turn_error_span(
+                        state.tokenizer,
                         pending_turns[-1],
-                        _response_span_to_output_token_span(
-                            state.tokenizer,
-                            response,
-                            action_span,
-                            output_len=len(pending_turns[-1]["turn"].output_ids),
-                        ),
+                        response,
+                        action_span,
                         output_len=len(pending_turns[-1]["turn"].output_ids),
                     )
 
@@ -569,7 +606,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         last_info["credit_assignment_event"] = credit_event
         last_info["credit_assignment_error_step_index"] = credit_step_index
 
-    _record_pending_turns(
+    # Turn recording + trajectory assembly touch every token of the episode;
+    # keep them off the event loop since whole waves of trajectories finish
+    # (and hit this path) together.
+    await asyncio.to_thread(
+        _record_pending_turns,
         manager,
         session_id=session_id,
         pending_turns=pending_turns,
@@ -602,7 +643,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         steps=trajectory_steps,
         task_type=env.mode,
     )
-    samples = manager.get_trajectory(
+    samples = await asyncio.to_thread(
+        manager.get_trajectory,
         session_id,
         base_sample=base_sample,
         reward=final_reward,
@@ -645,6 +687,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         )
         return failed
     for sample in samples:
+        sample.response = final_response
         sample.reward = final_reward
         sample.status = Sample.Status.COMPLETED
         if sample.rollout_log_probs is None:
@@ -743,6 +786,19 @@ def _valid_tool_names(tools: list[dict]) -> set[str]:
 
 def _requires_non_finish_tool(tools: list[dict]) -> bool:
     return any(name not in {"finish", "submit"} for name in _declared_tool_names(tools))
+
+
+def _has_token_prefix(token_ids: list[int], prefix_ids: list[int]) -> bool:
+    return len(token_ids) >= len(prefix_ids) and token_ids[: len(prefix_ids)] == prefix_ids
+
+
+def _qwen_tito_model_type(model_name: str | None) -> str | None:
+    normalized = str(model_name or "").lower().replace("-", "_")
+    if "qwen3.5" in normalized or "qwen3_5" in normalized:
+        return "qwen3_5"
+    if "qwen3" in normalized:
+        return "qwen3"
+    return None
 
 
 def _declared_tool_names(tools: list[dict]) -> set[str]:
@@ -920,6 +976,26 @@ def _first_malformed_tool_call_span(response: str) -> tuple[int, int] | None:
     return None
 
 
+async def _mark_pending_turn_error_span(
+    tokenizer,
+    item: dict[str, Any],
+    response: str,
+    char_span: tuple[int, int] | None,
+    *,
+    output_len: int,
+) -> None:
+    # The char->token span conversion may re-encode the response twice; run it
+    # off the event loop since abnormal terminations cluster in waves.
+    span = await asyncio.to_thread(
+        _response_span_to_output_token_span,
+        tokenizer,
+        response,
+        char_span,
+        output_len=output_len,
+    )
+    _set_pending_turn_error_span(item, span, output_len=output_len)
+
+
 def _set_pending_turn_error_span(item: dict[str, Any], span: tuple[int, int] | None, *, output_len: int) -> None:
     if span is None:
         return
@@ -980,6 +1056,7 @@ def _record_pending_turns(
             credit_step_index=credit_step_index,
             parser_error_token_window=parser_error_token_window,
             action_span=item.get("credit_assignment_action_span"),
+            base_loss_mask=turn.loss_mask,
         )
         metadata = dict(item["metadata"])
         if credit_event is not None:
@@ -996,6 +1073,10 @@ def _record_pending_turns(
                 output_ids=turn.output_ids,
                 finish_reason=turn.finish_reason,
                 output_log_probs=turn.output_log_probs,
+                context_delta_ids=turn.context_delta_ids,
+                tito_boundary_before=turn.tito_boundary_before,
+                tito_model_type=turn.tito_model_type,
+                disable_thinking=turn.disable_thinking,
                 loss_mask=turn.loss_mask,
                 policy_loss_mask=policy_loss_mask,
                 prompt_context_start_idx=turn.prompt_context_start_idx,
@@ -1016,30 +1097,69 @@ def _credit_assignment_loss_mask(
     credit_step_index: int | None,
     parser_error_token_window: int = 256,
     action_span: tuple[int, int] | None = None,
+    base_loss_mask: list[int] | None = None,
 ) -> list[int] | None:
+    def apply_base(mask: list[int]) -> list[int]:
+        if base_loss_mask is None:
+            return mask
+        assert len(base_loss_mask) == output_len, f"base_loss_mask length {len(base_loss_mask)} != output length {output_len}"
+        return [int(policy) & int(base) for policy, base in zip(mask, base_loss_mask, strict=True)]
+
     if credit_event is None:
         return None
     if credit_event == "search_bypass":
         return None
     if credit_event == "direct_submit_without_tool":
-        return [0] * output_len
+        return apply_base([0] * output_len)
     if credit_event in {"tail_guard_early_stop"}:
-        return [0] * output_len
+        return apply_base([0] * output_len)
     if credit_step_index is None:
-        return [0] * output_len
+        return apply_base([0] * output_len)
     if credit_event == "mixed_tool_and_answer":
-        return [1] * output_len if turn_index == credit_step_index else [0] * output_len
+        return apply_base([1] * output_len if turn_index == credit_step_index else [0] * output_len)
     if turn_index == credit_step_index and action_span is not None:
         start, end = action_span
         if 0 <= start < end <= output_len:
-            return [0] * start + [1] * (end - start) + [0] * (output_len - end)
+            return apply_base([0] * start + [1] * (end - start) + [0] * (output_len - end))
     if credit_event == "tool_parser_error" and turn_index == credit_step_index:
         trained_len = max(0, min(output_len, parser_error_token_window))
-        return [0] * (output_len - trained_len) + [1] * trained_len
+        return apply_base([0] * (output_len - trained_len) + [1] * trained_len)
     if credit_event == "max_response_len_exceeded" and turn_index == credit_step_index:
         trained_len = max(0, min(output_len, parser_error_token_window))
-        return [0] * (output_len - trained_len) + [1] * trained_len
-    return [1] * output_len if turn_index == credit_step_index else [0] * output_len
+        return apply_base([0] * (output_len - trained_len) + [1] * trained_len)
+    return apply_base([1] * output_len if turn_index == credit_step_index else [0] * output_len)
+
+
+def _decode_and_parse_step(tokenizer, parser, output_ids: list[int], *, disable_thinking: bool):
+    """Decode one LLM turn and derive its parsed actions + default loss mask.
+
+    Everything here is CPU-bound pure-Python/tokenizer work; callers run it via
+    asyncio.to_thread to keep the rollout event loop free.
+    """
+    raw_response = tokenizer.decode(output_ids, skip_special_tokens=False) if output_ids else ""
+    response = _strip_trailing_chat_template_stop(raw_response)
+    parsed_actions = parser.parse(response)
+    loss_mask = _default_response_loss_mask(
+        tokenizer,
+        response,
+        output_len=len(output_ids),
+        disable_thinking=disable_thinking,
+        output_ids=output_ids,
+    )
+    return response, parsed_actions, loss_mask
+
+
+def _decode_step(tokenizer, _parser, output_ids: list[int], *, disable_thinking: bool):
+    raw_response = tokenizer.decode(output_ids, skip_special_tokens=False) if output_ids else ""
+    response = _strip_trailing_chat_template_stop(raw_response)
+    loss_mask = _default_response_loss_mask(
+        tokenizer,
+        response,
+        output_len=len(output_ids),
+        disable_thinking=disable_thinking,
+        output_ids=output_ids,
+    )
+    return response, [], loss_mask
 
 
 def _default_response_loss_mask(
@@ -1538,13 +1658,17 @@ async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, A
         raise
     meta = output.get("meta_info") or {}
     token_logprobs = meta.get("output_token_logprobs") or []
-    output_ids = [x[1] for x in token_logprobs]
-    top_p_data = _extract_rollout_top_p_token_data(meta, expected_num_tokens=len(output_ids))
+    # Unpacking per-token logprob/top-p payloads is CPU work proportional to
+    # the response length; offload long responses to keep the event loop free.
+    if len(token_logprobs) >= 256:
+        output_ids, output_logprobs, top_p_data = await asyncio.to_thread(_unpack_generate_meta, meta, token_logprobs)
+    else:
+        output_ids, output_logprobs, top_p_data = _unpack_generate_meta(meta, token_logprobs)
     finish_reason = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
     result = {
         "text": output.get("text") or "",
         "output_ids": output_ids,
-        "output_logprobs": [float(x[0]) for x in token_logprobs],
+        "output_logprobs": output_logprobs,
         "finish_reason": finish_reason,
     }
     if top_p_data is not None:
@@ -1558,6 +1682,13 @@ async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, A
             time.time() - started,
         )
     return result
+
+
+def _unpack_generate_meta(meta: dict[str, Any], token_logprobs: list) -> tuple[list[int], list[float], tuple[list[int], list[int]] | None]:
+    output_ids = [x[1] for x in token_logprobs]
+    output_logprobs = [float(x[0]) for x in token_logprobs]
+    top_p_data = _extract_rollout_top_p_token_data(meta, expected_num_tokens=len(output_ids))
+    return output_ids, output_logprobs, top_p_data
 
 
 async def _abort_sglang_request(args, rid: str) -> None:

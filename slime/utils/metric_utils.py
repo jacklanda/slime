@@ -40,6 +40,49 @@ def compute_pass_rate(
     return log_dict
 
 
+def compute_pass_at_k_and_pass_all(
+    flat_rewards: list[float],
+    group_size: int,
+    num_groups: int | None = None,
+) -> dict[str, float]:
+    if group_size < 1:
+        return {}
+
+    if num_groups is None:
+        num_groups = len(flat_rewards) // group_size
+    if num_groups < 1:
+        return {}
+
+    assert len(flat_rewards) == num_groups * group_size, f"{len(flat_rewards)=} {num_groups=} {group_size=}"
+    rewards_of_group = np.array(flat_rewards).reshape(num_groups, group_size)
+    correct_by_group = np.sum(rewards_of_group == 1, axis=1)
+    pass_all = (correct_by_group == group_size).astype(float)
+    episode_std_by_group = np.std((rewards_of_group == 1).astype(float), axis=1)
+    episode_std = round(float(np.mean(episode_std_by_group)), 3)
+
+    metrics = {}
+    for k in _pass_at_k_report_sizes(group_size):
+        num_samples = np.full(num_groups, group_size)
+        pass_at_k = _estimate_pass_at_k(num_samples, correct_by_group, k)
+        metrics |= {
+            f"pass@{k}/mean": round(float(np.mean(pass_at_k)), 3),
+            f"pass@{k}/std": episode_std,
+        }
+
+    metrics |= {
+        f"pass^{group_size}/mean": round(float(np.mean(pass_all)), 3),
+        f"pass^{group_size}/std": episode_std,
+    }
+    return metrics
+
+
+def _pass_at_k_report_sizes(group_size: int) -> list[int]:
+    sizes = [2**i for i in range(int(math.log2(group_size)) + 1)]
+    if sizes[-1] != group_size:
+        sizes.append(group_size)
+    return sizes
+
+
 def _estimate_pass_at_k(num_samples, num_correct, k):
     """
     Estimates pass@k of each problem and returns them in an array.

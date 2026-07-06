@@ -95,8 +95,9 @@ Options:
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
   --offload-train BOOL                   Offload trainer model between rollout/train phases. Default: matches --colocate.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 400.
-  --sglang-max-running-requests N        SGLang max running requests. Default: 512.
+  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 3072; auto-derived for fully_async unless explicitly set.
+  --sglang-max-running-requests N        SGLang max running requests. Default: 3072.
+  --fully-async-group-concurrency N      Target in-flight prompt groups for fully_async rollout. Default: rollout-batch-size.
   --colocate / --no-colocate             Share trainer and rollout GPUs with offload. Default: disabled.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
@@ -168,8 +169,13 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # in-flight request counts so more trajectories overlap and cover those I/O waits.
 # 4B weights are tiny at mem_fraction=0.9, so KV headroom is ample; watch for KV
 # eviction only if 38k-context trajectories start getting preempted.
+SGLANG_SERVER_CONCURRENCY_EXPLICIT=0
+if [ -n "${SGLANG_SERVER_CONCURRENCY+x}" ]; then
+   SGLANG_SERVER_CONCURRENCY_EXPLICIT=1
+fi
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-3072}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-3072}"
+FULLY_ASYNC_GROUP_CONCURRENCY="${FULLY_ASYNC_GROUP_CONCURRENCY:-}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-300}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
@@ -289,8 +295,9 @@ while [ "$#" -gt 0 ]; do
       --n-samples-per-eval-prompt) N_SAMPLES_PER_EVAL_PROMPT="${2:?Missing value for --n-samples-per-eval-prompt}"; shift 2 ;;
       --offload-train) OFFLOAD_TRAIN="${2:?Missing value for --offload-train}"; shift 2 ;;
       --max-tool-output-length) MAX_TOOL_OUTPUT_LENGTH="${2:?Missing value for --max-tool-output-length}"; shift 2 ;;
-      --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
+      --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; SGLANG_SERVER_CONCURRENCY_EXPLICIT=1; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
+      --fully-async-group-concurrency) FULLY_ASYNC_GROUP_CONCURRENCY="${2:?Missing value for --fully-async-group-concurrency}"; shift 2 ;;
       --colocate) COLOCATE=true; shift ;;
       --no-colocate) COLOCATE=false; shift ;;
       --experiment-name) EXPERIMENT_NAME="${2:?Missing value for --experiment-name}"; shift 2 ;;
@@ -412,6 +419,7 @@ SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 
 CUSTOM_GENERATE_FUNCTION_PATH="${CUSTOM_GENERATE_FUNCTION_PATH:-slime.rollout.fused_agent.generate.generate}"
+EVAL_FUNCTION_PATH="${EVAL_FUNCTION_PATH:-slime.rollout.sglang_rollout.generate_rollout}"
 CUSTOM_RM_PATH="${CUSTOM_RM_PATH:-}"
 CUSTOM_REWARD_POST_PROCESS_PATH="${CUSTOM_REWARD_POST_PROCESS_PATH:-}"
 if is_truthy "${HORIZON_REWARD_SHAPING}" && [ -z "${CUSTOM_REWARD_POST_PROCESS_PATH}" ]; then
@@ -548,6 +556,33 @@ if [ "${FULLY_ASYNC,,}" = "true" ] || [ "${FULLY_ASYNC}" = "1" ]; then
 else
    ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.sglang_rollout.generate_rollout}"
 fi
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+FULLY_ASYNC_GROUP_CONCURRENCY="${FULLY_ASYNC_GROUP_CONCURRENCY:-${ROLLOUT_BATCH_SIZE}}"
+case "${ROLLOUT_FUNCTION_PATH}" in
+   *fully_async_rollout.generate_rollout_fully_async)
+      if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -le 0 ]; then
+         echo "Invalid ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE}; expected positive integer." >&2
+         exit 2
+      fi
+      ROLLOUT_NUM_ENGINES="$(( (ROLLOUT_GPUS + ROLLOUT_NUM_GPUS_PER_ENGINE - 1) / ROLLOUT_NUM_GPUS_PER_ENGINE ))"
+      if [ "${ROLLOUT_NUM_ENGINES}" -le 0 ]; then
+         echo "Invalid rollout engine count from rollout_gpus=${ROLLOUT_GPUS}, rollout_num_gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}." >&2
+         exit 2
+      fi
+      if [ "${SGLANG_SERVER_CONCURRENCY_EXPLICIT}" = "0" ]; then
+         # fully_async_rollout treats sglang_server_concurrency * num_engines as
+         # in-flight prompt-group concurrency. Keep the group window bounded.
+         SGLANG_SERVER_CONCURRENCY="$(( (FULLY_ASYNC_GROUP_CONCURRENCY + ROLLOUT_NUM_ENGINES - 1) / ROLLOUT_NUM_ENGINES ))"
+         if [ "${SGLANG_SERVER_CONCURRENCY}" -lt 1 ]; then
+            SGLANG_SERVER_CONCURRENCY=1
+         fi
+      fi
+      ;;
+   *)
+      ROLLOUT_NUM_ENGINES="$(( (ROLLOUT_GPUS + ROLLOUT_NUM_GPUS_PER_ENGINE - 1) / ROLLOUT_NUM_GPUS_PER_ENGINE ))"
+      ;;
+esac
+FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY="$((SGLANG_SERVER_CONCURRENCY * ROLLOUT_NUM_ENGINES))"
 
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-${MAX_CONTEXT_LEN}}"
 if [ "${MAX_MODEL_LEN}" -ne "${MAX_CONTEXT_LEN}" ]; then
@@ -697,7 +732,7 @@ fi
 
 EVAL_ARGS=()
 if [ -n "${EVAL_INTERVAL}" ]; then
-   EVAL_ARGS+=(--eval-interval "${EVAL_INTERVAL}")
+   EVAL_ARGS+=(--eval-interval "${EVAL_INTERVAL}" --eval-function-path "${EVAL_FUNCTION_PATH}")
    if [ -n "${EVAL_CONFIG}" ]; then
       EVAL_ARGS+=(--eval-config "${EVAL_CONFIG}")
    elif [ "${#EVAL_PROMPT_DATA[@]}" -gt 0 ]; then
@@ -783,7 +818,7 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+   --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
    --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-${GPU_MEMORY_UTILIZATION:-0.9}}"
    --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}"
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
@@ -985,8 +1020,9 @@ echo "W&B enabled: ${USE_WANDB:-0}"
 echo "Custom generate: ${CUSTOM_GENERATE_FUNCTION_PATH:-<stock slime rollout>}"
 echo "Custom reward post-process: ${CUSTOM_REWARD_POST_PROCESS_PATH:-<vanilla>}"
 echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
+echo "Eval function: ${EVAL_FUNCTION_PATH}"
 echo "Actor GPUs: ${ACTOR_GPUS}, rollout GPUs: ${ROLLOUT_GPUS}, colocate=${COLOCATE}, ray GPUs=${NUM_GPUS}"
-echo "SGLang concurrency: server=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}"
+echo "SGLang concurrency: server=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}, fully_async_group_concurrency=${FULLY_ASYNC_GROUP_CONCURRENCY}, effective_group_concurrency=${FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY}, rollout_num_engines=${ROLLOUT_NUM_ENGINES}, explicit_server_concurrency=${SGLANG_SERVER_CONCURRENCY_EXPLICIT}"
 echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
 echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; async mini_batch=${ASYNC_MINI_BATCH_SIZE}, sync_interval=${ASYNC_TRIGGER_PARAMETER_SYNC_STEP}"
 echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"

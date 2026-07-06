@@ -62,9 +62,7 @@ def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
     with _worker_lock:
         if _global_worker is None or not _global_worker.worker_thread.is_alive():
             logger.info("starting fully-async rollout worker")
-            _global_worker = AsyncRolloutWorker(
-                args, data_buffer, concurrency=args.sglang_server_concurrency * get_rollout_num_engines(args)
-            )
+            _global_worker = AsyncRolloutWorker(args, data_buffer, concurrency=args.sglang_server_concurrency * get_rollout_num_engines(args))
             _global_worker.start()
         return _global_worker
 
@@ -209,9 +207,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
     assert args.rollout_global_dataset
     worker = _get_global_worker(args, data_buffer)
     worker.resume()
-    dynamic_filter = (
-        load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
-    )
+    dynamic_filter = load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
     metric_gatherer = MetricGatherer()
 
     target = args.rollout_batch_size
@@ -234,9 +230,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
     last_log = started
     LOG_EVERY = 30.0
 
-    while len(collected) < target or (
-        quotas and len(collected) < candidate_limit and not _has_task_family_quota_candidates(collected.values(), target, quotas)
-    ):
+    while len(collected) < target or (quotas and len(collected) < candidate_limit and not _has_task_family_quota_candidates(collected.values(), target, quotas)):
         # Pull whatever's done.
         drained = 0
         for gid, group in worker.get_completed_groups():
@@ -249,7 +243,9 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
                 continue
             if not dynamic_filter_output.keep and relax_filter:
                 metric_gatherer.on_dynamic_filter_drop(reason=f"relaxed_{dynamic_filter_output.reason}")
-            maybe_print_rollout_group(args, group, group_id=gid)
+            # Keep the seconds-long rich episode render off the event loop
+            # (same reasoning as the sync collection path).
+            await asyncio.to_thread(maybe_print_rollout_group, args, group, group_id=gid)
             collected[gid] = group
             drained += 1
 
@@ -348,11 +344,7 @@ def _select_task_family_quota_groups(groups: list[list[Sample]], target: int, ar
             if taken >= count:
                 break
 
-    missing_families = [
-        family
-        for family, count in counts.items()
-        if count > 0 and not any(_sample_group_task_family(group) == family for group in selected)
-    ]
+    missing_families = [family for family, count in counts.items() if count > 0 and not any(_sample_group_task_family(group) == family for group in selected)]
     for family in missing_families:
         for idx, group in enumerate(groups):
             if idx in selected_ids or _sample_group_task_family(group) != family:

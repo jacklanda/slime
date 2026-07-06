@@ -44,6 +44,8 @@ def make_args(**overrides):
         mask_offpolicy_in_partial_rollout = False
         group_rm = False
         custom_generate_function_path = None
+        custom_rm_path = None
+        rm_type = None
         sglang_enable_deterministic_inference = False
         rollout_seed = 7
         n_samples_per_prompt = 2
@@ -154,6 +156,43 @@ def test_generate_and_rm_prefers_per_sample_generate_function(patch_generate_sta
     result = asyncio.run(generate_and_rm(args, sample, sampling_params={"temperature": 0.3}, evaluation=True))
     assert_sample_contract(result)
     assert result.metadata["evaluation"] is True
+
+
+def test_eval_benchmark_verifier_rescores_custom_generate_reward(patch_generate_state, monkeypatch):
+    sglang_rollout = patch_generate_state
+
+    async def custom_generate_wrong_reward(args, sample: Sample, sampling_params: dict, evaluation: bool = False):
+        sample.tokens = [21, 22]
+        sample.response = "The final answer is B."
+        sample.response_length = len(sample.tokens)
+        sample.reward = 0.0
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda _path: custom_generate_wrong_reward)
+    sample = Sample(
+        index=0,
+        prompt="prompt",
+        label="B",
+        metadata={
+            "rm_type": "benchmark_verifier",
+            "data_source": "gpqa_diamond",
+            "choices": ["wrong", "right"],
+            "correct_letter": "B",
+        },
+    )
+
+    result = asyncio.run(
+        generate_and_rm(
+            make_args(custom_generate_function_path="plugin_contracts.fake_generate"),
+            sample,
+            sampling_params={"temperature": 0.3},
+            evaluation=True,
+        )
+    )
+
+    assert_sample_contract(result)
+    assert result.reward == 1.0
 
 
 def test_custom_generate_function_path_supports_user_override(patch_generate_state):
