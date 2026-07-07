@@ -154,6 +154,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--release-train",
+                action="store_true",
+                default=False,
+                help=(
+                    "Release Megatron training actors during rollout and recreate them before each train step. "
+                    "Requires disk weight sync and --save for Megatron reload."
+                ),
+            )
+            parser.add_argument(
                 "--update-weight-disk-dir",
                 type=str,
                 default=None,
@@ -200,25 +209,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--custom-delta-pre-push-path",
+                "--custom-update-weight-post-write-path",
                 type=str,
                 default=None,
                 help=(
-                    "Path to a custom function called on each trainer rank after its delta files "
-                    "are written, before the engines read them — to publish the writes on a "
-                    "non-POSIX filesystem (no cross-host visibility without an explicit sync). "
+                    "Path to a custom function called on each trainer rank after a disk weight "
+                    "sync's files are written (full or delta), before the engines read them — to "
+                    "publish the writes on a non-POSIX filesystem (no cross-host visibility "
+                    "without an explicit sync). "
                     "Signature: ``def hook(args, version_dir: str, rollout_engines) -> None``; the hook gates itself."
-                ),
-            )
-            parser.add_argument(
-                "--custom-delta-pre-read-path",
-                type=str,
-                default=None,
-                help=(
-                    "Path to a custom function called on each rollout host before it reads the "
-                    "published delta directory — refreshes the mount so the just-published version "
-                    "is visible on a non-POSIX filesystem (no cross-host read-after-write consistency). "
-                    "Signature: ``def hook(delta_dir: str, target_version: int) -> None``."
                 ),
             )
             parser.add_argument(
@@ -226,11 +225,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=(
-                    "Rollout-host-local directory (NVMe) holding a full HF checkpoint that "
-                    "disk-delta sync patches in place. Each host materializes it from "
-                    "--hf-checkpoint at engine start, applies each version's delta there, and "
-                    "the engines reload from it. Required for --update-weight-mode=delta "
-                    "--update-weight-transport=disk."
+                    "Rollout-host-local directory (NVMe) holding a full HF checkpoint kept in "
+                    "sync by each engine's /pull_weights: every host copies a published full "
+                    "checkpoint as-is or patches published deltas in place, and the engines "
+                    "reload from it. Required for --update-weight-mode=delta "
+                    "--update-weight-transport=disk; optional for full disk sync (engines then "
+                    "pull to local disk instead of reading the shared dir directly). The "
+                    "read-side counterpart of --custom-update-weight-post-write-path is the engine's "
+                    "--sglang-custom-pull-weights-pre-read-hook."
                 ),
             )
             parser.add_argument(
@@ -1667,11 +1669,6 @@ def parse_megatron_role_args(base_args, megatron_config_path, role):
     return role_args
 
 
-def parse_critic_args(actor_args, megatron_config_path):
-    """Backward-compatible wrapper for critic-specific Megatron role parsing."""
-    return parse_megatron_role_args(actor_args, megatron_config_path, role="critic")
-
-
 def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     """
     Build evaluation dataset configurations from either --eval-config or --eval-prompt-data.
@@ -1882,9 +1879,17 @@ def slime_validate_args(args):
         "debug_rollout_only and debug_train_only cannot be set at the same time, " "please set only one of them."
     )
 
-    # always true on offload for colocate at the moment.
+    # Colocate normally offloads Megatron between rollout and train.  Release-train mode
+    # releases Megatron actors instead, so only rollout needs memory-saver offload.
     if args.colocate:
-        if args.offload_train is None:
+        if args.release_train:
+            if args.offload_train:
+                logger.info("Ignoring --offload-train because --release-train releases train actors instead.")
+            args.offload_train = False
+            if args.offload_rollout is False:
+                logger.info("Ignoring --no-offload-rollout because colocated --release-train needs rollout offload.")
+            args.offload_rollout = True
+        elif args.offload_train is None:
             args.offload_train = True
         if args.offload_rollout is None:
             args.offload_rollout = True
@@ -1983,6 +1988,19 @@ def slime_validate_args(args):
             "--update-weight-transport=disk requires --update-weight-disk-dir to point at "
             "a filesystem shared between the trainer and the rollout engines."
         )
+    if args.release_train:
+        if args.train_backend != "megatron":
+            raise ValueError("--release-train is only supported with the Megatron train backend.")
+        if args.use_critic:
+            raise ValueError("--release-train does not support critic training yet.")
+        if args.keep_old_actor:
+            raise ValueError("--release-train does not support --keep-old-actor.")
+        if args.save is None:
+            raise ValueError("--release-train requires --save so the next Megatron actor can reload.")
+        if args.save_interval is None:
+            args.save_interval = 1
+        if args.update_weight_mode != "full" or args.update_weight_transport != "disk":
+            raise ValueError("--release-train requires --update-weight-mode=full and --update-weight-transport=disk.")
     if args.update_weight_mode == "delta":
         if args.update_weight_transport != "disk":
             raise ValueError(
