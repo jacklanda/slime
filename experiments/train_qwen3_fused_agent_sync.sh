@@ -316,11 +316,11 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 default_experiment_name() {
-   #local prefix="fused-dapo-q3-4b-no_think-gem-async-dev"
+   local prefix="fused-dapo-q3-4b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="webqa-dapo-q3-4b-no_think-gem-sync-dev"
-   local prefix="webqa-dapo-q3-4b-think-gem-sync-dev"
+   #local prefix="webqa-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="webqa-dapo-q3.5-4b-no_think-gem-sync-dev"
    #local prefix="mcp-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3.5-4b-no_think-gem-sync-dev"
@@ -399,15 +399,16 @@ DUMP_DETAILS="${DUMP_DETAILS:-${LOG_ROOT}/debug}"
 # one shuffled parquet before launching slime.
 DEFAULT_TRAIN_FILES=(
    #"${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
-   "${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
+   #"${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
    #"${SCRIPT_DIR}/artifacts/asearcher.parquet"
+   "${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet"
 )
 TRAIN_FILE_PATHS=("${DEFAULT_TRAIN_FILES[@]}")
 if [ -n "${TRAIN_FILES:-}" ]; then
    IFS=',' read -r -a TRAIN_FILE_PATHS <<< "${TRAIN_FILES}"
 fi
-#PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet}"
-PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/search_data_final/train.parquet}"
+PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet}"
+#PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/search_data_final/train.parquet}"
 #PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet}"
 #PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/asearcher.parquet}"
 SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
