@@ -75,6 +75,8 @@ Options:
   --horizon-reward-target-steps X        Target steps for no horizon penalty. Default: 8.
   --horizon-reward-target-tool-calls X   Target tool calls for no horizon penalty. Default: target_steps - 1.
   --enable-dynamic-sampling-filter BOOL  Enable DAPO-style non-zero reward variance dynamic filtering. Default: true.
+  --normalize-advantages / --no-normalize-advantages
+                                         Whiten advantages across the data-parallel batch. Default: disabled.
   --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
   --grm-model NAME                       OpenRouter judge model. Default: deepseek/deepseek-v4-flash.
   --grm-concurrency N                    Max concurrent GRM requests. Default: 512.
@@ -124,9 +126,9 @@ SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 COLOCATE="${COLOCATE:-false}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
-ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-8}"
+ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-16}"
 ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE:-8}}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE:-16}}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-1}}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 TAIL_GUARD="${TAIL_GUARD:-False}"
@@ -147,6 +149,7 @@ CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_
 CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER:-True}"
 CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP:-False}"
 HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
+NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
@@ -166,8 +169,8 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # in-flight request counts so more trajectories overlap and cover those I/O waits.
 # 4B weights are tiny at mem_fraction=0.9, so KV headroom is ample; watch for KV
 # eviction only if 38k-context trajectories start getting preempted.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-2048}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-2048}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-1024}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-1024}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-300}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
@@ -254,6 +257,8 @@ while [ "$#" -gt 0 ]; do
       --horizon-reward-target-steps) FUSED_HORIZON_REWARD_TARGET_STEPS="${2:?Missing value for --horizon-reward-target-steps}"; shift 2 ;;
       --horizon-reward-target-tool-calls) FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS="${2:?Missing value for --horizon-reward-target-tool-calls}"; shift 2 ;;
       --enable-dynamic-sampling-filter) ENABLE_DYNAMIC_SAMPLING_FILTER="${2:?Missing value for --enable-dynamic-sampling-filter}"; shift 2 ;;
+      --normalize-advantages) NORMALIZE_ADVANTAGES=true; shift ;;
+      --no-normalize-advantages) NORMALIZE_ADVANTAGES=false; shift ;;
       --enable_use_grm_evals|--enable-use-grm-evals) ENABLE_USE_GRM_EVALS="${2:?Missing value for --enable_use_grm_evals}"; shift 2 ;;
       --grm-model) GRM_MODEL="${2:?Missing value for --grm-model}"; shift 2 ;;
       --grm-concurrency) GRM_CONCURRENCY="${2:?Missing value for --grm-concurrency}"; shift 2 ;;
@@ -316,11 +321,11 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 default_experiment_name() {
-   local prefix="fused-dapo-q3-4b-no_think-gem-sync-dev"
+   #local prefix="fused-dapo-q3-4b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="webqa-dapo-q3-4b-no_think-gem-sync-dev"
-   #local prefix="webqa-dapo-q3-4b-think-gem-sync-dev"
+   local prefix="webqa-dapo-q3-8b-no_think-gem-sync-dev"
    #local prefix="webqa-dapo-q3.5-4b-no_think-gem-sync-dev"
    #local prefix="mcp-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3.5-4b-no_think-gem-sync-dev"
@@ -351,8 +356,8 @@ elif [ "${SLIME_CLEANUP:-0}" = "1" ]; then
    echo "SLIME_CLEANUP=1 ignored because SLIME_CLEANUP_CONFIRM=1 is not set; preserving existing processes and artifacts."
 fi
 
-MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
-#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
+#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
+MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
@@ -384,9 +389,9 @@ if [ "${DEFAULT_TP_SIZE}" -gt "${ACTOR_GPUS}" ]; then
 fi
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/checkpoints/FusedRL/${EXPERIMENT_NAME}}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
@@ -399,16 +404,16 @@ DUMP_DETAILS="${DUMP_DETAILS:-${LOG_ROOT}/debug}"
 # one shuffled parquet before launching slime.
 DEFAULT_TRAIN_FILES=(
    #"${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
-   #"${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
+   "${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
    #"${SCRIPT_DIR}/artifacts/asearcher.parquet"
-   "${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet"
+   #"${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet"
 )
 TRAIN_FILE_PATHS=("${DEFAULT_TRAIN_FILES[@]}")
 if [ -n "${TRAIN_FILES:-}" ]; then
    IFS=',' read -r -a TRAIN_FILE_PATHS <<< "${TRAIN_FILES}"
 fi
-PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet}"
-#PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/search_data_final/train.parquet}"
+#PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet}"
+PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/search_data_final/train.parquet}"
 #PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet}"
 #PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/asearcher.parquet}"
 SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
@@ -533,7 +538,7 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-38000}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-64}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
@@ -622,8 +627,8 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len "${MAX_CONTEXT_LEN}"
    --rollout-max-prompt-len "${MAX_PROMPT_LENGTH}"
    --rollout-max-response-len "${MAX_RESPONSE_LENGTH}"
-   --rollout-temperature "${TEMPERATURE:-1.0}"
-   --rollout-top-p "${TOP_P:-1.0}"
+   --rollout-temperature "${TEMPERATURE:-0.8}"
+   --rollout-top-p "${TOP_P:-0.95}"
 
    --global-batch-size "${EFFECTIVE_GLOBAL_BATCH_SIZE}"
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
@@ -748,13 +753,16 @@ fi
 
 GRPO_ARGS=(
    --advantage-estimator "${ADVANTAGE_ESTIMATOR:-grpo}"
-   --kl-coef "${KL_COEF:-0.01}"
+   --kl-coef "${KL_COEF:-0.03}"
    --kl-loss-coef "${KL_LOSS_COEF:-0.00}"
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF:-0.00}"
    --eps-clip "${EPS_CLIP:-0.2}"
    --eps-clip-high "${EPS_CLIP_HIGH:-0.28}"
 )
+if is_truthy "${NORMALIZE_ADVANTAGES}"; then
+   GRPO_ARGS+=(--normalize-advantages)
+fi
 
 # Rollout correction defaults:
 # - TIS (Truncated Importance Sampling): soft correction. It multiplies pg_loss
@@ -852,7 +860,7 @@ export RETRIEVAL_SERVER_URL="${RETRIEVAL_SERVER_URL:-http://10.2.152.50:65432}"
 export RLLM_RETRIEVAL_MODE="${RLLM_RETRIEVAL_MODE:-hybrid}"
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
 export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-${RLLM_RETRIEVAL_MAX_RESULTS:-4}}"
-export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-1}"
+export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-3}"
 # Summarize is a ~2s LLM call per search with a large retry budget; on slow
 # trajectories it stacks up and blows the 180s rollout collection timeout,
 # causing groups to be dropped. Default off and use raw retrieve docs instead.
@@ -993,6 +1001,7 @@ echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WOR
 echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, relax_after_groups=${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}"
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}"
 echo "OpenRouter GRM evals: enable=${ENABLE_USE_GRM_EVALS}, model=${GRM_MODEL}, concurrency=${GRM_CONCURRENCY}, timeout=${GRM_TIMEOUT}, retries=${GRM_MAX_RETRIES}, custom_rm=${GRM_CUSTOM_RM_PATH}"
+echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, normalize_advantages=${NORMALIZE_ADVANTAGES}, kl_coef=${KL_COEF:-0.03}, lr=${LR:-2e-6}, eps_clip=${EPS_CLIP:-0.2}, eps_clip_high=${EPS_CLIP_HIGH:-0.28}"
 echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING:-0}, path=${BUFFER_FILTER_PATH:-${ENABLE_QUOTA_BUCKET_SAMPLING:+slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps}}"
 echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}"
 echo "Horizon reward shaping: enable=${HORIZON_REWARD_SHAPING}, min_multiplier=${FUSED_HORIZON_REWARD_MIN_MULTIPLIER}, gamma=${FUSED_HORIZON_REWARD_GAMMA}, step_weight=${FUSED_HORIZON_REWARD_STEP_WEIGHT}, tool_call_weight=${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT}, target_steps=${FUSED_HORIZON_REWARD_TARGET_STEPS}, target_tool_calls=${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-target_steps-1}"
