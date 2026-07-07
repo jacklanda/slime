@@ -20,6 +20,7 @@ from slime.backends.sglang_utils.sglang_engine import SGLangEngine, remove_worke
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
 from slime.utils.credit_assignment import CreditAssignmentConfig, build_policy_loss_mask
+from slime.utils.data import get_source
 from slime.utils.dp_schedule import build_dp_schedule
 from slime.utils.episode_dump import save_rllm_episode_batch
 from slime.utils.health_monitor import RolloutHealthMonitor
@@ -310,14 +311,14 @@ class ServerGroup:
         if not self.engine_urls:
             self.engine_urls = [None] * len(self.all_engines)
 
-        num_gpu_per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
+        num_gpus_per_engine_on_node = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
 
         pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
         validate_server_group_gpu_indices(
             worker_type=self.worker_type,
             gpu_offset=self.gpu_offset,
             num_gpus_per_engine=self.num_gpus_per_engine,
-            num_gpu_per_engine=num_gpu_per_engine,
+            num_gpus_per_engine_on_node=num_gpus_per_engine_on_node,
             num_engines=len(self.all_engines),
             num_available_gpus=len(reordered_gpu_ids),
             rollout_num_gpus=self.args.rollout_num_gpus,
@@ -336,7 +337,7 @@ class ServerGroup:
             num_cpus = num_gpus
 
             # Get the base GPU ID from placement group using gpu_offset.
-            gpu_index = self.gpu_offset + i * num_gpu_per_engine
+            gpu_index = self.gpu_offset + i * num_gpus_per_engine_on_node
             base_gpu_id = int(reordered_gpu_ids[gpu_index])
 
             scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -355,7 +356,6 @@ class ServerGroup:
                     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                     "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
-                    "SLIME_ENABLE_PROFILING": "true",
                 }.items()
             }
             rollout_engine = RolloutRayActor.options(
@@ -849,7 +849,7 @@ class RolloutManager:
             srv.onload_kv()
 
     def recover_updatable_engines(self):
-        """Restart any dead rollout engines and update num_new_engines for update_weights detection.
+        """Restart dead updatable rollout engines before the next weight update.
 
         Recovers the updatable model (the one that receives weight
         updates from training).
@@ -857,10 +857,7 @@ class RolloutManager:
         self.health_monitoring_pause()
         srv = self._get_updatable_server()
         if self.rollout_id == -1 or srv is None:
-            engines = srv.engines if srv else []
-            gpu_counts = srv.engine_gpu_counts if srv else []
-            gpu_offsets = srv.engine_gpu_offsets if srv else []
-            return engines, self.rollout_engine_lock, (srv.num_new_engines if srv else 0), gpu_counts, gpu_offsets
+            return
 
         if isinstance(srv, RolloutServer):
             srv.recover(health_check_timeout=self.args.rollout_health_check_timeout)
@@ -1031,6 +1028,9 @@ class RolloutManager:
         ) is not None:
             train_data["teacher_log_probs"] = teacher_log_probs
 
+        if samples[0].metadata is not None:
+            train_data["source_names"] = [get_source(sample) for sample in samples]
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -1082,6 +1082,7 @@ class RolloutManager:
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
+                "source_names",
                 "prompt",
                 "teacher_log_probs",
             ]:
@@ -1363,8 +1364,8 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
         def _make_group(group_cfg, router_ip, router_port, overrides_extra=None):
             nonlocal engine_offset, gpu_offset
             gpus_per_engine = group_cfg.num_gpus_per_engine
-            num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
-            num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
+            num_gpus_per_engine_on_node = min(gpus_per_engine, args.num_gpus_per_node)
+            num_engines = group_cfg.num_gpus // num_gpus_per_engine_on_node
 
             group_abs_start = rollout_pg_offset + gpu_offset
             needs_offload = args.offload_rollout and group_abs_start < megatron_num_gpus
@@ -1962,10 +1963,26 @@ def _compute_top_p_kept_vocab_metrics(args, all_samples: list[Sample]):
     total_tokens = 0
     for sample in all_samples:
         offsets = sample.rollout_top_p_token_offsets
-        if not offsets or sample.response_length == 0:
+        if offsets is None or sample.response_length == 0:
             continue
-        total_kept += offsets[-1] - offsets[0]
-        total_tokens += sample.response_length
+        offsets = torch.as_tensor(offsets, dtype=torch.int64)
+        if offsets.numel() == 0:
+            continue
+        assert (
+            offsets.numel() == sample.response_length + 1
+        ), f"top-p token offsets length {offsets.numel()} != response length + 1 {sample.response_length + 1}"
+        if sample.remove_sample:
+            continue
+        if sample.loss_mask is None:
+            total_kept += int(offsets[-1] - offsets[0])
+            total_tokens += sample.response_length
+            continue
+        loss_mask = torch.as_tensor(sample.loss_mask, dtype=torch.bool, device=offsets.device)
+        assert (
+            loss_mask.numel() == sample.response_length
+        ), f"loss mask length {loss_mask.numel()} != response length {sample.response_length}"
+        total_kept += int(torch.diff(offsets)[loss_mask].sum())
+        total_tokens += int(loss_mask.sum())
     if total_tokens == 0:
         return {}
     return {"top_p_kept_vocab_per_token": total_kept / total_tokens}

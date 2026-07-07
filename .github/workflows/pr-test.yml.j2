@@ -1,5 +1,6 @@
 <% set megatron_tests = [
     {'test_file': 'test_full_disk_weight_update.py', 'num_gpus': 4},
+    {'test_file': 'test_release_train.py', 'num_gpus': 4},
     {'test_file': 'test_quick_start_glm4_9B.py', 'num_gpus': 8, 'enable_eval': '0'},
     {'test_file': 'test_glm4.7_30B_A3B_pd_mooncake.py', 'num_gpus': 8},
     {'test_file': 'test_qwen3_30B_A3B.py', 'num_gpus': 8, 'use_deepep': '1', 'use_fp8_rollout': '1', 'enable_eval': '0'},
@@ -8,6 +9,7 @@
     {'test_file': 'test_qwen3_4B_ppo.py', 'num_gpus': 8, 'enable_eval': '0'},
     {'test_file': 'test_qwen3_4B_ppo_disaggregate.py', 'num_gpus': 8, 'enable_eval': '0'},
     {'test_file': 'test_qwen3_4B_ppo_train_critic_only.py', 'num_gpus': 8, 'enable_eval': '0'},
+    {'test_file': 'test_ppo_logprob_entropy_gpu.py', 'num_gpus': 2},
     {'test_file': 'test_moonlight_16B_A3B.py', 'num_gpus': 8, 'enable_eval': '0'},
     {'test_file': 'test_moonlight_16B_A3B_r3.py', 'num_gpus': 8, 'enable_eval': '0'},
     {'test_file': 'test_mimo_7B_mtp_only_grad.py', 'num_gpus': 8},
@@ -63,6 +65,7 @@
       'cpu': True,
       'tests': [
         {'test_file': 'test_megatron_argument_validation.py', 'num_gpus': 0},
+        {'test_file': 'utils/test_megatron_server_arguments.py', 'num_gpus': 0},
         {'test_file': 'test_dp_schedule.py', 'num_gpus': 0},
         {'test_file': 'test_cp_utils.py', 'num_gpus': 0},
         {'test_file': 'test_metric_report.py', 'num_gpus': 0},
@@ -71,6 +74,7 @@
         {'test_file': 'test_logprob_response_spans.py', 'num_gpus': 0},
         {'test_file': 'test_value_temperature.py', 'num_gpus': 0},
         {'test_file': 'test_cispo_loss.py', 'num_gpus': 0},
+        {'test_file': 'test_ppo_logprob_entropy.py', 'num_gpus': 0},
         {'test_file': 'test_rm_f1.py', 'num_gpus': 0},
         {'test_file': 'test_rm_gpqa.py', 'num_gpus': 0},
         {'test_file': 'test_rm_math.py', 'num_gpus': 0},
@@ -85,6 +89,7 @@
         {'test_file': 'test_logging_noise_suppression.py', 'num_gpus': 0},
         {'test_file': 'test_sglang_rollout_group_timeout.py', 'num_gpus': 0},
         {'test_file': 'test_external_sglang_engines.py', 'num_gpus': 0},
+        {'test_file': 'test_empty_colocated_weight_bucket.py', 'num_gpus': 0},
         {'test_file': 'utils/test_hf_checkpoint_saver.py', 'num_gpus': 0},
         {'test_file': 'plugin_contracts/test_plugin_rollout_contracts.py', 'num_gpus': 0},
         {'test_file': 'plugin_contracts/test_plugin_runtime_hook_contracts.py', 'num_gpus': 0},
@@ -153,7 +158,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        info: << config.tests | tojson >>
+        info:
+<< config.tests | tojson(indent=2) | indent(10, true) >>
     defaults:
       run:
         working-directory: ${{ github.workspace }}

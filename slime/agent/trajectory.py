@@ -45,6 +45,7 @@ class TurnRecord:
     prompt_context_start_idx: int | None = None
     rollout_top_p_token_ids: list[int] | None = None
     rollout_top_p_token_offsets: list[int] | None = None
+    ill_formed: bool = False
 
 
 # ===========================================================================
@@ -332,28 +333,41 @@ class _SampleBuilder:
     def has_trained_response(self) -> bool:
         return any(self.loss_mask[self.leading_prompt_len :])
 
-    def to_sample(self, base_sample: Sample, extra_metadata: dict[str, Any] | None) -> Sample:
+    def to_sample(
+        self, base_sample: Sample, extra_metadata: dict[str, Any] | None, max_sample_tokens: int = 0
+    ) -> Sample:
         """Emit the accumulated tokens as one ``Sample``, stripping the first-turn
         prompt so loss_mask / logprobs cover only the response region."""
         start = self.leading_prompt_len  # first-turn prompt stripped; response region starts here
+        tokens = list(self.tokens)
+        loss_mask = list(self.loss_mask)
+        policy_loss_mask = list(self.policy_loss_mask)
+        logprobs = list(self.logprobs)
+        if max_sample_tokens and len(tokens) > max_sample_tokens:
+            tokens = tokens[:max_sample_tokens]
+            loss_mask = loss_mask[:max_sample_tokens]
+            policy_loss_mask = policy_loss_mask[:max_sample_tokens]
+            logprobs = logprobs[:max_sample_tokens]
+            self._truncate_top_p_tokens(max_sample_tokens)
+        md = dict(extra_metadata or {})
         sample = Sample(
             index=base_sample.index,
             group_index=base_sample.group_index,
             rollout_id=base_sample.rollout_id if base_sample.rollout_id is not None else base_sample.index,
             prompt=base_sample.prompt,
             label=base_sample.label,
-            tokens=list(self.tokens),
-            response_length=len(self.loss_mask) - start,
-            loss_mask=self.loss_mask[start:],
-            rollout_log_probs=self.logprobs[start:],
+            tokens=tokens,
+            response_length=len(loss_mask) - start,
+            loss_mask=loss_mask[start:],
+            rollout_log_probs=logprobs[start:],
             reward=0.0,
             status=Sample.Status.COMPLETED,
-            metadata=dict(extra_metadata or {}),
+            metadata=md,
         )
-        policy_loss_mask = self.policy_loss_mask[start:]
+        policy_loss_mask = policy_loss_mask[start:]
         if policy_loss_mask != sample.loss_mask:
             sample.policy_loss_mask = policy_loss_mask
-        top_p_data = self._top_p_slice(start, len(self.tokens))
+        top_p_data = self._top_p_slice(start, len(tokens))
         if top_p_data is not None:
             sample.rollout_top_p_token_ids, sample.rollout_top_p_token_offsets = top_p_data
         return sample
@@ -431,6 +445,7 @@ class TrajectoryManager:
         reward: float = 0.0,
         extra_metadata: dict[str, Any] | None = None,
         allow_fully_masked: bool = False,
+        max_sample_tokens: int = 0,
     ) -> list[Sample]:
         """Linearize this sid's routing tree into slime ``Sample`` objects and
         consume the session.
@@ -454,10 +469,10 @@ class TrajectoryManager:
                     base_sample=base_sample,
                     extra_metadata=extra_metadata,
                     allow_fully_masked=allow_fully_masked,
+                    max_sample_tokens=max_sample_tokens,
                 )
             )
 
-        # TODO custom reward func
         per_sample_reward = (reward / len(samples)) if samples else 0.0
         for s in samples:
             s.reward = per_sample_reward
@@ -465,6 +480,10 @@ class TrajectoryManager:
         self._trees.pop(sid, None)
         self._turn_count.pop(sid, None)
         return samples
+
+    def drop_session(self, sid: str) -> None:
+        self._trees.pop(sid, None)
+        self._turn_count.pop(sid, None)
 
     # -------------------- internals ----------------------------------------
 
@@ -602,9 +621,21 @@ class TrajectoryManager:
         base_sample: Sample,
         extra_metadata: dict[str, Any] | None,
         allow_fully_masked: bool = False,
+        max_sample_tokens: int = 0,
     ) -> list[Sample]:
+
+        asst_nodes = [n for n in chain if n.role == "assistant" and n.turn is not None]
+        truncated = bool(asst_nodes) and asst_nodes[-1].turn.finish_reason == "length"
+        use_tool = any(bool((n.message or {}).get("tool_calls")) for n in asst_nodes)
+        ill_formed = any(n.turn.ill_formed for n in asst_nodes)
+        md = {
+            **(extra_metadata or {}),
+            "truncated": truncated,
+            "use_tool": use_tool,
+            "ill_formed": ill_formed,
+        }
         return [
-            builder.to_sample(base_sample, extra_metadata)
+            builder.to_sample(base_sample, md, max_sample_tokens)
             for builder in self._split_chain_into_builders(chain)
             if allow_fully_masked or builder.has_trained_response()
         ]

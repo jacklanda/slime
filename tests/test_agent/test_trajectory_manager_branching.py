@@ -1353,8 +1353,8 @@ def _print_case(title: str, mgr, sid: str, samples: list) -> None:
     n = len(samples)
     if n:
         r_in = _REWARD_IN.get(sid, 0.0)
-        per = r_in / n
-        print(f"[samples] {n}  (reward split: {r_in:.3f} / {n} = {per:.3f} per sample)")
+        per = (r_in / n) if n else 0.0
+        print(f"[samples] {n}  (reward: {r_in:.3f} split to {per:.3f} each)")
     else:
         print(f"[samples] {n}")
     for i, s in enumerate(samples):
