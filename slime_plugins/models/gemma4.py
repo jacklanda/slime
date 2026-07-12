@@ -59,6 +59,9 @@ class Gemma4TransformerConfig(Gemma3TransformerConfig):
     global_partial_rotary_factor: float = 0.25  # fraction of global head_dim that gets RoPE
     attention_k_eq_v: bool = True  # global layers: V = K (no v_proj)
     enable_moe_block: bool = False  # 26B-A4B MoE variant
+    hidden_size_per_layer_input: int = 0  # E2B/E4B per-layer embeddings
+    num_kv_shared_layers: int = 0  # E2B/E4B KV reuse in final layers
+    use_double_wide_mlp: bool = False  # E2B/E4B wide MLP in KV-shared layers
 
 
 class VNorm(nn.Module):
@@ -79,6 +82,7 @@ class VNorm(nn.Module):
 class Gemma4TransformerLayerSubmodules(TransformerLayerSubmodules):
     post_attention_layernorm: ModuleSpec | type = IdentityOp
     post_feedforward_layernorm: ModuleSpec | type = IdentityOp
+    post_per_layer_input_norm: ModuleSpec | type = IdentityOp
     # For MoE-enabled variants (26B-A4B), the primary `mlp` submodule is swapped
     # to a Gemma4MoELayer and the original dense MLP moves to `dense_mlp`. This
     # keeps the `.mlp.experts.linear_fc...` naming that mbridge's EP auto-handling
@@ -338,6 +342,13 @@ class Gemma4TransformerLayer(TransformerLayer):
         )
 
         self.self_attention._is_global = self._is_global
+        self.self_attention._global_layer_idx = global_layer_number - 1
+        self.self_attention._kv_shared_layer_index = getattr(config, "kv_shared_layer_map", {}).get(
+            global_layer_number - 1
+        )
+        self.self_attention._store_full_length_kv = (global_layer_number - 1) in getattr(
+            config, "kv_store_layers", set()
+        )
 
         # Global layers require this because head_dim=512 exceeds flash attention's limit (256).
         # Local layers also use SDPA for consistency.
@@ -369,6 +380,39 @@ class Gemma4TransformerLayer(TransformerLayer):
         # Don't switch to ``dtype=self.config.params_dtype``; that would
         # silently change the arithmetic.
         self.register_buffer("layer_scalar", torch.ones(1))
+
+        self.global_layer_idx = global_layer_number - 1
+        self.hidden_size_per_layer_input = getattr(config, "hidden_size_per_layer_input", 0)
+        if self.hidden_size_per_layer_input:
+            self.per_layer_input_gate = torch.nn.Linear(
+                config.hidden_size,
+                self.hidden_size_per_layer_input,
+                bias=False,
+            )
+            self.per_layer_projection = torch.nn.Linear(
+                self.hidden_size_per_layer_input,
+                config.hidden_size,
+                bias=False,
+            )
+            self.post_per_layer_input_norm = build_module(
+                submodules.post_per_layer_input_norm,
+                config=config,
+                hidden_size=config.hidden_size,
+                eps=config.layernorm_epsilon,
+            )
+
+        self.is_kv_shared_layer = self.global_layer_idx in getattr(config, "kv_shared_layer_map", {})
+        if (
+            getattr(config, "use_double_wide_mlp", False)
+            and self.is_kv_shared_layer
+            and not getattr(config, "enable_moe_block", False)
+        ):
+            wide_config = dc_replace(config, ffn_hidden_size=config.ffn_hidden_size * 2)
+            self.mlp = build_module(
+                submodules.mlp,
+                config=wide_config,
+                tp_group=self.tp_group,
+            )
 
         # MoE block (26B-A4B): super().__init__ already built self.mlp from the
         # layer spec, which when enable_moe_block=True is a Gemma4MoELayer (not
@@ -426,6 +470,23 @@ class Gemma4TransformerLayer(TransformerLayer):
         moe_output = self.post_feedforward_layernorm_2(moe_output)
 
         return mlp_output + moe_output
+
+    def _forward_per_layer_input(self, hidden_states):
+        per_layer_inputs = getattr(self.config, "_gemma4_per_layer_inputs", None)
+        if per_layer_inputs is None:
+            raise RuntimeError(
+                "Gemma4 per-layer inputs are missing. E2B/E4B PLE currently requires "
+                "the Gemma4 provider hooks installed by --custom-model-provider-path."
+            )
+
+        residual = hidden_states
+        per_layer_input = per_layer_inputs[..., self.global_layer_idx, :]
+        hidden_states = self.per_layer_input_gate(hidden_states)
+        hidden_states = self.config.activation_func(hidden_states)
+        hidden_states = hidden_states * per_layer_input
+        hidden_states = self.per_layer_projection(hidden_states)
+        hidden_states = self.post_per_layer_input_norm(hidden_states)
+        return residual + hidden_states
 
     def forward(
         self,
@@ -503,6 +564,9 @@ class Gemma4TransformerLayer(TransformerLayer):
             hidden_states = self._forward_dense_ffn(pre_mlp_layernorm_output)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
+
+        if self.hidden_size_per_layer_input:
+            hidden_states = self._forward_per_layer_input(hidden_states)
 
         hidden_states = hidden_states * self.layer_scalar
 
@@ -859,6 +923,9 @@ class Gemma4SelfAttention(SelfAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._is_global = False  # set by Gemma4TransformerLayer after construction
+        self._global_layer_idx = None
+        self._kv_shared_layer_index = None
+        self._store_full_length_kv = False
         self.v_norm = VNorm(self.hidden_size_per_attention_head, eps=self.config.layernorm_epsilon)
 
     def _split_qkv_global_k_eq_v(self, hidden_states):
@@ -898,7 +965,8 @@ class Gemma4SelfAttention(SelfAttention):
         if self._is_global and self.config.attention_k_eq_v and split_qkv:
             if output_gate:
                 raise NotImplementedError("output_gate is not supported together with attention_k_eq_v")
-            return self._split_qkv_global_k_eq_v(hidden_states)
+            query, key, value = self._split_qkv_global_k_eq_v(hidden_states)
+            return self._apply_kv_sharing(query, key, value)
 
         result = super().get_query_key_value_tensors(
             hidden_states, key_value_states, output_gate=output_gate, split_qkv=split_qkv
@@ -909,11 +977,33 @@ class Gemma4SelfAttention(SelfAttention):
         if output_gate:
             query, key, value, gate = result
             value = self.v_norm(value)
+            query, key, value = self._apply_kv_sharing(query, key, value)
             return query, key, value, gate
 
         query, key, value = result
         value = self.v_norm(value)
-        return query, key, value
+        return self._apply_kv_sharing(query, key, value)
+
+    def _apply_kv_sharing(self, query, key, value):
+        shared_states = getattr(self.config, "_gemma4_shared_kv_states", None)
+        if shared_states is None:
+            shared_states = {}
+            self.config._gemma4_shared_kv_states = shared_states
+
+        if self._store_full_length_kv and self._global_layer_idx is not None:
+            shared_states[self._global_layer_idx] = (key, value)
+
+        if self._kv_shared_layer_index is None:
+            return query, key, value
+
+        if self._kv_shared_layer_index not in shared_states:
+            raise RuntimeError(
+                f"Gemma4 layer {self._global_layer_idx} needs shared KV from layer "
+                f"{self._kv_shared_layer_index}, but it has not been produced. "
+                "Use pipeline-model-parallel-size=1 for E2B/E4B KV-sharing models."
+            )
+        shared_key, shared_value = shared_states[self._kv_shared_layer_index]
+        return query, shared_key.to(query.device), shared_value.to(query.device)
 
 
 def _build_moe_submodule_spec(config):
@@ -981,6 +1071,7 @@ def get_gemma4_layer_spec_te(config=None) -> ModuleSpec:
         mlp_bda=get_bias_dropout_add,
         post_attention_layernorm=TENorm,
         post_feedforward_layernorm=TENorm,
+        post_per_layer_input_norm=TENorm,
         dense_mlp=dense_spec,
     )
     return ModuleSpec(module=Gemma4TransformerLayer, submodules=submods)
@@ -1032,22 +1123,25 @@ def _install_moe_warning_filter():
 
 def _assert_hf_features_supported(hf_text):
     """Fail loudly on Gemma4 HF features this plugin doesn't implement."""
-    if getattr(hf_text, "hidden_size_per_layer_input", 0):
-        raise NotImplementedError(
-            "Gemma4 per-layer input mechanism "
-            f"(hidden_size_per_layer_input={hf_text.hidden_size_per_layer_input}) "
-            "is not implemented. See Gemma4TextDecoderLayer.per_layer_input_gate in HF."
-        )
-    if getattr(hf_text, "num_kv_shared_layers", 0):
-        raise NotImplementedError(
-            "Gemma4 KV-sharing across the last N layers "
-            f"(num_kv_shared_layers={hf_text.num_kv_shared_layers}) is not implemented."
-        )
-    if getattr(hf_text, "use_double_wide_mlp", False):
-        raise NotImplementedError("Gemma4 use_double_wide_mlp is not implemented.")
     # Text-only training assumes causal attention; HF's "all" mode disables it.
     if getattr(hf_text, "use_bidirectional_attention", "vision") == "all":
         raise NotImplementedError("Gemma4 use_bidirectional_attention='all' disables causal masking; not supported.")
+
+
+def _kv_sharing_maps(hf_text):
+    first_shared = hf_text.num_hidden_layers - getattr(hf_text, "num_kv_shared_layers", 0)
+    if first_shared <= 0 or first_shared >= hf_text.num_hidden_layers:
+        return {}, set()
+
+    prev_layers = list(hf_text.layer_types[:first_shared])
+    store_layers = {
+        len(prev_layers) - 1 - prev_layers[::-1].index(layer_type) for layer_type in set(prev_layers)
+    }
+    shared_map = {}
+    for layer_idx in range(first_shared, hf_text.num_hidden_layers):
+        layer_type = hf_text.layer_types[layer_idx]
+        shared_map[layer_idx] = len(prev_layers) - 1 - prev_layers[::-1].index(layer_type)
+    return shared_map, store_layers
 
 
 def _apply_core_config(config, hf_text):
@@ -1082,10 +1176,16 @@ def _apply_core_config(config, hf_text):
 
     config.__class__ = Gemma4TransformerConfig
     config.global_kv_channels = hf_text.global_head_dim
-    config.global_num_query_groups = hf_text.num_global_key_value_heads
+    config.global_num_query_groups = (
+        getattr(hf_text, "num_global_key_value_heads", None) or hf_text.num_key_value_heads
+    )
     config.attention_k_eq_v = getattr(hf_text, "attention_k_eq_v", True)
     config.final_logit_softcapping = getattr(hf_text, "final_logit_softcapping", 30.0)
     config.sliding_window = hf_text.sliding_window
+    config.hidden_size_per_layer_input = getattr(hf_text, "hidden_size_per_layer_input", 0) or 0
+    config.num_kv_shared_layers = getattr(hf_text, "num_kv_shared_layers", 0) or 0
+    config.use_double_wide_mlp = bool(getattr(hf_text, "use_double_wide_mlp", False))
+    config.kv_shared_layer_map, config.kv_store_layers = _kv_sharing_maps(hf_text)
 
     # `sliding_window_pattern` isn't in Gemma4 HF configs - infer from
     # layer_types (first full_attention layer's 1-indexed position).

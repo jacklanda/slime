@@ -29,6 +29,8 @@ Options:
   --show-rollout-progress-logs BOOL      Show periodic fused rollout request/progress logs. Default: false.
   --accepted-group-update-min-groups N   Maps to ROLLOUT_BATCH_SIZE by default.
   --accepted-group-update-max-groups N   Stored in env for compatible fused code.
+  --micro-batch-size N                   Training micro-batch size.
+  --update-weights-interval N            Rollout weight update interval. Default: 1.
   --async-mini-batch-size N              Maps to MICRO_BATCH_SIZE by default.
   --async-fwd-bwd-group-size N           Stored in env for compatible fused code.
   --async-staleness-threshold X          Stored in env for compatible fused code.
@@ -73,6 +75,8 @@ Options:
   --horizon-reward-target-steps X        Target steps for no horizon penalty. Default: 8.
   --horizon-reward-target-tool-calls X   Target tool calls for no horizon penalty. Default: target_steps - 1.
   --enable-dynamic-sampling-filter BOOL  Enable DAPO-style non-zero reward variance dynamic filtering. Default: true.
+  --normalize-advantages / --no-normalize-advantages
+                                         Whiten advantages across the data-parallel batch. Default: disabled.
   --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
   --grm-model NAME                       OpenRouter judge model. Default: deepseek/deepseek-v4-flash.
   --grm-concurrency N                    Max concurrent GRM requests. Default: 512.
@@ -150,6 +154,7 @@ CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_
 CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER:-True}"
 CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP:-False}"
 HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
+NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
@@ -175,7 +180,7 @@ if [ -n "${SGLANG_SERVER_CONCURRENCY+x}" ]; then
 fi
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-3072}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-3072}"
-FULLY_ASYNC_GROUP_CONCURRENCY="${FULLY_ASYNC_GROUP_CONCURRENCY:-}"
+FULLY_ASYNC_GROUP_CONCURRENCY="${FULLY_ASYNC_GROUP_CONCURRENCY:-72}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-300}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
@@ -220,6 +225,8 @@ while [ "$#" -gt 0 ]; do
       --show-rollout-progress-logs) SHOW_ROLLOUT_PROGRESS_LOGS="${2:?Missing value for --show-rollout-progress-logs}"; shift 2 ;;
       --accepted-group-update-min-groups) ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${2:?Missing value for --accepted-group-update-min-groups}"; shift 2 ;;
       --accepted-group-update-max-groups) ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${2:?Missing value for --accepted-group-update-max-groups}"; shift 2 ;;
+      --micro-batch-size) MICRO_BATCH_SIZE="${2:?Missing value for --micro-batch-size}"; ASYNC_MINI_BATCH_SIZE="${MICRO_BATCH_SIZE}"; shift 2 ;;
+      --update-weights-interval) UPDATE_WEIGHTS_INTERVAL="${2:?Missing value for --update-weights-interval}"; ASYNC_TRIGGER_PARAMETER_SYNC_STEP="${UPDATE_WEIGHTS_INTERVAL}"; shift 2 ;;
       --async-mini-batch-size) ASYNC_MINI_BATCH_SIZE="${2:?Missing value for --async-mini-batch-size}"; MICRO_BATCH_SIZE="${ASYNC_MINI_BATCH_SIZE}"; shift 2 ;;
       --async-fwd-bwd-group-size) ASYNC_FWD_BWD_GROUP_SIZE="${2:?Missing value for --async-fwd-bwd-group-size}"; shift 2 ;;
       --async-staleness-threshold) ASYNC_STALENESS_THRESHOLD="${2:?Missing value for --async-staleness-threshold}"; shift 2 ;;
@@ -260,6 +267,8 @@ while [ "$#" -gt 0 ]; do
       --horizon-reward-target-steps) FUSED_HORIZON_REWARD_TARGET_STEPS="${2:?Missing value for --horizon-reward-target-steps}"; shift 2 ;;
       --horizon-reward-target-tool-calls) FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS="${2:?Missing value for --horizon-reward-target-tool-calls}"; shift 2 ;;
       --enable-dynamic-sampling-filter) ENABLE_DYNAMIC_SAMPLING_FILTER="${2:?Missing value for --enable-dynamic-sampling-filter}"; shift 2 ;;
+      --normalize-advantages) NORMALIZE_ADVANTAGES=true; shift ;;
+      --no-normalize-advantages) NORMALIZE_ADVANTAGES=false; shift ;;
       --enable_use_grm_evals|--enable-use-grm-evals) ENABLE_USE_GRM_EVALS="${2:?Missing value for --enable_use_grm_evals}"; shift 2 ;;
       --grm-model) GRM_MODEL="${2:?Missing value for --grm-model}"; shift 2 ;;
       --grm-concurrency) GRM_CONCURRENCY="${2:?Missing value for --grm-concurrency}"; shift 2 ;;
@@ -324,9 +333,9 @@ BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 default_experiment_name() {
    #local prefix="mcp-dapo-q3.5-4b-no_think-gem-async-dev"
-   #local prefix="webqa-dapo-q3.5-4b-no_think-gem-async-dev"
+   local prefix="webqa-dapo-q3.5-4b-no_think-gem-async-dev"
    #local prefix="fused-dapo-q3.5-4b-no_think-gem-async-dev"
-   local prefix="asearcher-dapo-q3.5-4b-no_think-gem-async-dev"
+   #local prefix="asearcher-dapo-q3.5-4b-no_think-gem-async-dev"
    local max_dev=-1
    local root base suffix
    for root in "${REPO_ROOT}/checkpoints/FusedRL" "${REPO_ROOT}/experiments/logs/FusedRL"; do
@@ -370,15 +379,10 @@ else
    DEFAULT_TP_SIZE=8
 fi
 
-# Non-colocate split on a single 8-GPU node: 2 GPUs train, 6 GPUs rollout.
-# Profiling the sync loop showed the trainer GPUs idle ~99% of wall-clock (train
-# and rollout never overlap in sync mode and rollout dominates), while rollout is
-# the bottleneck. So shift two GPUs from the idle trainer to rollout: 6 rollout
-# GPUs at 2 GPUs/engine gives 3 SGLang engines instead of 2 (+50% rollout
-# capacity) for almost no trainer cost. Trainer TP auto-clamps to 2 below.
-# NOTE: a checkpoint saved under TP=4 (e.g. an earlier 4/4 run) cannot reshard its
-# optimizer state to TP=2 — resume such a run once with NO_LOAD_OPTIM=1 (see the
-# CKPT_ARGS note below). Fresh EXPERIMENT_NAMEs start from the HF ref and are fine.
+# Non-colocate split on a single 8-GPU node. Keep 4 GPUs for trainer by default:
+# qwen3.5 fused-agent rollouts can reach ~40k training context, and TP=2 is too
+# tight for backward even with recompute. Use env overrides for rollout-heavy
+# experiments that also reduce context length or token budget.
 # Defined here (before PERF_ARGS is built) so the TP clamp below actually takes
 # effect — bash arrays expand their values at definition time.
 ACTOR_GPUS="${ACTOR_GPUS:-4}"
@@ -401,20 +405,18 @@ LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/FusedRL/${EXPERIMENT_NAME}}"
 EPISODE_LOG_DIR="${EPISODE_LOG_DIR:-${LOG_ROOT}}"
 DUMP_DETAILS="${DUMP_DETAILS:-${LOG_ROOT}/debug}"
 
-# Current slime's stock RolloutDataSource takes one --prompt-data path. Mirror
-# the rllm fused launcher by accepting multiple train parquet files, then build
-# one shuffled parquet before launching slime.
-DEFAULT_TRAIN_FILES=(
-   #"${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
-   #"${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
-   "${SCRIPT_DIR}/artifacts/asearcher.parquet"
-)
-TRAIN_FILE_PATHS=("${DEFAULT_TRAIN_FILES[@]}")
 if [ -n "${TRAIN_FILES:-}" ]; then
-   IFS=',' read -r -a TRAIN_FILE_PATHS <<< "${TRAIN_FILES}"
+   IFS=',' read -r -a TRAIN_FILES <<< "${TRAIN_FILES}"
+else
+   # Current slime's stock RolloutDataSource takes one --prompt-data path. Keep
+   # TRAIN_FILES as the source of truth; only build a prepared parquet when
+   # multiple source files need to be merged.
+   TRAIN_FILES=(
+      #"${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
+      "${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
+      #"${SCRIPT_DIR}/artifacts/asearcher.parquet"
+   )
 fi
-#PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet}"
-PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/asearcher.parquet}"
 SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 
@@ -431,7 +433,7 @@ if [ ! -d "${MODEL_DIR}" ]; then
    exit 1
 fi
 RESOLVED_TRAIN_FILES=()
-for train_file in "${TRAIN_FILE_PATHS[@]}"; do
+for train_file in "${TRAIN_FILES[@]}"; do
    if [ -f "${train_file}" ]; then
       RESOLVED_TRAIN_FILES+=("${train_file}")
       continue
@@ -460,8 +462,12 @@ if [ "${#RESOLVED_TRAIN_FILES[@]}" -eq 0 ]; then
    exit 1
 fi
 
-mkdir -p "$(dirname "${PROMPT_DATA}")"
-python3 - "${PROMPT_DATA}" "${SHUFFLE_TRAIN_DATA}" "${SHUFFLE_SEED}" "${RESOLVED_TRAIN_FILES[@]}" <<'PY'
+if [ "${#RESOLVED_TRAIN_FILES[@]}" -eq 1 ]; then
+   PROMPT_DATA_FOR_SLIME="${RESOLVED_TRAIN_FILES[0]}"
+else
+   PROMPT_DATA_FOR_SLIME="${PREPARED_PROMPT_DATA:-${LOG_ROOT}/prepared_train.parquet}"
+   mkdir -p "$(dirname "${PROMPT_DATA_FOR_SLIME}")"
+   python3 - "${PROMPT_DATA_FOR_SLIME}" "${SHUFFLE_TRAIN_DATA}" "${SHUFFLE_SEED}" "${RESOLVED_TRAIN_FILES[@]}" <<'PY'
 import sys
 from pathlib import Path
 
@@ -497,8 +503,8 @@ if shuffle and combined.num_rows:
     indices = pa.array(np.random.default_rng(seed).permutation(combined.num_rows), type=pa.int64())
     combined = combined.take(indices)
 
-# Write to a temp file then atomically rename. PROMPT_DATA may be the same path
-# as an input file, so a crash mid-write must never corrupt the source parquet.
+# Write to a temp file then atomically rename, so a crash mid-write never leaves
+# a partial prepared parquet.
 tmp_output = output.with_suffix(output.suffix + ".tmp")
 pq.write_table(combined, tmp_output)
 tmp_output.replace(output)
@@ -509,6 +515,7 @@ for path, table in zip(paths, tables):
     print(f"  {path}: {table.num_rows}")
 print(f"Shuffle: {shuffle} seed={seed}")
 PY
+fi
 if [ "${PREPARE_DATA_ONLY:-0}" = "1" ]; then
    exit 0
 fi
@@ -538,8 +545,11 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-38000}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
+# One actor update consumes one rollout batch. In fully-async mode the rollout
+# function returns as soon as it has this many valid task groups.
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-96}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-64}"
+# Number of sampled trajectories per task group.
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_EPOCH="${NUM_EPOCH:-100}"
@@ -557,7 +567,6 @@ else
    ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.sglang_rollout.generate_rollout}"
 fi
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
-FULLY_ASYNC_GROUP_CONCURRENCY="${FULLY_ASYNC_GROUP_CONCURRENCY:-${ROLLOUT_BATCH_SIZE}}"
 case "${ROLLOUT_FUNCTION_PATH}" in
    *fully_async_rollout.generate_rollout_fully_async)
       if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -le 0 ]; then
@@ -598,7 +607,7 @@ if [ "${LOG_PROBS_MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}" -lt "${MAX_CONTEXT_LE
    exit 2
 fi
 
-TRAIN_NUM_ROWS=$(python3 - "${PROMPT_DATA}" <<'PY'
+TRAIN_NUM_ROWS=$(python3 - "${PROMPT_DATA_FOR_SLIME}" <<'PY'
 import sys
 import pyarrow.parquet as pq
 
@@ -606,7 +615,7 @@ print(pq.ParquetFile(sys.argv[1]).metadata.num_rows)
 PY
 )
 if [ "${TRAIN_NUM_ROWS}" -le 0 ]; then
-   echo "PROMPT_DATA has no rows: ${PROMPT_DATA}" >&2
+   echo "Prompt data has no rows: ${PROMPT_DATA_FOR_SLIME}" >&2
    exit 2
 fi
 AUTO_NUM_ROLLOUT=$(( (TRAIN_NUM_ROWS + ROLLOUT_BATCH_SIZE - 1) / ROLLOUT_BATCH_SIZE * NUM_EPOCH ))
@@ -640,7 +649,7 @@ fi
 ROLLOUT_ARGS=(
    --rollout-function-path "${ROLLOUT_FUNCTION_PATH}"
 
-   --prompt-data "${PROMPT_DATA}"
+   --prompt-data "${PROMPT_DATA_FOR_SLIME}"
    --input-key "${INPUT_KEY:-prompt}"
    --label-key "${LABEL_KEY:-reward_model}"
    --metadata-key "${METADATA_KEY:-extra_info}"
@@ -780,13 +789,16 @@ fi
 
 GRPO_ARGS=(
    --advantage-estimator "${ADVANTAGE_ESTIMATOR:-grpo}"
-   --kl-coef "${KL_COEF:-0.01}"
+   --kl-coef "${KL_COEF:-0.03}"
    --kl-loss-coef "${KL_LOSS_COEF:-0.00}"
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF:-0.00}"
    --eps-clip "${EPS_CLIP:-0.2}"
    --eps-clip-high "${EPS_CLIP_HIGH:-0.28}"
 )
+if is_truthy "${NORMALIZE_ADVANTAGES}"; then
+   GRPO_ARGS+=(--normalize-advantages)
+fi
 
 # Rollout correction defaults:
 # - TIS (Truncated Importance Sampling): soft correction. It multiplies pg_loss
@@ -875,7 +887,7 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
 export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-10000000000}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export OPENROUTER_APP_NAME="${OPENROUTER_APP_NAME:-GRM}"
 
 # Fused-agent service knobs inherited from the rllm launcher. They are runtime
@@ -884,7 +896,7 @@ export RETRIEVAL_SERVER_URL="${RETRIEVAL_SERVER_URL:-http://10.2.152.50:65432}"
 export RLLM_RETRIEVAL_MODE="${RLLM_RETRIEVAL_MODE:-hybrid}"
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
 export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-${RLLM_RETRIEVAL_MAX_RESULTS:-4}}"
-export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-1}"
+export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-3}"
 # Summarize is a ~2s LLM call per search with a large retry budget; on slow
 # trajectories it stacks up and blows the 180s rollout collection timeout,
 # causing groups to be dropped. Default off and use raw retrieve docs instead.
@@ -1010,7 +1022,7 @@ PY
 echo "Experiment: ${EXPERIMENT_NAME}"
 echo "Model: ${MODEL_DIR}"
 echo "Ref: ${REF_LOAD}"
-echo "Prompt data: ${PROMPT_DATA}"
+echo "Prompt data: ${PROMPT_DATA_FOR_SLIME}"
 echo "Train rows: ${TRAIN_NUM_ROWS}; rollout_batch_size=${ROLLOUT_BATCH_SIZE}; num_epoch=${NUM_EPOCH}; num_rollout=${NUM_ROLLOUT}"
 echo "Save dir: ${SAVE_DIR}"
 echo "Log root: ${LOG_ROOT}"
@@ -1024,11 +1036,13 @@ echo "Eval function: ${EVAL_FUNCTION_PATH}"
 echo "Actor GPUs: ${ACTOR_GPUS}, rollout GPUs: ${ROLLOUT_GPUS}, colocate=${COLOCATE}, ray GPUs=${NUM_GPUS}"
 echo "SGLang concurrency: server=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}, fully_async_group_concurrency=${FULLY_ASYNC_GROUP_CONCURRENCY}, effective_group_concurrency=${FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY}, rollout_num_engines=${ROLLOUT_NUM_ENGINES}, explicit_server_concurrency=${SGLANG_SERVER_CONCURRENCY_EXPLICIT}"
 echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
-echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; async mini_batch=${ASYNC_MINI_BATCH_SIZE}, sync_interval=${ASYNC_TRIGGER_PARAMETER_SYNC_STEP}"
+echo "Actor update cadence: collect ${ROLLOUT_BATCH_SIZE} valid task groups x ${N_SAMPLES_PER_PROMPT} samples/group = ${EFFECTIVE_GLOBAL_BATCH_SIZE} samples, then update actor"
+echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; micro_batch=${MICRO_BATCH_SIZE}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}, async_fwd_bwd_group_size=${ASYNC_FWD_BWD_GROUP_SIZE}, async_staleness_threshold=${ASYNC_STALENESS_THRESHOLD}"
 echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"
 echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, relax_after_groups=${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}"
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}"
 echo "OpenRouter GRM evals: enable=${ENABLE_USE_GRM_EVALS}, model=${GRM_MODEL}, concurrency=${GRM_CONCURRENCY}, timeout=${GRM_TIMEOUT}, retries=${GRM_MAX_RETRIES}, custom_rm=${GRM_CUSTOM_RM_PATH}"
+echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, normalize_advantages=${NORMALIZE_ADVANTAGES}, kl_coef=${KL_COEF:-0.03}, lr=${LR:-2e-6}, eps_clip=${EPS_CLIP:-0.2}, eps_clip_high=${EPS_CLIP_HIGH:-0.28}"
 echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING:-0}, path=${BUFFER_FILTER_PATH:-${ENABLE_QUOTA_BUCKET_SAMPLING:+slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps}}"
 echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}"
 echo "Horizon reward shaping: enable=${HORIZON_REWARD_SHAPING}, min_multiplier=${FUSED_HORIZON_REWARD_MIN_MULTIPLIER}, gamma=${FUSED_HORIZON_REWARD_GAMMA}, step_weight=${FUSED_HORIZON_REWARD_STEP_WEIGHT}, tool_call_weight=${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT}, target_steps=${FUSED_HORIZON_REWARD_TARGET_STEPS}, target_tool_calls=${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-target_steps-1}"

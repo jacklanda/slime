@@ -19,7 +19,7 @@ from slime.utils import http_utils
 from slime.utils.types import Sample
 
 from .env import FusedEnvironment, _format_retrieval, normalize_task, resolve_task_mode
-from .parser import ToolCall, make_tool_parser
+from .parser import Gemma4ToolParser, ToolCall, make_tool_parser
 from .prompts import (
     COT_SYSTEM_PROMPT,
     COT_USER_PROMPT,
@@ -130,8 +130,20 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             # many concurrent trajectory coroutines actually overlap instead of
             # serializing on the single rollout event-loop thread (which
             # otherwise saturates one core and starves the SGLang engines).
-            prompt_ids = await asyncio.to_thread(_render_prompt_ids, state.tokenizer, messages, disable_thinking=disable_thinking)
-            prompt_context_start_idx = await asyncio.to_thread(_last_assistant_context_start_idx, state.tokenizer, messages, disable_thinking=disable_thinking)
+            prompt_ids = await asyncio.to_thread(
+                _render_prompt_ids,
+                state.tokenizer,
+                messages,
+                tools=tools,
+                disable_thinking=disable_thinking,
+            )
+            prompt_context_start_idx = await asyncio.to_thread(
+                _last_assistant_context_start_idx,
+                state.tokenizer,
+                messages,
+                tools=tools,
+                disable_thinking=disable_thinking,
+            )
             tito_boundary_before = bool(tito_prefix_ids) and not _has_token_prefix(prompt_ids, tito_prefix_ids)
             if tito_boundary_before:
                 if prompt_context_start_idx is not None and 0 <= prompt_context_start_idx <= len(prompt_ids):
@@ -211,7 +223,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         output_log_probs=output_logprobs,
                         context_delta_ids=context_delta_ids,
                         tito_boundary_before=tito_boundary_before,
-                        tito_model_type=_qwen_tito_model_type(model_name),
+                        tito_model_type=_tito_model_type(model_name),
                         disable_thinking=disable_thinking,
                         loss_mask=response_loss_mask,
                         rollout_top_p_token_ids=output.get("rollout_top_p_token_ids"),
@@ -313,6 +325,43 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     )
                     break
                 actions = [ToolCall("finish", {"command": "submit", "result": response})]
+            elif (
+                isinstance(parser, Gemma4ToolParser)
+                and detect_abnormal_trajectories
+                and credit_assignment_tool_parser_error
+                and _response_has_malformed_tool_call(response)
+            ):
+                final_reward = 0.0
+                final_done = True
+                credit_event = "tool_parser_error"
+                credit_step_index = len(pending_turns) - 1
+                await _mark_pending_turn_error_span(
+                    state.tokenizer,
+                    pending_turns[-1],
+                    response,
+                    _parser_error_action_span(response),
+                    output_len=len(output_ids),
+                )
+                last_info = {
+                    "termination_reason": "ABNORMAL_PARSE_ERROR",
+                    "credit_assignment_event": credit_event,
+                    "credit_assignment_error_step_index": credit_step_index,
+                    "tool_parser_error_count": 1,
+                }
+                trajectory_steps.append(
+                    _episode_step(
+                        observation=observation,
+                        response=response,
+                        action="",
+                        reward=0.0,
+                        done=True,
+                        messages=messages,
+                        llm_time=step_llm_time,
+                        env_time=0.0,
+                        disable_thinking=disable_thinking,
+                    )
+                )
+                break
             if detect_abnormal_trajectories and max_tool_calls_per_turn > 0 and len(actions) > max_tool_calls_per_turn:
                 final_reward = 0.0
                 final_done = True
@@ -368,7 +417,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     _episode_step(
                         observation=observation,
                         response=response,
-                        action=_format_action(actions[0]),
+                        action=parser.format_action(actions[0]),
                         reward=0.0,
                         done=True,
                         messages=messages,
@@ -394,7 +443,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     _episode_step(
                         observation=observation,
                         response=response,
-                        action=_format_action(actions[0]),
+                        action=parser.format_action(actions[0]),
                         reward=0.0,
                         done=True,
                         messages=messages,
@@ -415,13 +464,13 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 }
                 if repeated_search_strikes < repeated_search_max_strikes:
                     obs = "Repeated search query detected. Use different keywords, split the question into a new " "sub-query, or submit only if the existing evidence is sufficient."
-                    formatted_obs = _format_tool_observation(actions[0].name, obs)
+                    formatted_obs = _format_tool_observation(parser, actions[0].name, obs)
                     last_info = duplicate_search_info
                     trajectory_steps.append(
                         _episode_step(
                             observation=formatted_obs,
                             response=response,
-                            action=_format_action(actions[0]),
+                            action=parser.format_action(actions[0]),
                             reward=0.0,
                             done=False,
                             messages=messages,
@@ -430,7 +479,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             disable_thinking=disable_thinking,
                         )
                     )
-                    messages.append({"role": "user", "content": formatted_obs})
+                    _append_tool_observation_message(messages, parser, actions[0], formatted_obs, obs)
                     observation = formatted_obs
                     continue
                 final_reward = 0.0
@@ -455,7 +504,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     _episode_step(
                         observation=observation,
                         response=response,
-                        action=_format_action(actions[0]),
+                        action=parser.format_action(actions[0]),
                         reward=0.0,
                         done=True,
                         messages=messages,
@@ -499,7 +548,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     _episode_step(
                         observation=observation,
                         response=response,
-                        action=_format_action(actions[0]),
+                        action=parser.format_action(actions[0]),
                         reward=0.0,
                         done=True,
                         messages=messages,
@@ -509,6 +558,51 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     )
                 )
                 break
+            if env.mode in {"mcp", "web_search"} and _can_append_batched_tool_results(parser, actions):
+                batch_start = time.time()
+                formatted_observations: list[str] = []
+                raw_observations: list[Any] = []
+                executed_actions: list[ToolCall] = []
+                env_infos: list[dict[str, Any]] = []
+                batch_done = False
+                batch_reward = 0.0
+                for action in actions:
+                    if action.name != "finish":
+                        used_non_finish_tool = True
+                    obs, reward, done, env_info = await env.step(action)
+                    executed_actions.append(action)
+                    raw_observations.append(obs)
+                    formatted_observations.append(_format_tool_observation(parser, action.name, obs))
+                    env_infos.append(dict(env_info or {}))
+                    batch_reward = float(reward)
+                    batch_done = bool(done)
+                    if batch_done:
+                        break
+                step_env_time = time.time() - batch_start
+                env_time += step_env_time
+                formatted_obs = "\n".join(formatted_observations)
+                final_reward = batch_reward
+                final_done = batch_done
+                last_info = _merge_tool_infos(env_infos)
+                trajectory_steps.append(
+                    _episode_step(
+                        observation=formatted_obs,
+                        response=response,
+                        action="".join(parser.format_action(action) for action in executed_actions),
+                        reward=final_reward if batch_done else 0.0,
+                        done=batch_done,
+                        messages=messages,
+                        llm_time=step_llm_time,
+                        env_time=step_env_time,
+                        disable_thinking=disable_thinking,
+                    )
+                )
+                _append_tool_observation_messages(messages, parser, executed_actions, formatted_observations, raw_observations)
+                observation = formatted_obs
+                if batch_done:
+                    break
+                continue
+
             action = actions[0]
             if action.name != "finish":
                 used_non_finish_tool = True
@@ -516,7 +610,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             obs, reward, done, env_info = await env.step(action)
             step_env_time = time.time() - env_start
             env_time += step_env_time
-            formatted_obs = _format_tool_observation(action.name, obs)
+            formatted_obs = _format_tool_observation(parser, action.name, obs)
             final_reward = float(reward)
             final_done = bool(done)
             last_info = dict(env_info or {})
@@ -561,7 +655,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 _episode_step(
                     observation=formatted_obs,
                     response=response,
-                    action=_format_action(action),
+                    action=parser.format_action(action),
                     reward=final_reward if done else 0.0,
                     done=done,
                     messages=messages,
@@ -570,7 +664,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     disable_thinking=disable_thinking,
                 )
             )
-            messages.append({"role": "user", "content": formatted_obs})
+            _append_tool_observation_message(messages, parser, action, formatted_obs, obs)
             observation = formatted_obs
             if done:
                 break
@@ -772,6 +866,50 @@ def _initial_messages(harness: str, task_type: str, observation: str, tools: lis
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def _append_tool_observation_message(
+    messages: list[dict[str, Any]],
+    parser,
+    action: ToolCall,
+    formatted_observation: str,
+    raw_observation: Any,
+) -> None:
+    _append_tool_observation_messages(messages, parser, [action], [formatted_observation], [raw_observation])
+
+
+def _append_tool_observation_messages(
+    messages: list[dict[str, Any]],
+    parser,
+    actions: list[ToolCall],
+    formatted_observations: list[str],
+    raw_observations: list[Any],
+) -> None:
+    payloads = [
+        _tool_response_payload(action.name, raw_observation)
+        for action, raw_observation in zip(actions, raw_observations, strict=True)
+    ]
+    assistant_message = parser.assistant_tool_results_message(actions, payloads)
+    if assistant_message is not None:
+        messages[-1] = assistant_message
+        return
+    for formatted_observation in formatted_observations:
+        messages.append({"role": "user", "content": formatted_observation})
+
+
+def _can_append_batched_tool_results(parser, actions: list[ToolCall]) -> bool:
+    if len(actions) <= 1 or any(action.name == "finish" for action in actions):
+        return False
+    return parser.assistant_tool_results_message(actions, [{} for _ in actions]) is not None
+
+
+def _merge_tool_infos(infos: list[dict[str, Any]]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for info in infos:
+        merged.update(info)
+    if len(infos) > 1:
+        merged["tools/batched_calls"] = len(infos)
+    return merged
+
+
 def _valid_tool_names(tools: list[dict]) -> set[str]:
     names = set()
     for schema in tools:
@@ -792,8 +930,10 @@ def _has_token_prefix(token_ids: list[int], prefix_ids: list[int]) -> bool:
     return len(token_ids) >= len(prefix_ids) and token_ids[: len(prefix_ids)] == prefix_ids
 
 
-def _qwen_tito_model_type(model_name: str | None) -> str | None:
+def _tito_model_type(model_name: str | None) -> str | None:
     normalized = str(model_name or "").lower().replace("-", "_")
+    if "gemma4" in normalized or "gemma_4" in normalized:
+        return "gemma4"
     if "qwen3.5" in normalized or "qwen3_5" in normalized:
         return "qwen3_5"
     if "qwen3" in normalized:
@@ -952,17 +1092,34 @@ def _parser_error_action_span(response: str) -> tuple[int, int] | None:
             start += 1
         if start < len(response):
             return start, len(response)
+    idx = response.rfind("<channel|>")
+    if idx >= 0:
+        start = idx + len("<channel|>")
+        while start < len(response) and response[start].isspace():
+            start += 1
+        if start < len(response):
+            return start, len(response)
     return (0, len(response)) if response else None
 
 
+def _response_has_malformed_tool_call(response: str) -> bool:
+    return _first_unclosed_tool_call_span(response) is not None or _first_malformed_tool_call_span(response) is not None
+
+
 def _first_unclosed_tool_call_span(response: str) -> tuple[int, int] | None:
-    start = response.find("<tool_call>")
-    if start < 0:
-        return None
-    end = response.find("</tool_call>", start + len("<tool_call>"))
-    if end >= 0:
-        return None
-    return start, len(response)
+    spans = []
+    for begin, end_marker in (("<tool_call>", "</tool_call>"), ("<|tool_call>", "<tool_call|>")):
+        search_pos = 0
+        while True:
+            start = response.find(begin, search_pos)
+            if start < 0:
+                break
+            end = response.find(end_marker, start + len(begin))
+            if end < 0:
+                spans.append((start, len(response)))
+                break
+            search_pos = end + len(end_marker)
+    return min(spans, default=None)
 
 
 def _first_malformed_tool_call_span(response: str) -> tuple[int, int] | None:
@@ -972,6 +1129,13 @@ def _first_malformed_tool_call_span(response: str) -> tuple[int, int] | None:
         try:
             json.loads(match.group(1).strip())
         except json.JSONDecodeError:
+            return match.start(), match.end()
+    for match in re.finditer(r"<\|tool_call>\s*(.*?)\s*<tool_call\|>", response, flags=re.DOTALL):
+        payload = match.group(1).strip()
+        if not re.fullmatch(r"call:[A-Za-z0-9_.-]+\s*\{.*\}", payload, flags=re.DOTALL):
+            return match.start(), match.end()
+        parsed = make_tool_parser("gemma4").parse(match.group(0))
+        if not parsed:
             return match.start(), match.end()
     return None
 
@@ -1199,8 +1363,9 @@ def _default_response_loss_mask(
         return [0] * start + [1] * (output_len - start)
 
     # Fallback for tokenizers without a resolvable </think> id: character-level
-    # boundary with the pre-existing ±1 re-encode behavior.
-    think_end = _leading_think_block_end(response)
+    # boundary with the pre-existing ±1 re-encode behavior. Gemma4 uses a
+    # native thought channel instead of <think>...</think>.
+    think_end = _leading_thinking_block_end(response)
     if think_end is None:
         return [1] * output_len
 
@@ -1233,25 +1398,38 @@ def _think_close_token_id(tokenizer) -> int | None:
     return tid
 
 
-def _leading_think_block_end(response: str) -> int | None:
+def _leading_thinking_block_end(response: str) -> int | None:
     text = str(response or "")
     stripped = text.lstrip()
-    if not stripped.startswith("<think>"):
-        return None
     prefix_len = len(text) - len(stripped)
-    end = stripped.find("</think>")
-    if end < 0:
+    if stripped.startswith("<think>"):
+        end = stripped.find("</think>")
+        if end < 0:
+            return None
+        block_end = prefix_len + end + len("</think>")
+    elif stripped.startswith("<|channel>thought\n"):
+        end = stripped.find("<channel|>")
+        if end < 0:
+            return None
+        block_end = prefix_len + end + len("<channel|>")
+    else:
         return None
-    block_end = prefix_len + end + len("</think>")
     while block_end < len(text) and text[block_end] in {"\n", "\r"}:
         block_end += 1
     return block_end
 
 
-def _render_prompt_ids(tokenizer, messages: list[dict[str, Any]], *, disable_thinking: bool = True) -> list[int]:
+def _render_prompt_ids(
+    tokenizer,
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict] | None = None,
+    disable_thinking: bool = True,
+) -> list[int]:
     rendered = _apply_chat_template(
         tokenizer,
         messages,
+        tools=tools,
         tokenize=True,
         add_generation_prompt=True,
         disable_thinking=disable_thinking,
@@ -1267,6 +1445,7 @@ def _last_assistant_context_start_idx(
     tokenizer,
     messages: list[dict[str, Any]],
     *,
+    tools: list[dict] | None = None,
     disable_thinking: bool = True,
 ) -> int | None:
     for idx in range(len(messages) - 1, -1, -1):
@@ -1275,6 +1454,7 @@ def _last_assistant_context_start_idx(
                 _render_messages_without_generation_prompt(
                     tokenizer,
                     messages[: idx + 1],
+                    tools=tools,
                     disable_thinking=disable_thinking,
                 )
             )
@@ -1285,11 +1465,13 @@ def _render_messages_without_generation_prompt(
     tokenizer,
     messages: list[dict[str, Any]],
     *,
+    tools: list[dict] | None = None,
     disable_thinking: bool = True,
 ) -> list[int]:
     rendered = _apply_chat_template(
         tokenizer,
         messages,
+        tools=tools,
         tokenize=True,
         add_generation_prompt=False,
         disable_thinking=disable_thinking,
@@ -1305,37 +1487,105 @@ def _apply_chat_template(
     tokenizer,
     messages: list[dict[str, Any]],
     *,
+    tools: list[dict] | None = None,
     tokenize: bool,
     add_generation_prompt: bool,
     disable_thinking: bool,
 ):
-    messages = _prepare_messages_for_chat_template(messages, disable_thinking=disable_thinking)
+    native_tools = _chat_template_accepts_native_tools(tokenizer)
+    messages = _prepare_messages_for_chat_template(
+        messages,
+        disable_thinking=disable_thinking,
+        add_empty_reasoning=not native_tools,
+    )
     kwargs = {
         "tokenize": tokenize,
         "add_generation_prompt": add_generation_prompt,
         "enable_thinking": not disable_thinking,
     }
+    if tools and native_tools:
+        kwargs["tools"] = tools
     try:
         return tokenizer.apply_chat_template(messages, **kwargs)
     except TypeError as exc:
+        if tools and native_tools and _type_error_mentions_kwarg(exc, "tools"):
+            kwargs.pop("tools", None)
+            inline_messages = _messages_with_inline_gemma4_tools(messages, tools)
+            try:
+                return tokenizer.apply_chat_template(inline_messages, **kwargs)
+            except TypeError as inline_exc:
+                if "enable_thinking" not in str(inline_exc):
+                    raise
+                kwargs.pop("enable_thinking", None)
+                return tokenizer.apply_chat_template(inline_messages, **kwargs)
         if "enable_thinking" not in str(exc):
             raise
-        kwargs.pop("enable_thinking")
-        rendered = tokenizer.apply_chat_template(
-            _prepare_messages_for_fallback_chat_template(messages, disable_thinking=disable_thinking),
-            **kwargs,
-        )
-        if not (disable_thinking and add_generation_prompt):
+        kwargs.pop("enable_thinking", None)
+        fallback_messages = messages if native_tools else _prepare_messages_for_fallback_chat_template(messages, disable_thinking=disable_thinking)
+        try:
+            rendered = tokenizer.apply_chat_template(fallback_messages, **kwargs)
+        except TypeError as fallback_exc:
+            if not (tools and native_tools and _type_error_mentions_kwarg(fallback_exc, "tools")):
+                raise
+            kwargs.pop("tools", None)
+            fallback_messages = _messages_with_inline_gemma4_tools(messages, tools)
+            rendered = tokenizer.apply_chat_template(fallback_messages, **kwargs)
+        if native_tools or not (disable_thinking and add_generation_prompt):
             return rendered
         return _append_disabled_thinking_generation_prefix(tokenizer, rendered, tokenize=tokenize)
 
 
-def _prepare_messages_for_chat_template(messages: list[dict[str, Any]], *, disable_thinking: bool) -> list[dict[str, Any]]:
-    if not disable_thinking:
+def _chat_template_accepts_native_tools(tokenizer) -> bool:
+    name = str(getattr(tokenizer, "name_or_path", "") or "").lower().replace("-", "_")
+    return "gemma4" in name or "gemma_4" in name
+
+
+def _type_error_mentions_kwarg(exc: TypeError, kwarg: str) -> bool:
+    message = str(exc)
+    return kwarg in message and ("keyword" in message or "argument" in message)
+
+
+def _messages_with_inline_gemma4_tools(messages: list[dict[str, Any]], tools: list[dict]) -> list[dict[str, Any]]:
+    declarations = _inline_gemma4_tool_declarations(tools)
+    if not declarations:
+        return messages
+
+    prepared = [dict(message) for message in messages]
+    for idx, message in enumerate(prepared):
+        if message.get("role") != "system":
+            continue
+        content = str(message.get("content") or "").strip()
+        if "<|tool>declaration:" in content:
+            return prepared
+        prepared[idx] = {**message, "content": (content + "\n" + declarations).strip()}
+        return prepared
+
+    return [{"role": "system", "content": declarations}, *prepared]
+
+
+def _inline_gemma4_tool_declarations(tools: list[dict]) -> str:
+    declarations = []
+    for schema in tools:
+        declaration = Gemma4ToolParser._format_function_declaration(schema)
+        if declaration:
+            declarations.append(f"<|tool>{declaration}<tool|>")
+    return "".join(declarations)
+
+
+def _prepare_messages_for_chat_template(
+    messages: list[dict[str, Any]],
+    *,
+    disable_thinking: bool,
+    add_empty_reasoning: bool = True,
+) -> list[dict[str, Any]]:
+    if not disable_thinking or not add_empty_reasoning:
         return messages
     prepared = []
     for message in messages:
         if message.get("role") != "assistant":
+            prepared.append(message)
+            continue
+        if message.get("tool_calls") or message.get("tool_responses"):
             prepared.append(message)
             continue
         content = str(message.get("content") or "")
@@ -1450,6 +1700,10 @@ def _extract_thought(response: str) -> str:
     end = response.find("</think>")
     if start >= 0 and end > start:
         return response[start : end + len("</think>")]
+    start = response.find("<|channel>thought")
+    end = response.find("<channel|>", start + len("<|channel>thought")) if start >= 0 else -1
+    if start >= 0 and end > start:
+        return response[start : end + len("<channel|>")]
     return response
 
 
@@ -1458,8 +1712,18 @@ def _format_action(action: ToolCall) -> str:
     return "<tool_call>" + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "</tool_call>"
 
 
-def _format_tool_observation(tool_name: str, output: Any) -> str:
-    output_text = _format_observation_output(tool_name, output)
+def _format_tool_observation(parser_or_tool_name, tool_name_or_output: Any, output: Any | None = None) -> str:
+    if output is None:
+        parser = None
+        tool_name = str(parser_or_tool_name)
+        output_value = tool_name_or_output
+    else:
+        parser = parser_or_tool_name
+        tool_name = str(tool_name_or_output)
+        output_value = output
+    output_text = _format_observation_output(tool_name, output_value)
+    if parser is not None and hasattr(parser, "format_tool_observation"):
+        return parser.format_tool_observation(tool_name, output_text)
     return "<tool_response>\n" f"Execution output of [{tool_name}]:\n" f"{output_text}\n" "</tool_response>"
 
 
@@ -1469,6 +1733,17 @@ def _format_observation_output(tool_name: str, output: Any) -> str:
     if isinstance(output, str):
         return output
     return json.dumps(output, ensure_ascii=False, default=str)
+
+
+def _tool_response_payload(tool_name: str, output: Any) -> Any:
+    if _is_web_search_tool(tool_name):
+        return _format_observation_output(tool_name, output)
+    if not isinstance(output, str):
+        return output
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError:
+        return output
 
 
 def _is_web_search_tool(tool_name: str) -> bool:

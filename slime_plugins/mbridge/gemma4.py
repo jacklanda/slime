@@ -94,12 +94,24 @@ class Gemma4Bridge(Gemma3Bridge):
         "decoder.layers.{layer_number}.post_feedforward_layernorm_1.weight": [
             "model.language_model.layers.{layer_number}.post_feedforward_layernorm_1.weight",
         ],
+        "decoder.layers.{layer_number}.per_layer_input_gate.weight": [
+            "model.language_model.layers.{layer_number}.per_layer_input_gate.weight",
+        ],
+        "decoder.layers.{layer_number}.per_layer_projection.weight": [
+            "model.language_model.layers.{layer_number}.per_layer_projection.weight",
+        ],
+        "decoder.layers.{layer_number}.post_per_layer_input_norm.weight": [
+            "model.language_model.layers.{layer_number}.post_per_layer_input_norm.weight",
+        ],
     }
 
     _RE_MOE_EXPERT = re.compile(r"^decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc([12])\.weight(\d+)$")
 
     _DIRECT_MAPPING = {
         "embedding.word_embeddings.weight": "model.language_model.embed_tokens.weight",
+        "embedding.per_layer_embeddings.weight": "model.language_model.embed_tokens_per_layer.weight",
+        "per_layer_model_projection.weight": "model.language_model.per_layer_model_projection.weight",
+        "per_layer_projection_norm.weight": "model.language_model.per_layer_projection_norm.weight",
         "decoder.final_layernorm.weight": "model.language_model.norm.weight",
         "output_layer.weight": "model.language_model.embed_tokens.weight",
     }
@@ -116,11 +128,19 @@ class Gemma4Bridge(Gemma3Bridge):
         layer_types = getattr(hf_text, "layer_types", [])
         self._GLOBAL_ATTN_LAYERS = {i for i, t in enumerate(layer_types) if t == "full_attention"}
 
-    def _attention_shape_for_hf_weights(self, hf_weights: list[torch.Tensor]) -> tuple[int, int]:
+    def _attention_shape_for_hf_weights(
+        self, layer_number: int, hf_weights: list[torch.Tensor]
+    ) -> tuple[int, int]:
         hf_text = self.hf_config.text_config if hasattr(self.hf_config, "text_config") else self.hf_config
+        is_global = layer_number in self._GLOBAL_ATTN_LAYERS
+        if is_global:
+            return (
+                int(getattr(hf_text, "num_global_key_value_heads", None) or hf_text.num_key_value_heads),
+                int(getattr(hf_text, "global_head_dim", hf_text.head_dim)),
+            )
         if len(hf_weights) == 2:
             return (
-                int(getattr(hf_text, "num_global_key_value_heads", hf_text.num_key_value_heads)),
+                int(getattr(hf_text, "num_global_key_value_heads", None) or hf_text.num_key_value_heads),
                 int(getattr(hf_text, "global_head_dim", hf_text.head_dim)),
             )
         if len(hf_weights) == 3:
@@ -137,7 +157,8 @@ class Gemma4Bridge(Gemma3Bridge):
         key = ".".join(split_name)
 
         if key == "decoder.layers.{layer_number}.self_attention.linear_qkv.weight":
-            if layer_number in self._GLOBAL_ATTN_LAYERS:
+            hf_text = self.hf_config.text_config if hasattr(self.hf_config, "text_config") else self.hf_config
+            if layer_number in self._GLOBAL_ATTN_LAYERS and getattr(hf_text, "attention_k_eq_v", True):
                 return [
                     f"model.language_model.layers.{layer_number}.self_attn.q_proj.weight",
                     f"model.language_model.layers.{layer_number}.self_attn.k_proj.weight",
@@ -202,7 +223,7 @@ class Gemma4Bridge(Gemma3Bridge):
 
             hf_text = self.hf_config.text_config if hasattr(self.hf_config, "text_config") else self.hf_config
             num_attention_heads = hf_text.num_attention_heads
-            num_kv_heads, head_dim = self._attention_shape_for_hf_weights(hf_weights)
+            num_kv_heads, head_dim = self._attention_shape_for_hf_weights(layer_num, hf_weights)
 
             if len(hf_weights) == 2:
                 q, k = hf_weights

@@ -363,20 +363,18 @@ LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/FusedRL/${EXPERIMENT_NAME}}"
 EPISODE_LOG_DIR="${EPISODE_LOG_DIR:-${LOG_ROOT}}"
 DUMP_DETAILS="${DUMP_DETAILS:-${LOG_ROOT}/debug}"
 
-# Current slime's stock RolloutDataSource takes one --prompt-data path. Mirror
-# the rllm fused launcher by accepting multiple train parquet files, then build
-# one shuffled parquet before launching slime.
-DEFAULT_TRAIN_FILES=(
-   #"${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
-   #"${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
-   "${SCRIPT_DIR}/artifacts/asearcher.parquet"
-)
-TRAIN_FILE_PATHS=("${DEFAULT_TRAIN_FILES[@]}")
 if [ -n "${TRAIN_FILES:-}" ]; then
-   IFS=',' read -r -a TRAIN_FILE_PATHS <<< "${TRAIN_FILES}"
+   IFS=',' read -r -a TRAIN_FILES <<< "${TRAIN_FILES}"
+else
+   # Current slime's stock RolloutDataSource takes one --prompt-data path. Keep
+   # TRAIN_FILES as the source of truth; only build a prepared parquet when
+   # multiple source files need to be merged.
+   TRAIN_FILES=(
+      #"${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
+      #"${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
+      "${SCRIPT_DIR}/artifacts/asearcher.parquet"
+   )
 fi
-#PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet}"
-PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/asearcher.parquet}"
 SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 
@@ -393,7 +391,7 @@ if [ ! -d "${MODEL_DIR}" ]; then
    exit 1
 fi
 RESOLVED_TRAIN_FILES=()
-for train_file in "${TRAIN_FILE_PATHS[@]}"; do
+for train_file in "${TRAIN_FILES[@]}"; do
    if [ -f "${train_file}" ]; then
       RESOLVED_TRAIN_FILES+=("${train_file}")
       continue
@@ -422,8 +420,12 @@ if [ "${#RESOLVED_TRAIN_FILES[@]}" -eq 0 ]; then
    exit 1
 fi
 
-mkdir -p "$(dirname "${PROMPT_DATA}")"
-python3 - "${PROMPT_DATA}" "${SHUFFLE_TRAIN_DATA}" "${SHUFFLE_SEED}" "${RESOLVED_TRAIN_FILES[@]}" <<'PY'
+if [ "${#RESOLVED_TRAIN_FILES[@]}" -eq 1 ]; then
+   PROMPT_DATA_FOR_SLIME="${RESOLVED_TRAIN_FILES[0]}"
+else
+   PROMPT_DATA_FOR_SLIME="${PREPARED_PROMPT_DATA:-${LOG_ROOT}/prepared_train.parquet}"
+   mkdir -p "$(dirname "${PROMPT_DATA_FOR_SLIME}")"
+   python3 - "${PROMPT_DATA_FOR_SLIME}" "${SHUFFLE_TRAIN_DATA}" "${SHUFFLE_SEED}" "${RESOLVED_TRAIN_FILES[@]}" <<'PY'
 import sys
 from pathlib import Path
 
@@ -459,8 +461,8 @@ if shuffle and combined.num_rows:
     indices = pa.array(np.random.default_rng(seed).permutation(combined.num_rows), type=pa.int64())
     combined = combined.take(indices)
 
-# Write to a temp file then atomically rename. PROMPT_DATA may be the same path
-# as an input file, so a crash mid-write must never corrupt the source parquet.
+# Write to a temp file then atomically rename, so a crash mid-write never leaves
+# a partial prepared parquet.
 tmp_output = output.with_suffix(output.suffix + ".tmp")
 pq.write_table(combined, tmp_output)
 tmp_output.replace(output)
@@ -471,6 +473,7 @@ for path, table in zip(paths, tables):
     print(f"  {path}: {table.num_rows}")
 print(f"Shuffle: {shuffle} seed={seed}")
 PY
+fi
 if [ "${PREPARE_DATA_ONLY:-0}" = "1" ]; then
    exit 0
 fi
@@ -533,7 +536,7 @@ if [ "${LOG_PROBS_MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}" -lt "${MAX_CONTEXT_LE
    exit 2
 fi
 
-TRAIN_NUM_ROWS=$(python3 - "${PROMPT_DATA}" <<'PY'
+TRAIN_NUM_ROWS=$(python3 - "${PROMPT_DATA_FOR_SLIME}" <<'PY'
 import sys
 import pyarrow.parquet as pq
 
@@ -541,7 +544,7 @@ print(pq.ParquetFile(sys.argv[1]).metadata.num_rows)
 PY
 )
 if [ "${TRAIN_NUM_ROWS}" -le 0 ]; then
-   echo "PROMPT_DATA has no rows: ${PROMPT_DATA}" >&2
+   echo "Prompt data has no rows: ${PROMPT_DATA_FOR_SLIME}" >&2
    exit 2
 fi
 AUTO_NUM_ROLLOUT=$(( (TRAIN_NUM_ROWS + ROLLOUT_BATCH_SIZE - 1) / ROLLOUT_BATCH_SIZE * NUM_EPOCH ))
@@ -575,7 +578,7 @@ fi
 ROLLOUT_ARGS=(
    --rollout-function-path "${ROLLOUT_FUNCTION_PATH}"
 
-   --prompt-data "${PROMPT_DATA}"
+   --prompt-data "${PROMPT_DATA_FOR_SLIME}"
    --input-key "${INPUT_KEY:-prompt}"
    --label-key "${LABEL_KEY:-reward_model}"
    --metadata-key "${METADATA_KEY:-extra_info}"
@@ -949,7 +952,7 @@ PY
 echo "Experiment: ${EXPERIMENT_NAME}"
 echo "Model: ${MODEL_DIR}"
 echo "Ref: ${REF_LOAD}"
-echo "Prompt data: ${PROMPT_DATA}"
+echo "Prompt data: ${PROMPT_DATA_FOR_SLIME}"
 echo "Train rows: ${TRAIN_NUM_ROWS}; rollout_batch_size=${ROLLOUT_BATCH_SIZE}; num_epoch=${NUM_EPOCH}; num_rollout=${NUM_ROLLOUT}"
 echo "Save dir: ${SAVE_DIR}"
 echo "Log root: ${LOG_ROOT}"

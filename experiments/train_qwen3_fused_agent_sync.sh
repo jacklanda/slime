@@ -99,9 +99,9 @@ Options:
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
   --offload-train BOOL                   Offload trainer model between rollout/train phases. Default: matches --colocate.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 400.
-  --sglang-max-running-requests N        SGLang max running requests. Default: 512.
-  --colocate / --no-colocate             Share trainer and rollout GPUs with offload. Default: disabled.
+  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 1280.
+  --sglang-max-running-requests N        SGLang max running requests. Default: 1280.
+  --colocate / --no-colocate             Share trainer and rollout GPUs with offload. Default: enabled.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
 EOF
@@ -118,17 +118,13 @@ FULLY_ASYNC="${FULLY_ASYNC:-false}"
 PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
-# Default to non-colocate: train and rollout live on separate GPUs so training
-# never runs the per-step torch_memory_saver offload/pause path. That pause path
-# (cudaError 1 "invalid argument" in torch_memory_saver.cpp func=pause) crashes
-# after ~20 offload cycles under colocate + enable_cpu_backup and has no upstream
-# fix (already on the latest torch_memory_saver; see slime issues #1786/#71).
-COLOCATE="${COLOCATE:-false}"
+# Share all eight GPUs between training and rollout by default.
+COLOCATE="${COLOCATE:-true}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
-ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-16}"
+ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-8}"
 ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE:-16}}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE:-8}}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-1}}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 TAIL_GUARD="${TAIL_GUARD:-False}"
@@ -148,13 +144,13 @@ CREDIT_ASSIGNMENT_SEARCH_BYPASS="${CREDIT_ASSIGNMENT_SEARCH_BYPASS:-True}"
 CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL:-True}"
 CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER:-True}"
 CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP:-False}"
-HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
-NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
+HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-true}"
+NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
 FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT="${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT:-0.3}"
-FUSED_HORIZON_REWARD_TARGET_STEPS="${FUSED_HORIZON_REWARD_TARGET_STEPS:-8}"
+FUSED_HORIZON_REWARD_TARGET_STEPS="${FUSED_HORIZON_REWARD_TARGET_STEPS:-16}"
 FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS="${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-}"
 MAX_STEPS="${MAX_STEPS:-128}"
 MCP_MAX_STEPS="${MCP_MAX_STEPS:-128}"
@@ -169,8 +165,8 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # in-flight request counts so more trajectories overlap and cover those I/O waits.
 # 4B weights are tiny at mem_fraction=0.9, so KV headroom is ample; watch for KV
 # eviction only if 38k-context trajectories start getting preempted.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-1024}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-1024}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-1280}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-1280}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-300}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
@@ -321,11 +317,11 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 default_experiment_name() {
-   #local prefix="fused-dapo-q3-4b-no_think-gem-sync-dev"
+   local prefix="fused-dapo-q3-4b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="webqa-dapo-q3-4b-no_think-gem-sync-dev"
-   local prefix="webqa-dapo-q3-8b-no_think-gem-sync-dev"
+   #local prefix="webqa-dapo-q3-8b-no_think-gem-sync-dev"
    #local prefix="webqa-dapo-q3.5-4b-no_think-gem-sync-dev"
    #local prefix="mcp-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3.5-4b-no_think-gem-sync-dev"
@@ -356,8 +352,8 @@ elif [ "${SLIME_CLEANUP:-0}" = "1" ]; then
    echo "SLIME_CLEANUP=1 ignored because SLIME_CLEANUP_CONFIRM=1 is not set; preserving existing processes and artifacts."
 fi
 
-#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
-MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
+MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
+#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
@@ -376,11 +372,10 @@ else
    DEFAULT_TP_SIZE=8
 fi
 
-# Non-colocate split on a single 8-GPU node: 4 GPUs train, 4 GPUs rollout.
-# Defined here (before PERF_ARGS is built) so the TP clamp below actually takes
-# effect — bash arrays expand their values at definition time.
-ACTOR_GPUS="${ACTOR_GPUS:-4}"
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
+# Colocate training and rollout across the same 8-GPU node. Defined here before
+# PERF_ARGS is built because bash arrays expand their values at definition time.
+ACTOR_GPUS="${ACTOR_GPUS:-8}"
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
 
 # TP cannot exceed the number of actor GPUs. Clamp the model-level default so a
 # 4-GPU non-colocate actor uses TP=4 instead of the colocate-era TP=8 default.
@@ -389,9 +384,9 @@ if [ "${DEFAULT_TP_SIZE}" -gt "${ACTOR_GPUS}" ]; then
 fi
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/checkpoints/FusedRL/${EXPERIMENT_NAME}}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
@@ -399,23 +394,19 @@ LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/FusedRL/${EXPERIMENT_NAME}}"
 EPISODE_LOG_DIR="${EPISODE_LOG_DIR:-${LOG_ROOT}}"
 DUMP_DETAILS="${DUMP_DETAILS:-${LOG_ROOT}/debug}"
 
-# Current slime's stock RolloutDataSource takes one --prompt-data path. Mirror
-# the rllm fused launcher by accepting multiple train parquet files, then build
-# one shuffled parquet before launching slime.
-DEFAULT_TRAIN_FILES=(
-   #"${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
-   "${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
-   #"${SCRIPT_DIR}/artifacts/asearcher.parquet"
-   #"${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet"
-)
-TRAIN_FILE_PATHS=("${DEFAULT_TRAIN_FILES[@]}")
 if [ -n "${TRAIN_FILES:-}" ]; then
-   IFS=',' read -r -a TRAIN_FILE_PATHS <<< "${TRAIN_FILES}"
+   IFS=',' read -r -a TRAIN_FILES <<< "${TRAIN_FILES}"
+else
+   # Current slime's stock RolloutDataSource takes one --prompt-data path. Keep
+   # TRAIN_FILES as the source of truth; only build a prepared parquet when
+   # multiple source files need to be merged.
+   TRAIN_FILES=(
+      "${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
+      "${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
+      #"${SCRIPT_DIR}/artifacts/asearcher.parquet"
+      #"${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet"
+   )
 fi
-#PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet}"
-PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/search_data_final/train.parquet}"
-#PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet}"
-#PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/artifacts/asearcher.parquet}"
 SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 
@@ -431,7 +422,7 @@ if [ ! -d "${MODEL_DIR}" ]; then
    exit 1
 fi
 RESOLVED_TRAIN_FILES=()
-for train_file in "${TRAIN_FILE_PATHS[@]}"; do
+for train_file in "${TRAIN_FILES[@]}"; do
    if [ -f "${train_file}" ]; then
       RESOLVED_TRAIN_FILES+=("${train_file}")
       continue
@@ -460,8 +451,12 @@ if [ "${#RESOLVED_TRAIN_FILES[@]}" -eq 0 ]; then
    exit 1
 fi
 
-mkdir -p "$(dirname "${PROMPT_DATA}")"
-python3 - "${PROMPT_DATA}" "${SHUFFLE_TRAIN_DATA}" "${SHUFFLE_SEED}" "${RESOLVED_TRAIN_FILES[@]}" <<'PY'
+if [ "${#RESOLVED_TRAIN_FILES[@]}" -eq 1 ]; then
+   PROMPT_DATA_FOR_SLIME="${RESOLVED_TRAIN_FILES[0]}"
+else
+   PROMPT_DATA_FOR_SLIME="${PREPARED_PROMPT_DATA:-${LOG_ROOT}/prepared_train.parquet}"
+   mkdir -p "$(dirname "${PROMPT_DATA_FOR_SLIME}")"
+   python3 - "${PROMPT_DATA_FOR_SLIME}" "${SHUFFLE_TRAIN_DATA}" "${SHUFFLE_SEED}" "${RESOLVED_TRAIN_FILES[@]}" <<'PY'
 import sys
 from pathlib import Path
 
@@ -497,8 +492,8 @@ if shuffle and combined.num_rows:
     indices = pa.array(np.random.default_rng(seed).permutation(combined.num_rows), type=pa.int64())
     combined = combined.take(indices)
 
-# Write to a temp file then atomically rename. PROMPT_DATA may be the same path
-# as an input file, so a crash mid-write must never corrupt the source parquet.
+# Write to a temp file then atomically rename, so a crash mid-write never leaves
+# a partial prepared parquet.
 tmp_output = output.with_suffix(output.suffix + ".tmp")
 pq.write_table(combined, tmp_output)
 tmp_output.replace(output)
@@ -509,6 +504,7 @@ for path, table in zip(paths, tables):
     print(f"  {path}: {table.num_rows}")
 print(f"Shuffle: {shuffle} seed={seed}")
 PY
+fi
 if [ "${PREPARE_DATA_ONLY:-0}" = "1" ]; then
    exit 0
 fi
@@ -538,7 +534,7 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-38000}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-64}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
@@ -571,7 +567,7 @@ if [ "${LOG_PROBS_MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}" -lt "${MAX_CONTEXT_LE
    exit 2
 fi
 
-TRAIN_NUM_ROWS=$(python3 - "${PROMPT_DATA}" <<'PY'
+TRAIN_NUM_ROWS=$(python3 - "${PROMPT_DATA_FOR_SLIME}" <<'PY'
 import sys
 import pyarrow.parquet as pq
 
@@ -579,7 +575,7 @@ print(pq.ParquetFile(sys.argv[1]).metadata.num_rows)
 PY
 )
 if [ "${TRAIN_NUM_ROWS}" -le 0 ]; then
-   echo "PROMPT_DATA has no rows: ${PROMPT_DATA}" >&2
+   echo "Prompt data has no rows: ${PROMPT_DATA_FOR_SLIME}" >&2
    exit 2
 fi
 AUTO_NUM_ROLLOUT=$(( (TRAIN_NUM_ROWS + ROLLOUT_BATCH_SIZE - 1) / ROLLOUT_BATCH_SIZE * NUM_EPOCH ))
@@ -613,7 +609,7 @@ fi
 ROLLOUT_ARGS=(
    --rollout-function-path "${ROLLOUT_FUNCTION_PATH}"
 
-   --prompt-data "${PROMPT_DATA}"
+   --prompt-data "${PROMPT_DATA_FOR_SLIME}"
    --input-key "${INPUT_KEY:-prompt}"
    --label-key "${LABEL_KEY:-reward_model}"
    --metadata-key "${METADATA_KEY:-extra_info}"
@@ -628,7 +624,7 @@ ROLLOUT_ARGS=(
    --rollout-max-prompt-len "${MAX_PROMPT_LENGTH}"
    --rollout-max-response-len "${MAX_RESPONSE_LENGTH}"
    --rollout-temperature "${TEMPERATURE:-0.8}"
-   --rollout-top-p "${TOP_P:-0.95}"
+   --rollout-top-p "${TOP_P:-1.0}"
 
    --global-batch-size "${EFFECTIVE_GLOBAL_BATCH_SIZE}"
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
@@ -793,9 +789,20 @@ OPTIMIZER_ARGS=(
    --adam-beta2 0.98
 )
 
+# Colocated SGLang shares each GPU with residual trainer allocations during
+# weight synchronization. A 0.9 static pool needs about 71 GiB on an 80 GiB
+# GPU and cannot resume when the trainer is still using roughly 18 GiB.
+if [ -z "${SGLANG_MEM_FRACTION_STATIC:-}" ]; then
+   if is_truthy "${COLOCATE}"; then
+      SGLANG_MEM_FRACTION_STATIC=0.75
+   else
+      SGLANG_MEM_FRACTION_STATIC="${GPU_MEMORY_UTILIZATION:-0.9}"
+   fi
+fi
+
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
-   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-${GPU_MEMORY_UTILIZATION:-0.9}}"
+   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
    --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}"
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
    --sglang-context-length "${MAX_CONTEXT_LEN}"
@@ -983,7 +990,7 @@ PY
 echo "Experiment: ${EXPERIMENT_NAME}"
 echo "Model: ${MODEL_DIR}"
 echo "Ref: ${REF_LOAD}"
-echo "Prompt data: ${PROMPT_DATA}"
+echo "Prompt data: ${PROMPT_DATA_FOR_SLIME}"
 echo "Train rows: ${TRAIN_NUM_ROWS}; rollout_batch_size=${ROLLOUT_BATCH_SIZE}; num_epoch=${NUM_EPOCH}; num_rollout=${NUM_ROLLOUT}"
 echo "Save dir: ${SAVE_DIR}"
 echo "Log root: ${LOG_ROOT}"
@@ -994,7 +1001,7 @@ echo "Custom generate: ${CUSTOM_GENERATE_FUNCTION_PATH:-<stock slime rollout>}"
 echo "Custom reward post-process: ${CUSTOM_REWARD_POST_PROCESS_PATH:-<vanilla>}"
 echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
 echo "Actor GPUs: ${ACTOR_GPUS}, rollout GPUs: ${ROLLOUT_GPUS}, colocate=${COLOCATE}, ray GPUs=${NUM_GPUS}"
-echo "SGLang concurrency: server=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}"
+echo "SGLang: mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}, server_concurrency=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}"
 echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
 echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; micro_batch=${MICRO_BATCH_SIZE}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}"
 echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"

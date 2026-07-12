@@ -10,7 +10,9 @@ Installs Gemma4-specific behaviors that sit outside the transformer layer:
 import json
 import logging
 import os
+from types import MethodType
 
+import torch.nn.functional as F
 import torch
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.spec_utils import import_module
@@ -110,6 +112,52 @@ def _logit_softcapping(logits: torch.Tensor, scale: float) -> torch.Tensor:
     return _Gemma4LogitSoftcap.apply(logits, float(scale))
 
 
+class _Gemma4RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(x, (self.weight.shape[0],), self.weight, self.eps)
+
+
+def _install_per_layer_input_modules(inner, args, config, hf_text):
+    ple_dim = getattr(hf_text, "hidden_size_per_layer_input", 0) or 0
+    if not ple_dim or not hasattr(inner, "embedding"):
+        return
+
+    from megatron.core import tensor_parallel
+
+    num_layers = hf_text.num_hidden_layers
+    packed_dim = num_layers * ple_dim
+    vocab_size = getattr(hf_text, "vocab_size_per_layer_input", hf_text.vocab_size)
+    inner.embedding.per_layer_embeddings = tensor_parallel.VocabParallelEmbedding(
+        num_embeddings=vocab_size,
+        embedding_dim=packed_dim,
+        init_method=config.embedding_init_method,
+        reduce_scatter_embeddings=False,
+        config=config,
+        tp_group=inner.embedding.tp_group,
+    )
+    inner.per_layer_model_projection = torch.nn.Linear(config.hidden_size, packed_dim, bias=False)
+    inner.per_layer_projection_norm = _Gemma4RMSNorm(ple_dim, eps=config.layernorm_epsilon)
+
+    inner._gemma4_ple_dim = ple_dim
+    inner._gemma4_num_layers = num_layers
+    inner._gemma4_per_layer_input_scale = 2.0**-0.5
+    inner._gemma4_per_layer_model_projection_scale = config.hidden_size**-0.5
+
+    orig_forward = inner.forward
+
+    def _forward_with_gemma4_state(self, *f_args, **f_kwargs):
+        self.config._gemma4_shared_kv_states = {}
+        self.config._gemma4_per_layer_inputs = None
+        return orig_forward(*f_args, **f_kwargs)
+
+    inner.forward = MethodType(_forward_with_gemma4_state, inner)
+
+
 def _install_hooks(model, args, config, pre_process, post_process):
     """Install Gemma4-specific pre/post-process hooks on a built GPTModel.
 
@@ -129,6 +177,7 @@ def _install_hooks(model, args, config, pre_process, post_process):
     hidden_size = config.hidden_size
 
     inner = model.module if hasattr(model, "module") else model
+    _install_per_layer_input_modules(inner, args, config, hf_text)
 
     # Embedding scaling - HF applies this inside the embedding module.
     # See ``Gemma4TextScaledWordEmbedding``: the scale is stored as an fp32
@@ -139,7 +188,38 @@ def _install_hooks(model, args, config, pre_process, post_process):
         embed_scale = torch.tensor(hidden_size**0.5)  # fp32
 
         def _embed_hook(module, inp, output):
-            return output * embed_scale.to(output.dtype)
+            scaled = output * embed_scale.to(output.dtype)
+            if not hasattr(module, "per_layer_embeddings"):
+                return scaled
+
+            input_ids = inp[0]
+            token_ple = module.per_layer_embeddings(input_ids)
+            token_ple = token_ple.transpose(0, 1).contiguous()
+            if token_ple.shape[0] != scaled.shape[0]:
+                from megatron.core import tensor_parallel
+
+                token_ple = tensor_parallel.scatter_to_sequence_parallel_region(
+                    token_ple,
+                    group=module.tp_group,
+                )
+
+            projected = inner.per_layer_model_projection(scaled) * inner._gemma4_per_layer_model_projection_scale
+            projected = projected.reshape(
+                scaled.shape[0],
+                scaled.shape[1],
+                inner._gemma4_num_layers,
+                inner._gemma4_ple_dim,
+            )
+            projected = inner.per_layer_projection_norm(projected)
+
+            token_ple = token_ple.reshape(
+                scaled.shape[0],
+                scaled.shape[1],
+                inner._gemma4_num_layers,
+                inner._gemma4_ple_dim,
+            )
+            config._gemma4_per_layer_inputs = (projected + token_ple) * inner._gemma4_per_layer_input_scale
+            return scaled
 
         inner.embedding.register_forward_hook(_embed_hook)
 
@@ -227,8 +307,24 @@ def _read_layer_scalars_from_safetensors(hf_checkpoint: str) -> dict[int, float]
     """
     index_path = os.path.join(hf_checkpoint, "model.safetensors.index.json")
     if not os.path.exists(index_path):
-        logger.warning("No safetensors index at %s; skipping layer scalars", index_path)
-        return None
+        single_path = os.path.join(hf_checkpoint, "model.safetensors")
+        if not os.path.exists(single_path):
+            logger.warning("No safetensors index at %s; skipping layer scalars", index_path)
+            return None
+
+        from safetensors import safe_open
+
+        scalars: dict[int, float] = {}
+        with safe_open(single_path, framework="pt", device="cpu") as sf:
+            for key in sf.keys():
+                if "layer_scalar" not in key:
+                    continue
+                layer_idx = int(key.split(".layers.")[1].split(".")[0])
+                scalars[layer_idx] = sf.get_tensor(key).item()
+        if not scalars:
+            logger.warning("No layer_scalar weights found in checkpoint %s", hf_checkpoint)
+            return None
+        return scalars
 
     from safetensors import safe_open
 

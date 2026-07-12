@@ -201,6 +201,16 @@ def _write_fake_safetensors_layer_scalars(ckpt_dir, scalars):
     (ckpt_dir / "model.safetensors.index.json").write_text(json.dumps(index))
 
 
+def _write_fake_single_safetensors_layer_scalars(ckpt_dir, scalars):
+    from safetensors.torch import save_file
+
+    tensors = {
+        f"model.language_model.layers.{layer_idx}.layer_scalar": torch.tensor(value)
+        for layer_idx, value in scalars.items()
+    }
+    save_file(tensors, str(ckpt_dir / "model.safetensors"))
+
+
 def test_load_layer_scalars_applies_values_to_layers(tmp_path):
     scalars = {0: 0.5, 1: 1.5, 2: 2.5}
     _write_fake_safetensors_layer_scalars(tmp_path, scalars)
@@ -225,6 +235,32 @@ def test_load_layer_scalars_applies_values_to_layers(tmp_path):
 
     for i, expected in scalars.items():
         assert inner.decoder.layers[i].layer_scalar.item() == pytest.approx(expected)
+
+
+def test_load_layer_scalars_reads_single_safetensors_file(tmp_path):
+    scalars = {0: 0.25, 1: 0.75}
+    _write_fake_single_safetensors_layer_scalars(tmp_path, scalars)
+
+    inner = torch.nn.Module()
+    inner.decoder = torch.nn.Module()
+    layers = []
+    for _ in range(2):
+        layer = torch.nn.Module()
+        layer.register_buffer("layer_scalar", torch.ones(1))
+        layers.append(layer)
+    inner.decoder.layers = torch.nn.ModuleList(layers)
+
+    import megatron.core.transformer.transformer_layer as tl
+
+    orig_offset = tl.get_transformer_layer_offset
+    tl.get_transformer_layer_offset = lambda _cfg: 0
+    try:
+        _provider._load_layer_scalars(inner, str(tmp_path), config=SimpleNamespace())
+    finally:
+        tl.get_transformer_layer_offset = orig_offset
+
+    assert inner.decoder.layers[0].layer_scalar.item() == pytest.approx(0.25)
+    assert inner.decoder.layers[1].layer_scalar.item() == pytest.approx(0.75)
 
 
 def test_load_layer_scalars_respects_pp_offset(tmp_path):

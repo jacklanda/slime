@@ -37,6 +37,18 @@ CFG_31B = SimpleNamespace(
     layer_types=(["sliding_attention"] * 5 + ["full_attention"]) * 10,
 )
 
+CFG_E2B = SimpleNamespace(
+    hidden_size=1536,
+    num_attention_heads=8,
+    head_dim=256,
+    num_key_value_heads=1,
+    global_head_dim=512,
+    num_global_key_value_heads=None,
+    num_hidden_layers=35,
+    attention_k_eq_v=False,
+    layer_types=(["sliding_attention"] * 4 + ["full_attention"]) * 7,
+)
+
 
 def test_gemma4_bridge_dense_config_does_not_set_moe_kwargs():
     bridge = object.__new__(load_gemma4_bridge_class())
@@ -77,6 +89,34 @@ def test_gemma4_bridge_moe_config_sets_expert_parallel_kwargs():
     assert cfg["moe_router_score_function"] == "softmax"
     assert cfg["moe_router_pre_softmax"] is False
     assert cfg["moe_router_dtype"] == "fp32"
+
+
+def test_gemma4_bridge_maps_e2b_ple_weights():
+    bridge = object.__new__(load_gemma4_bridge_class())
+    bridge.hf_config = SimpleNamespace(text_config=CFG_E2B)
+    bridge._GLOBAL_ATTN_LAYERS = {i for i, t in enumerate(CFG_E2B.layer_types) if t == "full_attention"}
+
+    assert (
+        bridge._DIRECT_MAPPING["embedding.per_layer_embeddings.weight"]
+        == "model.language_model.embed_tokens_per_layer.weight"
+    )
+    assert (
+        bridge._DIRECT_MAPPING["per_layer_model_projection.weight"]
+        == "model.language_model.per_layer_model_projection.weight"
+    )
+    assert (
+        bridge._DIRECT_MAPPING["per_layer_projection_norm.weight"]
+        == "model.language_model.per_layer_projection_norm.weight"
+    )
+    assert bridge._weight_name_mapping_other("decoder.layers.0.per_layer_input_gate.weight") == [
+        "model.language_model.layers.0.per_layer_input_gate.weight"
+    ]
+    assert bridge._weight_name_mapping_other("decoder.layers.0.per_layer_projection.weight") == [
+        "model.language_model.layers.0.per_layer_projection.weight"
+    ]
+    assert bridge._weight_name_mapping_other("decoder.layers.0.post_per_layer_input_norm.weight") == [
+        "model.language_model.layers.0.post_per_layer_input_norm.weight"
+    ]
 
 
 def _pack_local_qkv(q, k, v):
@@ -162,6 +202,83 @@ def test_convert_gemma4_to_hf_global_layer_emits_no_v_proj():
         "model.language_model.layers.5.self_attn.q_proj.weight",
         "model.language_model.layers.5.self_attn.k_proj.weight",
     }
+
+
+def test_convert_gemma4_to_hf_e2b_global_layer_emits_v_proj():
+    conv = _load_convert_module()
+
+    conv._config_cache["/nonexistent"] = {
+        "global_attn_layers": {4, 9, 14, 19, 24, 29, 34},
+        "local_head_dim": CFG_E2B.head_dim,
+        "global_head_dim": CFG_E2B.global_head_dim,
+        "num_attention_heads": CFG_E2B.num_attention_heads,
+        "local_num_kv_heads": CFG_E2B.num_key_value_heads,
+        "global_num_kv_heads": CFG_E2B.num_key_value_heads,
+        "attention_k_eq_v": False,
+        "hidden_size": CFG_E2B.hidden_size,
+    }
+
+    q = torch.randn(CFG_E2B.num_attention_heads * CFG_E2B.global_head_dim, CFG_E2B.hidden_size)
+    k = torch.randn(CFG_E2B.num_key_value_heads * CFG_E2B.global_head_dim, CFG_E2B.hidden_size)
+    v = torch.randn(CFG_E2B.num_key_value_heads * CFG_E2B.global_head_dim, CFG_E2B.hidden_size)
+    packed = torch.cat(
+        [
+            q.view(1, -1, CFG_E2B.hidden_size),
+            k.view(1, CFG_E2B.global_head_dim, CFG_E2B.hidden_size),
+            v.view(1, CFG_E2B.global_head_dim, CFG_E2B.hidden_size),
+        ],
+        dim=1,
+    ).reshape(-1, CFG_E2B.hidden_size)
+
+    args = SimpleNamespace(hf_checkpoint="/nonexistent")
+    emitted = conv.convert_gemma4_to_hf(
+        args,
+        "module.module.decoder.layers.4.self_attention.linear_qkv.weight",
+        packed,
+    )
+    out = dict(emitted)
+    assert set(out) == {
+        "model.language_model.layers.4.self_attn.q_proj.weight",
+        "model.language_model.layers.4.self_attn.k_proj.weight",
+        "model.language_model.layers.4.self_attn.v_proj.weight",
+    }
+    assert torch.allclose(out["model.language_model.layers.4.self_attn.q_proj.weight"], q)
+    assert torch.allclose(out["model.language_model.layers.4.self_attn.k_proj.weight"], k)
+    assert torch.allclose(out["model.language_model.layers.4.self_attn.v_proj.weight"], v)
+
+
+def test_convert_gemma4_to_hf_e2b_ple_direct_weights():
+    conv = _load_convert_module()
+    conv._config_cache["/nonexistent"] = {
+        "global_attn_layers": set(),
+        "local_head_dim": CFG_E2B.head_dim,
+        "global_head_dim": CFG_E2B.global_head_dim,
+        "num_attention_heads": CFG_E2B.num_attention_heads,
+        "local_num_kv_heads": CFG_E2B.num_key_value_heads,
+        "global_num_kv_heads": CFG_E2B.num_key_value_heads,
+        "attention_k_eq_v": False,
+        "hidden_size": CFG_E2B.hidden_size,
+    }
+    args = SimpleNamespace(hf_checkpoint="/nonexistent")
+
+    for mcore_name, hf_name, tensor in [
+        (
+            "module.module.embedding.per_layer_embeddings.weight",
+            "model.language_model.embed_tokens_per_layer.weight",
+            torch.randn(8, 16),
+        ),
+        (
+            "module.module.per_layer_model_projection.weight",
+            "model.language_model.per_layer_model_projection.weight",
+            torch.randn(16, 4),
+        ),
+        (
+            "module.module.per_layer_projection_norm.weight",
+            "model.language_model.per_layer_projection_norm.weight",
+            torch.randn(4),
+        ),
+    ]:
+        assert conv.convert_gemma4_to_hf(args, mcore_name, tensor) == [(hf_name, tensor)]
 
 
 def test_convert_config_cache_is_checkpoint_scoped(monkeypatch):

@@ -18,8 +18,10 @@ from slime.rollout.fused_agent.generate import (
     _valid_tool_names,
 )
 from slime.rollout.fused_agent.parser import (
+    Gemma4ToolParser,
     Qwen3CoderToolParser,
     QwenToolParser,
+    ToolCall,
     make_tool_parser,
     tool_schema,
 )
@@ -66,6 +68,57 @@ class FakeChatTemplateTokenizer:
 
     def decode(self, ids, skip_special_tokens=False):
         return "".join(chr(i) for i in ids)
+
+
+class FakeGemma4Tokenizer:
+    name_or_path = "/share/nlp/share/plm/gemma-4-E2B-it"
+    unk_token_id = 0
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, tools=None, **_kwargs):
+        chunks = ["<bos>"]
+        for message in messages:
+            role = "model" if message["role"] == "assistant" else message["role"]
+            content = str(message.get("content") or "")
+            reasoning = message.get("reasoning") or message.get("reasoning_content")
+            body = ""
+            if role == "model" and reasoning:
+                body += f"<|channel>thought\n{reasoning}\n<channel|>"
+            if role == "system" and tools:
+                for schema in tools:
+                    body += f"<|tool>{Gemma4ToolParser._format_function_declaration(schema)}<tool|>"
+            for tool_call in message.get("tool_calls") or []:
+                function = tool_call.get("function", tool_call)
+                body += (
+                    f"<|tool_call>call:{function['name']}"
+                    f"{Gemma4ToolParser._format_argument(function.get('arguments') or {}, escape_keys=False)}"
+                    "<tool_call|>"
+                )
+            if message.get("tool_responses"):
+                body += "<|tool_response>"
+                for response in message["tool_responses"]:
+                    body += (
+                        f"response:{response['name']}"
+                        f"{Gemma4ToolParser._format_argument(response.get('response') or {}, escape_keys=False)}"
+                    )
+                body += "<tool_response|>"
+            body += content
+            chunks.append(f"<|turn>{role}\n{body}<turn|>\n")
+        if add_generation_prompt:
+            chunks.append("<|turn>model\n")
+        text = "".join(chunks)
+        return [ord(ch) for ch in text] if tokenize else text
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [ord(ch) for ch in text]}
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(ch) for ch in text]
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(chr(i) for i in ids)
+
+    def convert_tokens_to_ids(self, token):
+        return self.unk_token_id
 
 
 def _run_generate_with_fake_sglang(
@@ -194,6 +247,14 @@ def _finish_call(payload: str = '{\\"done\\":true}') -> str:
     return f'<tool_call>{{"name":"finish","arguments":{{"command":"submit","result":"{payload}"}}}}</tool_call>'
 
 
+def _gemma4_echo_call(value: str) -> str:
+    return f'<|tool_call>call:echo{{value:<|"|>{value}<|"|>}}<tool_call|>'
+
+
+def _gemma4_finish_call(payload: str = '{"done":true}') -> str:
+    return f'<|tool_call>call:finish{{command:<|"|>submit<|"|>,result:<|"|>{payload}<|"|>}}<tool_call|>'
+
+
 def _search_call(query: str) -> str:
     return f'<tool_call>{{"name":"web_search","arguments":{{"query":"{query}","max_results":3}}}}</tool_call>'
 
@@ -284,6 +345,8 @@ def test_qwen_tool_parser_records_tool_call_span():
 
 
 def test_make_tool_parser_selects_by_model_name():
+    assert type(make_tool_parser("/share/nlp/share/plm/gemma-4-E2B-it")) is Gemma4ToolParser
+    assert type(make_tool_parser("/models/gemma4-12B-it")) is Gemma4ToolParser
     assert type(make_tool_parser("/share/nlp/share/plm/Qwen3.5-4B")) is Qwen3CoderToolParser
     assert type(make_tool_parser("/models/Qwen3-Coder-30B")) is Qwen3CoderToolParser
     # Qwen3 (and anything else) keeps the JSON parser unchanged.
@@ -319,6 +382,612 @@ def test_qwen3_coder_parser_normalizes_submit_and_keeps_boxed_fallback():
     assert boxed[0].arguments["result"] == "42"
 
 
+def test_gemma4_tool_prompt_uses_native_declarations():
+    tools = [web_search_schema(), finish_schema()]
+    parser = make_tool_parser("gemma-4-E2B-it", valid_tools={"web_search", "finish"})
+
+    prompt = parser.get_tool_prompt("\n".join(json.dumps(t, indent=0, ensure_ascii=False) for t in tools))
+
+    assert "<|tool>declaration:web_search{" in prompt
+    assert "query:{description:<|\"|>Search query.<|\"|>,type:<|\"|>STRING<|\"|>}" in prompt
+    assert "<|tool_call>call:TOOL_NAME{" in prompt
+    assert "<tool_call|><|tool_response>" in prompt
+
+
+def test_gemma4_tool_prompt_formats_complex_json_schema_without_python_repr():
+    schema = {
+        "type": "function",
+        "function": {
+            "name": "complex",
+            "description": "Complex schema",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "display name": {"type": "string", "description": "Human readable name"},
+                    "maybe": {"type": ["string", "null"], "description": "Optional text"},
+                    "mode": {"anyOf": [{"type": "string", "enum": ["fast", "safe"]}, {"type": "null"}]},
+                    "nums": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 1},
+                        "description": "Numbers",
+                        "default": [1, 2],
+                        "minItems": 1,
+                        "maxItems": 4,
+                    },
+                    "pair": {"type": "array", "items": [{"type": "string"}, {"type": "integer"}]},
+                    "payload": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "profile": {"$ref": "#/$defs/Profile"},
+                    "sealed": {"type": "object", "additionalProperties": False},
+                    "token": {
+                        "type": "string",
+                        "const": "ok",
+                        "pattern": "^[a-z]+$",
+                        "minLength": 2,
+                        "maxLength": 8,
+                        "$defs": {"Alias": {"type": "string", "description": "Short name"}},
+                    },
+                },
+                "required": ["nums"],
+                "$defs": {
+                    "Profile": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+                        "required": ["name"],
+                    }
+                },
+                "definitions": {"legacy type": {"type": "string", "enum": ["old"]}},
+            },
+        },
+    }
+
+    declaration = Gemma4ToolParser._format_function_declaration(schema)
+
+    assert '<|"|>display name<|"|>:{description:<|"|>Human readable name<|"|>,type:<|"|>STRING<|"|>}' in declaration
+    assert "maybe:{description:<|\"|>Optional text<|\"|>,type:[<|\"|>STRING<|\"|>,<|\"|>NULL<|\"|>]}" in declaration
+    assert (
+        "nums:{description:<|\"|>Numbers<|\"|>,default:[1,2],items:{minimum:1,type:<|\"|>INTEGER<|\"|>},"
+        "minItems:1,maxItems:4,type:<|\"|>ARRAY<|\"|>}"
+    ) in declaration
+    assert "pair:{items:[{type:<|\"|>STRING<|\"|>},{type:<|\"|>INTEGER<|\"|>}],type:<|\"|>ARRAY<|\"|>}" in declaration
+    assert "mode:{anyOf:[{enum:[<|\"|>fast<|\"|>,<|\"|>safe<|\"|>],type:<|\"|>STRING<|\"|>},{type:<|\"|>NULL<|\"|>}]}" in declaration
+    assert "payload:{additionalProperties:{type:<|\"|>STRING<|\"|>},type:<|\"|>OBJECT<|\"|>}" in declaration
+    assert "profile:{$ref:<|\"|>#/$defs/Profile<|\"|>}" in declaration
+    assert "sealed:{additionalProperties:false,type:<|\"|>OBJECT<|\"|>}" in declaration
+    assert (
+        "token:{const:<|\"|>ok<|\"|>,$defs:{Alias:{description:<|\"|>Short name<|\"|>,type:<|\"|>STRING<|\"|>}},"
+        "pattern:<|\"|>^[a-z]+$<|\"|>,minLength:2,maxLength:8,type:<|\"|>STRING<|\"|>}"
+    ) in declaration
+    assert (
+        "$defs:{Profile:{properties:{age:{type:<|\"|>INTEGER<|\"|>},name:{type:<|\"|>STRING<|\"|>}},"
+        "required:[<|\"|>name<|\"|>],type:<|\"|>OBJECT<|\"|>}}"
+    ) in declaration
+    assert 'definitions:{<|"|>legacy type<|"|>:{enum:[<|"|>old<|"|>],type:<|"|>STRING<|"|>}}' in declaration
+    assert "['STRING', 'NULL']" not in declaration
+
+
+def test_gemma4_tool_parser_parses_native_calls_and_formats_observation():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search", "finish", "submit"})
+
+    calls = parser.parse(
+        '<|tool_call>call:web_search{query:<|"|>Tokyo weather<|"|>,max_results:3}<tool_call|><|tool_response>'
+    )
+
+    assert len(calls) == 1
+    assert calls[0].name == "web_search"
+    assert calls[0].arguments == {"query": "Tokyo weather", "max_results": 3}
+
+    action_text = parser.format_action(calls[0])
+    assert action_text == '<|tool_call>call:web_search{max_results:3,query:<|"|>Tokyo weather<|"|>}<tool_call|>'
+
+    observation = parser.format_tool_observation("web_search", "Sunny")
+    assert observation == '<|tool_response>response:web_search{value:<|"|>Sunny<|"|>}<tool_response|>'
+
+
+def test_gemma4_formatter_uses_json_string_when_value_contains_native_quote_marker():
+    parser = make_tool_parser("gemma4", valid_tools={"echo"})
+    value = 'prefix <|"|> sentinel suffix'
+
+    action_text = parser.format_action(ToolCall("echo", {"value": value}))
+    calls = parser.parse(action_text)
+
+    assert '<|"|>prefix <|"|> sentinel suffix<|"|>' not in action_text
+    assert '"prefix <|\\"|> sentinel suffix"' in action_text
+    assert len(calls) == 1
+    assert calls[0].arguments == {"value": value}
+
+    observation = parser.format_tool_observation("echo", value)
+    assert '<|"|>prefix <|"|> sentinel suffix<|"|>' not in observation
+    assert 'response:echo{value:"prefix <|\\"|> sentinel suffix"}' in observation
+
+
+def test_gemma4_formatter_quotes_unsafe_argument_keys_for_round_trip():
+    parser = make_tool_parser("gemma4", valid_tools={"echo"})
+    action = ToolCall("echo", {"display name": "Gemma 4", "safe_key": 7})
+
+    action_text = parser.format_action(action)
+    calls = parser.parse(action_text)
+
+    assert '<|"|>display name<|"|>:<|"|>Gemma 4<|"|>' in action_text
+    assert "safe_key:7" in action_text
+    assert len(calls) == 1
+    assert calls[0].arguments == {"display name": "Gemma 4", "safe_key": 7}
+
+
+def test_gemma4_tool_response_template_quotes_unsafe_response_keys():
+    parser = make_tool_parser("gemma4", valid_tools={"echo"})
+    message = parser.assistant_tool_results_message(
+        [ToolCall("echo", {"value": "x"})],
+        [{"display name": "Gemma 4", "safe_key": 7}],
+    )
+
+    rendered = FakeGemma4Tokenizer().apply_chat_template(
+        [message],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+
+    assert 'response:echo{<|"|>display name<|"|>:<|"|>Gemma 4<|"|>,safe_key:7}' in rendered
+
+
+def test_gemma4_tool_parser_formats_multiple_tool_responses():
+    parser = make_tool_parser("gemma4", valid_tools={"first", "second"})
+    actions = [
+        ToolCall("first", {"value": "a"}),
+        ToolCall("second", {"value": "b"}),
+    ]
+
+    message = parser.assistant_tool_results_message(actions, [{"ok": 1}, "plain"])
+
+    assert message == {
+        "role": "assistant",
+        "tool_calls": [
+            {"function": {"name": "first", "arguments": {"value": "a"}}},
+            {"function": {"name": "second", "arguments": {"value": "b"}}},
+        ],
+        "tool_responses": [
+            {"name": "first", "response": {"ok": 1}},
+            {"name": "second", "response": {"value": "plain"}},
+        ],
+    }
+
+
+def test_gemma4_tool_parser_handles_nested_arguments_and_finish_alias():
+    parser = make_tool_parser("gemma_4", valid_tools={"finish", "submit"})
+
+    calls = parser.parse(
+        '<|tool_call>call:submit{command:<|"|>submit<|"|>,result:{answer:<|"|>42<|"|>,sources:[<|"|>a<|"|>,<|"|>b<|"|>]}}<tool_call|>'
+    )
+
+    assert calls[0].name == "finish"
+    assert calls[0].arguments == {"command": "submit", "result": {"answer": "42", "sources": ["a", "b"]}}
+
+
+def test_gemma4_tool_parser_accepts_python_style_bare_literals():
+    parser = make_tool_parser("gemma4", valid_tools={"set_flags"})
+
+    calls = parser.parse(
+        '<|tool_call>call:set_flags{enabled:True,disabled:False,missing:None,quoted:"True"}<tool_call|>'
+    )
+
+    assert len(calls) == 1
+    assert calls[0].name == "set_flags"
+    assert calls[0].arguments == {
+        "enabled": True,
+        "disabled": False,
+        "missing": None,
+        "quoted": "True",
+    }
+
+
+def test_gemma4_tool_parser_does_not_truncate_braces_inside_strings():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    calls = parser.parse(
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>The answer is \\boxed{Chacruna}. {"ok": true}<|"|>}<tool_call|><|tool_response>'
+    )
+
+    assert len(calls) == 1
+    assert calls[0].name == "finish"
+    assert calls[0].arguments == {
+        "command": "submit",
+        "result": 'The answer is \\boxed{Chacruna}. {"ok": true}',
+    }
+    assert calls[0].end == calls[0].start + len(
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>The answer is \\boxed{Chacruna}. {"ok": true}<|"|>}<tool_call|>'
+    )
+
+
+def test_gemma4_tool_parser_parses_logged_finish_call():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>Chacruna<|"|>}<tool_call|><|tool_response>')
+
+    assert len(calls) == 1
+    assert calls[0].name == "finish"
+    assert calls[0].arguments == {"command": "submit", "result": "Chacruna"}
+
+
+def test_gemma4_tool_parser_repairs_finish_command_missing_native_quote_before_result(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>submit,result:<|"|>answer<|"|>}<tool_call|><|tool_response>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].name == "finish"
+    assert calls[0].arguments == {"command": "submit", "result": "answer"}
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_finish_command_value_before_result(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>finish,result:<|"|>answer<|"|>}<tool_call|><|tool_response>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].name == "finish"
+    assert calls[0].arguments == {"command": "finish", "result": "answer"}
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_finish_result_with_extra_native_marker(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+            'result:<|"|>The literal marker <|"|> appeared in prose.<|"|>}<tool_call|>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {
+        "command": "submit",
+        "result": 'The literal marker <|"|> appeared in prose.',
+    }
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_missing_command_quote_with_json_quoted_result(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>submit,result:"Could not identify \\"Creek E\\"."}<tool_call|>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"command": "submit", "result": 'Could not identify \\"Creek E\\".'}
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_finish_function_like_command_payload(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>finish(result="I am unable to identify it.")"}<tool_call|>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"command": "finish", "result": "I am unable to identify it."}
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_finish_newline_command_payload(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>finish\nThe question asks for a gene.}<tool_call|>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"command": "finish", "result": "The question asks for a gene."}
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_finish_braced_result_payload(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>finish{result:<|"|>Wordian formation<|"|>}}<tool_call|>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"command": "finish", "result": "Wordian formation"}
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_finish_json_answer_payload(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>submit,{"answer":"High Performance Fortran"}}<tool_call|>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"command": "submit", "result": "High Performance Fortran"}
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_incomplete_finish_json_answer_payload(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>submit,{"answer":"High Performance Fortran}<tool_call|>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"command": "submit", "result": "High Performance Fortran"}
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_instruction_like_finish_command(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>Finish the task and submit the final result with the synthesized answer.<|"|>,'
+            'result:<|"|>Journal of Hand Surgery<|"|>}<tool_call|>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"command": "submit", "result": "Journal of Hand Surgery"}
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_function_like_command_argument(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>finish(command="Which theory was used with Classical Laminate Theory?")<|"|>,'
+            'result="The provided search results do not name it}<tool_call|>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {
+        "command": "finish",
+        "result": "The provided search results do not name it",
+    }
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_unclosed_finish_result(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>Please synthesize the search results to answer the question.<|"|>,'
+            'result:<|"|>Based on the search results, the relevant journal is Journal of Hand Surgery'
+            '<tool_call|>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {
+        "command": "submit",
+        "result": "Based on the search results, the relevant journal is Journal of Hand Surgery",
+    }
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_web_search_query_equals(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:web_search{query="Greek phrase primary manuscript authority"}<tool_call|>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "Greek phrase primary manuscript authority"}
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_repairs_web_search_query_with_extra_quotes(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            '<|tool_call>call:web_search{query:<|"|>EEG system adaptive gain control neuronal populations daily imaging"""}<tool_call|>'
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "EEG system adaptive gain control neuronal populations daily imaging"}
+    assert "Failed to parse Gemma4 tool-call arguments" not in caplog.text
+
+
+def test_gemma4_tool_parser_accepts_json_like_quoted_arguments():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+
+    calls = parser.parse('<|tool_call>call:web_search{query:"entity with spaces",max_results:3}<tool_call|>')
+
+    assert len(calls) == 1
+    assert calls[0].name == "web_search"
+    assert calls[0].arguments == {"query": "entity with spaces", "max_results": 3}
+
+    calls = parser.parse('<|tool_call>call:web_search{"query":"who founded Mimikama?","max_results":3}<tool_call|>')
+
+    assert len(calls) == 1
+    assert calls[0].name == "web_search"
+    assert calls[0].arguments == {"query": "who founded Mimikama?", "max_results": 3}
+
+
+def test_gemma4_tool_parser_decodes_json_like_unicode_escapes():
+    parser = make_tool_parser("gemma4", valid_tools={"echo"})
+
+    calls = parser.parse(
+        '<|tool_call>call:echo{text:"\\u003cscript\\u003e",emoji:"\\ud83d\\ude00"}<tool_call|>'
+    )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"text": "<script>", "emoji": "😀"}
+
+
+def test_gemma4_tool_parser_tolerates_unescaped_quotes_inside_json_like_strings():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+
+    calls = parser.parse('<|tool_call>call:web_search{query:"who wrote "In Context Music" with Angus Tarnawsky?",max_results:3}<tool_call|>')
+
+    assert len(calls) == 1
+    assert calls[0].name == "web_search"
+    assert calls[0].arguments == {
+        "query": 'who wrote "In Context Music" with Angus Tarnawsky?',
+        "max_results": 3,
+    }
+
+
+def test_gemma4_tool_parser_accepts_braces_inside_json_like_quoted_strings():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search", "finish"})
+
+    calls = parser.parse('<|tool_call>call:web_search{query:"literal } brace",max_results:3}<tool_call|>')
+    assert len(calls) == 1
+    assert calls[0].name == "web_search"
+    assert calls[0].arguments == {"query": "literal } brace", "max_results": 3}
+
+    calls = parser.parse('<|tool_call>call:web_search{query:"literal { brace",max_results:3}<tool_call|>')
+    assert len(calls) == 1
+    assert calls[0].name == "web_search"
+    assert calls[0].arguments == {"query": "literal { brace", "max_results": 3}
+
+    calls = parser.parse('<|tool_call>call:finish{command:"submit",result:"{\\"done\\":true}"}<tool_call|>')
+    assert len(calls) == 1
+    assert calls[0].name == "finish"
+    assert calls[0].arguments == {"command": "submit", "result": '{"done":true}'}
+
+
+def test_gemma4_tool_parser_logs_malformed_arguments_without_traceback(caplog):
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse('<|tool_call>call:web_search{query:"unterminated}<tool_call|>')
+
+    assert calls == []
+    assert "Failed to parse Gemma4 tool-call arguments" in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_gemma4_parser_error_span_finds_unclosed_native_tool_call():
+    response = '<|tool_call>call:web_search{query:<|"|>bad<|"|>'
+
+    assert fused_generate._parser_error_action_span(response) == (0, len(response))
+
+
+def test_gemma4_parser_error_span_skips_leading_thought_channel():
+    thought = "<|channel>thought\nNeed evidence.\n<channel|>\n"
+    tail = "I forgot to call a tool."
+
+    assert fused_generate._parser_error_action_span(thought + tail) == (len(thought), len(thought + tail))
+
+
+def test_gemma4_parser_error_credit_assignment_masks_only_bad_native_action():
+    bad = '<|tool_call>call:web_search{query:<|"|>bad<|"|>'
+
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Use web_search before submit"}),
+        [{"text": bad}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
+    assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
+    assert _policy_masked_text(sample) == bad
+
+
+def test_gemma4_malformed_closed_tool_call_terminates_as_parser_error():
+    bad = '<|tool_call>call:web_search{query:"unterminated}<tool_call|>'
+
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Use web_search before submit"}),
+        [{"text": bad}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
+    assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
+    assert _policy_masked_text(sample) == bad
+
+
+def test_gemma4_valid_call_then_unclosed_native_marker_terminates_as_parser_error(tmp_path: Path):
+    valid = _gemma4_echo_call("before-error")
+    malformed = '<|tool_call>call:echo{value:<|"|>unterminated'
+    response = valid + malformed
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Trigger mixed Gemma4 parser error"),
+        [{"text": response}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
+    assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
+    assert _policy_masked_text(sample) == malformed
+    assert "before-error" not in sample.metadata["rllm_episode"]["trajectories"][0]["steps"][0]["observation"]
+
+
+def test_gemma4_valid_call_then_malformed_closed_native_marker_terminates_as_parser_error(tmp_path: Path):
+    valid = _gemma4_echo_call("before-error")
+    malformed = '<|tool_call>call:echo{value:"unterminated}<tool_call|>'
+    response = valid + malformed
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Trigger mixed Gemma4 parser error"),
+        [{"text": response}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
+    assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
+    assert _policy_masked_text(sample) == malformed
+    assert "before-error" not in sample.metadata["rllm_episode"]["trajectories"][0]["steps"][0]["observation"]
+
+
+def test_tito_model_type_detects_gemma4_without_changing_qwen_detection():
+    assert fused_generate._tito_model_type("/share/nlp/share/plm/gemma-4-E2B-it") == "gemma4"
+    assert fused_generate._tito_model_type("/models/Qwen3.5-4B") == "qwen3_5"
+    assert fused_generate._tito_model_type("/models/Qwen3-4B") == "qwen3"
+
+
 def test_build_system_prompt_switches_tool_format_by_model():
     tools = [web_search_schema(), finish_schema()]
 
@@ -329,6 +998,10 @@ def test_build_system_prompt_switches_tool_format_by_model():
     legacy = build_system_prompt(FUSED_SEARCH_SYSTEM_PROMPT, tools, "/share/nlp/share/plm/Qwen3-4B")
     assert "<function=FUNCTION_NAME>" not in legacy
     assert '{"name": <function-name>, "arguments": <args-json-object>}' in legacy
+
+    gemma4 = build_system_prompt(FUSED_SEARCH_SYSTEM_PROMPT, tools, "/share/nlp/share/plm/gemma-4-E2B-it")
+    assert gemma4 == FUSED_SEARCH_SYSTEM_PROMPT.strip()
+    assert "<|tool>declaration:web_search{" not in gemma4
 
 
 def test_resolve_cli_and_et_modes_without_docker_reset():
@@ -394,6 +1067,37 @@ def verify(tools, answer):
     env.answer = json.dumps({"answer": 3})
     env.tool_calls = 1
     assert env.compute_final_reward() == 1.0
+
+
+def test_local_mcp_tools_keep_definition_time_asset_directory(tmp_path: Path):
+    asset = tmp_path / "asset"
+    data = asset / "data"
+    data.mkdir(parents=True)
+    (data / "first.json").write_text('{"value": "first"}', encoding="utf-8")
+    (asset / "tools.py").write_text(
+        """
+import json
+from pathlib import Path
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("Tools")
+BASE_DIR = Path(__file__).parent
+
+@mcp.tool(description="Read the first asset")
+def read_first() -> dict:
+    with open(BASE_DIR / "data" / "first.json", encoding="utf-8") as file:
+        return json.load(file)
+
+# Concatenated generated tool blocks can rebind this global after read_first
+# is defined. The first tool must retain its own block's asset directory.
+BASE_DIR = Path(__file__).parent.parent
+""",
+        encoding="utf-8",
+    )
+
+    env = FusedEnvironment({"question": "Read data", "tools_py": str(asset / "tools.py")})
+
+    assert env.mcp_tools.call("read_first", {}) == json.dumps({"value": "first"})
 
 
 def test_mcp_verifier_reward_requires_a_tool_call(tmp_path: Path):
@@ -535,6 +1239,71 @@ def test_render_prompt_ids_fallback_appends_empty_thinking_prefix():
 
     assert prompt_ids[:3] == [1, 2, 3]
     assert prompt_ids[3:] == [ord(ch) for ch in "<think>\n\n</think>\n\n"]
+
+
+def test_gemma4_render_prompt_ids_falls_back_to_inline_native_tools_when_tools_kwarg_is_unsupported():
+    class NoToolsGemma4Tokenizer:
+        name_or_path = "/models/gemma-4-E2B-it"
+
+        def __init__(self):
+            self.rendered_messages = None
+
+        def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, enable_thinking=True, **kwargs):
+            if "tools" in kwargs:
+                raise TypeError("apply_chat_template() got an unexpected keyword argument 'tools'")
+            self.rendered_messages = messages
+            text = "\n".join(str(message.get("content") or "") for message in messages)
+            return [ord(ch) for ch in text]
+
+    tokenizer = NoToolsGemma4Tokenizer()
+    tools = [web_search_schema(), finish_schema()]
+
+    prompt_ids = _render_prompt_ids(
+        tokenizer,
+        [{"role": "system", "content": FUSED_SEARCH_SYSTEM_PROMPT.strip()}, {"role": "user", "content": "Who?"}],
+        tools=tools,
+    )
+    rendered = "".join(chr(ch) for ch in prompt_ids)
+
+    assert tokenizer.rendered_messages is not None
+    assert "<|tool>declaration:web_search{" in rendered
+    assert "<|tool>declaration:finish{" in rendered
+    assert "When you need to call a tool" not in rendered
+    assert "Do not wrap Gemma4 tool calls" not in rendered
+    assert "<tools>" not in rendered
+    assert "<function=FUNCTION_NAME>" not in rendered
+
+
+def test_gemma4_render_prompt_ids_does_not_add_qwen_think_shell_when_enable_thinking_is_unsupported():
+    class NoThinkingGemma4Tokenizer:
+        name_or_path = "/models/gemma-4-E2B-it"
+
+        def __init__(self):
+            self.rendered_messages = None
+
+        def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, **kwargs):
+            if "enable_thinking" in kwargs:
+                raise TypeError("apply_chat_template() got an unexpected keyword argument 'enable_thinking'")
+            self.rendered_messages = messages
+            text = "\n".join(f"{message['role']}:{message.get('content') or ''}" for message in messages)
+            return [ord(ch) for ch in text]
+
+    tokenizer = NoThinkingGemma4Tokenizer()
+
+    prompt_ids = _render_prompt_ids(
+        tokenizer,
+        [
+            {"role": "user", "content": "Who?"},
+            {"role": "assistant", "content": '<|tool_call>call:echo{value:<|"|>x<|"|>}<tool_call|>'},
+        ],
+        tools=[web_search_schema()],
+    )
+    rendered = "".join(chr(ch) for ch in prompt_ids)
+
+    assert tokenizer.rendered_messages is not None
+    assert "<think>" not in rendered
+    assert "</think>" not in rendered
+    assert '<|tool_call>call:echo{value:<|"|>x<|"|>}<tool_call|>' in rendered
 
 
 def test_disable_thinking_prompt_prefix_stays_masked_as_prompt_context():
@@ -689,6 +1458,28 @@ def test_disable_thinking_loss_mask_falls_back_to_char_level_without_close_id():
     assert mask == [0] * split + [1] * (len(response) - split)
 
 
+def test_gemma4_disable_thinking_loss_mask_masks_leading_thought_channel():
+    thought = "<|channel>thought\nNeed evidence.\n<channel|>\n"
+    action = '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>answer<|"|>}<tool_call|>'
+
+    mask = _default_response_loss_mask(
+        FakeGemma4Tokenizer(),
+        thought + action,
+        output_len=len(thought + action),
+        disable_thinking=True,
+        output_ids=[ord(ch) for ch in thought + action],
+    )
+
+    assert mask == [0] * len(thought) + [1] * len(action)
+
+
+def test_gemma4_extract_thought_channel_excludes_native_action():
+    thought = "<|channel>thought\nNeed evidence.\n<channel|>"
+    action = '\n<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>answer<|"|>}<tool_call|>'
+
+    assert fused_generate._extract_thought(thought + action) == thought
+
+
 def test_disable_thinking_generate_masks_model_generated_think_tokens():
     think = "<think>\nNeed evidence.\n</think>\n"
     action = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"answer"}}</tool_call>'
@@ -708,6 +1499,26 @@ def test_disable_thinking_generate_masks_model_generated_think_tokens():
     assert think in _unmasked_text(sample)
 
 
+def test_gemma4_non_action_masking_masks_generated_thought_channel():
+    thought = "<|channel>thought\nNeed evidence.\n<channel|>\n"
+    action = _gemma4_finish_call('{"done":true}')
+
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Use tools"}),
+        [{"text": thought + action}],
+        {
+            "FUSED_DISABLE_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0]
+    assert thought not in _masked_text(sample)
+    assert action in _masked_text(sample)
+    assert thought in _unmasked_text(sample)
+
+
 def test_initial_messages_include_tool_prompt():
     schemas = [
         tool_schema("web_search", "Search", {"query": {"type": "string", "description": ""}}, ["query"]),
@@ -720,6 +1531,25 @@ def test_initial_messages_include_tool_prompt():
     assert "<tools>" in messages[0]["content"]
     assert "web_search" in messages[0]["content"]
     assert messages[1]["role"] == "user"
+
+
+def test_gemma4_initial_messages_leave_tools_to_chat_template():
+    schemas = [web_search_schema(), finish_schema()]
+
+    messages = _initial_messages(
+        "gem",
+        "web search",
+        "Who?",
+        schemas,
+        model_name="/share/nlp/share/plm/gemma-4-E2B-it",
+    )
+
+    assert messages[0]["content"] == FUSED_SEARCH_SYSTEM_PROMPT.strip()
+    assert "<|tool>declaration:" not in messages[0]["content"]
+
+    rendered = FakeGemma4Tokenizer().apply_chat_template(messages, tools=schemas, tokenize=False)
+    assert "<|tool>declaration:web_search{" in rendered
+    assert "<|tool>declaration:finish{" in rendered
 
 
 def test_cot_initial_messages_do_not_include_fused_tool_prompt():
@@ -854,6 +1684,53 @@ def test_web_search_tool_observation_limits_json_string_to_256_words():
 
     assert len(body.split()) == 256
     assert "token299" not in body
+
+
+def test_web_search_falls_back_to_one_for_malformed_max_results(monkeypatch):
+    class FakeResponse:
+        status = 200
+        reason = "OK"
+        request_info = SimpleNamespace(real_url="http://127.0.0.1:65432/retrieve")
+        history = ()
+        headers = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self, content_type=None):
+            text = " ".join(f"fallback{i}" for i in range(30))
+            return {"results": [{"content": {"title": "Doc", "chunk_text": text}}]}
+
+        async def text(self):
+            return json.dumps(await self.json())
+
+    class FakeSession:
+        calls = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, url, json=None):
+            FakeSession.calls.append((url, json))
+            return FakeResponse()
+
+    monkeypatch.setattr("slime.rollout.fused_agent.env.aiohttp.ClientSession", FakeSession)
+    env = FusedEnvironment({"question": "Find evidence"})
+
+    observation, reward, done, info = asyncio.run(
+        env.step(fused_generate.ToolCall("web_search", {"query": "q", "max_results": "10\n</<|im_start|>user>"}))
+    )
+
+    assert observation.startswith("[Result 1] Title: Doc\nSnippet: fallback0 fallback1")
+    assert reward == 0.0
+    assert done is False
+    assert info["tools/search_calls"] == 1
+    assert FakeSession.calls[0][1]["top_k"] == 1
+    assert FakeSession.calls[0][1]["topk"] == 1
+    assert FakeSession.calls[0][1]["max_results"] == 1
 
 
 def test_no_ground_truth_reward_is_zero_even_after_tool_call():
@@ -1603,6 +2480,92 @@ def test_long_horizon_web_search_mask_and_visualization_unmask_all_assistant_gen
     assert "<|im_start|>system\\n" in visual_masked
     assert "<|im_start|>user\\n" in visual_masked
     assert visual_masked.count("<tool_response>") == 24
+
+
+def test_gemma4_tito_masks_tool_response_context_and_trains_only_actions(tmp_path: Path):
+    first = _gemma4_echo_call("before-finish")
+    finish = _gemma4_finish_call('{"done":true}')
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Use echo before finish"),
+        [{"text": first}, {"text": finish}],
+        {
+            "FUSED_DISABLE_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.reward == 1.0
+    assert _masked_text(sample) == finish
+    full_text = "".join(chr(tok) for tok in sample.tokens)
+    assert "response:echo{echo:<|\"|>before-finish<|\"|>}" in full_text
+    assert "<tool_response>\nExecution output" not in full_text
+    assert first not in full_text
+    assert "<|turn>model" not in _masked_text(sample)
+    assert len(sample.loss_mask) == sample.response_length
+    assert sum(sample.loss_mask) == len(finish)
+
+
+def test_gemma4_batches_multiple_independent_tool_calls_in_one_turn(tmp_path: Path):
+    first_turn = _gemma4_echo_call("alpha") + _gemma4_echo_call("beta")
+    finish = _gemma4_finish_call('{"done":true}')
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Call echo twice, then finish"),
+        [{"text": first_turn}, {"text": finish}],
+        {
+            "FUSED_DISABLE_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.reward == 1.0
+    assert sample.metadata["fused_tool_call_turns"] == 1
+    first_step = sample.metadata["rllm_episode"]["trajectories"][0]["steps"][0]
+    assert first_step["action"] == first_turn
+    assert '{"echo": "alpha"}' in first_step["observation"]
+    assert '{"echo": "beta"}' in first_step["observation"]
+    assert _masked_text(sample) == finish
+    full_text = "".join(chr(tok) for tok in sample.tokens)
+    assert "response:echo{echo:<|\"|>alpha<|\"|>}" in full_text
+    assert "response:echo{echo:<|\"|>beta<|\"|>}" in full_text
+    assert "<tool_response>\nExecution output" not in full_text
+
+
+def test_gemma4_batched_tool_results_record_only_executed_actions(monkeypatch, tmp_path: Path):
+    first = _gemma4_echo_call("alpha")
+    second = _gemma4_echo_call("beta")
+    original_step = FusedEnvironment.step
+
+    async def done_after_first_step(self, action):
+        if isinstance(action, ToolCall) and action.name == "echo":
+            return {"echo": action.arguments["value"]}, 1.0, True, {"reward_debug": {"forced_done": True}}
+        return await original_step(self, action)
+
+    monkeypatch.setattr(FusedEnvironment, "step", done_after_first_step)
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Call echo twice"),
+        [{"text": first + second}],
+        {
+            "FUSED_DISABLE_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0]
+    first_step = sample.metadata["rllm_episode"]["trajectories"][0]["steps"][0]
+    assert first_step["action"] == first
+    assert first_step["done"] is True
+    assert "alpha" in first_step["observation"]
+    assert "beta" not in first_step["observation"]
 
 
 def test_long_horizon_visualization_keeps_actions_unmasked_under_assistant_replay_drift():

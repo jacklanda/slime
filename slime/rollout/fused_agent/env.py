@@ -116,7 +116,7 @@ class LocalMCPToolset:
         return None
 
     def _load_tools(self, tools_py: Path) -> None:
-        registry: dict[str, tuple[Callable[..., Any], str]] = {}
+        registry: dict[str, tuple[Callable[..., Any], str, dict[str, Any]]] = {}
 
         class FakeFastMCP:
             def __init__(self, *_args, **_kwargs):
@@ -124,7 +124,15 @@ class LocalMCPToolset:
 
             def tool(self, description: str | None = None, **_kwargs):
                 def deco(fn):
-                    registry[fn.__name__] = (fn, description or inspect.getdoc(fn) or "")
+                    # Generated MCP assets can contain concatenated source blocks
+                    # that repeatedly assign globals such as BASE_DIR. Preserve
+                    # the values visible at definition time so a later block
+                    # cannot redirect an earlier tool to another asset directory.
+                    registry[fn.__name__] = (
+                        fn,
+                        description or inspect.getdoc(fn) or "",
+                        dict(fn.__globals__),
+                    )
                     return fn
 
                 return deco
@@ -158,8 +166,18 @@ class LocalMCPToolset:
                 else:
                     sys.modules[name] = mod
 
-        self.tools = {name: fn for name, (fn, _) in registry.items()}
-        self.descriptions = {name: desc for name, (_, desc) in registry.items()}
+        module_globals = dict(module.__dict__)
+        for name, (fn, description, definition_globals) in registry.items():
+            function_globals = module_globals.copy()
+            function_globals.update(definition_globals)
+            bound_fn = types.FunctionType(fn.__code__, function_globals, fn.__name__, fn.__defaults__, fn.__closure__)
+            bound_fn.__kwdefaults__ = fn.__kwdefaults__
+            bound_fn.__annotations__ = fn.__annotations__
+            bound_fn.__dict__.update(fn.__dict__)
+            bound_fn.__module__ = fn.__module__
+            bound_fn.__qualname__ = fn.__qualname__
+            self.tools[name] = bound_fn
+            self.descriptions[name] = description
 
     def schemas(self) -> list[dict]:
         schemas = []
@@ -350,9 +368,12 @@ class FusedEnvironment:
 
     async def _step_web_search(self, args: dict[str, Any]) -> tuple[str, float, bool, dict[str, Any]]:
         query = str(args.get("query") or "")
-        max_results = int(args.get("max_results") or self.retrieval_max_results)
         if not query:
             return "Error: web_search requires query.", 0.0, False, {}
+        try:
+            max_results = int(args.get("max_results") or self.retrieval_max_results)
+        except (TypeError, ValueError):
+            max_results = 1
         self.web_search_queries.add(_normalize_search_query(query))
         retrieval_mode = os.environ.get("RLLM_RETRIEVAL_MODE", "hybrid")
         retrieval_max_words = int(os.environ.get("RLLM_RETRIEVAL_MAX_WORDS", "4096"))

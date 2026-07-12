@@ -523,8 +523,6 @@ def get_log_probs_and_entropy(
 
     # Apply rollout temperature scaling to logits to match rollout-time log-probs.
     rollout_temperature = getattr(args, "rollout_temperature", 1.0)
-    if rollout_temperature != 1.0:
-        logits = logits / rollout_temperature
     logits = logits.contiguous()
     T = logits.size(0)
     device = logits.device
@@ -560,6 +558,7 @@ def get_log_probs_and_entropy(
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
+        logits_scale=1.0 / rollout_temperature,
     )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 

@@ -85,8 +85,19 @@ def get_args():
 
 
 def main():
+    import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
+
+    # Conversion is a one-shot offline path; prefer a slower blocking D2H copy
+    # over Megatron's default non-blocking checkpoint preload, which can fail
+    # with cudaErrorInvalidValue on some driver / shared-filesystem setups.
+    _orig_preload_tensors = filesystem_async_module.FileSystemWriterAsync.preload_tensors
+
+    def _preload_tensors_blocking(write_buckets, non_blocking=True):
+        return _orig_preload_tensors(write_buckets, non_blocking=False)
+
+    filesystem_async_module.FileSystemWriterAsync.preload_tensors = staticmethod(_preload_tensors_blocking)
+
     if torch.version.hip:
-        import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
         from slime.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync
 
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync

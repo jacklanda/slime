@@ -461,5 +461,183 @@ def test_parse_xml_tool_uses_ignores_unknown_tool():
     assert "<tool_call>" in cleaned  # left untouched
 
 
+def test_parse_model_output_gemma4_tool_parser():
+    schema = [{"function": {"name": "lookup"}}]
+    parsed = parse_model_output(
+        'lead <|tool_call>call:lookup{q:<|"|>slime<|"|>,limit:2}<tool_call|><|tool_response>',
+        tools_schema=schema,
+        tool_parser_name="gemma4",
+        reasoning_parser_name=None,
+    )
+
+    assert parsed.tool_uses == [{"name": "lookup", "input": {"q": "slime", "limit": 2}}]
+    assert "<|tool_call>" not in parsed.text
+    assert "<|tool_response>" not in parsed.text
+    assert "lead" in parsed.text
+
+
+def test_parse_model_output_gemma4_tool_parser_accepts_model_path_name():
+    schema = [{"function": {"name": "lookup"}}]
+    parsed = parse_model_output(
+        '<|tool_call>call:lookup{q:<|"|>slime<|"|>}<tool_call|><|tool_response>',
+        tools_schema=schema,
+        tool_parser_name="/share/nlp/share/plm/gemma-4-E2B-it",
+        reasoning_parser_name=None,
+    )
+
+    assert parsed.tool_uses == [{"name": "lookup", "input": {"q": "slime"}}]
+    assert parsed.text == ""
+    assert parsed.ill_formed is False
+
+
+def test_parse_model_output_gemma4_splits_native_thought_channel_before_tool_call():
+    schema = [{"function": {"name": "lookup"}}]
+    parsed = parse_model_output(
+        '<|channel>thought\nNeed a lookup.\n<channel|>\n<|tool_call>call:lookup{q:<|"|>slime<|"|>}<tool_call|><|tool_response>',
+        tools_schema=schema,
+        tool_parser_name="gemma4",
+        reasoning_parser_name=None,
+    )
+
+    assert parsed.reasoning == "Need a lookup."
+    assert parsed.tool_uses == [{"name": "lookup", "input": {"q": "slime"}}]
+    assert parsed.text == ""
+    assert parsed.ill_formed is False
+
+
+def test_parse_model_output_gemma4_reasoning_parser_splits_native_thought_channel_without_sglang():
+    parsed = parse_model_output(
+        "<|channel>thought\nDraft answer.\n<channel|>\nFinal answer.",
+        tools_schema=None,
+        tool_parser_name=None,
+        reasoning_parser_name="gemma4",
+    )
+
+    assert parsed.reasoning == "Draft answer."
+    assert parsed.text == "Final answer."
+    assert parsed.tool_uses == []
+    assert parsed.ill_formed is False
+
+
+def test_parse_model_output_gemma4_no_argument_tool_call():
+    schema = [{"function": {"name": "refresh"}}]
+    parsed = parse_model_output(
+        "lead <|tool_call>call:refresh{}<tool_call|><|tool_response>",
+        tools_schema=schema,
+        tool_parser_name="gemma4",
+        reasoning_parser_name=None,
+    )
+
+    assert parsed.tool_uses == [{"name": "refresh", "input": {}}]
+    assert parsed.ill_formed is False
+    assert parsed.text == "lead"
+
+
+def test_parse_model_output_gemma4_strips_repeated_adjacent_tool_response_markers():
+    schema = [{"function": {"name": "lookup"}}]
+    parsed = parse_model_output(
+        'lead <|tool_call>call:lookup{q:<|"|>slime<|"|>}<tool_call|><|tool_response>  <|tool_response> tail',
+        tools_schema=schema,
+        tool_parser_name="gemma4",
+        reasoning_parser_name=None,
+    )
+
+    assert parsed.tool_uses == [{"name": "lookup", "input": {"q": "slime"}}]
+    assert parsed.text == "lead tail"
+
+
+def test_parse_model_output_gemma4_strips_adjacent_markers_after_multiple_calls():
+    schema = [{"function": {"name": "lookup"}}, {"function": {"name": "summarize"}}]
+    parsed = parse_model_output(
+        (
+            'lead <|tool_call>call:lookup{q:<|"|>slime<|"|>}<tool_call|><|tool_response>'
+            ' middle <|tool_call>call:summarize{id:7}<tool_call|><|tool_response><|tool_response> tail'
+        ),
+        tools_schema=schema,
+        tool_parser_name="gemma4",
+        reasoning_parser_name=None,
+    )
+
+    assert parsed.tool_uses == [
+        {"name": "lookup", "input": {"q": "slime"}},
+        {"name": "summarize", "input": {"id": 7}},
+    ]
+    assert "<|tool_call>" not in parsed.text
+    assert "<|tool_response>" not in parsed.text
+    assert parsed.text == "lead middle tail"
+
+
+def test_parse_model_output_gemma4_flags_leftover_malformed_marker_after_valid_call():
+    schema = [{"function": {"name": "lookup"}}]
+    parsed = parse_model_output(
+        (
+            'lead <|tool_call>call:lookup{q:<|"|>slime<|"|>}<tool_call|><|tool_response> '
+            '<|tool_call>call:lookup{q:"unterminated}<tool_call|>'
+        ),
+        tools_schema=schema,
+        tool_parser_name="gemma4",
+        reasoning_parser_name=None,
+    )
+
+    assert parsed.tool_uses == [{"name": "lookup", "input": {"q": "slime"}}]
+    assert parsed.ill_formed is True
+    assert '<|tool_call>call:lookup{q:"unterminated}<tool_call|>' in parsed.text
+
+
+def test_parse_model_output_gemma4_keeps_non_adjacent_tool_response_text():
+    schema = [{"function": {"name": "lookup"}}]
+    parsed = parse_model_output(
+        'lead <|tool_call>call:lookup{q:<|"|>slime<|"|>}<tool_call|> visible <|tool_response>',
+        tools_schema=schema,
+        tool_parser_name="gemma4",
+        reasoning_parser_name=None,
+    )
+
+    assert parsed.tool_uses == [{"name": "lookup", "input": {"q": "slime"}}]
+    assert parsed.text == "lead visible <|tool_response>"
+
+
+def test_parse_model_output_gemma4_malformed_native_call_is_ill_formed():
+    schema = [{"function": {"name": "lookup"}}]
+    parsed = parse_model_output(
+        '<|tool_call>call:lookup{q:"unterminated}<tool_call|>',
+        tools_schema=schema,
+        tool_parser_name="gemma4",
+        reasoning_parser_name=None,
+    )
+
+    assert parsed.tool_uses == []
+    assert parsed.ill_formed is True
+    assert "<|tool_call>" in parsed.text
+
+
+def test_parse_model_output_gemma4_orphaned_tool_response_is_ill_formed():
+    schema = [{"function": {"name": "lookup"}}]
+    parsed = parse_model_output(
+        "lead <|tool_response>response:lookup{ok:true}<tool_response|>",
+        tools_schema=schema,
+        tool_parser_name="gemma4",
+        reasoning_parser_name=None,
+    )
+
+    assert parsed.tool_uses == []
+    assert parsed.ill_formed is True
+    assert "<|tool_response>" in parsed.text
+
+
+def test_parse_model_output_gemma4_plain_text_is_not_ill_formed():
+    schema = [{"function": {"name": "lookup"}}]
+    parsed = parse_model_output(
+        "plain answer without tool use",
+        tools_schema=schema,
+        tool_parser_name="gemma4",
+        reasoning_parser_name=None,
+    )
+
+    assert parsed.tool_uses == []
+    assert parsed.ill_formed is False
+    assert parsed.text == "plain answer without tool use"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

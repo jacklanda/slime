@@ -69,6 +69,8 @@ class RayTrainGroup:
             **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
             **self.args.train_env_vars,
         }
+        if "SLIME_TENSOR_BACKUP_PIN_MEMORY" in os.environ:
+            env_vars["SLIME_TENSOR_BACKUP_PIN_MEMORY"] = os.environ["SLIME_TENSOR_BACKUP_PIN_MEMORY"]
 
         if self.args.offload_train and self.args.train_backend == "megatron":
             import torch_memory_saver

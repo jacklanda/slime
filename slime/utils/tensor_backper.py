@@ -1,10 +1,14 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+import logging
+import os
 
 import torch
 
 _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
+logger = logging.getLogger(__name__)
+_ACCELERATOR_ERROR = getattr(torch, "AcceleratorError", RuntimeError)
 
 
 class TensorBackuper(ABC):
@@ -43,6 +47,7 @@ class _TensorBackuperNormal(TensorBackuper):
     def __init__(self, source_getter):
         super().__init__(source_getter=source_getter)
         self._backups: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
+        self._pin_memory = _env_flag("SLIME_TENSOR_BACKUP_PIN_MEMORY", default=True)
 
     @property
     def backup_tags(self):
@@ -56,7 +61,7 @@ class _TensorBackuperNormal(TensorBackuper):
         backup_dict = self._backups[tag]
         for name, param in self._source_getter():
             if name not in backup_dict:
-                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
+                backup_dict[name] = _empty_cpu_like(param, pin_memory=self._pin_memory, name=name)
             backup_dict[name].copy_(param.detach(), non_blocking=True)
         torch.cuda.synchronize()
 
@@ -113,3 +118,29 @@ def _compute_hash_tensor(x: torch.Tensor):
     x = x.view(torch.uint32)
     x = x.sum()
     return x.item()
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _empty_cpu_like(param: torch.Tensor, *, pin_memory: bool, name: str) -> torch.Tensor:
+    if not pin_memory:
+        return torch.empty_like(param, device=torch.device("cpu"), pin_memory=False)
+
+    try:
+        return torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
+    except (RuntimeError, _ACCELERATOR_ERROR):
+        logger.warning(
+            "Pinned CPU tensor backup allocation failed for %s with shape=%s dtype=%s; "
+            "falling back to non-pinned CPU backup. Set SLIME_TENSOR_BACKUP_PIN_MEMORY=0 "
+            "to disable pinned backup allocations explicitly.",
+            name,
+            tuple(param.shape),
+            param.dtype,
+            exc_info=True,
+        )
+        return torch.empty_like(param, device=torch.device("cpu"), pin_memory=False)

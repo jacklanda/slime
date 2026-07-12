@@ -31,7 +31,8 @@ def _get_config(args):
             "global_head_dim": hf_text.global_head_dim,
             "num_attention_heads": hf_text.num_attention_heads,
             "local_num_kv_heads": hf_text.num_key_value_heads,
-            "global_num_kv_heads": hf_text.num_global_key_value_heads,
+            "global_num_kv_heads": getattr(hf_text, "num_global_key_value_heads", None) or hf_text.num_key_value_heads,
+            "attention_k_eq_v": getattr(hf_text, "attention_k_eq_v", True),
             "hidden_size": hf_text.hidden_size,
             "num_experts": getattr(hf_text, "num_experts", 0),
         }
@@ -44,6 +45,12 @@ def convert_gemma4_to_hf(args, name, param):
 
     if name == "module.module.embedding.word_embeddings.weight":
         return [(f"{prefix}embed_tokens.weight", param)]
+    if name == "module.module.embedding.per_layer_embeddings.weight":
+        return [(f"{prefix}embed_tokens_per_layer.weight", param)]
+    if name == "module.module.per_layer_model_projection.weight":
+        return [(f"{prefix}per_layer_model_projection.weight", param)]
+    if name == "module.module.per_layer_projection_norm.weight":
+        return [(f"{prefix}per_layer_projection_norm.weight", param)]
     if name == "module.module.output_layer.weight":
         return [(f"{prefix}embed_tokens.weight", param)]  # tied embeddings
     if name == "module.module.decoder.final_layernorm.weight":
@@ -73,7 +80,7 @@ def convert_gemma4_to_hf(args, name, param):
             q_param = param[:, :q_dim, :].reshape(-1, hidden_size)
             k_param = param[:, q_dim : q_dim + head_dim, :].reshape(-1, hidden_size)
 
-            if is_global:
+            if is_global and cfg.get("attention_k_eq_v", True):
                 return [
                     (f"{L}.self_attn.q_proj.weight", q_param),
                     (f"{L}.self_attn.k_proj.weight", k_param),
@@ -107,6 +114,12 @@ def convert_gemma4_to_hf(args, name, param):
             return [(f"{L}.post_attention_layernorm.weight", param)]
         elif rest == "post_feedforward_layernorm.weight":
             return [(f"{L}.post_feedforward_layernorm.weight", param)]
+        elif rest == "per_layer_input_gate.weight":
+            return [(f"{L}.per_layer_input_gate.weight", param)]
+        elif rest == "per_layer_projection.weight":
+            return [(f"{L}.per_layer_projection.weight", param)]
+        elif rest == "post_per_layer_input_norm.weight":
+            return [(f"{L}.post_per_layer_input_norm.weight", param)]
         elif rest == "layer_scalar":
             return [(f"{L}.layer_scalar", param)]
         elif rest == "mlp.router.proj.weight":

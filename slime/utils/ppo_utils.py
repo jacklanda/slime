@@ -203,9 +203,11 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
         vocab_end_index = vocab_start_index + vocab_parallel_size
 
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
-        masked_target_1d = (target - vocab_start_index).clone()
-        masked_target_1d[target_mask] = 0
-        arange_1d = torch.arange(seq_len, device=vocab_parallel_logits.device)
+        # Keep every local gather index in range, including targets owned by a
+        # different TP rank. Boolean assignment followed by advanced indexing
+        # has triggered asynchronous vectorized_gather OOB asserts on long
+        # packed batches even though the original global token IDs are valid.
+        masked_target_1d = (target - vocab_start_index).clamp(0, vocab_parallel_size - 1)
 
         def vocab_parallel_softmax(
             logits: torch.Tensor,
@@ -219,7 +221,11 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
             normalized_logits = logits.sub_(logits_max) if inplace else logits - logits_max
             # The normalized logit at the target position is the log-prob numerator;
             # gather it (a small copy) before the in-place ``exp_`` destroys it.
-            predicted_logits = normalized_logits.view(-1, vocab_parallel_size)[arange_1d, masked_target_1d]
+            predicted_logits = torch.gather(
+                normalized_logits.view(-1, vocab_parallel_size),
+                dim=-1,
+                index=masked_target_1d.reshape(-1, 1),
+            ).squeeze(-1)
             # Reuse the ``normalized_logits`` storage for exp and softmax so the whole
             # softmax costs a single [seq_len, vocab] buffer instead of three.
             exp_logits = normalized_logits.exp_()
@@ -751,6 +757,7 @@ def calculate_log_probs_and_entropy(
     chunk_size: int = -1,
     log_prob_keep_mask=None,
     with_entropy_grad: bool = True,
+    logits_scale: float = 1.0,
 ):
     logits = logits.contiguous()
     entropy = None
@@ -766,6 +773,8 @@ def calculate_log_probs_and_entropy(
             log_probs = []
             entropy_chunks = []
             for tokens_chunk, logits_chunk, mask_chunk in zip(tokens_chunks, logits_chunks, mask_chunks, strict=True):
+                if logits_scale != 1.0:
+                    logits_chunk = logits_chunk * logits_scale
                 log_prob, entropy_chunk = _calculate_log_probs_and_entropy_chunk(
                     logits_chunk,
                     tokens_chunk,
@@ -782,7 +791,7 @@ def calculate_log_probs_and_entropy(
                 entropy = torch.cat(entropy_chunks, dim=0)
         else:
             log_prob, entropy = _calculate_log_probs_and_entropy_chunk(
-                logits,
+                logits * logits_scale if logits_scale != 1.0 else logits,
                 tokens,
                 tp_group,
                 with_entropy=with_entropy,

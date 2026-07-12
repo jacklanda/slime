@@ -126,6 +126,9 @@ def web_search_schema() -> dict:
 
 
 def build_system_prompt(base_prompt: str, schemas: list[dict], model_name: str | None = None) -> str:
+    normalized = str(model_name or "").lower().replace("-", "_")
+    if "gemma4" in normalized or "gemma_4" in normalized:
+        return base_prompt.strip()
     schemas_str = "\n".join(json.dumps(schema, indent=0, ensure_ascii=False) for schema in schemas)
     return base_prompt.strip() + "\n" + make_tool_parser(model_name).get_tool_prompt(schemas_str)
 
