@@ -50,10 +50,10 @@ Generation/eval:
   --eval-max-context-len N             Default: prompt + response.
   --limit-per-benchmark N              Generate config with first N examples per benchmark. Default: 0 (all).
   --no-prefer-verl                     Normalize from raw files even when data_verl.parquet exists.
-  --retrieval-concurrency N            Concurrent retrieval requests. Default: 160.
+  --retrieval-concurrency N            Concurrent retrieval requests. Default: 176.
   --retrieval-cache-size N             Cross-episode retrieval LRU entries. Default: 4096.
   --eval-initial-inflight-tasks N      Initial scheduled eval trajectories. Default: 384.
-  --eval-max-inflight-tasks N          Adaptive hard limit for eval trajectories. Default: 512.
+  --eval-max-inflight-tasks N          Adaptive hard limit for eval trajectories. Default: 576.
   --eval-adaptive-concurrency BOOL     Adjust inflight work from engine metrics. Default: true.
   --eval-trajectory-sample-rate X      Full trajectory dump fraction. Default: 0.
   --eval-dump-failures BOOL            Dump failed eval trajectories. Default: true.
@@ -61,7 +61,7 @@ Generation/eval:
 
 SGLang/runtime:
   --sglang-mem-fraction-static X       Default: 0.9.
-  --sglang-server-concurrency N        Default: 56.
+  --sglang-server-concurrency N        Default: 60.
   --sglang-max-running-requests N      Default: 96.
   --router-policy NAME                 Default: manual.
   --router-assignment-mode NAME        Default: min_load.
@@ -116,16 +116,16 @@ EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-2048}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
 LIMIT_PER_BENCHMARK="${LIMIT_PER_BENCHMARK:-0}"
 PREFER_VERL="${PREFER_VERL:-1}"
-RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-160}"
+RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-176}"
 RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE:-4096}"
 EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-384}"
-EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-512}"
+EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-576}"
 EVAL_ADAPTIVE_CONCURRENCY="${EVAL_ADAPTIVE_CONCURRENCY:-true}"
 EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-0}"
 EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES:-true}"
 NATIVE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION:-true}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.9}"
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-56}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-60}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-96}"
 ROUTER_POLICY="${ROUTER_POLICY:-manual}"
 ROUTER_ASSIGNMENT_MODE="${ROUTER_ASSIGNMENT_MODE:-min_load}"
