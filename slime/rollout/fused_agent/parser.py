@@ -384,7 +384,9 @@ class Qwen3CoderToolParser(QwenToolParser):
             return param_value
         if param_type.startswith("int") or param_type.startswith("uint") or param_type.startswith("long") or param_type.startswith("short") or param_type.startswith("unsigned"):
             try:
-                return int(param_value)
+                # Qwen3.5 occasionally emits ``<parameter=name>: 10``. Treat the
+                # extra colon as a formatting delimiter for integer parameters.
+                return int(re.sub(r"^:\s*", "", param_value))
             except Exception:
                 logger.warning(
                     "Parsed value '%s' of parameter '%s' is not an integer in tool '%s'; returning string value.",

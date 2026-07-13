@@ -26,6 +26,9 @@ _SUPPRESSED_LOG_PATTERNS = [
 _SUPPRESSED_OUTPUT_PATTERNS = [
     re.compile(r"Failed to load .*/torchao/_C_.*\.so"),
     re.compile(r"Unable to import `torchao` Tensor objects\."),
+    re.compile(r"transformers>=5\.0 support is experimental\. Unified Hugging Face checkpoint export"),
+    re.compile(r"^\s*(?:\(pid=\d+\)\s+)?_warnings\.warn\(\s*(?:\[repeated \d+x across cluster\])?\s*$"),
+    re.compile(r"^\(pid=\d+\)\s*(?:\[repeated \d+x across cluster\])?\s*$"),
     re.compile(r"\[ERROR\] `\w+` is part of .* but not documented\. Make sure to add it to the docstring"),
     re.compile(r"^LANG_RL Log directory:"),
 ]
@@ -48,12 +51,27 @@ class _FilteredStream:
 
     def __init__(self, wrapped):
         self._wrapped = wrapped
+        self._suppress_next_linebreak = False
 
     def write(self, text):
         if not text:
             return self._wrapped.write(text)
-        kept = [line for line in text.splitlines(keepends=True) if not any(pattern.search(line) for pattern in _SUPPRESSED_OUTPUT_PATTERNS)]
-        if len(kept) != len(text.splitlines(keepends=True)):
+        kept = []
+        dropped = False
+        for line in text.splitlines(keepends=True):
+            if self._suppress_next_linebreak:
+                self._suppress_next_linebreak = False
+                if not line.strip():
+                    dropped = True
+                    continue
+
+            if any(pattern.search(line) for pattern in _SUPPRESSED_OUTPUT_PATTERNS):
+                dropped = True
+                self._suppress_next_linebreak = not line.endswith(("\n", "\r"))
+                continue
+            kept.append(line)
+
+        if dropped:
             if kept:
                 self._wrapped.write("".join(kept))
             # Report a full write so callers that check the return value don't retry.
@@ -99,6 +117,12 @@ def suppress_known_training_warnings():
         message=r"transformers>=5\.0 support is experimental\..*",
         category=UserWarning,
         module=r"modelopt\.torch",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var.*",
+        category=FutureWarning,
+        module=r"ray\._private\.worker",
     )
     warnings.filterwarnings(
         "ignore",

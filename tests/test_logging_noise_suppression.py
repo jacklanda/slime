@@ -2,6 +2,7 @@ import importlib.util
 import io
 import sys
 import types
+import warnings
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,11 @@ def load_logging_utils(monkeypatch):
 SUPPRESSED_LINES = [
     "WARNING:torchao:Failed to load /env/site-packages/torchao/_C_cutlass_90a.abi3.so: oops\n",
     "Unable to import `torchao` Tensor objects. This may affect loading checkpoints serialized with `torchao`\n",
+    "(pid=123) UserWarning: transformers>=5.0 support is experimental. Unified Hugging Face checkpoint export for quantized checkpoints may not work for some models yet.\n",
+    "  _warnings.warn(\n",
+    "(pid=123)   _warnings.warn(\n",
+    "(pid=123)   _warnings.warn( [repeated 6x across cluster]\n",
+    "(pid=123)\n",
     "[ERROR] `cache_position` is part of Qwen3ASRThinkerTextModel.forward's signature, " "but not documented. Make sure to add it to the docstring of the function in /x/y.py.\n",
     "LANG_RL Log directory: None\n",
 ]
@@ -45,6 +51,8 @@ SUPPRESSED_LINES = [
 KEPT_LINES = [
     "Training step 5 loss=0.12\n",
     "WARNING:torchao:some other torchao message we should keep\n",
+    "worker called _warnings.warn( while handling a real error\n",
+    "(RolloutManager pid=123) healthy\n",
     "[ERROR] real training error: CUDA out of memory\n",
 ]
 
@@ -78,6 +86,32 @@ def test_filtered_stream_mixed_batch_keeps_only_clean_lines(monkeypatch):
     batched = KEPT_LINES[0] + SUPPRESSED_LINES[0] + KEPT_LINES[1]
     stream.write(batched)
     assert sink.getvalue() == KEPT_LINES[0] + KEPT_LINES[1]
+
+
+def test_filtered_stream_preserves_separately_written_linebreaks(monkeypatch):
+    mod = load_logging_utils(monkeypatch)
+    sink = io.StringIO()
+    stream = mod._FilteredStream(sink)
+
+    stream.write("first log")
+    stream.write("\n")
+    stream.write("second log")
+    stream.write("\n")
+
+    assert sink.getvalue() == "first log\nsecond log\n"
+
+
+def test_filtered_stream_drops_only_linebreak_after_suppressed_fragment(monkeypatch):
+    mod = load_logging_utils(monkeypatch)
+    sink = io.StringIO()
+    stream = mod._FilteredStream(sink)
+
+    stream.write("before\n")
+    stream.write("(pid=123)   _warnings.warn(")
+    stream.write("\n")
+    stream.write("(SGLangEngine pid=456) after\n")
+
+    assert sink.getvalue() == "before\n(SGLangEngine pid=456) after\n"
 
 
 def test_log_drops_untracked_metric_namespaces(monkeypatch):
@@ -122,6 +156,22 @@ def test_suppress_is_idempotent_and_wraps_both_streams(monkeypatch):
         assert sys.stderr is wrapped_err
     finally:
         sys.stdout, sys.stderr = real_out, real_err
+
+
+def test_suppress_ignores_ray_accelerator_override_future_warning(monkeypatch):
+    mod = load_logging_utils(monkeypatch)
+    mod.suppress_known_training_warnings()
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.warn_explicit(
+            "Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default).",
+            FutureWarning,
+            filename="ray/_private/worker.py",
+            lineno=2051,
+            module="ray._private.worker",
+        )
+
+    assert caught == []
 
 
 def test_filtered_stderr_alias(monkeypatch):

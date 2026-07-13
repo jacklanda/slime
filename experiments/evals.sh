@@ -45,7 +45,7 @@ Generation/eval:
   --temperature X                      Default: 0.7.
   --top-p X                            Default: 1.0.
   --top-k N                            Default: 20.
-  --eval-max-response-len N            Default: 38000.
+  --eval-max-response-len N            Default: 38000; also the default cot per-step budget.
   --eval-max-prompt-len N              Default: 2048.
   --eval-max-context-len N             Default: prompt + response.
   --limit-per-benchmark N              Generate config with first N examples per benchmark. Default: 0 (all).
@@ -55,7 +55,7 @@ Generation/eval:
   --eval-initial-inflight-tasks N      Initial scheduled eval trajectories. Default: 384.
   --eval-max-inflight-tasks N          Adaptive hard limit for eval trajectories. Default: 576.
   --eval-adaptive-concurrency BOOL     Adjust inflight work from engine metrics. Default: true.
-  --eval-trajectory-sample-rate X      Full trajectory dump fraction. Default: 0.
+  --eval-trajectory-sample-rate X      Full trajectory dump fraction. Default: 1.
   --eval-dump-failures BOOL            Dump failed eval trajectories. Default: true.
   --native-sglang-session BOOL         Use verified incremental SGLang sessions. Default: true.
 
@@ -121,7 +121,7 @@ RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE:-4096}"
 EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-384}"
 EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-576}"
 EVAL_ADAPTIVE_CONCURRENCY="${EVAL_ADAPTIVE_CONCURRENCY:-true}"
-EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-0}"
+EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-1}"
 EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES:-true}"
 NATIVE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION:-true}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.9}"
@@ -301,6 +301,13 @@ fi
 case "${FUSED_HARNESS}" in
    cot|bare) UNIFIED_SYSTEM_PROMPT=False ;;
 esac
+if [ -z "${PER_STEP_MAX_TOKENS:-}" ]; then
+   if [ "${FUSED_HARNESS}" = "cot" ]; then
+      PER_STEP_MAX_TOKENS="${EVAL_MAX_RESPONSE_LEN}"
+   else
+      PER_STEP_MAX_TOKENS=2048
+   fi
+fi
 
 LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/evals/${EXPERIMENT_NAME}}"
 EVAL_CONFIG="${EVAL_CONFIG:-${LOG_ROOT}/eval_config.yaml}"
@@ -376,7 +383,7 @@ export FUSED_WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS}"
 export FUSED_CLI_MAX_STEPS="${CLI_MAX_STEPS}"
 export FUSED_TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT}"
 export FUSED_EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT}"
-export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-2048}"
+export PER_STEP_MAX_TOKENS
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH:-4096}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${SLIME_FUSED_TERMINAL_LOG_STYLE:-both}"
 export SLIME_FUSED_PROGRESS_LOGS="${SLIME_FUSED_PROGRESS_LOGS:-false}"
@@ -427,7 +434,7 @@ echo "Benchmarks root: ${BENCHMARKS_ROOT}"
 echo "Eval config: ${EVAL_CONFIG}"
 echo "Log root: ${LOG_ROOT}"
 echo "GPUs: ${ROLLOUT_GPUS}; gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}"
-echo "Harness: ${FUSED_HARNESS}; disable_thinking=${DISABLE_THINKING}; n=${N_SAMPLES_PER_EVAL_PROMPT}"
+echo "Harness: ${FUSED_HARNESS}; disable_thinking=${DISABLE_THINKING}; n=${N_SAMPLES_PER_EVAL_PROMPT}; per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
 echo "Concurrency: eval=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS} adaptive=${EVAL_ADAPTIVE_CONCURRENCY}; sglang_per_engine=${SGLANG_SERVER_CONCURRENCY}; retrieval=${RETRIEVAL_CONCURRENCY}"
 
 EVAL_ADAPTIVE_CONCURRENCY_ARG="--eval-adaptive-concurrency"
@@ -500,5 +507,6 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
 
 if ! is_truthy "${RAY_JOB_WAIT}" && is_truthy "${RAY_JOB_FOLLOW_LOGS}"; then
    echo "Following Ray job logs for ${RAY_SUBMISSION_ID}"
-   ray job logs --address="${RAY_DASHBOARD_ADDRESS}" --follow "${RAY_SUBMISSION_ID}"
+   ray job logs --address="${RAY_DASHBOARD_ADDRESS}" --follow "${RAY_SUBMISSION_ID}" \
+      | sed -u -E '/^[[:space:]]*$/d; /^\([^)]*pid=[0-9]+[^)]*\)[[:space:]]*$/d'
 fi

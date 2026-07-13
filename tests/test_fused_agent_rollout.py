@@ -412,6 +412,21 @@ def test_initial_messages_configure_runtime_qwen35_parser_schema():
     assert call.arguments == {"query": "query", "max_results": 10}
 
 
+def test_qwen3_coder_parser_accepts_colon_before_integer_value():
+    tools = [web_search_schema()]
+    parser = make_tool_parser("Qwen3.5-4B", valid_tools={"web_search"})
+    parser.get_tool_prompt("\n".join(json.dumps(t, indent=0, ensure_ascii=False) for t in tools))
+
+    call = parser.parse(
+        "<tool_call>\n<function=web_search>\n"
+        "<parameter=query>\n: 10\n</parameter>\n"
+        "<parameter=max_results>\n: 10\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )[0]
+
+    assert call.arguments == {"query": ": 10", "max_results": 10}
+
+
 def test_qwen3_coder_parser_normalizes_submit_and_keeps_boxed_fallback():
     parser = make_tool_parser("qwen3-coder", valid_tools={"web_search", "finish", "submit"})
 
