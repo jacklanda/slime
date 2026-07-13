@@ -4,13 +4,21 @@ import logging
 import re
 from typing import Any
 
-from slime.ray.rollout import _compute_eval_source_metrics, _eval_dataset_group_size
+import numpy as np
+
+from slime.ray.rollout import (
+    _compute_eval_source_metrics,
+    _eval_dataset_group_size,
+    _eval_sample_steps,
+    _eval_sample_tool_calls,
+)
 from slime.utils.metric_utils import compute_pass_at_k_and_pass_all
 
 logger = logging.getLogger(__name__)
 
 _BENCHMARK_COLUMN = ("Benchmark", 21, "<")
 _METRIC_COLUMN_WIDTH = 15
+_COUNT_COLUMNS = (("# steps", "steps", 10, ">"), ("# tool calls", "tool_calls", 12, ">"))
 
 
 def log_eval_results_table(rollout_id: int, args: Any, data: dict[str, Any], extra_metrics: dict[str, Any] | None) -> bool:
@@ -29,6 +37,12 @@ def format_eval_results_table(args: Any, data: dict[str, Any]) -> str:
         source_metrics = {}
         if (samples := dataset_data.get("samples")) is not None:
             source_metrics = _compute_eval_source_metrics(samples, rewards, group_size)
+            steps = [value for sample in samples if (value := _eval_sample_steps(sample)) is not None]
+            if steps:
+                dataset_metrics["steps"] = float(np.mean(steps))
+            tool_calls = [value for sample in samples if (value := _eval_sample_tool_calls(sample)) is not None]
+            if tool_calls:
+                dataset_metrics["tool_calls"] = float(np.mean(tool_calls))
 
         overall_name = f"overall / {dataset_name}" if source_metrics else dataset_name
         if overall_row := _result_row(overall_name, dataset_metrics):
@@ -66,7 +80,11 @@ def _result_row(
 
 def _render_table(rows: list[tuple[str, dict[str, float]]]) -> str:
     metric_keys = _table_metric_keys(rows)
-    columns = (_BENCHMARK_COLUMN, *[(f"{key.replace('/', ' ')} (%)", _METRIC_COLUMN_WIDTH, ">") for key in metric_keys])
+    columns = (
+        _BENCHMARK_COLUMN,
+        *[(f"{key.replace('/', ' ')} (%)", _METRIC_COLUMN_WIDTH, ">") for key in metric_keys],
+        *[(header, width, align) for header, _, width, align in _COUNT_COLUMNS],
+    )
     header = _render_cells(tuple(column[0] for column in columns), columns)
     heavy_rule = "  ".join("━" * width for _, width, _ in columns)
     light_rule = "  ".join("─" * width for _, width, _ in columns)
@@ -74,7 +92,8 @@ def _render_table(rows: list[tuple[str, dict[str, float]]]) -> str:
     for index, row in enumerate(rows):
         name, metrics = row
         values = tuple(_format_metric(metrics[key]) if key in metrics else "" for key in metric_keys)
-        lines.append(_render_cells((name, *values), columns))
+        counts = tuple(_format_count(metrics[key]) if key in metrics else "" for _, key, _, _ in _COUNT_COLUMNS)
+        lines.append(_render_cells((name, *values, *counts), columns))
         if index != len(rows) - 1:
             lines.append(light_rule)
     return "\n".join(lines)
@@ -91,12 +110,16 @@ def _format_metric(value: float) -> str:
     return f"{value * 100:.1f}"
 
 
+def _format_count(value: float) -> str:
+    return f"{value:.1f}"
+
+
 def _is_table_metric_key(key: str) -> bool:
-    return re.fullmatch(r"pass[@^]\d+/(mean|std)", key) is not None
+    return re.fullmatch(r"pass[@^]\d+/(mean|std)", key) is not None or key in {"steps", "tool_calls"}
 
 
 def _table_metric_keys(rows: list[tuple[str, dict[str, float]]]) -> list[str]:
-    keys = {key for _, metrics in rows for key in metrics}
+    keys = {key for _, metrics in rows for key in metrics if key not in {"steps", "tool_calls"}}
     return sorted(keys, key=_metric_key_sort_key)
 
 

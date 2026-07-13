@@ -43,6 +43,32 @@ def test_compute_metrics_from_samples_omits_response_aborted_ratio():
     assert "prompt_length/mean" in metrics
 
 
+def test_compute_metrics_from_samples_uses_compact_eval_token_lengths():
+    args = SimpleNamespace(
+        advantage_estimator="ppo",
+        log_reward_category=None,
+        rollout_max_response_len=8,
+        rollout_max_prompt_len=16,
+    )
+    sample = Sample(
+        tokens=[],
+        response="compact",
+        response_length=7,
+        reward=1.0,
+        metadata={
+            "fused_prompt_length_tokens": 11,
+            "fused_completion_length_tokens": 7,
+        },
+    )
+
+    metrics = compute_metrics_from_samples(args, [sample])
+
+    assert metrics["prompt_length/mean"] == 11.0
+    assert metrics["response_length/mean"] == 7.0
+    assert metrics["prompt_length/clip_ratio"] == 0.0
+    assert metrics["response_length/clip_ratio"] == 0.0
+
+
 def test_compute_pass_at_k_and_pass_all_uses_full_eval_group_size():
     metrics = compute_pass_at_k_and_pass_all([0.0, 1.0, 0.0, 1.0, 1.0, 1.0], group_size=3)
 
@@ -133,22 +159,27 @@ def test_eval_rollout_log_adds_source_pass_metrics(monkeypatch):
         rollout_max_prompt_len=16,
     )
 
-    def sample(index: int, source: str) -> Sample:
+    def sample(index: int, source: str, *, steps: int | None = None, tool_calls: int | None = None) -> Sample:
+        metadata = {
+            "tools_kwargs": {
+                "search": {
+                    "create_kwargs": {
+                        "data_source": source,
+                    }
+                }
+            }
+        }
+        if steps is not None:
+            metadata["fused_traj_steps"] = steps
+        if tool_calls is not None:
+            metadata["fused_reward_debug"] = {"tool_calls": tool_calls}
         return Sample(
             index=index,
             tokens=[1, 2, 3],
             response_length=1,
             reward=0.0,
             response="ok",
-            metadata={
-                "tools_kwargs": {
-                    "search": {
-                        "create_kwargs": {
-                            "data_source": source,
-                        }
-                    }
-                }
-            },
+            metadata=metadata,
         )
 
     data = {
@@ -156,9 +187,9 @@ def test_eval_rollout_log_adds_source_pass_metrics(monkeypatch):
             "rewards": [0.0, 1.0, 0.0, 0.0],
             "truncated": [False, False, False, False],
             "samples": [
-                sample(0, "searchR1_nq"),
-                sample(1, "searchR1_nq"),
-                sample(2, "searchR1_triviaqa"),
+                sample(0, "searchR1_nq", steps=2, tool_calls=1),
+                sample(1, "searchR1_nq", steps=4, tool_calls=3),
+                sample(2, "searchR1_triviaqa", steps=5, tool_calls=4),
                 sample(3, "searchR1_triviaqa"),
             ],
         }
@@ -170,6 +201,8 @@ def test_eval_rollout_log_adds_source_pass_metrics(monkeypatch):
     assert "eval/search_r1/nq/num_samples" not in log_dict
     assert log_dict["eval/search_r1/nq/num_episdoes"] == 2
     assert log_dict["eval/search_r1/nq/num_problems"] == 1
+    assert log_dict["eval/search_r1/nq/steps"] == 3.0
+    assert log_dict["eval/search_r1/nq/tool_calls"] == 2.0
     assert "eval/search_r1/nq/pass@2" not in log_dict
     assert "eval/search_r1/nq/pass^2" not in log_dict
     assert log_dict["eval/search_r1/nq/pass@2/mean"] == 1.0
@@ -180,6 +213,8 @@ def test_eval_rollout_log_adds_source_pass_metrics(monkeypatch):
     assert "eval/search_r1/triviaqa/num_samples" not in log_dict
     assert log_dict["eval/search_r1/triviaqa/num_episdoes"] == 2
     assert log_dict["eval/search_r1/triviaqa/num_problems"] == 1
+    assert log_dict["eval/search_r1/triviaqa/steps"] == 5.0
+    assert log_dict["eval/search_r1/triviaqa/tool_calls"] == 4.0
     assert "eval/search_r1/triviaqa/pass@2" not in log_dict
     assert "eval/search_r1/triviaqa/pass^2" not in log_dict
     assert log_dict["eval/search_r1/triviaqa/pass@2/mean"] == 0.0

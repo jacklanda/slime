@@ -129,13 +129,24 @@ def _run_generate_with_fake_sglang(
     evaluation: bool = False,
     tokenizer=None,
 ):
-    async def fake_call_sglang(args, prompt_ids, sampling_params, *, session_id):
+    async def fake_call_sglang(
+        args,
+        prompt_ids,
+        sampling_params,
+        *,
+        session_id,
+        evaluation=False,
+        request_semaphore=None,
+    ):
         item = calls.pop(0)
         text = item["text"]
         return {
+            "text": text,
             "output_ids": [ord(c) for c in text],
             "output_logprobs": [-0.1] * len(text),
             "finish_reason": item.get("finish_reason", "stop"),
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": len(text),
         }
 
     old_generate_state = fused_generate.GenerateState
@@ -144,7 +155,10 @@ def _run_generate_with_fake_sglang(
     if env:
         os.environ.update(env)
     fake_tokenizer = tokenizer or FakeTokenizer()
-    fused_generate.GenerateState = lambda args: SimpleNamespace(tokenizer=fake_tokenizer)
+    fused_generate.GenerateState = lambda args: SimpleNamespace(
+        tokenizer=fake_tokenizer,
+        semaphore=asyncio.Semaphore(1000),
+    )
     fused_generate._call_sglang = fake_call_sglang
     try:
         import asyncio
@@ -2178,6 +2192,55 @@ def test_web_search_skips_summary_when_disabled(monkeypatch):
     assert done is False
 
 
+def test_web_search_cache_and_singleflight_share_retrieval_work(monkeypatch):
+    calls = 0
+    active = 0
+    max_active = 0
+
+    async def fake_post(_session, _url, payload, *, retry_budget):
+        nonlocal calls, active, max_active
+        calls += 1
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return {"results": [{"title": payload["query"], "content": "answer"}]}, 0
+
+    monkeypatch.setattr("slime.rollout.fused_agent.env._post_json_with_retries", fake_post)
+    monkeypatch.setattr("slime.rollout.fused_agent.env._get_shared_http_session", lambda: object())
+    monkeypatch.setenv("RLLM_RETRIEVAL_CONCURRENCY", "1")
+    monkeypatch.setenv("RLLM_RETRIEVAL_CACHE_SIZE", "8")
+
+    async def scenario():
+        first = FusedEnvironment({"question": "q"})
+        first_result = await first.step(fused_generate.ToolCall("web_search", {"query": "same query"}))
+        repeated_result = await first.step(fused_generate.ToolCall("web_search", {"query": "  SAME   query "}))
+
+        second = FusedEnvironment({"question": "q"})
+        global_result = await second.step(fused_generate.ToolCall("web_search", {"query": "same query"}))
+
+        third = FusedEnvironment({"question": "q"})
+        fourth = FusedEnvironment({"question": "q"})
+        singleflight_results = await asyncio.gather(
+            third.step(fused_generate.ToolCall("web_search", {"query": "new query"})),
+            fourth.step(fused_generate.ToolCall("web_search", {"query": "new query"})),
+        )
+        await asyncio.gather(
+            FusedEnvironment({"question": "q"}).step(fused_generate.ToolCall("web_search", {"query": "unique one"})),
+            FusedEnvironment({"question": "q"}).step(fused_generate.ToolCall("web_search", {"query": "unique two"})),
+        )
+        return first_result, repeated_result, global_result, singleflight_results
+
+    first_result, repeated_result, global_result, singleflight_results = asyncio.run(scenario())
+
+    assert first_result[3]["tools/search_episode_cache_hits"] == 0
+    assert repeated_result[3]["tools/search_episode_cache_hits"] == 1
+    assert global_result[3]["tools/search_global_cache_hits"] == 1
+    assert sum(result[3]["tools/search_singleflight_hits"] for result in singleflight_results) == 1
+    assert calls == 4
+    assert max_active == 1
+
+
 def test_task_from_sample_promotes_extra_info_ground_truth():
     sample = Sample(
         prompt="Question",
@@ -2231,6 +2294,49 @@ def test_call_sglang_aborts_request_on_timeout(monkeypatch):
         {"rid": calls[0][2]["rid"]},
         5.0,
     )
+
+
+def test_call_sglang_eval_uses_text_without_logprobs(monkeypatch):
+    requests = []
+
+    async def fake_post(url, payload, headers=None):
+        requests.append((url, payload, headers))
+        return {
+            "text": "final answer",
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 2,
+                "completion_tokens": 2,
+            },
+        }
+
+    monkeypatch.setattr(fused_generate.http_utils, "post", fake_post)
+    args = SimpleNamespace(
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        router_policy="consistent_hashing",
+        sglang_context_length=100,
+        rollout_max_context_len=100,
+    )
+
+    result = asyncio.run(
+        fused_generate._call_sglang(
+            args,
+            [1, 2],
+            {"max_new_tokens": 4},
+            session_id="sid",
+            evaluation=True,
+        )
+    )
+
+    assert requests[0][1]["return_logprob"] is False
+    assert requests[0][2] == {"X-SMG-Routing-Key": "sid"}
+    assert result == {
+        "text": "final answer",
+        "finish_reason": "stop",
+        "prompt_tokens": 2,
+        "completion_tokens": 2,
+    }
 
 
 def test_effective_sglang_context_limit_uses_margin(monkeypatch):
@@ -2331,6 +2437,13 @@ def test_eval_generate_defers_reward_to_benchmark_verifier():
     assert isinstance(result, list)
     assert result[0].response == response
     assert result[0].reward == 0.0
+    assert result[0].tokens == []
+    assert result[0].response_length == len(response)
+    assert result[0].metadata["fused_prompt_length_tokens"] > 0
+    assert result[0].metadata["fused_completion_length_tokens"] == len(response)
+    assert result[0].rollout_log_probs is None
+    assert result[0].loss_mask is None
+    assert "rllm_episode" not in result[0].metadata
 
     from slime.rollout import sglang_rollout
     from slime.rollout.rm_hub.benchmark_verifier import reward_func
@@ -2976,8 +3089,9 @@ def test_eval_allows_mixed_tool_and_submit_call():
     assert sample.metadata["fused_termination"] == "env_done"
     assert sample.metadata["fused_traj_steps"] == 3
     assert sample.metadata.get("mixed_tool_and_answer") is None
-    assert mixed in _masked_text(sample)
-    assert _policy_masked_text(sample) == first + mixed + final
+    assert sample.response == final
+    assert sample.tokens == []
+    assert sample.loss_mask is None
 
 
 def test_eval_disables_direct_submit_abnormal_detection():
@@ -3022,7 +3136,7 @@ def test_eval_disables_repeated_search_abnormal_detection():
     assert sample.metadata["credit_assignment_event"] is None
     assert sample.metadata["fused_termination"] == "env_done"
     assert "duplicate_search_detected" not in sample.metadata
-    assert "Repeated search query detected" not in _policy_unmasked_text(sample)
+    assert sample.tokens == []
 
 
 def test_eval_disables_parser_error_abnormal_detection(tmp_path: Path):

@@ -1579,6 +1579,12 @@ def _compute_eval_source_metrics(samples: list[Sample], rewards: list[float], gr
         source_rewards = [rewards[i] for i in indices]
         metrics[f"{source}/num_episdoes"] = len(source_rewards)
         metrics[f"{source}/num_problems"] = len(source_rewards) // group_size
+        source_steps = [value for i in indices if (value := _eval_sample_steps(samples[i])) is not None]
+        if source_steps:
+            metrics[f"{source}/steps"] = float(np.mean(source_steps))
+        source_tool_calls = [value for i in indices if (value := _eval_sample_tool_calls(samples[i])) is not None]
+        if source_tool_calls:
+            metrics[f"{source}/tool_calls"] = float(np.mean(source_tool_calls))
         if len(source_rewards) % group_size != 0:
             logger.warning(
                 "Skip pass metrics for eval source %s because %s rewards are not divisible by group size %s",
@@ -1595,6 +1601,26 @@ def _compute_eval_source_metrics(samples: list[Sample], rewards: list[float], gr
             f"{source}/",
         )
     return metrics
+
+
+def _eval_sample_steps(sample: Sample) -> float | None:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    return _coerce_finite_float(
+        metadata.get("fused_traj_steps")
+        if metadata.get("fused_traj_steps") is not None
+        else metadata.get("traj_steps")
+    )
+
+
+def _eval_sample_tool_calls(sample: Sample) -> float | None:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    reward_debug = metadata.get("fused_reward_debug")
+    if isinstance(reward_debug, dict) and reward_debug.get("tool_calls") is not None:
+        return _coerce_finite_float(reward_debug["tool_calls"])
+    for key in ("fused_tool_call_turns", "tool_call_turns", "tool_call_turn"):
+        if metadata.get(key) is not None:
+            return _coerce_finite_float(metadata[key])
+    return None
 
 
 def _eval_source_from_sample(sample: Sample) -> str | None:
@@ -1648,7 +1674,15 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
 
 def compute_metrics_from_samples(args, samples):
     response_lengths = [sample.effective_response_length for sample in samples]
-    prompt_lengths = [len(sample.tokens) - sample.response_length for sample in samples]
+    prompt_lengths = []
+    for sample in samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        compact_prompt_length = metadata.get("fused_prompt_length_tokens")
+        prompt_lengths.append(
+            int(compact_prompt_length)
+            if compact_prompt_length is not None
+            else len(sample.tokens) - sample.response_length
+        )
 
     log_dict = {}
     response_length_stats = compute_statistics(response_lengths)

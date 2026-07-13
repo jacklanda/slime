@@ -5,7 +5,7 @@ from slime.utils.types import Sample
 from slime_plugins.evals.results_table import format_eval_results_table, log_eval_results_table
 
 
-def _sample(index: int, source: str) -> Sample:
+def _sample(index: int, source: str, *, steps: int, tool_calls: int) -> Sample:
     return Sample(
         index=index,
         tokens=[1, 2, 3],
@@ -13,6 +13,8 @@ def _sample(index: int, source: str) -> Sample:
         reward=0.0,
         response="ok",
         metadata={
+            "fused_traj_steps": steps,
+            "fused_reward_debug": {"tool_calls": tool_calls},
             "tools_kwargs": {
                 "search": {
                     "create_kwargs": {
@@ -33,22 +35,22 @@ def test_format_eval_results_table_includes_overall_and_sources():
         "search_r1": {
             "rewards": [1.0, 0.0, 1.0, 0.0],
             "samples": [
-                _sample(0, "searchR1_nq"),
-                _sample(1, "searchR1_nq"),
-                _sample(2, "searchR1_triviaqa"),
-                _sample(3, "searchR1_triviaqa"),
+                _sample(0, "searchR1_nq", steps=2, tool_calls=1),
+                _sample(1, "searchR1_nq", steps=4, tool_calls=3),
+                _sample(2, "searchR1_triviaqa", steps=6, tool_calls=5),
+                _sample(3, "searchR1_triviaqa", steps=8, tool_calls=7),
             ],
         }
     }
 
     assert format_eval_results_table(args, data) == (
-        "Benchmark              pass@1 mean (%)   pass@1 std (%)  pass^1 mean (%)   pass^1 std (%)\n"
-        "━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━\n"
-        "overall / search_r1               50.0              0.0             50.0              0.0\n"
-        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────\n"
-        "nq                                50.0              0.0             50.0              0.0\n"
-        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────\n"
-        "triviaqa                          50.0              0.0             50.0              0.0"
+        "Benchmark              pass@1 mean (%)   pass@1 std (%)  pass^1 mean (%)   pass^1 std (%)     # steps  # tool calls\n"
+        "━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━  ━━━━━━━━━━━━\n"
+        "overall / search_r1               50.0              0.0             50.0              0.0         5.0           4.0\n"
+        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────  ──────────  ────────────\n"
+        "nq                                50.0              0.0             50.0              0.0         3.0           2.0\n"
+        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────  ──────────  ────────────\n"
+        "triviaqa                          50.0              0.0             50.0              0.0         7.0           6.0"
     )
 
 

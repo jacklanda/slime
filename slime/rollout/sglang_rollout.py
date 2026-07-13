@@ -334,25 +334,33 @@ async def generate_and_rm(
 
     state = GenerateState(args)
 
-    # generate
-    async with state.semaphore:
+    custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+    custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
+    manages_eval_request_concurrency = evaluation and getattr(
+        custom_generate_func, "manages_eval_request_concurrency", False
+    )
+
+    if manages_eval_request_concurrency:
         if state.aborted:
             sample.status = Sample.Status.ABORTED
             return sample
-
         with state.dp_rank_context() as _:
-            # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
-            custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+            sample = await custom_generate_func(args, sample, sampling_params, evaluation=True)
+    else:
+        async with state.semaphore:
+            if state.aborted:
+                sample.status = Sample.Status.ABORTED
+                return sample
 
-            if custom_func_path is not None:
-                custom_generate_func = load_function(custom_func_path)
-                # if signature has evaluation, pass evaluation
-                if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                    sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
+            with state.dp_rank_context() as _:
+                if custom_generate_func is not None:
+                    # if signature has evaluation, pass evaluation
+                    if "evaluation" in inspect.signature(custom_generate_func).parameters:
+                        sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
+                    else:
+                        sample = await custom_generate_func(args, sample, sampling_params)
                 else:
-                    sample = await custom_generate_func(args, sample, sampling_params)
-            else:
-                sample = await generate(args, sample, sampling_params)
+                    sample = await generate(args, sample, sampling_params)
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -696,13 +704,9 @@ EVAL_PROMPT_DATASET = {}
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
     assert not args.group_rm, "Group RM is not supported for eval rollout"
 
-    coros = []
-    for dataset_cfg in getattr(args, "eval_datasets", []) or []:
-        coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
-    results_list = await asyncio.gather(*coros)
     results = {}
-    for r in results_list:
-        results.update(r)
+    for dataset_cfg in getattr(args, "eval_datasets", []) or []:
+        results.update(await eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
     return RolloutFnEvalOutput(data=results), []
 
 
@@ -776,52 +780,7 @@ async def eval_rollout_single_dataset(args: Namespace, rollout_id: int, dataset_
     if dataset_cfg.repetition_penalty is not None:
         base_sampling_params["repetition_penalty"] = dataset_cfg.repetition_penalty
 
-    tasks = []
-    # do multiple samples for eval prompts
-    sample_index = 0
-    for _i, prompt_sample in enumerate(dataset.samples):
-        for j in range(dataset_cfg.n_samples_per_eval_prompt):
-            # use the same prompt for multiple samples
-            sample = copy.deepcopy(prompt_sample)
-            sample.index = sample_index
-            sample_index += 1
-            sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
-            sample.custom_rm_path = dataset_cfg.custom_rm_path
-            sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
-            if getattr(args, "enable_use_grm_evals", False):
-                sample.custom_rm_path = getattr(args, "grm_custom_rm_path", None)
-            sampling_params = base_sampling_params
-            if getattr(args, "sglang_enable_deterministic_inference", False):
-                sampling_params = base_sampling_params.copy()
-                sampling_params["sampling_seed"] = args.rollout_seed + j
-            tasks.append(
-                asyncio.create_task(
-                    generate_and_rm(
-                        args,
-                        sample,
-                        sampling_params=sampling_params,
-                        evaluation=True,
-                    )
-                )
-            )
-
-    data = []
-    do_print = True
-    pbar = tqdm(total=len(tasks), desc=f"Eval {dataset_cfg.name}", disable=not do_print)
-    for coro in asyncio.as_completed(tasks):
-        sample = await coro
-        if do_print:
-            logged_sample = sample[0] if isinstance(sample, list) else sample
-            logger.info("eval_rollout_single_dataset example data: " f"{[str(logged_sample.prompt) + logged_sample.response]} " f"reward={logged_sample.reward}")
-            do_print = False
-        if isinstance(sample, list):
-            data.extend(sample)
-        else:
-            data.append(sample)
-        pbar.update(1)
-    pbar.close()
-
-    data.sort(key=lambda sample: sample.index)
+    data = await _generate_eval_samples_bounded(args, dataset, dataset_cfg, base_sampling_params)
 
     reward_key = args.eval_reward_key or args.reward_key
     return {
@@ -831,6 +790,85 @@ async def eval_rollout_single_dataset(args: Namespace, rollout_id: int, dataset_
             "samples": data,
         }
     }
+
+
+async def _generate_eval_samples_bounded(
+    args: Namespace,
+    dataset: Dataset,
+    dataset_cfg: EvalDatasetConfig,
+    base_sampling_params: dict[str, Any],
+) -> list[Sample]:
+    total = len(dataset.samples) * dataset_cfg.n_samples_per_eval_prompt
+    max_inflight = max(1, min(total, int(getattr(args, "eval_max_inflight_tasks", 384)))) if total else 0
+
+    def sample_specs():
+        sample_index = 0
+        for prompt_sample in dataset.samples:
+            for sample_offset in range(dataset_cfg.n_samples_per_eval_prompt):
+                yield sample_index, prompt_sample, sample_offset
+                sample_index += 1
+
+    async def generate_one(sample_index: int, prompt_sample: Sample, sample_offset: int):
+        sample = copy.deepcopy(prompt_sample)
+        sample.index = sample_index
+        sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
+        sample.custom_rm_path = dataset_cfg.custom_rm_path
+        sample.generate_function_path = dataset_cfg.custom_generate_function_path
+        if getattr(args, "enable_use_grm_evals", False):
+            sample.custom_rm_path = getattr(args, "grm_custom_rm_path", None)
+        sampling_params = base_sampling_params
+        if getattr(args, "sglang_enable_deterministic_inference", False):
+            sampling_params = base_sampling_params.copy()
+            sampling_params["sampling_seed"] = args.rollout_seed + sample_offset
+        return await generate_and_rm(
+            args,
+            sample,
+            sampling_params=sampling_params,
+            evaluation=True,
+        )
+
+    specs = iter(sample_specs())
+    pending: set[asyncio.Task] = set()
+    for _ in range(max_inflight):
+        sample_index, prompt_sample, sample_offset = next(specs)
+        pending.add(asyncio.create_task(generate_one(sample_index, prompt_sample, sample_offset)))
+
+    data: list[Sample] = []
+    log_example = True
+    pbar = tqdm(total=total, desc=f"Eval {dataset_cfg.name}", disable=not log_example)
+    try:
+        while pending:
+            completed, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in completed:
+                generated = task.result()
+                if log_example:
+                    logged_sample = generated[0] if isinstance(generated, list) else generated
+                    logger.info(
+                        "eval_rollout_single_dataset example data: %s reward=%s",
+                        [str(logged_sample.prompt) + logged_sample.response],
+                        logged_sample.reward,
+                    )
+                    log_example = False
+                if isinstance(generated, list):
+                    data.extend(generated)
+                else:
+                    data.append(generated)
+                pbar.update(1)
+                try:
+                    sample_index, prompt_sample, sample_offset = next(specs)
+                except StopIteration:
+                    continue
+                pending.add(asyncio.create_task(generate_one(sample_index, prompt_sample, sample_offset)))
+    except BaseException:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        raise
+    finally:
+        pbar.close()
+
+    data.sort(key=lambda sample: sample.index)
+    return data
 
 
 def generate_rollout(args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False) -> RolloutFnTrainOutput | RolloutFnEvalOutput:

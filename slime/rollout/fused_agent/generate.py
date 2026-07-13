@@ -101,9 +101,10 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     messages = _initial_messages(harness, info.get("task_type", ""), observation, tools, model_name)
     max_steps = _max_steps_for_mode(env.mode, base_max_steps)
     parser = make_tool_parser(model_name, valid_tools=_valid_tool_names(tools))
-    manager = TrajectoryManager(fork_threshold_tokens=int(os.environ.get("SLIME_FUSED_FORK_THRESHOLD_TOKENS", "1024")))
+    manager = None if evaluation else TrajectoryManager(fork_threshold_tokens=int(os.environ.get("SLIME_FUSED_FORK_THRESHOLD_TOKENS", "1024")))
     session_id = base_sample.session_id or uuid.uuid4().hex
     base_sample.session_id = session_id
+    capture_eval_details = not evaluation or _should_capture_eval_trajectory(base_sample)
 
     final_reward = 0.0
     final_done = False
@@ -121,6 +122,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     repeated_search_strikes = 0
     used_non_finish_tool = False
     final_response = ""
+    last_finish_reason = "stop"
+    compact_prompt_length = 0
+    total_completion_tokens = 0
     credit_event: str | None = None
     credit_step_index: int | None = None
     try:
@@ -137,25 +141,31 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 tools=tools,
                 disable_thinking=disable_thinking,
             )
-            prompt_context_start_idx = await asyncio.to_thread(
-                _last_assistant_context_start_idx,
-                state.tokenizer,
-                messages,
-                tools=tools,
-                disable_thinking=disable_thinking,
-            )
-            tito_boundary_before = bool(tito_prefix_ids) and not _has_token_prefix(prompt_ids, tito_prefix_ids)
-            if tito_boundary_before:
-                if prompt_context_start_idx is not None and 0 <= prompt_context_start_idx <= len(prompt_ids):
-                    context_delta_ids = list(prompt_ids[prompt_context_start_idx:])
-                    tito_boundary_before = False
-                    tito_context_reason = "assistant_replay_tail_delta"
-                else:
-                    context_delta_ids = list(prompt_ids)
-                    tito_context_reason = "prompt_prefix_mismatch"
+            if evaluation:
+                prompt_context_start_idx = None
+                tito_boundary_before = False
+                context_delta_ids = []
+                tito_context_reason = "evaluation"
             else:
-                context_delta_ids = list(prompt_ids[len(tito_prefix_ids) :])
-                tito_context_reason = "initial" if not tito_prefix_ids else "append_delta"
+                prompt_context_start_idx = await asyncio.to_thread(
+                    _last_assistant_context_start_idx,
+                    state.tokenizer,
+                    messages,
+                    tools=tools,
+                    disable_thinking=disable_thinking,
+                )
+                tito_boundary_before = bool(tito_prefix_ids) and not _has_token_prefix(prompt_ids, tito_prefix_ids)
+                if tito_boundary_before:
+                    if prompt_context_start_idx is not None and 0 <= prompt_context_start_idx <= len(prompt_ids):
+                        context_delta_ids = list(prompt_ids[prompt_context_start_idx:])
+                        tito_boundary_before = False
+                        tito_context_reason = "assistant_replay_tail_delta"
+                    else:
+                        context_delta_ids = list(prompt_ids)
+                        tito_context_reason = "prompt_prefix_mismatch"
+                else:
+                    context_delta_ids = list(prompt_ids[len(tito_prefix_ids) :])
+                    tito_context_reason = "initial" if not tito_prefix_ids else "append_delta"
             if max_context_tokens and len(prompt_ids) >= max_context_tokens:
                 final_done = True
                 last_info = {
@@ -179,7 +189,14 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
 
             llm_start = time.time()
             try:
-                output = await _call_sglang(args, prompt_ids, step_sampling, session_id=session_id)
+                output = await _call_sglang(
+                    args,
+                    prompt_ids,
+                    step_sampling,
+                    session_id=session_id,
+                    evaluation=evaluation,
+                    request_semaphore=state.semaphore if evaluation else None,
+                )
             except SGLangContextLengthExceededError as exc:
                 final_done = True
                 last_info = {
@@ -192,64 +209,83 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 break
             step_llm_time = time.time() - llm_start
             llm_time += step_llm_time
-            output_ids = output["output_ids"]
-            output_logprobs = output["output_logprobs"]
-            # Decode, tool-call parsing, and the default loss mask are pure-Python
-            # CPU work; bundle them into a single worker-thread hop so a wave of
-            # trajectories finishing an LLM turn together cannot monopolize the
-            # rollout event loop (which must stay free to dispatch env/LLM
-            # requests for every other in-flight trajectory).
-            decode_fn = _decode_step if reasoning_only else _decode_and_parse_step
-            response, parsed_actions, response_loss_mask = await asyncio.to_thread(
-                decode_fn,
-                state.tokenizer,
-                None if reasoning_only else parser,
-                output_ids,
-                disable_thinking=disable_thinking,
-            )
+            if evaluation:
+                output_ids = []
+                output_logprobs = []
+                response_loss_mask = None
+                response = _strip_trailing_chat_template_stop(output["text"])
+                parsed_actions = [] if reasoning_only else await asyncio.to_thread(parser.parse, response)
+            else:
+                output_ids = output["output_ids"]
+                output_logprobs = output["output_logprobs"]
+                # Decode, tool-call parsing, and the default loss mask are pure-Python
+                # CPU work; bundle them into a single worker-thread hop so a wave of
+                # trajectories finishing an LLM turn together cannot monopolize the
+                # rollout event loop (which must stay free to dispatch env/LLM
+                # requests for every other in-flight trajectory).
+                decode_fn = _decode_step if reasoning_only else _decode_and_parse_step
+                response, parsed_actions, response_loss_mask = await asyncio.to_thread(
+                    decode_fn,
+                    state.tokenizer,
+                    None if reasoning_only else parser,
+                    output_ids,
+                    disable_thinking=disable_thinking,
+                )
             final_response = response
             finish_reason = output["finish_reason"]
+            last_finish_reason = finish_reason
+            step_completion_tokens = output.get("completion_tokens")
+            if step_completion_tokens is None:
+                step_completion_tokens = await asyncio.to_thread(_encode_len, state.tokenizer, response)
+            step_completion_tokens = int(step_completion_tokens or 0)
+            total_completion_tokens += step_completion_tokens
+            current_prompt_tokens = int(output.get("prompt_tokens", len(prompt_ids)))
+            compact_prompt_length = max(
+                0,
+                current_prompt_tokens + step_completion_tokens - total_completion_tokens,
+            )
             total_steps += 1
             if any(action.name != "finish" for action in parsed_actions):
                 total_tool_call_turns += 1
 
             assistant_msg = {"role": "assistant", "content": response}
-            pending_turns.append(
-                {
-                    "turn": TurnRecord(
-                        prompt_ids=prompt_ids,
-                        output_ids=output_ids,
-                        finish_reason="tool_calls" if parsed_actions else finish_reason,
-                        output_log_probs=output_logprobs,
-                        context_delta_ids=context_delta_ids,
-                        tito_boundary_before=tito_boundary_before,
-                        tito_model_type=_tito_model_type(model_name),
-                        disable_thinking=disable_thinking,
-                        loss_mask=response_loss_mask,
-                        rollout_top_p_token_ids=output.get("rollout_top_p_token_ids"),
-                        rollout_top_p_token_offsets=output.get("rollout_top_p_token_offsets"),
-                        prompt_context_start_idx=prompt_context_start_idx,
-                    ),
-                    "prompt_messages": list(messages),
-                    "response_message": assistant_msg,
-                    "raw_response": response,
-                    "metadata": {
-                        "sid": session_id,
-                        "step": step_idx,
-                        "tito_context_reason": tito_context_reason,
-                        "tito_context_delta_tokens": len(context_delta_ids),
-                        "tito_boundary_before": tito_boundary_before,
-                        "disable_thinking": disable_thinking,
-                    },
-                }
-            )
-            if tito_boundary_before:
-                tito_prefix_ids = context_delta_ids + list(output_ids)
-            else:
-                # Extend in place: rebuilding the full prefix each turn is an
-                # O(n^2) copy over the trajectory and runs on the event loop.
-                tito_prefix_ids.extend(context_delta_ids)
-                tito_prefix_ids.extend(output_ids)
+            if not evaluation:
+                pending_turns.append(
+                    {
+                        "turn": TurnRecord(
+                            prompt_ids=prompt_ids,
+                            output_ids=output_ids,
+                            finish_reason="tool_calls" if parsed_actions else finish_reason,
+                            output_log_probs=output_logprobs,
+                            context_delta_ids=context_delta_ids,
+                            tito_boundary_before=tito_boundary_before,
+                            tito_model_type=_tito_model_type(model_name),
+                            disable_thinking=disable_thinking,
+                            loss_mask=response_loss_mask,
+                            rollout_top_p_token_ids=output.get("rollout_top_p_token_ids"),
+                            rollout_top_p_token_offsets=output.get("rollout_top_p_token_offsets"),
+                            prompt_context_start_idx=prompt_context_start_idx,
+                        ),
+                        "prompt_messages": list(messages),
+                        "response_message": assistant_msg,
+                        "raw_response": response,
+                        "metadata": {
+                            "sid": session_id,
+                            "step": step_idx,
+                            "tito_context_reason": tito_context_reason,
+                            "tito_context_delta_tokens": len(context_delta_ids),
+                            "tito_boundary_before": tito_boundary_before,
+                            "disable_thinking": disable_thinking,
+                        },
+                    }
+                )
+                if tito_boundary_before:
+                    tito_prefix_ids = context_delta_ids + list(output_ids)
+                else:
+                    # Extend in place: rebuilding the full prefix each turn is an
+                    # O(n^2) copy over the trajectory and runs on the event loop.
+                    tito_prefix_ids.extend(context_delta_ids)
+                    tito_prefix_ids.extend(output_ids)
             messages.append(assistant_msg)
 
             if detect_abnormal_trajectories and finish_reason == "length":
@@ -262,7 +298,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action="",
                         reward=0.0,
                         done=True,
-                        messages=messages,
+                        messages=messages if capture_eval_details else [],
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -282,7 +318,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action="",
                         reward=final_reward,
                         done=True,
-                        messages=messages,
+                        messages=messages if capture_eval_details else [],
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -317,7 +353,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             action="",
                             reward=0.0,
                             done=True,
-                            messages=messages,
+                            messages=messages if capture_eval_details else [],
                             llm_time=step_llm_time,
                             env_time=0.0,
                             disable_thinking=disable_thinking,
@@ -355,7 +391,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action="",
                         reward=0.0,
                         done=True,
-                        messages=messages,
+                        messages=messages if capture_eval_details else [],
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -388,7 +424,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action="",
                         reward=0.0,
                         done=True,
-                        messages=messages,
+                        messages=messages if capture_eval_details else [],
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -420,7 +456,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action=parser.format_action(actions[0]),
                         reward=0.0,
                         done=True,
-                        messages=messages,
+                        messages=messages if capture_eval_details else [],
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -446,7 +482,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action=parser.format_action(actions[0]),
                         reward=0.0,
                         done=True,
-                        messages=messages,
+                        messages=messages if capture_eval_details else [],
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -473,7 +509,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             action=parser.format_action(actions[0]),
                             reward=0.0,
                             done=False,
-                            messages=messages,
+                            messages=messages if capture_eval_details else [],
                             llm_time=step_llm_time,
                             env_time=0.0,
                             disable_thinking=disable_thinking,
@@ -507,18 +543,22 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action=parser.format_action(actions[0]),
                         reward=0.0,
                         done=True,
-                        messages=messages,
+                        messages=messages if capture_eval_details else [],
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
                     )
                 )
                 break
-            repeated_output = await asyncio.to_thread(
-                _ngram_repetition_stats,
-                output_ids,
-                n=ngram_repetition_n,
-                min_tokens=ngram_repetition_min_tokens,
+            repeated_output = (
+                await asyncio.to_thread(
+                    _ngram_repetition_stats,
+                    output_ids,
+                    n=ngram_repetition_n,
+                    min_tokens=ngram_repetition_min_tokens,
+                )
+                if detect_abnormal_trajectories
+                else {"score": 0.0, "n": ngram_repetition_n, "total": 0, "unique": 0}
             )
             repeated_action_span = _actions_span(actions)
             if detect_abnormal_trajectories and repeated_output["score"] > ngram_repetition_threshold and repeated_action_span is not None:
@@ -551,7 +591,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action=parser.format_action(actions[0]),
                         reward=0.0,
                         done=True,
-                        messages=messages,
+                        messages=messages if capture_eval_details else [],
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -591,7 +631,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action="".join(parser.format_action(action) for action in executed_actions),
                         reward=final_reward if batch_done else 0.0,
                         done=batch_done,
-                        messages=messages,
+                        messages=messages if capture_eval_details else [],
                         llm_time=step_llm_time,
                         env_time=step_env_time,
                         disable_thinking=disable_thinking,
@@ -658,7 +698,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     action=parser.format_action(action),
                     reward=final_reward if done else 0.0,
                     done=done,
-                    messages=messages,
+                    messages=messages if capture_eval_details else [],
                     llm_time=step_llm_time,
                     env_time=step_env_time,
                     disable_thinking=disable_thinking,
@@ -700,6 +740,65 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         last_info["credit_assignment_event"] = credit_event
         last_info["credit_assignment_error_step_index"] = credit_step_index
 
+    episode_end_time = time.time()
+    episode_timing = {
+        "start_timestamp": episode_start_timestamp,
+        "end_timestamp": _utc_timestamp(),
+        "llm_time": llm_time,
+        "env_time": env_time,
+        "reward_time": 0.0,
+        "total_time": episode_end_time - episode_start_time,
+    }
+    reward_debug = env.reward_debug or last_info.get("reward_debug", {})
+    common_metadata = {
+        **dict(base_sample.metadata or {}),
+        **last_info,
+        "fused_task_type": env.mode,
+        "fused_reward_debug": reward_debug,
+        "fused_termination": termination_reason,
+        "credit_assignment_event": credit_event,
+        "credit_assignment_error_step_index": credit_step_index,
+        "fused_traj_steps": total_steps,
+        "fused_tool_call_turns": total_tool_call_turns,
+        "fused_prompt_length_tokens": compact_prompt_length,
+        "fused_completion_length_tokens": total_completion_tokens,
+    }
+
+    if evaluation:
+        should_dump_episode = capture_eval_details or _is_failed_eval_termination(termination_reason)
+        if should_dump_episode:
+            common_metadata["rllm_episode"] = _rllm_episode_dict(
+                base_sample=base_sample,
+                task=task,
+                session_id=session_id,
+                reward=final_reward,
+                termination_reason=termination_reason,
+                reward_debug=reward_debug,
+                credit_event=credit_event,
+                credit_step_index=credit_step_index,
+                total_steps=total_steps,
+                total_tool_call_turns=total_tool_call_turns,
+                timing=episode_timing,
+                steps=trajectory_steps,
+                task_type=env.mode,
+            )
+        return [
+            Sample(
+                index=base_sample.index,
+                group_index=base_sample.group_index,
+                rollout_id=base_sample.rollout_id if base_sample.rollout_id is not None else base_sample.index,
+                prompt=base_sample.prompt,
+                label=base_sample.label,
+                reward=final_reward,
+                response=final_response,
+                response_length=total_completion_tokens,
+                status=Sample.Status.TRUNCATED if last_finish_reason == "length" else Sample.Status.COMPLETED,
+                metadata=common_metadata,
+                session_id=session_id,
+            )
+        ]
+
+    assert manager is not None
     # Turn recording + trajectory assembly touch every token of the episode;
     # keep them off the event loop since whole waves of trajectories finish
     # (and hit this path) together.
@@ -713,22 +812,13 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         parser_error_token_window=credit_assignment_parser_error_token_window,
     )
 
-    episode_end_time = time.time()
-    episode_timing = {
-        "start_timestamp": episode_start_timestamp,
-        "end_timestamp": _utc_timestamp(),
-        "llm_time": llm_time,
-        "env_time": env_time,
-        "reward_time": 0.0,
-        "total_time": episode_end_time - episode_start_time,
-    }
     episode_dict = _rllm_episode_dict(
         base_sample=base_sample,
         task=task,
         session_id=session_id,
         reward=final_reward,
         termination_reason=termination_reason,
-        reward_debug=env.reward_debug or last_info.get("reward_debug", {}),
+        reward_debug=reward_debug,
         credit_event=credit_event,
         credit_step_index=credit_step_index,
         total_steps=total_steps,
@@ -743,18 +833,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         base_sample=base_sample,
         reward=final_reward,
         allow_fully_masked=credit_event == "tail_guard_early_stop",
-        extra_metadata={
-            **dict(base_sample.metadata or {}),
-            **last_info,
-            "fused_task_type": env.mode,
-            "fused_reward_debug": env.reward_debug or last_info.get("reward_debug", {}),
-            "fused_termination": termination_reason,
-            "credit_assignment_event": credit_event,
-            "credit_assignment_error_step_index": credit_step_index,
-            "fused_traj_steps": total_steps,
-            "fused_tool_call_turns": total_tool_call_turns,
-            "rllm_episode": episode_dict,
-        },
+        extra_metadata={**common_metadata, "rllm_episode": episode_dict},
     )
     if not samples:
         failed = Sample(
@@ -787,6 +866,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         if sample.rollout_log_probs is None:
             sample.rollout_log_probs = [0.0] * sample.response_length
     return samples
+
+
+generate.manages_eval_request_concurrency = True
 
 
 def _task_from_sample(sample: Sample) -> dict[str, Any]:
@@ -1893,7 +1975,15 @@ def _effective_sglang_context_limit(args) -> int:
     return max(0, min(limits) - margin)
 
 
-async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, Any], *, session_id: str) -> dict[str, Any]:
+async def _call_sglang(
+    args,
+    prompt_ids: list[int],
+    sampling_params: dict[str, Any],
+    *,
+    session_id: str,
+    evaluation: bool = False,
+    request_semaphore: asyncio.Semaphore | None = None,
+) -> dict[str, Any]:
     global _LAST_SGLANG_REQUEST_LOG_TS
     max_new_tokens = int(sampling_params.get("max_new_tokens", 0) or 0)
     max_context_tokens = _effective_sglang_context_limit(args)
@@ -1911,7 +2001,7 @@ async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, A
             "spaces_between_special_tokens": False,
             "no_stop_trim": True,
         },
-        "return_logprob": True,
+        "return_logprob": not evaluation,
     }
     headers = {"X-SMG-Routing-Key": session_id} if getattr(args, "router_policy", None) == "consistent_hashing" else None
     started = time.time()
@@ -1927,11 +2017,24 @@ async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, A
             url,
         )
     try:
-        output = await http_utils.post(url, payload, headers=headers)
+        if request_semaphore is None:
+            output = await http_utils.post(url, payload, headers=headers)
+        else:
+            async with request_semaphore:
+                output = await http_utils.post(url, payload, headers=headers)
     except (asyncio.CancelledError, httpx.TimeoutException):
         await _abort_sglang_request(args, rid)
         raise
     meta = output.get("meta_info") or {}
+    finish_reason = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
+    if evaluation:
+        completion_tokens = meta.get("completion_tokens")
+        return {
+            "text": output.get("text") or "",
+            "finish_reason": finish_reason,
+            "prompt_tokens": int(meta.get("prompt_tokens", len(prompt_ids))),
+            "completion_tokens": int(completion_tokens) if completion_tokens is not None else None,
+        }
     token_logprobs = meta.get("output_token_logprobs") or []
     # Unpacking per-token logprob/top-p payloads is CPU work proportional to
     # the response length; offload long responses to keep the event loop free.
@@ -1939,7 +2042,6 @@ async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, A
         output_ids, output_logprobs, top_p_data = await asyncio.to_thread(_unpack_generate_meta, meta, token_logprobs)
     else:
         output_ids, output_logprobs, top_p_data = _unpack_generate_meta(meta, token_logprobs)
-    finish_reason = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
     result = {
         "text": output.get("text") or "",
         "output_ids": output_ids,
@@ -1957,6 +2059,23 @@ async def _call_sglang(args, prompt_ids: list[int], sampling_params: dict[str, A
             time.time() - started,
         )
     return result
+
+
+def _should_capture_eval_trajectory(sample: Sample) -> bool:
+    rate = min(1.0, max(0.0, float(os.environ.get("SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE", "0"))))
+    if rate <= 0:
+        return False
+    if rate >= 1:
+        return True
+    key = sample.index if sample.index is not None else sample.session_id or sample.prompt
+    bucket = int(hashlib.sha256(str(key).encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+    return bucket < rate
+
+
+def _is_failed_eval_termination(termination_reason: str) -> bool:
+    if not _env_bool("SLIME_FUSED_EVAL_DUMP_FAILURES", True):
+        return False
+    return termination_reason not in {"env_done", "reasoning_only"}
 
 
 def _unpack_generate_meta(meta: dict[str, Any], token_logprobs: list) -> tuple[list[int], list[float], tuple[list[int], list[int]] | None]:

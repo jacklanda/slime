@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import importlib.util
 import inspect
 import json
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 # of half-set-up connections whose request bodies were never sent.
 _shared_http_session: aiohttp.ClientSession | None = None
 _shared_http_session_loop: asyncio.AbstractEventLoop | None = None
+_retrieval_runtime_loop: asyncio.AbstractEventLoop | None = None
+_retrieval_semaphore: asyncio.Semaphore | None = None
+_retrieval_cache: OrderedDict[str, Any] = OrderedDict()
+_retrieval_inflight: dict[str, asyncio.Task] = {}
 
 
 def _get_shared_http_session() -> aiohttp.ClientSession:
@@ -38,10 +43,26 @@ def _get_shared_http_session() -> aiohttp.ClientSession:
     if _shared_http_session is None or getattr(_shared_http_session, "closed", False) or _shared_http_session_loop is not loop:
         _shared_http_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=120),
-            connector=aiohttp.TCPConnector(limit=0, ttl_dns_cache=300),
+            connector=aiohttp.TCPConnector(
+                limit=max(1, int(os.environ.get("RLLM_RETRIEVAL_CONCURRENCY", "160"))),
+                limit_per_host=max(1, int(os.environ.get("RLLM_RETRIEVAL_CONCURRENCY", "160"))),
+                ttl_dns_cache=300,
+            ),
         )
         _shared_http_session_loop = loop
     return _shared_http_session
+
+
+def _get_retrieval_runtime() -> tuple[asyncio.Semaphore, OrderedDict[str, Any], dict[str, asyncio.Task]]:
+    global _retrieval_runtime_loop, _retrieval_semaphore, _retrieval_cache, _retrieval_inflight
+    loop = asyncio.get_running_loop()
+    if _retrieval_runtime_loop is not loop:
+        _retrieval_runtime_loop = loop
+        _retrieval_semaphore = asyncio.Semaphore(max(1, int(os.environ.get("RLLM_RETRIEVAL_CONCURRENCY", "160"))))
+        _retrieval_cache = OrderedDict()
+        _retrieval_inflight = {}
+    assert _retrieval_semaphore is not None
+    return _retrieval_semaphore, _retrieval_cache, _retrieval_inflight
 
 
 WEB_SEARCH_OBSERVATION_MAX_WORDS = 256
@@ -270,6 +291,7 @@ class FusedEnvironment:
         self.answer = ""
         self.tool_calls = 0
         self.web_search_queries: set[str] = set()
+        self.web_search_cache: dict[str, Any] = {}
         self.reward_debug: dict[str, Any] = {}
         self.mcp_tools = LocalMCPToolset(self.task) if enable_tools and self.mode == "mcp" else None
         self.docker_env = DockerTaskEnvironment(self.task, mode=self.mode) if enable_tools and self.mode in {"cli", "et"} else None
@@ -399,16 +421,21 @@ class FusedEnvironment:
             "tools/search_retrieve_retries": 0,
             "tools/search_retrieve_failures": 0,
             "tools/search_lexrank_summary": 0,
+            "tools/search_episode_cache_hits": 0,
+            "tools/search_global_cache_hits": 0,
+            "tools/search_singleflight_hits": 0,
         }
         retrieve_started_at = _now_monotonic()
         try:
-            data, retrieve_retries = await _post_json_with_retries(
-                _get_shared_http_session(),
+            data, retrieve_retries, cache_source = await _retrieve_json_cached(
                 _normalize_retrieve_url(self.retrieval_url),
                 payload,
                 retry_budget=retrieve_retry_budget,
+                episode_cache=self.web_search_cache,
             )
             metrics["tools/search_retrieve_retries"] = retrieve_retries
+            if cache_source is not None:
+                metrics[f"tools/search_{cache_source}_hits"] = 1
         except Exception as e:
             metrics["tools/search_failed"] = 1
             metrics["tools/search_retrieve_failures"] = 1
@@ -691,6 +718,65 @@ async def _post_json_with_retries(
             retries_used += 1
     assert last_error is not None
     raise last_error
+
+
+async def _retrieve_json_cached(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    retry_budget: int,
+    episode_cache: dict[str, Any],
+) -> tuple[Any, int, str | None]:
+    cache_key = json.dumps(
+        {
+            "url": url,
+            **payload,
+            "query": _normalize_search_query(str(payload.get("query") or "")),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    if cache_key in episode_cache:
+        return episode_cache[cache_key], 0, "episode_cache"
+
+    semaphore, cache, inflight = _get_retrieval_runtime()
+    cache_size = max(0, int(os.environ.get("RLLM_RETRIEVAL_CACHE_SIZE", "4096")))
+    if cache_key in cache:
+        data = cache.pop(cache_key)
+        cache[cache_key] = data
+        episode_cache[cache_key] = data
+        return data, 0, "global_cache"
+
+    task = inflight.get(cache_key)
+    cache_source = "singleflight" if task is not None else None
+    if task is None:
+
+        async def fetch():
+            async with semaphore:
+                return await _post_json_with_retries(
+                    _get_shared_http_session(),
+                    url,
+                    payload,
+                    retry_budget=retry_budget,
+                )
+
+        task = asyncio.create_task(fetch())
+        inflight[cache_key] = task
+
+    try:
+        data, retries_used = await asyncio.shield(task)
+    finally:
+        if task.done() and inflight.get(cache_key) is task:
+            inflight.pop(cache_key, None)
+
+    episode_cache[cache_key] = data
+    if cache_size > 0:
+        cache[cache_key] = data
+        cache.move_to_end(cache_key)
+        while len(cache) > cache_size:
+            cache.popitem(last=False)
+    return data, 0 if cache_source is not None else retries_used, cache_source
 
 
 async def _summarize_with_retries(

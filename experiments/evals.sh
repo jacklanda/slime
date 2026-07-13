@@ -27,7 +27,7 @@ Core:
   --exclude LIST                       Extra comma-separated benchmark names to skip.
   --experiment-name NAME               Log/run name.
   --gpus N                             Total rollout GPUs. Default: 8.
-  --gpus-per-engine N                  Tensor parallel size per SGLang engine. Default: min(2, gpus).
+  --gpus-per-engine N                  Tensor parallel size per SGLang engine. Default: 1.
   --ray-num-cpus N                     Ray CPU resources. Default: 64.
 
 Generation/eval:
@@ -45,16 +45,21 @@ Generation/eval:
   --temperature X                      Default: 0.7.
   --top-p X                            Default: 1.0.
   --top-k N                            Default: 20.
-  --eval-max-response-len N            Default: 16384.
-  --eval-max-prompt-len N              Default: 23616.
+  --eval-max-response-len N            Default: 38000.
+  --eval-max-prompt-len N              Default: 2048.
   --eval-max-context-len N             Default: prompt + response.
   --limit-per-benchmark N              Generate config with first N examples per benchmark. Default: 0 (all).
   --no-prefer-verl                     Normalize from raw files even when data_verl.parquet exists.
+  --retrieval-concurrency N            Concurrent retrieval requests. Default: 160.
+  --retrieval-cache-size N             Cross-episode retrieval LRU entries. Default: 4096.
+  --eval-max-inflight-tasks N          Maximum scheduled eval trajectories. Default: 384.
+  --eval-trajectory-sample-rate X      Full trajectory dump fraction. Default: 0.
+  --eval-dump-failures BOOL            Dump failed eval trajectories. Default: true.
 
 SGLang/runtime:
   --sglang-mem-fraction-static X       Default: 0.9.
-  --sglang-server-concurrency N        Default: 64.
-  --sglang-max-running-requests N      Default: 512.
+  --sglang-server-concurrency N        Default: 48.
+  --sglang-max-running-requests N      Default: 192.
   --ray-dashboard-address URL          Default: http://127.0.0.1:8265.
   --ray-job-wait BOOL                  Default: false.
   --ray-job-follow-logs BOOL           Default: true.
@@ -106,9 +111,14 @@ EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-2048}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
 LIMIT_PER_BENCHMARK="${LIMIT_PER_BENCHMARK:-0}"
 PREFER_VERL="${PREFER_VERL:-1}"
+RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-160}"
+RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE:-4096}"
+EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-384}"
+EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-0}"
+EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES:-true}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.9}"
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-1024}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-1024}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-48}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-192}"
 RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
 RAY_JOB_WAIT="${RAY_JOB_WAIT:-0}"
 RAY_JOB_FOLLOW_LOGS="${RAY_JOB_FOLLOW_LOGS:-1}"
@@ -147,6 +157,11 @@ while [ "$#" -gt 0 ]; do
       --eval-max-context-len) EVAL_MAX_CONTEXT_LEN="${2:?Missing value for --eval-max-context-len}"; shift 2 ;;
       --limit-per-benchmark) LIMIT_PER_BENCHMARK="${2:?Missing value for --limit-per-benchmark}"; shift 2 ;;
       --no-prefer-verl) PREFER_VERL=0; shift ;;
+      --retrieval-concurrency) RETRIEVAL_CONCURRENCY="${2:?Missing value for --retrieval-concurrency}"; shift 2 ;;
+      --retrieval-cache-size) RETRIEVAL_CACHE_SIZE="${2:?Missing value for --retrieval-cache-size}"; shift 2 ;;
+      --eval-max-inflight-tasks) EVAL_MAX_INFLIGHT_TASKS="${2:?Missing value for --eval-max-inflight-tasks}"; shift 2 ;;
+      --eval-trajectory-sample-rate) EVAL_TRAJECTORY_SAMPLE_RATE="${2:?Missing value for --eval-trajectory-sample-rate}"; shift 2 ;;
+      --eval-dump-failures) EVAL_DUMP_FAILURES="${2:?Missing value for --eval-dump-failures}"; shift 2 ;;
       --sglang-mem-fraction-static) SGLANG_MEM_FRACTION_STATIC="${2:?Missing value for --sglang-mem-fraction-static}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
@@ -198,11 +213,33 @@ fi
 source "${MODEL_CONFIG_PATH}"
 
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-$((EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN))}"
-ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-$(( ROLLOUT_GPUS < 2 ? ROLLOUT_GPUS : 2 ))}"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
 if [ "${ROLLOUT_GPUS}" -lt 1 ]; then
    echo "--gpus must be >= 1" >&2
    exit 2
 fi
+if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -lt 1 ]; then
+   echo "--gpus-per-engine must be >= 1" >&2
+   exit 2
+fi
+if [ "${RETRIEVAL_CONCURRENCY}" -lt 1 ] || [ "${EVAL_MAX_INFLIGHT_TASKS}" -lt 1 ]; then
+   echo "--retrieval-concurrency and --eval-max-inflight-tasks must be >= 1" >&2
+   exit 2
+fi
+if [ "${RETRIEVAL_CACHE_SIZE}" -lt 0 ]; then
+   echo "--retrieval-cache-size must be >= 0" >&2
+   exit 2
+fi
+python3 - "${EVAL_TRAJECTORY_SAMPLE_RATE}" <<'PY' || exit 2
+import sys
+
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit("--eval-trajectory-sample-rate must be a number in [0, 1]")
+if not 0 <= value <= 1:
+    raise SystemExit("--eval-trajectory-sample-rate must be in [0, 1]")
+PY
 if [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
    echo "--gpus (${ROLLOUT_GPUS}) must be divisible by --gpus-per-engine (${ROLLOUT_NUM_GPUS_PER_ENGINE})." >&2
    exit 2
@@ -269,6 +306,8 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:F
 export RETRIEVAL_SERVER_URL="${RETRIEVAL_SERVER_URL:-http://10.2.152.50:65432}"
 export RLLM_RETRIEVAL_MODE="${RLLM_RETRIEVAL_MODE:-hybrid}"
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
+export RLLM_RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY}"
+export RLLM_RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE}"
 export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-4}"
 export RLLM_RETRIEVAL_SUMMARIZE="${RLLM_RETRIEVAL_SUMMARIZE:-0}"
 export DOCKER_HOST="${DOCKER_HOST:-tcp://10.2.152.50:2375}"
@@ -287,6 +326,8 @@ export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH:
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${SLIME_FUSED_TERMINAL_LOG_STYLE:-both}"
 export SLIME_FUSED_PROGRESS_LOGS="${SLIME_FUSED_PROGRESS_LOGS:-false}"
 export SLIME_EPISODE_LOG_DIR="${LOG_ROOT}"
+export SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE}"
+export SLIME_FUSED_EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES}"
 
 RUNTIME_ENV_JSON="$(python3 - <<'PY'
 import json
@@ -296,7 +337,8 @@ keys = (
     "HYDRA_FULL_ERROR", "TOKENIZERS_PARALLELISM", "VLLM_ALLOW_LONG_MAX_MODEL_LEN",
     "VLLM_ENGINE_ITERATION_TIMEOUT_S", "VLLM_WORKER_MULTIPROC_METHOD",
     "PYTORCH_CUDA_ALLOC_CONF", "RETRIEVAL_SERVER_URL", "RLLM_RETRIEVAL_MODE",
-    "RLLM_RETRIEVAL_MAX_WORDS", "RETRIEVAL_MAX_RESULTS", "RLLM_RETRIEVAL_SUMMARIZE",
+    "RLLM_RETRIEVAL_MAX_WORDS", "RLLM_RETRIEVAL_CONCURRENCY", "RLLM_RETRIEVAL_CACHE_SIZE",
+    "RETRIEVAL_MAX_RESULTS", "RLLM_RETRIEVAL_SUMMARIZE",
     "DOCKER_HOST", "DOCKER_API_VERSION", "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL",
     "OPENROUTER_APP_NAME", "FUSED_HARNESS", "FUSED_UNIFIED_SYSTEM_PROMPT",
     "FUSED_DISABLE_THINKING", "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS",
@@ -304,6 +346,7 @@ keys = (
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "PER_STEP_MAX_TOKENS",
     "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH", "SLIME_FUSED_TERMINAL_LOG_STYLE",
     "SLIME_FUSED_PROGRESS_LOGS", "SLIME_EPISODE_LOG_DIR",
+    "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE", "SLIME_FUSED_EVAL_DUMP_FAILURES",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["PYTHONPATH"] = f"{os.environ['MEGATRON_LM_PATH']}:{os.environ['REPO_ROOT']}:{os.environ['SCRIPT_DIR']}"
@@ -319,6 +362,7 @@ echo "Eval config: ${EVAL_CONFIG}"
 echo "Log root: ${LOG_ROOT}"
 echo "GPUs: ${ROLLOUT_GPUS}; gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}"
 echo "Harness: ${FUSED_HARNESS}; disable_thinking=${DISABLE_THINKING}; n=${N_SAMPLES_PER_EVAL_PROMPT}"
+echo "Concurrency: eval_inflight=${EVAL_MAX_INFLIGHT_TASKS}; sglang_per_engine=${SGLANG_SERVER_CONCURRENCY}; retrieval=${RETRIEVAL_CONCURRENCY}"
 
 RAY_JOB_SUBMIT_ARGS=()
 if ! is_truthy "${RAY_JOB_WAIT}"; then
@@ -368,12 +412,14 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}" \
    --eval-max-prompt-len "${EVAL_MAX_PROMPT_LEN}" \
    --eval-max-context-len "${EVAL_MAX_CONTEXT_LEN}" \
+   --eval-max-inflight-tasks "${EVAL_MAX_INFLIGHT_TASKS}" \
    --custom-eval-rollout-log-function-path slime_plugins.evals.results_table.log_eval_results_table \
    --dump-details "${DUMP_DETAILS}" \
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}" \
    --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}" \
    --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}" \
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}" \
+   --router-policy consistent_hashing \
    --sglang-context-length "${EVAL_MAX_CONTEXT_LEN}" \
    --sglang-disable-custom-all-reduce \
    "${EXTRA_SLIME_ARGS[@]}"

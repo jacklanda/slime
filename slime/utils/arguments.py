@@ -864,6 +864,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eval-max-prompt-len", type=int, default=None)
             parser.add_argument("--eval-min-new-tokens", type=int, default=None)
             parser.add_argument("--eval-max-context-len", type=int, default=None)
+            parser.add_argument(
+                "--eval-max-inflight-tasks",
+                type=int,
+                default=384,
+                help="Maximum number of evaluation trajectories scheduled at once.",
+            )
 
             return parser
 
@@ -1952,6 +1958,7 @@ def slime_validate_args(args):
 
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
+        assert args.eval_max_inflight_tasks > 0, "eval_max_inflight_tasks must be positive."
 
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
