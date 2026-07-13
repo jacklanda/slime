@@ -3,8 +3,6 @@ import copy
 import json
 import logging
 import os
-from pathlib import Path
-import warnings
 from typing import Any
 
 import yaml
@@ -868,7 +866,31 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--eval-max-inflight-tasks",
                 type=int,
                 default=384,
-                help="Maximum number of evaluation trajectories scheduled at once.",
+                help="Hard limit for the number of evaluation trajectories scheduled at once.",
+            )
+            parser.add_argument(
+                "--eval-initial-inflight-tasks",
+                type=int,
+                default=None,
+                help="Initial evaluation trajectory concurrency. Defaults to --eval-max-inflight-tasks.",
+            )
+            parser.add_argument(
+                "--eval-adaptive-concurrency",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help="Adjust evaluation trajectory concurrency from SGLang engine load metrics.",
+            )
+            parser.add_argument(
+                "--eval-concurrency-step",
+                type=int,
+                default=32,
+                help="Number of evaluation trajectories added or removed by each adaptive adjustment.",
+            )
+            parser.add_argument(
+                "--eval-concurrency-poll-interval",
+                type=float,
+                default=5.0,
+                help="Seconds between SGLang engine metric samples for adaptive evaluation concurrency.",
             )
 
             return parser
@@ -1959,6 +1981,12 @@ def slime_validate_args(args):
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
         assert args.eval_max_inflight_tasks > 0, "eval_max_inflight_tasks must be positive."
+        if args.eval_initial_inflight_tasks is not None:
+            assert 0 < args.eval_initial_inflight_tasks <= args.eval_max_inflight_tasks, (
+                "eval_initial_inflight_tasks must be positive and no larger than eval_max_inflight_tasks."
+            )
+        assert args.eval_concurrency_step > 0, "eval_concurrency_step must be positive."
+        assert args.eval_concurrency_poll_interval > 0, "eval_concurrency_poll_interval must be positive."
 
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."

@@ -8,6 +8,7 @@ import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -41,10 +42,312 @@ from .prompts import (
 logger = logging.getLogger(__name__)
 DEFAULT_SGLANG_CONTEXT_LENGTH_MARGIN = 256
 _LAST_SGLANG_REQUEST_LOG_TS = 0.0
+_EVAL_ENGINE_POOL_LOOP: asyncio.AbstractEventLoop | None = None
+_EVAL_ENGINE_POOL: EvalSessionEnginePool | None = None
 
 
 class SGLangContextLengthExceededError(ValueError):
     pass
+
+
+def _routing_headers(args, session_id: str) -> dict[str, str] | None:
+    if getattr(args, "router_policy", None) in {"consistent_hashing", "manual"}:
+        return {"X-SMG-Routing-Key": session_id}
+    return None
+
+
+class EvalSessionEnginePool:
+    def __init__(
+        self,
+        urls: list[str],
+        *,
+        max_sessions_per_engine: int | None = None,
+        control_concurrency: int | None = None,
+    ):
+        self._active = {url.rstrip("/"): 0 for url in urls}
+        self._blocked_until = {url.rstrip("/"): 0.0 for url in urls}
+        self._tie_breaker = 0
+        self._max_sessions_per_engine = max_sessions_per_engine
+        default_control_concurrency = max(1, min(64, len(self._active) * 4))
+        self.control_concurrency = control_concurrency or default_control_concurrency
+        self.control_semaphore = asyncio.Semaphore(self.control_concurrency)
+        self._control_client: httpx.AsyncClient | None = None
+        self._background_tasks: set[asyncio.Task] = set()
+
+    def control_client(self) -> httpx.AsyncClient:
+        if self._control_client is None:
+            keepalive_expiry = max(0.1, float(os.environ.get("SLIME_HTTP_KEEPALIVE_EXPIRY", "4")))
+            self._control_client = httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_connections=self.control_concurrency,
+                    # SGLang control calls are tiny and infrequent relative to
+                    # generation. Avoid reusing a server-closed Uvicorn socket
+                    # after long agent/tool gaps; concurrency remains unchanged.
+                    max_keepalive_connections=0,
+                    keepalive_expiry=keepalive_expiry,
+                ),
+                timeout=httpx.Timeout(None),
+                trust_env=False,
+            )
+        return self._control_client
+
+    async def post_control(self, url: str, payload: dict[str, Any], *, max_retries: int) -> Any:
+        return await http_utils._post(
+            self.control_client(),
+            url,
+            payload,
+            max_retries=max_retries,
+        )
+
+    def run_control_in_background(self, coroutine) -> None:
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def acquire(self) -> str | None:
+        if not self._active:
+            return None
+        now = time.monotonic()
+        eligible = [
+            url
+            for url, count in self._active.items()
+            if self._blocked_until[url] <= now
+            and (self._max_sessions_per_engine is None or count < self._max_sessions_per_engine)
+        ]
+        if not eligible:
+            return None
+        minimum = min(self._active[url] for url in eligible)
+        candidates = [url for url in eligible if self._active[url] == minimum]
+        url = candidates[self._tie_breaker % len(candidates)]
+        self._tie_breaker += 1
+        self._active[url] += 1
+        return url
+
+    def release(self, url: str) -> None:
+        normalized = url.rstrip("/")
+        if normalized in self._active:
+            self._active[normalized] = max(0, self._active[normalized] - 1)
+
+    def record_transport_failure(self, url: str, cooldown: float = 15.0) -> bool:
+        normalized = url.rstrip("/")
+        if normalized not in self._blocked_until:
+            return True
+        now = time.monotonic()
+        was_available = self._blocked_until[normalized] <= now
+        self._blocked_until[normalized] = max(self._blocked_until[normalized], now + cooldown)
+        return was_available
+
+
+def _get_eval_engine_pool(args) -> EvalSessionEnginePool | None:
+    global _EVAL_ENGINE_POOL_LOOP, _EVAL_ENGINE_POOL
+    urls = list(getattr(args, "sglang_engine_urls", None) or [])
+    if not urls:
+        return None
+    loop = asyncio.get_running_loop()
+    normalized_urls = {url.rstrip("/") for url in urls}
+    if _EVAL_ENGINE_POOL_LOOP is not loop or _EVAL_ENGINE_POOL is None or set(_EVAL_ENGINE_POOL._active) != normalized_urls:
+        _EVAL_ENGINE_POOL_LOOP = loop
+        max_sessions_per_engine = max(
+            1,
+            min(
+                int(getattr(args, "sglang_server_concurrency", 48)),
+                int(getattr(args, "sglang_max_running_requests", 1 << 30)),
+            ),
+        )
+        _EVAL_ENGINE_POOL = EvalSessionEnginePool(
+            urls,
+            max_sessions_per_engine=max_sessions_per_engine,
+        )
+    return _EVAL_ENGINE_POOL
+
+
+@dataclass
+class EvalSGLangSession:
+    args: Any
+    session_id: str
+    capacity: int
+    enabled: bool
+    opened: bool = False
+    last_rid: str | None = None
+    expected_prefix_ids: list[int] | None = None
+    stable_prefix_length: int = 0
+    session_turns: int = 0
+    fallback_count: int = 0
+    delta_tokens: int = 0
+    full_tokens_avoided: int = 0
+    engine_pool: EvalSessionEnginePool | None = None
+    server_url: str | None = None
+
+    @classmethod
+    def for_eval(cls, args, session_id: str, capacity: int) -> EvalSGLangSession:
+        engine_pool = _get_eval_engine_pool(args)
+        enabled = _env_bool("SLIME_FUSED_EVAL_USE_SGLANG_SESSION", False) and engine_pool is not None
+        return cls(
+            args=args,
+            session_id=session_id,
+            capacity=max(1, capacity),
+            enabled=enabled,
+            engine_pool=engine_pool,
+        )
+
+    async def prepare_request(self, full_prompt_ids: list[int]) -> tuple[list[int], dict[str, Any] | None]:
+        if not self.enabled:
+            return full_prompt_ids, None
+        if not self.opened and not await self._open():
+            return full_prompt_ids, None
+
+        if self.expected_prefix_ids is None:
+            request_ids = full_prompt_ids
+        elif _has_token_prefix(full_prompt_ids, self.expected_prefix_ids):
+            prefix_length = len(self.expected_prefix_ids)
+            request_ids = full_prompt_ids[prefix_length:]
+            if not request_ids:
+                await self.disable("empty prompt delta")
+                return full_prompt_ids, None
+            self.delta_tokens += len(request_ids)
+            self.full_tokens_avoided += prefix_length
+        else:
+            # Chat templates commonly normalize the generated assistant stop
+            # marker when rendering the next turn.  SGLang sessions support
+            # replacing the unstable suffix from a verified offset, so retain
+            # the session when the entire previous prompt is still unchanged.
+            prefix_length = _common_token_prefix_length(full_prompt_ids, self.expected_prefix_ids)
+            if prefix_length < self.stable_prefix_length or prefix_length == 0:
+                await self.disable("rendered prompt changed before the previous prompt boundary")
+                return full_prompt_ids, None
+            request_ids = full_prompt_ids[prefix_length:]
+            if not request_ids:
+                await self.disable("empty prompt delta")
+                return full_prompt_ids, None
+            self.delta_tokens += len(request_ids)
+            self.full_tokens_avoided += prefix_length
+            return request_ids, {"id": self.session_id, "rid": self.last_rid, "offset": prefix_length}
+
+        return request_ids, {"id": self.session_id, "rid": self.last_rid}
+
+    async def record_response(
+        self,
+        *,
+        full_prompt_ids: list[int],
+        output_ids: list[int],
+        output_text: str,
+        rid: str | None,
+    ) -> None:
+        if not self.enabled:
+            return
+        if not rid:
+            await self.disable("SGLang session response did not include a request id")
+            return
+        if output_text and not output_ids:
+            await self.disable("SGLang session response did not include output token ids")
+            return
+        self.last_rid = rid
+        self.expected_prefix_ids = [*full_prompt_ids, *output_ids]
+        self.stable_prefix_length = len(full_prompt_ids)
+        self.session_turns += 1
+
+    async def disable(self, reason: str, *, log_warning: bool = True) -> None:
+        if not self.enabled:
+            return
+        self.fallback_count += 1
+        if log_warning:
+            logger.warning("Disabling native SGLang session %s: %s", self.session_id, reason)
+        await self.close()
+        self.enabled = False
+
+    async def _open(self) -> bool:
+        assert self.engine_pool is not None
+        self.server_url = self.engine_pool.acquire()
+        if self.server_url is None:
+            self.enabled = False
+            return False
+        url = f"{self.server_url}/open_session"
+        try:
+            async with self.engine_pool.control_semaphore:
+                output = await asyncio.wait_for(
+                    self.engine_pool.post_control(
+                        url,
+                        {
+                            "capacity_of_str_len": self.capacity,
+                            "session_id": self.session_id,
+                            # Bound leaked server-side state if a transport
+                            # failure prevents /close_session from arriving.
+                            "timeout": float(os.environ.get("SLIME_FUSED_SESSION_IDLE_TIMEOUT", "600")),
+                        },
+                        max_retries=1,
+                    ),
+                    timeout=float(os.environ.get("SLIME_FUSED_SESSION_CONTROL_TIMEOUT", "120")),
+                )
+        except asyncio.CancelledError:
+            self.engine_pool.release(self.server_url)
+            self.server_url = None
+            raise
+        except Exception as exc:
+            self.fallback_count += 1
+            self.enabled = False
+            should_log = True
+            if isinstance(exc, httpx.TransportError):
+                should_log = self.engine_pool.record_transport_failure(self.server_url)
+            self.engine_pool.release(self.server_url)
+            self.server_url = None
+            if should_log:
+                logger.warning(
+                    "Native SGLang session unavailable for %s; using stateless generation: %s: %r",
+                    self.session_id,
+                    type(exc).__name__,
+                    exc,
+                )
+            return False
+        if output != self.session_id:
+            self.fallback_count += 1
+            self.enabled = False
+            self.engine_pool.release(self.server_url)
+            self.server_url = None
+            logger.warning(
+                "Native SGLang session returned unexpected id for %s; using stateless generation",
+                self.session_id,
+            )
+            return False
+        self.opened = True
+        return True
+
+    async def close(self, *, background: bool = False) -> None:
+        if not self.opened:
+            return
+        self.opened = False
+        assert self.engine_pool is not None and self.server_url is not None
+        engine_pool = self.engine_pool
+        server_url = self.server_url
+        self.server_url = None
+        engine_pool.release(server_url)
+
+        async def close_server_session() -> None:
+            try:
+                async with engine_pool.control_semaphore:
+                    await asyncio.wait_for(
+                        engine_pool.post_control(
+                            f"{server_url}/close_session",
+                            {"session_id": self.session_id},
+                            max_retries=2,
+                        ),
+                        timeout=float(os.environ.get("SLIME_FUSED_SESSION_CONTROL_TIMEOUT", "120")),
+                    )
+            except Exception as exc:
+                should_log = True
+                if isinstance(exc, httpx.TransportError):
+                    should_log = engine_pool.record_transport_failure(server_url)
+                if should_log:
+                    logger.warning(
+                        "Failed to close native SGLang session %s: %s: %r",
+                        self.session_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+
+        if background:
+            engine_pool.run_control_in_background(close_server_session())
+            return
+        await close_server_session()
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -98,12 +401,21 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
 
     tools = env.tools()
     model_name = getattr(state.tokenizer, "name_or_path", None) or getattr(args, "hf_checkpoint", None)
-    messages = _initial_messages(harness, info.get("task_type", ""), observation, tools, model_name)
-    max_steps = _max_steps_for_mode(env.mode, base_max_steps)
     parser = make_tool_parser(model_name, valid_tools=_valid_tool_names(tools))
+    messages = _initial_messages(harness, info.get("task_type", ""), observation, tools, model_name, tool_parser=parser)
+    max_steps = _max_steps_for_mode(env.mode, base_max_steps)
     manager = None if evaluation else TrajectoryManager(fork_threshold_tokens=int(os.environ.get("SLIME_FUSED_FORK_THRESHOLD_TOKENS", "1024")))
     session_id = base_sample.session_id or uuid.uuid4().hex
     base_sample.session_id = session_id
+    eval_sglang_session = (
+        EvalSGLangSession.for_eval(
+            args,
+            session_id,
+            max_context_tokens or int(getattr(args, "rollout_max_context_len", 0) or 65536),
+        )
+        if evaluation
+        else None
+    )
     capture_eval_details = not evaluation or _should_capture_eval_trajectory(base_sample)
 
     final_reward = 0.0
@@ -189,14 +501,49 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
 
             llm_start = time.time()
             try:
-                output = await _call_sglang(
-                    args,
-                    prompt_ids,
-                    step_sampling,
-                    session_id=session_id,
-                    evaluation=evaluation,
-                    request_semaphore=state.semaphore if evaluation else None,
-                )
+                request_prompt_ids = prompt_ids
+                session_params = None
+                if eval_sglang_session is not None:
+                    request_prompt_ids, session_params = await eval_sglang_session.prepare_request(prompt_ids)
+                try:
+                    output = await _call_sglang(
+                        args,
+                        request_prompt_ids,
+                        step_sampling,
+                        session_id=session_id,
+                        evaluation=evaluation,
+                        request_semaphore=state.semaphore if evaluation else None,
+                        session_params=session_params,
+                        context_token_count=len(prompt_ids),
+                        server_url=eval_sglang_session.server_url if session_params is not None else None,
+                    )
+                except (asyncio.CancelledError, SGLangContextLengthExceededError):
+                    raise
+                except Exception as exc:
+                    if eval_sglang_session is None or session_params is None:
+                        raise
+                    log_warning = True
+                    if (
+                        isinstance(exc, httpx.TransportError)
+                        and eval_sglang_session.engine_pool is not None
+                        and eval_sglang_session.server_url is not None
+                    ):
+                        log_warning = eval_sglang_session.engine_pool.record_transport_failure(
+                            eval_sglang_session.server_url
+                        )
+                    await eval_sglang_session.disable(
+                        f"session generation failed with {type(exc).__name__}: {exc!r}",
+                        log_warning=log_warning,
+                    )
+                    output = await _call_sglang(
+                        args,
+                        prompt_ids,
+                        step_sampling,
+                        session_id=session_id,
+                        evaluation=evaluation,
+                        request_semaphore=state.semaphore if evaluation else None,
+                        context_token_count=len(prompt_ids),
+                    )
             except SGLangContextLengthExceededError as exc:
                 final_done = True
                 last_info = {
@@ -213,6 +560,13 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 output_ids = []
                 output_logprobs = []
                 response_loss_mask = None
+                if eval_sglang_session is not None and session_params is not None:
+                    await eval_sglang_session.record_response(
+                        full_prompt_ids=prompt_ids,
+                        output_ids=output.get("output_ids") or [],
+                        output_text=output.get("text") or "",
+                        rid=output.get("rid"),
+                    )
                 response = _strip_trailing_chat_template_stop(output["text"])
                 parsed_actions = [] if reasoning_only else await asyncio.to_thread(parser.parse, response)
             else:
@@ -728,6 +1082,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             final_reward = env.compute_final_reward()
             last_info = {"reward_debug": env.reward_debug, **last_info}
     finally:
+        if eval_sglang_session is not None:
+            await eval_sglang_session.close(background=True)
         env.close()
 
     termination_reason = last_info.get("termination_reason", "env_done" if final_done else "unknown")
@@ -763,6 +1119,15 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         "fused_prompt_length_tokens": compact_prompt_length,
         "fused_completion_length_tokens": total_completion_tokens,
     }
+    if eval_sglang_session is not None:
+        common_metadata.update(
+            {
+                "fused_sglang_session_turns": eval_sglang_session.session_turns,
+                "fused_sglang_session_fallbacks": eval_sglang_session.fallback_count,
+                "fused_sglang_session_delta_tokens": eval_sglang_session.delta_tokens,
+                "fused_sglang_session_full_tokens_avoided": eval_sglang_session.full_tokens_avoided,
+            }
+        )
 
     if evaluation:
         should_dump_episode = capture_eval_details or _is_failed_eval_termination(termination_reason)
@@ -918,7 +1283,15 @@ def _sample_ground_truth(sample: Sample) -> Any:
     return _first_non_empty(list(sources))
 
 
-def _initial_messages(harness: str, task_type: str, observation: str, tools: list[dict], model_name: str | None = None) -> list[dict[str, str]]:
+def _initial_messages(
+    harness: str,
+    task_type: str,
+    observation: str,
+    tools: list[dict],
+    model_name: str | None = None,
+    *,
+    tool_parser=None,
+) -> list[dict[str, str]]:
     if harness == "bare":
         return [{"role": "user", "content": observation}]
     if harness == "cot":
@@ -927,23 +1300,23 @@ def _initial_messages(harness: str, task_type: str, observation: str, tools: lis
             {"role": "user", "content": COT_USER_PROMPT.format(problem_statement=observation)},
         ]
     if harness == "react":
-        system = build_system_prompt(REACT_SYSTEM_PROMPT, tools, model_name)
+        system = build_system_prompt(REACT_SYSTEM_PROMPT, tools, model_name, tool_parser=tool_parser)
         user = REACT_USER_PROMPT.format(problem_statement=observation)
     elif task_type == "mcp":
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_MCP_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools, model_name)
+        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser)
         user = FUSED_MCP_USER_PROMPT.format(problem_statement=observation)
     elif task_type == "cli":
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_CLI_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools, model_name)
+        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser)
         user = FUSED_CLI_USER_PROMPT.format(problem_statement=observation)
     elif task_type == "et":
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_ET_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools, model_name)
+        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser)
         user = FUSED_ET_USER_PROMPT.format(problem_statement=observation)
     else:
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_SEARCH_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools, model_name)
+        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser)
         user = FUSED_SEARCH_USER_PROMPT.format(problem_statement=observation)
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -1010,6 +1383,15 @@ def _requires_non_finish_tool(tools: list[dict]) -> bool:
 
 def _has_token_prefix(token_ids: list[int], prefix_ids: list[int]) -> bool:
     return len(token_ids) >= len(prefix_ids) and token_ids[: len(prefix_ids)] == prefix_ids
+
+
+def _common_token_prefix_length(left: list[int], right: list[int]) -> int:
+    length = 0
+    for left_token, right_token in zip(left, right, strict=False):
+        if left_token != right_token:
+            break
+        length += 1
+    return length
 
 
 def _tito_model_type(model_name: str | None) -> str | None:
@@ -1786,12 +2168,7 @@ def _extract_thought(response: str) -> str:
     end = response.find("<channel|>", start + len("<|channel>thought")) if start >= 0 else -1
     if start >= 0 and end > start:
         return response[start : end + len("<channel|>")]
-    return response
-
-
-def _format_action(action: ToolCall) -> str:
-    payload = {"name": action.name, "arguments": action.arguments or {}}
-    return "<tool_call>" + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "</tool_call>"
+    return ""
 
 
 def _format_tool_observation(parser_or_tool_name, tool_name_or_output: Any, output: Any | None = None) -> str:
@@ -1983,14 +2360,18 @@ async def _call_sglang(
     session_id: str,
     evaluation: bool = False,
     request_semaphore: asyncio.Semaphore | None = None,
+    session_params: dict[str, Any] | None = None,
+    context_token_count: int | None = None,
+    server_url: str | None = None,
 ) -> dict[str, Any]:
     global _LAST_SGLANG_REQUEST_LOG_TS
     max_new_tokens = int(sampling_params.get("max_new_tokens", 0) or 0)
     max_context_tokens = _effective_sglang_context_limit(args)
-    requested_tokens = len(prompt_ids) + max_new_tokens
+    effective_prompt_tokens = context_token_count if context_token_count is not None else len(prompt_ids)
+    requested_tokens = effective_prompt_tokens + max_new_tokens
     if max_context_tokens and requested_tokens > max_context_tokens:
-        raise SGLangContextLengthExceededError(f"SGLang request would use {requested_tokens} tokens " f"({len(prompt_ids)} prompt + {max_new_tokens} new), exceeding local limit {max_context_tokens}.")
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+        raise SGLangContextLengthExceededError(f"SGLang request would use {requested_tokens} tokens " f"({effective_prompt_tokens} prompt + {max_new_tokens} new), exceeding local limit {max_context_tokens}.")
+    url = f"{server_url.rstrip('/')}/generate" if server_url else f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     rid = uuid.uuid4().hex
     payload = {
         "rid": rid,
@@ -2003,7 +2384,15 @@ async def _call_sglang(
         },
         "return_logprob": not evaluation,
     }
-    headers = {"X-SMG-Routing-Key": session_id} if getattr(args, "router_policy", None) == "consistent_hashing" else None
+    if session_params is not None:
+        payload["session_params"] = session_params
+    headers = _routing_headers(args, session_id)
+    if server_url is not None:
+        # Native session requests bypass the router and can leave an origin
+        # idle for an arbitrary tool/retrieval interval. A fresh local TCP
+        # connection avoids ambiguous ReadError failures from stale Uvicorn
+        # keepalive sockets without changing request or GPU concurrency.
+        headers = {**(headers or {}), "Connection": "close"}
     started = time.time()
     now = started
     should_log = _env_bool("SLIME_FUSED_PROGRESS_LOGS", False) and now - _LAST_SGLANG_REQUEST_LOG_TS >= float(os.environ.get("SLIME_FUSED_SGLANG_LOG_INTERVAL", "10"))
@@ -2012,18 +2401,21 @@ async def _call_sglang(
         logger.info(
             "fused-agent sending SGLang generate request rid=%s prompt_tokens=%d max_new_tokens=%d url=%s",
             rid,
-            len(prompt_ids),
+            effective_prompt_tokens,
             max_new_tokens,
             url,
         )
     try:
+        post_kwargs = {"headers": headers}
+        if session_params is not None:
+            post_kwargs["max_retries"] = 1
         if request_semaphore is None:
-            output = await http_utils.post(url, payload, headers=headers)
+            output = await http_utils.post(url, payload, **post_kwargs)
         else:
             async with request_semaphore:
-                output = await http_utils.post(url, payload, headers=headers)
-    except (asyncio.CancelledError, httpx.TimeoutException):
-        await _abort_sglang_request(args, rid)
+                output = await http_utils.post(url, payload, **post_kwargs)
+    except (asyncio.CancelledError, httpx.TransportError):
+        await _abort_sglang_request(args, rid, server_url=server_url)
         raise
     meta = output.get("meta_info") or {}
     finish_reason = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
@@ -2032,8 +2424,10 @@ async def _call_sglang(
         return {
             "text": output.get("text") or "",
             "finish_reason": finish_reason,
-            "prompt_tokens": int(meta.get("prompt_tokens", len(prompt_ids))),
+            "prompt_tokens": int(meta.get("prompt_tokens", effective_prompt_tokens)),
             "completion_tokens": int(completion_tokens) if completion_tokens is not None else None,
+            "output_ids": output.get("output_ids") or [],
+            "rid": meta.get("id") or output.get("rid") or rid,
         }
     token_logprobs = meta.get("output_token_logprobs") or []
     # Unpacking per-token logprob/top-p payloads is CPU work proportional to
@@ -2085,13 +2479,15 @@ def _unpack_generate_meta(meta: dict[str, Any], token_logprobs: list) -> tuple[l
     return output_ids, output_logprobs, top_p_data
 
 
-async def _abort_sglang_request(args, rid: str) -> None:
+async def _abort_sglang_request(args, rid: str, *, server_url: str | None = None) -> None:
     client = http_utils._http_client
     if client is None:
         return
     try:
         await client.post(
-            f"http://{args.sglang_router_ip}:{args.sglang_router_port}/abort_request",
+            f"{server_url.rstrip('/')}/abort_request"
+            if server_url
+            else f"http://{args.sglang_router_ip}:{args.sglang_router_port}/abort_request",
             json={"rid": rid},
             timeout=5.0,
         )

@@ -233,6 +233,88 @@ def test_eval_generation_limits_inflight_tasks_and_preserves_order(monkeypatch):
     assert [sample.index for sample in samples] == [0, 1, 2, 3]
 
 
+def test_parse_eval_engine_metrics_aggregates_worker_load():
+    metrics = """
+# HELP sglang:num_running_reqs The number of running requests.
+sglang_num_running_reqs{worker_addr="http://engine-0"} 20
+sglang_num_running_reqs{worker_addr="http://engine-1"} 18
+sglang_num_queue_reqs{worker_addr="http://engine-0"} 2
+sglang_num_queue_reqs{worker_addr="http://engine-1"} 1
+sglang_token_usage{worker_addr="http://engine-0"} 0.72
+sglang_token_usage{worker_addr="http://engine-1"} 0.81
+sglang_cache_hit_rate{worker_addr="http://engine-0"} 0.80
+sglang_cache_hit_rate{worker_addr="http://engine-1"} 0.60
+"""
+
+    load = sglang_rollout._parse_eval_engine_metrics(metrics)
+
+    assert load == sglang_rollout.EvalEngineLoad(
+        engine_count=2,
+        running_requests=38.0,
+        waiting_requests=3.0,
+        max_token_usage=0.81,
+        mean_cache_hit_rate=0.7,
+    )
+
+
+def test_eval_concurrency_controller_uses_hysteresis_and_pressure_backoff():
+    args = Namespace(
+        eval_max_inflight_tasks=512,
+        eval_initial_inflight_tasks=384,
+        eval_concurrency_step=32,
+        eval_concurrency_poll_interval=5.0,
+        sglang_server_concurrency=56,
+    )
+    controller = sglang_rollout.EvalConcurrencyController(args, total=1000)
+    underfed = sglang_rollout.EvalEngineLoad(8, 200, 0, 0.70, 0.75)
+    pressured = sglang_rollout.EvalEngineLoad(8, 400, 120, 0.93, 0.40)
+
+    assert controller.update(underfed) == 384
+    assert controller.update(underfed) == 416
+    assert controller.update(pressured) == 384
+
+
+def test_adaptive_eval_scheduler_refills_to_updated_target(monkeypatch):
+    active = 0
+    max_active = 0
+
+    async def fake_generate(_args, sample, sampling_params, evaluation=False):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        sample.reward = 1.0
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    class FakeController:
+        def __init__(self, _args, _total):
+            self.target = 2
+
+        def poll(self, _args):
+            return 4
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", fake_generate)
+    monkeypatch.setattr(sglang_rollout, "EvalConcurrencyController", FakeController)
+    dataset = type("DatasetStub", (), {"samples": [Sample(prompt=str(i)) for i in range(8)]})()
+    dataset_cfg = EvalDatasetConfig(name="eval", path="unused", n_samples_per_eval_prompt=1)
+    args = Namespace(
+        eval_max_inflight_tasks=8,
+        eval_adaptive_concurrency=True,
+        enable_use_grm_evals=False,
+        sglang_enable_deterministic_inference=False,
+    )
+
+    samples = asyncio.run(sglang_rollout._generate_eval_samples_bounded(args, dataset, dataset_cfg, {"max_new_tokens": 4}))
+
+    assert max_active == 4
+    assert len(samples) == 8
+
+
 def test_eval_datasets_share_one_global_inflight_budget(monkeypatch):
     active_datasets = 0
     max_active_datasets = 0

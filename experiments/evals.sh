@@ -52,14 +52,19 @@ Generation/eval:
   --no-prefer-verl                     Normalize from raw files even when data_verl.parquet exists.
   --retrieval-concurrency N            Concurrent retrieval requests. Default: 160.
   --retrieval-cache-size N             Cross-episode retrieval LRU entries. Default: 4096.
-  --eval-max-inflight-tasks N          Maximum scheduled eval trajectories. Default: 384.
+  --eval-initial-inflight-tasks N      Initial scheduled eval trajectories. Default: 384.
+  --eval-max-inflight-tasks N          Adaptive hard limit for eval trajectories. Default: 512.
+  --eval-adaptive-concurrency BOOL     Adjust inflight work from engine metrics. Default: true.
   --eval-trajectory-sample-rate X      Full trajectory dump fraction. Default: 0.
   --eval-dump-failures BOOL            Dump failed eval trajectories. Default: true.
+  --native-sglang-session BOOL         Use verified incremental SGLang sessions. Default: true.
 
 SGLang/runtime:
   --sglang-mem-fraction-static X       Default: 0.9.
-  --sglang-server-concurrency N        Default: 48.
-  --sglang-max-running-requests N      Default: 192.
+  --sglang-server-concurrency N        Default: 56.
+  --sglang-max-running-requests N      Default: 96.
+  --router-policy NAME                 Default: manual.
+  --router-assignment-mode NAME        Default: min_load.
   --ray-dashboard-address URL          Default: http://127.0.0.1:8265.
   --ray-job-wait BOOL                  Default: false.
   --ray-job-follow-logs BOOL           Default: true.
@@ -79,7 +84,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
-MODEL_SERIES="${MODEL_SERIES:-qwen3}"
+MODEL_SERIES="${MODEL_SERIES:-qwen3.5}"
 MODEL_CONFIG="${MODEL_CONFIG:-}"
 MODEL_DIR="${MODEL_DIR:-}"
 BENCHMARKS_ROOT="${BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
@@ -113,12 +118,17 @@ LIMIT_PER_BENCHMARK="${LIMIT_PER_BENCHMARK:-0}"
 PREFER_VERL="${PREFER_VERL:-1}"
 RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-160}"
 RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE:-4096}"
-EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-384}"
+EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-384}"
+EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-512}"
+EVAL_ADAPTIVE_CONCURRENCY="${EVAL_ADAPTIVE_CONCURRENCY:-true}"
 EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-0}"
 EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES:-true}"
+NATIVE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION:-true}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.9}"
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-48}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-192}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-56}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-96}"
+ROUTER_POLICY="${ROUTER_POLICY:-manual}"
+ROUTER_ASSIGNMENT_MODE="${ROUTER_ASSIGNMENT_MODE:-min_load}"
 RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
 RAY_JOB_WAIT="${RAY_JOB_WAIT:-0}"
 RAY_JOB_FOLLOW_LOGS="${RAY_JOB_FOLLOW_LOGS:-1}"
@@ -159,12 +169,17 @@ while [ "$#" -gt 0 ]; do
       --no-prefer-verl) PREFER_VERL=0; shift ;;
       --retrieval-concurrency) RETRIEVAL_CONCURRENCY="${2:?Missing value for --retrieval-concurrency}"; shift 2 ;;
       --retrieval-cache-size) RETRIEVAL_CACHE_SIZE="${2:?Missing value for --retrieval-cache-size}"; shift 2 ;;
+      --eval-initial-inflight-tasks) EVAL_INITIAL_INFLIGHT_TASKS="${2:?Missing value for --eval-initial-inflight-tasks}"; shift 2 ;;
       --eval-max-inflight-tasks) EVAL_MAX_INFLIGHT_TASKS="${2:?Missing value for --eval-max-inflight-tasks}"; shift 2 ;;
+      --eval-adaptive-concurrency) EVAL_ADAPTIVE_CONCURRENCY="${2:?Missing value for --eval-adaptive-concurrency}"; shift 2 ;;
       --eval-trajectory-sample-rate) EVAL_TRAJECTORY_SAMPLE_RATE="${2:?Missing value for --eval-trajectory-sample-rate}"; shift 2 ;;
       --eval-dump-failures) EVAL_DUMP_FAILURES="${2:?Missing value for --eval-dump-failures}"; shift 2 ;;
+      --native-sglang-session) NATIVE_SGLANG_SESSION="${2:?Missing value for --native-sglang-session}"; shift 2 ;;
       --sglang-mem-fraction-static) SGLANG_MEM_FRACTION_STATIC="${2:?Missing value for --sglang-mem-fraction-static}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
+      --router-policy) ROUTER_POLICY="${2:?Missing value for --router-policy}"; shift 2 ;;
+      --router-assignment-mode) ROUTER_ASSIGNMENT_MODE="${2:?Missing value for --router-assignment-mode}"; shift 2 ;;
       --ray-dashboard-address) RAY_DASHBOARD_ADDRESS="${2:?Missing value for --ray-dashboard-address}"; shift 2 ;;
       --ray-job-wait) RAY_JOB_WAIT="${2:?Missing value for --ray-job-wait}"; shift 2 ;;
       --ray-job-follow-logs) RAY_JOB_FOLLOW_LOGS="${2:?Missing value for --ray-job-follow-logs}"; shift 2 ;;
@@ -210,6 +225,33 @@ if [ ! -d "${BENCHMARKS_ROOT}" ]; then
    exit 2
 fi
 
+python3 - "${MODEL_DIR}" "${MODEL_SERIES}" <<'PY' || exit 2
+import json
+import pathlib
+import sys
+
+model_dir = pathlib.Path(sys.argv[1])
+model_series = sys.argv[2]
+config_path = model_dir / "config.json"
+try:
+    with config_path.open(encoding="utf-8") as f:
+        model_type = str(json.load(f).get("model_type", ""))
+except (OSError, ValueError) as exc:
+    raise SystemExit(f"Unable to validate model series from {config_path}: {exc}")
+
+normalized_type = model_type.lower().replace("-", "_")
+if model_series == "qwen3.5":
+    matches = normalized_type == "qwen3_5" or normalized_type.startswith("qwen3_5_")
+else:
+    matches = (
+        normalized_type == "qwen3" or normalized_type.startswith("qwen3_")
+    ) and not normalized_type.startswith("qwen3_5")
+if not matches:
+    raise SystemExit(
+        f"--model-series {model_series} does not match {config_path} model_type={model_type!r}"
+    )
+PY
+
 source "${MODEL_CONFIG_PATH}"
 
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-$((EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN))}"
@@ -222,10 +264,22 @@ if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -lt 1 ]; then
    echo "--gpus-per-engine must be >= 1" >&2
    exit 2
 fi
-if [ "${RETRIEVAL_CONCURRENCY}" -lt 1 ] || [ "${EVAL_MAX_INFLIGHT_TASKS}" -lt 1 ]; then
-   echo "--retrieval-concurrency and --eval-max-inflight-tasks must be >= 1" >&2
+if [ "${RETRIEVAL_CONCURRENCY}" -lt 1 ] || [ "${EVAL_INITIAL_INFLIGHT_TASKS}" -lt 1 ] || [ "${EVAL_MAX_INFLIGHT_TASKS}" -lt 1 ]; then
+   echo "retrieval concurrency and eval inflight limits must be >= 1" >&2
    exit 2
 fi
+if [ "${EVAL_INITIAL_INFLIGHT_TASKS}" -gt "${EVAL_MAX_INFLIGHT_TASKS}" ]; then
+   echo "--eval-initial-inflight-tasks must not exceed --eval-max-inflight-tasks" >&2
+   exit 2
+fi
+case "${ROUTER_POLICY}" in
+   manual|consistent_hashing|cache_aware|round_robin|random|power_of_two|prefix_hash) ;;
+   *) echo "Unsupported --router-policy ${ROUTER_POLICY}" >&2; exit 2 ;;
+esac
+case "${ROUTER_ASSIGNMENT_MODE}" in
+   random|min_load|min_group) ;;
+   *) echo "Unsupported --router-assignment-mode ${ROUTER_ASSIGNMENT_MODE}" >&2; exit 2 ;;
+esac
 if [ "${RETRIEVAL_CACHE_SIZE}" -lt 0 ]; then
    echo "--retrieval-cache-size must be >= 0" >&2
    exit 2
@@ -313,6 +367,7 @@ export RLLM_RETRIEVAL_SUMMARIZE="${RLLM_RETRIEVAL_SUMMARIZE:-0}"
 export DOCKER_HOST="${DOCKER_HOST:-tcp://10.2.152.50:2375}"
 export DOCKER_API_VERSION="${DOCKER_API_VERSION:-1.44}"
 export FUSED_HARNESS="${FUSED_HARNESS}"
+export FUSED_MODEL_SERIES="${MODEL_SERIES}"
 export FUSED_UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT}"
 export FUSED_DISABLE_THINKING="${DISABLE_THINKING}"
 export FUSED_MAX_STEPS="${MAX_STEPS}"
@@ -328,6 +383,14 @@ export SLIME_FUSED_PROGRESS_LOGS="${SLIME_FUSED_PROGRESS_LOGS:-false}"
 export SLIME_EPISODE_LOG_DIR="${LOG_ROOT}"
 export SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE}"
 export SLIME_FUSED_EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES}"
+export SLIME_FUSED_EVAL_USE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION}"
+export SLIME_FUSED_SESSION_CONTROL_TIMEOUT="${SLIME_FUSED_SESSION_CONTROL_TIMEOUT:-120}"
+export SLIME_FUSED_SESSION_IDLE_TIMEOUT="${SLIME_FUSED_SESSION_IDLE_TIMEOUT:-600}"
+# Agent turns commonly spend several seconds in retrieval. Keep engine sockets
+# alive across that gap, while making the client expiry strictly shorter so it
+# never reuses a connection already closed by Uvicorn.
+export SGLANG_TIMEOUT_KEEP_ALIVE="${SGLANG_TIMEOUT_KEEP_ALIVE:-120}"
+export SLIME_HTTP_KEEPALIVE_EXPIRY="${SLIME_HTTP_KEEPALIVE_EXPIRY:-60}"
 
 RUNTIME_ENV_JSON="$(python3 - <<'PY'
 import json
@@ -340,13 +403,16 @@ keys = (
     "RLLM_RETRIEVAL_MAX_WORDS", "RLLM_RETRIEVAL_CONCURRENCY", "RLLM_RETRIEVAL_CACHE_SIZE",
     "RETRIEVAL_MAX_RESULTS", "RLLM_RETRIEVAL_SUMMARIZE",
     "DOCKER_HOST", "DOCKER_API_VERSION", "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL",
-    "OPENROUTER_APP_NAME", "FUSED_HARNESS", "FUSED_UNIFIED_SYSTEM_PROMPT",
+    "OPENROUTER_APP_NAME", "FUSED_HARNESS", "FUSED_MODEL_SERIES", "FUSED_UNIFIED_SYSTEM_PROMPT",
     "FUSED_DISABLE_THINKING", "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS",
     "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "PER_STEP_MAX_TOKENS",
     "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH", "SLIME_FUSED_TERMINAL_LOG_STYLE",
     "SLIME_FUSED_PROGRESS_LOGS", "SLIME_EPISODE_LOG_DIR",
     "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE", "SLIME_FUSED_EVAL_DUMP_FAILURES",
+    "SLIME_FUSED_EVAL_USE_SGLANG_SESSION", "SLIME_FUSED_SESSION_CONTROL_TIMEOUT",
+    "SLIME_FUSED_SESSION_IDLE_TIMEOUT", "SGLANG_TIMEOUT_KEEP_ALIVE",
+    "SLIME_HTTP_KEEPALIVE_EXPIRY",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["PYTHONPATH"] = f"{os.environ['MEGATRON_LM_PATH']}:{os.environ['REPO_ROOT']}:{os.environ['SCRIPT_DIR']}"
@@ -356,13 +422,18 @@ PY
 )"
 
 echo "Experiment: ${EXPERIMENT_NAME}"
-echo "Model: ${MODEL_DIR} (${MODEL_CONFIG})"
+echo "Model: ${MODEL_DIR} (${MODEL_CONFIG}; series=${MODEL_SERIES})"
 echo "Benchmarks root: ${BENCHMARKS_ROOT}"
 echo "Eval config: ${EVAL_CONFIG}"
 echo "Log root: ${LOG_ROOT}"
 echo "GPUs: ${ROLLOUT_GPUS}; gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}"
 echo "Harness: ${FUSED_HARNESS}; disable_thinking=${DISABLE_THINKING}; n=${N_SAMPLES_PER_EVAL_PROMPT}"
-echo "Concurrency: eval_inflight=${EVAL_MAX_INFLIGHT_TASKS}; sglang_per_engine=${SGLANG_SERVER_CONCURRENCY}; retrieval=${RETRIEVAL_CONCURRENCY}"
+echo "Concurrency: eval=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS} adaptive=${EVAL_ADAPTIVE_CONCURRENCY}; sglang_per_engine=${SGLANG_SERVER_CONCURRENCY}; retrieval=${RETRIEVAL_CONCURRENCY}"
+
+EVAL_ADAPTIVE_CONCURRENCY_ARG="--eval-adaptive-concurrency"
+if ! is_truthy "${EVAL_ADAPTIVE_CONCURRENCY}"; then
+   EVAL_ADAPTIVE_CONCURRENCY_ARG="--no-eval-adaptive-concurrency"
+fi
 
 RAY_JOB_SUBMIT_ARGS=()
 if ! is_truthy "${RAY_JOB_WAIT}"; then
@@ -412,14 +483,17 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}" \
    --eval-max-prompt-len "${EVAL_MAX_PROMPT_LEN}" \
    --eval-max-context-len "${EVAL_MAX_CONTEXT_LEN}" \
+   --eval-initial-inflight-tasks "${EVAL_INITIAL_INFLIGHT_TASKS}" \
    --eval-max-inflight-tasks "${EVAL_MAX_INFLIGHT_TASKS}" \
+   "${EVAL_ADAPTIVE_CONCURRENCY_ARG}" \
    --custom-eval-rollout-log-function-path slime_plugins.evals.results_table.log_eval_results_table \
    --dump-details "${DUMP_DETAILS}" \
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}" \
    --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}" \
    --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}" \
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}" \
-   --router-policy consistent_hashing \
+   --router-policy "${ROUTER_POLICY}" \
+   --router-assignment-mode "${ROUTER_ASSIGNMENT_MODE}" \
    --sglang-context-length "${EVAL_MAX_CONTEXT_LEN}" \
    --sglang-disable-custom-all-reduce \
    "${EXTRA_SLIME_ARGS[@]}"

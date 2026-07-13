@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from .parser import make_tool_parser, tool_schema
+from .parser import Gemma4ToolParser, make_tool_parser, tool_schema
 
 
 FUSED_SEARCH_SYSTEM_PROMPT = """You are a research assistant that answers questions by searching for relevant information. You have access to a web_search tool for looking up facts, and a finish tool to submit your final answer.
@@ -125,12 +125,18 @@ def web_search_schema() -> dict:
     )
 
 
-def build_system_prompt(base_prompt: str, schemas: list[dict], model_name: str | None = None) -> str:
-    normalized = str(model_name or "").lower().replace("-", "_")
-    if "gemma4" in normalized or "gemma_4" in normalized:
+def build_system_prompt(
+    base_prompt: str,
+    schemas: list[dict],
+    model_name: str | None = None,
+    *,
+    tool_parser=None,
+) -> str:
+    parser = tool_parser or make_tool_parser(model_name)
+    if isinstance(parser, Gemma4ToolParser):
         return base_prompt.strip()
     schemas_str = "\n".join(json.dumps(schema, indent=0, ensure_ascii=False) for schema in schemas)
-    return base_prompt.strip() + "\n" + make_tool_parser(model_name).get_tool_prompt(schemas_str)
+    return base_prompt.strip() + "\n" + parser.get_tool_prompt(schemas_str)
 
 
 def normalize_harness(harness: str | None) -> str:

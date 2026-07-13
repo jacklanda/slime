@@ -20,7 +20,17 @@ def _sample_with_episode() -> Sample:
                         "name": "main",
                         "uid": "traj-1",
                         "reward": 1.0,
-                        "steps": [{"observation": "q", "reward": 1.0, "done": True}],
+                        "steps": [
+                            {
+                                "observation": "q",
+                                "thought": "",
+                                "action": "<tool_call>...</tool_call>",
+                                "model_response": "plain response",
+                                "reward": 1.0,
+                                "done": True,
+                                "info": {"disable_thinking": True},
+                            }
+                        ],
                     }
                 ],
             }
@@ -40,7 +50,12 @@ def test_eval_episode_dump_uses_evals_global_steps_path(tmp_path, monkeypatch):
 
     assert train_path.exists()
     assert eval_path.exists()
-    assert json.loads(eval_path.read_text())["mode"] == "eval"
+    dumped = json.loads(eval_path.read_text())
+    assert dumped["mode"] == "eval"
+    step = dumped["trajectories"][0]["trajectories"][0]["steps"][0]
+    assert step["thought"] == ""
+    assert step["model_response"] == "plain response"
+    assert step["disable_thinking"] is True
 
 
 def test_eval_episode_dump_respects_episode_log_dir_sibling_evals(tmp_path, monkeypatch):

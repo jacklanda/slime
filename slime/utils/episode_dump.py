@@ -109,12 +109,13 @@ def _step_to_batch_dict(step: dict[str, Any]) -> dict[str, Any]:
     timing = info.get("timing") if isinstance(info.get("timing"), dict) else {}
     return {
         "observation": step.get("observation"),
-        "thought": _format_thought(step.get("thought")),
+        "thought": step.get("thought") or "",
         "action": step.get("action"),
         "reward": float(step.get("reward") or 0.0),
         "done": bool(step.get("done")),
         "model_response": step.get("model_response") or "",
         "chat_completions": step.get("chat_completions") or [],
+        "disable_thinking": bool(info.get("disable_thinking")),
         "timing": timing,
     }
 
@@ -128,14 +129,6 @@ def _sanitize_task(task: Any) -> Any:
     if isinstance(task, dict):
         return {k: v for k, v in task.items() if k not in ("image", "images")}
     return task
-
-
-def _format_thought(thought: Any) -> str:
-    text = str(thought or "")
-    stripped = text.strip()
-    if stripped.startswith("<think>"):
-        return text
-    return f"<think>{text}</think>" if text else ""
 
 
 def _safe_path_part(value: Any) -> str:

@@ -4,11 +4,13 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -21,6 +23,7 @@ from slime.backends.sglang_utils.server_control import abort_servers_until_idle
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from slime.utils.async_utils import run
+from slime.utils import http_utils
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.http_utils import get, get_rollout_num_engines, post
@@ -44,6 +47,7 @@ logger = logging.getLogger(__name__)
 _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
 _TOP_P_TOKEN_ID_META_KEYS = ("top_p_token_ids", "top_p_kept_token_ids")
 _TOP_P_TOKEN_OFFSET_META_KEYS = ("top_p_token_offsets", "top_p_kept_token_offsets")
+_ENGINE_METRIC_RE = re.compile(r"^(sglang[:_](?:num_running_reqs|num_queue_reqs|token_usage|cache_hit_rate))(?:\{([^}]*)\})?\s+([-+0-9.eE]+)$")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -51,6 +55,134 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "y", "on"}
+
+
+@dataclass(frozen=True)
+class EvalEngineLoad:
+    engine_count: int
+    running_requests: float
+    waiting_requests: float
+    max_token_usage: float
+    mean_cache_hit_rate: float
+
+
+def _parse_eval_engine_metrics(text: str) -> EvalEngineLoad | None:
+    values: dict[str, list[float]] = {
+        "sglang:num_running_reqs": [],
+        "sglang:num_queue_reqs": [],
+        "sglang:token_usage": [],
+        "sglang:cache_hit_rate": [],
+    }
+    workers: set[str] = set()
+    for line in text.splitlines():
+        match = _ENGINE_METRIC_RE.match(line.strip())
+        if match is None:
+            continue
+        name, labels, raw_value = match.groups()
+        name = name.replace("sglang_", "sglang:", 1)
+        if labels:
+            worker_match = re.search(r'worker_addr="([^"]+)"', labels)
+            if worker_match is not None:
+                workers.add(worker_match.group(1))
+            if re.search(r'priority="[^"]+"', labels):
+                continue
+        try:
+            values[name].append(float(raw_value))
+        except ValueError:
+            continue
+    token_usage = values["sglang:token_usage"]
+    if not token_usage:
+        return None
+    engine_count = len(workers) or len(token_usage)
+    cache_hits = values["sglang:cache_hit_rate"]
+    return EvalEngineLoad(
+        engine_count=max(1, engine_count),
+        running_requests=sum(values["sglang:num_running_reqs"]),
+        waiting_requests=sum(values["sglang:num_queue_reqs"]),
+        max_token_usage=max(token_usage),
+        mean_cache_hit_rate=sum(cache_hits) / len(cache_hits) if cache_hits else 0.0,
+    )
+
+
+async def _fetch_eval_engine_load(args: Namespace) -> EvalEngineLoad | None:
+    client = http_utils._http_client
+    if client is None:
+        return None
+    try:
+        response = await client.get(
+            f"http://{args.sglang_router_ip}:{args.sglang_router_port}/engine_metrics",
+            timeout=float(getattr(args, "eval_concurrency_poll_interval", 5.0)),
+        )
+        response.raise_for_status()
+        return _parse_eval_engine_metrics((await response.aread()).decode("utf-8", errors="replace"))
+    except Exception as exc:
+        logger.debug("Unable to sample SGLang engine metrics for adaptive eval concurrency: %s", exc)
+        return None
+
+
+class EvalConcurrencyController:
+    def __init__(self, args: Namespace, total: int):
+        self.maximum = max(1, min(total, int(args.eval_max_inflight_tasks)))
+        configured_initial = getattr(args, "eval_initial_inflight_tasks", None)
+        self.target = max(1, min(self.maximum, int(configured_initial or self.maximum)))
+        self.minimum = max(1, min(self.target, self.target // 2))
+        self.step = max(1, int(getattr(args, "eval_concurrency_step", 32)))
+        self.poll_interval = max(0.1, float(getattr(args, "eval_concurrency_poll_interval", 5.0)))
+        self.server_concurrency = max(1, int(args.sglang_server_concurrency))
+        self.next_poll_at = 0.0
+        self.poll_task: asyncio.Task | None = None
+        self.healthy_samples = 0
+
+    def update(self, load: EvalEngineLoad) -> int:
+        request_capacity = self.server_concurrency * load.engine_count
+        queue_pressure = load.waiting_requests >= max(4 * load.engine_count, 0.25 * request_capacity)
+        cache_pressure = load.max_token_usage >= 0.90 or (load.max_token_usage >= 0.84 and load.mean_cache_hit_rate < 0.50)
+        if queue_pressure or cache_pressure:
+            self.healthy_samples = 0
+            self.target = max(self.minimum, self.target - self.step)
+            return self.target
+
+        underfed = load.max_token_usage < 0.82 and load.waiting_requests <= load.engine_count and load.running_requests < 0.75 * request_capacity
+        self.healthy_samples = self.healthy_samples + 1 if underfed else 0
+        if self.healthy_samples >= 2:
+            self.target = min(self.maximum, self.target + self.step)
+            self.healthy_samples = 0
+        return self.target
+
+    def poll(self, args: Namespace) -> int:
+        if self.poll_task is not None and self.poll_task.done():
+            try:
+                load = self.poll_task.result()
+            except Exception as exc:
+                logger.debug("Adaptive eval concurrency metric task failed: %s", exc)
+                load = None
+            self.poll_task = None
+            if load is not None:
+                previous = self.target
+                self.update(load)
+                if self.target != previous:
+                    logger.info(
+                        "Adaptive eval concurrency changed %d -> %d " "(engines=%d running=%.0f waiting=%.0f kv=%.3f cache_hit=%.3f)",
+                        previous,
+                        self.target,
+                        load.engine_count,
+                        load.running_requests,
+                        load.waiting_requests,
+                        load.max_token_usage,
+                        load.mean_cache_hit_rate,
+                    )
+        now = time.monotonic()
+        if self.poll_task is None and now >= self.next_poll_at:
+            self.poll_task = asyncio.create_task(_fetch_eval_engine_load(args))
+            self.next_poll_at = now + self.poll_interval
+        return self.target
+
+    async def close(self) -> None:
+        if self.poll_task is None:
+            return
+        self.poll_task.cancel()
+        await asyncio.gather(self.poll_task, return_exceptions=True)
+        self.poll_task = None
 
 
 def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
@@ -610,9 +742,9 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
             else:
                 try:
                     group: list[Sample] = task.result()
-                except (asyncio.CancelledError, Exception):
+                except (asyncio.CancelledError, Exception) as exc:
                     if source_group is None:
-                        raise RuntimeError("Failed rollout task is missing its source group.")
+                        raise RuntimeError("Failed rollout task is missing its source group.") from exc
                     group = [_timeout_sample(sample, evaluation=False) for sample in source_group]
 
             if do_print:
@@ -799,7 +931,14 @@ async def _generate_eval_samples_bounded(
     base_sampling_params: dict[str, Any],
 ) -> list[Sample]:
     total = len(dataset.samples) * dataset_cfg.n_samples_per_eval_prompt
-    max_inflight = max(1, min(total, int(getattr(args, "eval_max_inflight_tasks", 384)))) if total else 0
+    controller = None
+    if total == 0:
+        max_inflight = 0
+    elif getattr(args, "eval_adaptive_concurrency", False):
+        controller = EvalConcurrencyController(args, total)
+        max_inflight = controller.target
+    else:
+        max_inflight = max(1, min(total, int(getattr(args, "eval_max_inflight_tasks", 384))))
 
     def sample_specs():
         sample_index = 0
@@ -829,9 +968,19 @@ async def _generate_eval_samples_bounded(
 
     specs = iter(sample_specs())
     pending: set[asyncio.Task] = set()
-    for _ in range(max_inflight):
-        sample_index, prompt_sample, sample_offset = next(specs)
-        pending.add(asyncio.create_task(generate_one(sample_index, prompt_sample, sample_offset)))
+    specs_exhausted = False
+
+    def schedule_until(target: int) -> None:
+        nonlocal specs_exhausted
+        while not specs_exhausted and len(pending) < target:
+            try:
+                sample_index, prompt_sample, sample_offset = next(specs)
+            except StopIteration:
+                specs_exhausted = True
+                return
+            pending.add(asyncio.create_task(generate_one(sample_index, prompt_sample, sample_offset)))
+
+    schedule_until(max_inflight)
 
     data: list[Sample] = []
     log_example = True
@@ -854,17 +1003,16 @@ async def _generate_eval_samples_bounded(
                 else:
                     data.append(generated)
                 pbar.update(1)
-                try:
-                    sample_index, prompt_sample, sample_offset = next(specs)
-                except StopIteration:
-                    continue
-                pending.add(asyncio.create_task(generate_one(sample_index, prompt_sample, sample_offset)))
+            target = controller.poll(args) if controller is not None else max_inflight
+            schedule_until(target)
     except BaseException:
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         raise
     finally:
+        if controller is not None:
+            await controller.close()
         pbar.close()
 
     data.sort(key=lambda sample: sample.index)

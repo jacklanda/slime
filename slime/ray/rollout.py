@@ -1452,6 +1452,20 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
 
     # Expose per-model router info for custom rollout functions.
     args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
+    args.sglang_model_engine_urls = {
+        name: [
+            url
+            for group in srv.server_groups
+            if group.worker_type == "regular"
+            for url in group.engine_urls
+            if url is not None
+        ]
+        for name, srv in servers.items()
+    }
+    default_model_name = next(iter(servers), None)
+    args.sglang_engine_urls = (
+        args.sglang_model_engine_urls.get(default_model_name, []) if default_model_name is not None else []
+    )
 
     return servers, pending_init_handles
 

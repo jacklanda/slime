@@ -137,6 +137,9 @@ def _run_generate_with_fake_sglang(
         session_id,
         evaluation=False,
         request_semaphore=None,
+        session_params=None,
+        context_token_count=None,
+        server_url=None,
     ):
         item = calls.pop(0)
         text = item["text"]
@@ -316,6 +319,7 @@ def test_qwen_tool_parser_finish_and_answer_fallback():
     calls = parser.parse('<tool_call>{"name":"web_search","arguments":{"query":"abc"}}</tool_call>')
     assert calls[0].name == "web_search"
     assert calls[0].arguments == {"query": "abc"}
+    assert parser.format_action(calls[0]) == '<tool_call>{"name":"web_search","arguments":{"query":"abc"}}</tool_call>'
 
     calls = parser.parse("reasoning\n\\boxed{Final}")
     assert calls[0].name == "finish"
@@ -382,6 +386,30 @@ def test_qwen3_coder_parser_parses_xml_calls_with_schema_coercion():
     assert calls[0].arguments == {"query": "senior comic artist", "max_results": 4}
     # start/end bound the full <tool_call> span so verifier finish checks work.
     assert raw[calls[0].start : calls[0].end].startswith("<tool_call>")
+
+    action_text = parser.format_action(calls[0])
+    assert action_text == (
+        "<tool_call>\n<function=web_search>\n"
+        "<parameter=query>\nsenior comic artist\n</parameter>\n"
+        "<parameter=max_results>\n4\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    assert parser.parse(action_text)[0].arguments == {"query": "senior comic artist", "max_results": 4}
+
+
+def test_initial_messages_configure_runtime_qwen35_parser_schema():
+    tools = [web_search_schema(), finish_schema()]
+    parser = make_tool_parser("Qwen3.5-4B", valid_tools={"web_search", "finish", "submit"})
+
+    _initial_messages("gem", "webqa", "question", tools, "Qwen3.5-4B", tool_parser=parser)
+    call = parser.parse(
+        "<tool_call>\n<function=web_search>\n"
+        "<parameter=query>\nquery\n</parameter>\n"
+        "<parameter=max_results>\n10\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )[0]
+
+    assert call.arguments == {"query": "query", "max_results": 10}
 
 
 def test_qwen3_coder_parser_normalizes_submit_and_keeps_boxed_fallback():
@@ -1016,6 +1044,27 @@ def test_build_system_prompt_switches_tool_format_by_model():
     gemma4 = build_system_prompt(FUSED_SEARCH_SYSTEM_PROMPT, tools, "/share/nlp/share/plm/gemma-4-E2B-it")
     assert gemma4 == FUSED_SEARCH_SYSTEM_PROMPT.strip()
     assert "<|tool>declaration:web_search{" not in gemma4
+
+
+def test_explicit_model_series_overrides_noncanonical_checkpoint_path(monkeypatch):
+    checkpoint = "checkpoints/FusedRL/webqa-dapo-q3.5-4b/iter_0000019_hf"
+    tools = [web_search_schema(), finish_schema()]
+
+    monkeypatch.setenv("FUSED_MODEL_SERIES", "qwen3.5")
+    assert isinstance(make_tool_parser(checkpoint), Qwen3CoderToolParser)
+    assert "<function=FUNCTION_NAME>" in build_system_prompt(FUSED_SEARCH_SYSTEM_PROMPT, tools, checkpoint)
+
+    monkeypatch.setenv("FUSED_MODEL_SERIES", "qwen3")
+    assert type(make_tool_parser(checkpoint)) is QwenToolParser
+    assert '{"name": <function-name>, "arguments": <args-json-object>}' in build_system_prompt(
+        FUSED_SEARCH_SYSTEM_PROMPT, tools, checkpoint
+    )
+
+
+def test_invalid_explicit_model_series_fails_closed(monkeypatch):
+    monkeypatch.setenv("FUSED_MODEL_SERIES", "qwen-next")
+    with pytest.raises(ValueError, match="Unsupported FUSED_MODEL_SERIES"):
+        make_tool_parser("/models/Qwen3-4B")
 
 
 def test_resolve_cli_and_et_modes_without_docker_reset():
@@ -2296,6 +2345,45 @@ def test_call_sglang_aborts_request_on_timeout(monkeypatch):
     )
 
 
+def test_call_sglang_aborts_native_session_request_on_direct_engine(monkeypatch):
+    calls = []
+
+    async def fake_post(url, payload, max_retries=60, headers=None):
+        calls.append(("generate", url, payload, headers))
+        raise httpx.ReadTimeout("timeout")
+
+    class FakeClient:
+        async def post(self, url, json=None, timeout=None):
+            calls.append(("abort", url, json, timeout))
+
+    monkeypatch.setattr(fused_generate.http_utils, "post", fake_post)
+    monkeypatch.setattr(fused_generate.http_utils, "_http_client", FakeClient())
+    args = SimpleNamespace(
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        router_policy="manual",
+    )
+
+    with pytest.raises(httpx.ReadTimeout):
+        asyncio.run(
+            fused_generate._call_sglang(
+                args,
+                [1, 2],
+                {"max_new_tokens": 4},
+                session_id="sid",
+                session_params={"id": "sid", "rid": "rid-0"},
+                server_url="http://engine-0",
+            )
+        )
+
+    assert calls[1] == (
+        "abort",
+        "http://engine-0/abort_request",
+        {"rid": calls[0][2]["rid"]},
+        5.0,
+    )
+
+
 def test_call_sglang_eval_uses_text_without_logprobs(monkeypatch):
     requests = []
 
@@ -2336,7 +2424,227 @@ def test_call_sglang_eval_uses_text_without_logprobs(monkeypatch):
         "finish_reason": "stop",
         "prompt_tokens": 2,
         "completion_tokens": 2,
+        "output_ids": [],
+        "rid": requests[0][1]["rid"],
     }
+
+
+def test_manual_router_policy_sends_sticky_routing_header():
+    args = SimpleNamespace(router_policy="manual")
+
+    assert fused_generate._routing_headers(args, "session-1") == {"X-SMG-Routing-Key": "session-1"}
+
+
+def test_eval_session_engine_pool_assigns_new_sessions_to_min_load():
+    pool = fused_generate.EvalSessionEnginePool(["http://engine-0/", "http://engine-1"])
+
+    first = pool.acquire()
+    second = pool.acquire()
+    third = pool.acquire()
+    pool.release(first)
+    fourth = pool.acquire()
+
+    assert (first, second, third, fourth) == (
+        "http://engine-0",
+        "http://engine-1",
+        "http://engine-0",
+        "http://engine-1",
+    )
+
+
+def test_eval_session_engine_pool_caps_sessions_and_cools_down_failed_engine():
+    pool = fused_generate.EvalSessionEnginePool(
+        ["http://engine-0"],
+        max_sessions_per_engine=1,
+    )
+
+    engine = pool.acquire()
+    assert engine == "http://engine-0"
+    assert pool.acquire() is None
+
+    assert pool.record_transport_failure(engine) is True
+    assert pool.record_transport_failure(engine) is False
+    pool.release(engine)
+    assert pool.acquire() is None
+
+
+def test_eval_sglang_session_releases_engine_slot_when_open_is_cancelled(monkeypatch):
+    async def cancelled_post(_self, url, payload, max_retries=60):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(fused_generate.EvalSessionEnginePool, "post_control", cancelled_post)
+    pool = fused_generate.EvalSessionEnginePool(
+        ["http://engine-0"],
+        max_sessions_per_engine=1,
+    )
+    session = fused_generate.EvalSGLangSession(
+        args=SimpleNamespace(),
+        session_id="sid",
+        capacity=100,
+        enabled=True,
+        engine_pool=pool,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(session.prepare_request([1, 2]))
+
+    assert session.server_url is None
+    assert pool.acquire() == "http://engine-0"
+
+
+def test_eval_sglang_session_sends_verified_prompt_deltas_and_closes(monkeypatch):
+    requests = []
+
+    async def fake_post(_self, url, payload, max_retries=60):
+        requests.append((url, payload, max_retries))
+        if url.endswith("/open_session"):
+            return payload["session_id"]
+        return ""
+
+    monkeypatch.setenv("SLIME_FUSED_EVAL_USE_SGLANG_SESSION", "true")
+    monkeypatch.setattr(fused_generate.EvalSessionEnginePool, "post_control", fake_post)
+    monkeypatch.setattr(fused_generate, "_EVAL_ENGINE_POOL_LOOP", None)
+    monkeypatch.setattr(fused_generate, "_EVAL_ENGINE_POOL", None)
+    args = SimpleNamespace(
+        sglang_engine_urls=["http://engine-0", "http://engine-1"],
+        router_policy="manual",
+    )
+
+    async def scenario():
+        session = fused_generate.EvalSGLangSession.for_eval(args, "sid", 100)
+        first_ids, first_params = await session.prepare_request([1, 2])
+        await session.record_response(full_prompt_ids=[1, 2], output_ids=[3], output_text="x", rid="rid-1")
+        delta_ids, delta_params = await session.prepare_request([1, 2, 3, 4, 5])
+        await session.close()
+        return session, first_ids, first_params, delta_ids, delta_params
+
+    session, first_ids, first_params, delta_ids, delta_params = asyncio.run(scenario())
+
+    assert first_ids == [1, 2]
+    assert first_params == {"id": "sid", "rid": None}
+    assert delta_ids == [4, 5]
+    assert delta_params == {"id": "sid", "rid": "rid-1"}
+    assert session.session_turns == 1
+    assert session.delta_tokens == 2
+    assert session.full_tokens_avoided == 3
+    assert [request[0] for request in requests] == [
+        "http://engine-0/open_session",
+        "http://engine-0/close_session",
+    ]
+
+
+def test_eval_sglang_session_replaces_only_normalized_assistant_suffix(monkeypatch):
+    async def fake_post(_self, url, payload, max_retries=60):
+        return payload["session_id"] if url.endswith("/open_session") else ""
+
+    monkeypatch.setenv("SLIME_FUSED_EVAL_USE_SGLANG_SESSION", "true")
+    monkeypatch.setattr(fused_generate.EvalSessionEnginePool, "post_control", fake_post)
+    monkeypatch.setattr(fused_generate, "_EVAL_ENGINE_POOL_LOOP", None)
+    monkeypatch.setattr(fused_generate, "_EVAL_ENGINE_POOL", None)
+    args = SimpleNamespace(
+        sglang_engine_urls=["http://engine-0"],
+        router_policy="manual",
+        sglang_server_concurrency=8,
+        sglang_max_running_requests=8,
+    )
+
+    async def scenario():
+        session = fused_generate.EvalSGLangSession.for_eval(args, "sid", 100)
+        await session.prepare_request([1, 2])
+        await session.record_response(
+            full_prompt_ids=[1, 2],
+            output_ids=[3, 99],
+            output_text="assistant",
+            rid="rid-1",
+        )
+        request_ids, params = await session.prepare_request([1, 2, 3, 4, 5])
+        await session.close()
+        return session, request_ids, params
+
+    session, request_ids, params = asyncio.run(scenario())
+
+    assert request_ids == [4, 5]
+    assert params == {"id": "sid", "rid": "rid-1", "offset": 3}
+    assert session.enabled is True
+    assert session.fallback_count == 0
+    assert session.delta_tokens == 2
+    assert session.full_tokens_avoided == 3
+
+
+def test_eval_sglang_session_falls_back_when_prompt_is_not_an_extension(monkeypatch):
+    requests = []
+
+    async def fake_post(_self, url, payload, max_retries=60):
+        requests.append(url)
+        return payload["session_id"] if url.endswith("/open_session") else ""
+
+    monkeypatch.setenv("SLIME_FUSED_EVAL_USE_SGLANG_SESSION", "true")
+    monkeypatch.setattr(fused_generate.EvalSessionEnginePool, "post_control", fake_post)
+    monkeypatch.setattr(fused_generate, "_EVAL_ENGINE_POOL_LOOP", None)
+    monkeypatch.setattr(fused_generate, "_EVAL_ENGINE_POOL", None)
+    args = SimpleNamespace(sglang_engine_urls=["http://engine-0"], router_policy="manual")
+
+    async def scenario():
+        session = fused_generate.EvalSGLangSession.for_eval(args, "sid", 100)
+        await session.prepare_request([1, 2])
+        await session.record_response(full_prompt_ids=[1, 2], output_ids=[3], output_text="x", rid="rid-1")
+        request_ids, params = await session.prepare_request([9, 10])
+        return session, request_ids, params
+
+    session, request_ids, params = asyncio.run(scenario())
+
+    assert request_ids == [9, 10]
+    assert params is None
+    assert session.enabled is False
+    assert session.fallback_count == 1
+    assert requests == ["http://engine-0/open_session", "http://engine-0/close_session"]
+
+
+def test_call_sglang_session_uses_direct_engine_and_delta_context_limit(monkeypatch):
+    requests = []
+
+    async def fake_post(url, payload, max_retries=60, headers=None):
+        requests.append((url, payload, max_retries, headers))
+        return {
+            "text": "x",
+            "output_ids": [7],
+            "meta_info": {
+                "id": "rid-1",
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 5,
+                "completion_tokens": 1,
+            },
+        }
+
+    monkeypatch.setattr(fused_generate.http_utils, "post", fake_post)
+    args = SimpleNamespace(
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        router_policy="manual",
+        sglang_context_length=10,
+        rollout_max_context_len=10,
+    )
+
+    result = asyncio.run(
+        fused_generate._call_sglang(
+            args,
+            [4, 5],
+            {"max_new_tokens": 2},
+            session_id="sid",
+            evaluation=True,
+            session_params={"id": "sid", "rid": "rid-0"},
+            context_token_count=5,
+            server_url="http://engine-0",
+        )
+    )
+
+    assert requests[0][0] == "http://engine-0/generate"
+    assert requests[0][1]["input_ids"] == [4, 5]
+    assert requests[0][1]["session_params"] == {"id": "sid", "rid": "rid-0"}
+    assert requests[0][2] == 1
+    assert requests[0][3] == {"X-SMG-Routing-Key": "sid", "Connection": "close"}
+    assert result["output_ids"] == [7]
+    assert result["rid"] == "rid-1"
 
 
 def test_effective_sglang_context_limit_uses_margin(monkeypatch):
@@ -2932,7 +3240,7 @@ def test_disable_thinking_visualization_keeps_thinking_empty_for_action_only_res
         disable_thinking=True,
     )
 
-    assert step["thought"] == action
+    assert step["thought"] == ""
     assert step["info"]["disable_thinking"] is True
     assert rollout_visualization._step_thinking_and_response(step) == ("", action)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -278,6 +279,21 @@ class Qwen3CoderToolParser(QwenToolParser):
         if not calls:
             calls.extend(self._extract_answer_fallback(text))
         return calls
+
+    def format_action(self, action: ToolCall) -> str:
+        lines = ["<tool_call>", f"<function={action.name}>"]
+        for name, value in (action.arguments or {}).items():
+            if value is None:
+                rendered = "null"
+            elif isinstance(value, bool):
+                rendered = "true" if value else "false"
+            elif isinstance(value, (dict, list)):
+                rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            else:
+                rendered = str(value)
+            lines.extend([f"<parameter={name}>", rendered, "</parameter>"])
+        lines.extend(["</function>", "</tool_call>"])
+        return "\n".join(lines)
 
     def _iter_tool_call_regions(self, text: str) -> list[tuple[str, int, int]]:
         regions = [(match.group(1) if match.group(1) is not None else (match.group(2) or ""), match.start(), match.end()) for match in self._TOOL_CALL_RE.finditer(text)]
@@ -1170,6 +1186,25 @@ class _Gemma4ArgumentParser:
         self.pos += 1
 
 
+def resolve_tool_model_name(model_name: str | None) -> str | None:
+    """Prefer the explicitly configured fused model series over path inference."""
+    model_series = os.environ.get("FUSED_MODEL_SERIES")
+    if model_series is None:
+        return model_name
+
+    normalized = model_series.strip().lower().replace("-", "_")
+    aliases = {
+        "qwen3": "qwen3",
+        "qwen3.5": "qwen3.5",
+        "qwen3_5": "qwen3.5",
+        "gemma4": "gemma4",
+        "gemma_4": "gemma4",
+    }
+    if normalized not in aliases:
+        raise ValueError(f"Unsupported FUSED_MODEL_SERIES: {model_series!r}")
+    return aliases[normalized]
+
+
 def make_tool_parser(model_name: str | None, valid_tools: set[str] | None = None) -> QwenToolParser:
     """Select and build the tool parser for a model path/name.
 
@@ -1177,7 +1212,7 @@ def make_tool_parser(model_name: str | None, valid_tools: set[str] | None = None
     native ``<|tool_call>call:...`` template, and everything else keeps the JSON
     ``<tool_call>`` format.
     """
-    name = (model_name or "").lower()
+    name = (resolve_tool_model_name(model_name) or "").lower()
     if "gemma4" in name or "gemma-4" in name or "gemma_4" in name:
         parser_class = Gemma4ToolParser
     elif any(x in name for x in ("qwen3.5", "qwen3-coder", "qwen3coder")):
@@ -1206,7 +1241,7 @@ class ActiveFinishParser:
         self._model_name: str | None = None
 
     def set(self, model_name: str | None) -> None:
-        self._model_name = model_name
+        self._model_name = resolve_tool_model_name(model_name)
 
     def get(self) -> QwenToolParser:
         return _cached_finish_parser(self._model_name, self._valid_tools)

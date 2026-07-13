@@ -230,7 +230,15 @@ async def _post(client, url, payload, max_retries=60, headers=None):
             else:
                 response_text = None
 
-            logger.info(f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})")
+            logger.info(
+                "HTTP %s: %r, retrying... (attempt %d/%d, url=%s, response=%s)",
+                type(e).__name__,
+                e,
+                retry_count,
+                max_retries,
+                url,
+                response_text,
+            )
             if retry_count >= max_retries:
                 logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
                 raise e
@@ -265,8 +273,22 @@ def init_http_client(args):
 
     _client_concurrency = args.sglang_server_concurrency * num_engines
     if _http_client is None:
+        keepalive_expiry = max(0.1, float(os.environ.get("SLIME_HTTP_KEEPALIVE_EXPIRY", "4")))
+        logger.info(
+            "Initializing rollout HTTP client: max_connections=%d keepalive_expiry=%.1fs",
+            _client_concurrency,
+            keepalive_expiry,
+        )
         _http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=_client_concurrency),
+            # Keep the idle lifetime strictly below the engine's Uvicorn
+            # timeout. Reusing a socket after SGLang's default 5-second
+            # keepalive is the main source of empty httpx.ReadError bursts in
+            # tool-using trajectories with multi-second retrieval gaps.
+            limits=httpx.Limits(
+                max_connections=_client_concurrency,
+                max_keepalive_connections=_client_concurrency,
+                keepalive_expiry=keepalive_expiry,
+            ),
             timeout=httpx.Timeout(None),
             trust_env=False,  # internal SGLang comm only — never route through system proxy
         )
@@ -302,8 +324,13 @@ def _init_ray_distributed_post(args):
     class _HttpPosterActor:
         def __init__(self, concurrency: int):
             # Lazy creation to this actor's event loop
+            keepalive_expiry = max(0.1, float(os.environ.get("SLIME_HTTP_KEEPALIVE_EXPIRY", "4")))
             self._client = httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=max(1, concurrency)),
+                limits=httpx.Limits(
+                    max_connections=max(1, concurrency),
+                    max_keepalive_connections=max(1, concurrency),
+                    keepalive_expiry=keepalive_expiry,
+                ),
                 timeout=httpx.Timeout(None),
                 trust_env=False,  # internal SGLang comm only — never route through system proxy
             )
