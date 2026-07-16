@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+import functools
 import importlib.util
 import inspect
 import json
@@ -9,6 +10,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -35,6 +37,8 @@ _retrieval_runtime_loop: asyncio.AbstractEventLoop | None = None
 _retrieval_semaphore: asyncio.Semaphore | None = None
 _retrieval_cache: OrderedDict[str, Any] = OrderedDict()
 _retrieval_inflight: dict[str, asyncio.Task] = {}
+_mcp_tool_cwd_lock = threading.RLock()
+_warned_partial_mcp_modules: set[Path] = set()
 
 
 def _get_shared_http_session() -> aiohttp.ClientSession:
@@ -109,6 +113,7 @@ class LocalMCPToolset:
         self.tools: dict[str, Callable[..., Any]] = {}
         self.descriptions: dict[str, str] = {}
         self.load_error = ""
+        self.load_warning = ""
         if self.tools_py:
             try:
                 self._load_tools(self.tools_py)
@@ -159,6 +164,7 @@ class LocalMCPToolset:
                 return deco
 
         old_modules = {name: sys.modules.get(name) for name in ("mcp", "mcp.server", "mcp.server.fastmcp", "tools")}
+        exec_error: Exception | None = None
         try:
             mcp_mod = types.ModuleType("mcp")
             server_mod = types.ModuleType("mcp.server")
@@ -180,6 +186,8 @@ class LocalMCPToolset:
             sys.modules[module_name] = module
             sys.modules["tools"] = module
             spec.loader.exec_module(module)
+        except Exception as e:
+            exec_error = e
         finally:
             for name, mod in old_modules.items():
                 if mod is None:
@@ -197,8 +205,35 @@ class LocalMCPToolset:
             bound_fn.__dict__.update(fn.__dict__)
             bound_fn.__module__ = fn.__module__
             bound_fn.__qualname__ = fn.__qualname__
-            self.tools[name] = bound_fn
+            self.tools[name] = self._run_from_asset_dir(bound_fn, tools_py.parent)
             self.descriptions[name] = description
+
+        if exec_error is not None:
+            if not self.tools:
+                raise exec_error
+            self.load_warning = f"{type(exec_error).__name__}: {exec_error}"
+            if tools_py not in _warned_partial_mcp_modules:
+                _warned_partial_mcp_modules.add(tools_py)
+                logger.warning(
+                    "MCP tool module %s failed after registering %d tools; keeping the registered tools: %s",
+                    tools_py,
+                    len(self.tools),
+                    self.load_warning,
+                )
+
+    @staticmethod
+    def _run_from_asset_dir(fn: Callable[..., Any], asset_dir: Path) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            with _mcp_tool_cwd_lock:
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(asset_dir)
+                    return fn(*args, **kwargs)
+                finally:
+                    os.chdir(previous_cwd)
+
+        return wrapped
 
     def schemas(self) -> list[dict]:
         schemas = []
@@ -312,6 +347,8 @@ class FusedEnvironment:
             info = {"task_type": "mcp", "tools_json": self.tools(), "difficulty": self.task.get("difficulty", "")}
             if self.mcp_tools is not None and self.mcp_tools.load_error:
                 info["env_error"] = self.mcp_tools.load_error
+            if self.mcp_tools is not None and self.mcp_tools.load_warning:
+                info["env_warning"] = self.mcp_tools.load_warning
             return str(question), info
         if self.mode in {"cli", "et"} and self.docker_env is not None:
             return self.docker_env.reset()

@@ -28,7 +28,7 @@ def save_rllm_episode_batch(args, *, rollout_id: int, samples: list[Sample], mod
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(batch_data, f, indent=4, ensure_ascii=False, default=str)
         f.write("\n")
-    logger.info("Saved %s rLLM-style episode trajectories to %s", len(episodes), file_path)
+    logger.info("Saved %s episode trajectories to %s", len(episodes), file_path)
 
 
 def _collect_rllm_episodes(samples: list[Sample]) -> list[dict[str, Any]]:
@@ -107,7 +107,7 @@ def _trajectory_to_batch_dict(trajectory: dict[str, Any]) -> dict[str, Any]:
 def _step_to_batch_dict(step: dict[str, Any]) -> dict[str, Any]:
     info = step.get("info") if isinstance(step.get("info"), dict) else {}
     timing = info.get("timing") if isinstance(info.get("timing"), dict) else {}
-    return {
+    result = {
         "observation": step.get("observation"),
         "thought": step.get("thought") or "",
         "action": step.get("action"),
@@ -118,6 +118,12 @@ def _step_to_batch_dict(step: dict[str, Any]) -> dict[str, Any]:
         "disable_thinking": bool(info.get("disable_thinking")),
         "timing": timing,
     }
+    if "tito_context_reason" in info:
+        # Marks how the served prompt related to the TiTO accumulator; in
+        # particular whether historical thinking was dropped before this step.
+        result["tito_context_reason"] = info["tito_context_reason"]
+        result["historical_thinking_discarded"] = bool(info.get("historical_thinking_discarded"))
+    return result
 
 
 def _compute_task_hash(task: Any, length: int = 8) -> str:

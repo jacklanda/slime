@@ -35,6 +35,8 @@ Generation/eval:
   --unified-system-prompt              Sets harness to unified_gem unless --harness is later set.
   --no-unified-system-prompt           Sets harness to gem unless --harness is later set.
   --disable-thinking BOOL              Default: true.
+  --discard-historical-thinking BOOL   Remove prior assistant <think> blocks before each new rollout step.
+                                       Effective only when --disable-thinking is false. Default: false.
   --max-steps N                        Default: 128.
   --mcp-max-steps N                    Default: max-steps.
   --web-search-max-steps N             Default: max-steps.
@@ -52,8 +54,8 @@ Generation/eval:
   --no-prefer-verl                     Normalize from raw files even when data_verl.parquet exists.
   --retrieval-concurrency N            Concurrent retrieval requests. Default: 176.
   --retrieval-cache-size N             Cross-episode retrieval LRU entries. Default: 4096.
-  --eval-initial-inflight-tasks N      Initial scheduled eval trajectories. Default: 384.
-  --eval-max-inflight-tasks N          Adaptive hard limit for eval trajectories. Default: 576.
+  --eval-initial-inflight-tasks N      Initial scheduled eval trajectories. Default: cot=4/engine, agent=384.
+  --eval-max-inflight-tasks N          Adaptive hard limit. Default: cot=8/engine, agent=576.
   --eval-adaptive-concurrency BOOL     Adjust inflight work from engine metrics. Default: true.
   --eval-trajectory-sample-rate X      Full trajectory dump fraction. Default: 1.
   --eval-dump-failures BOOL            Dump failed eval trajectories. Default: true.
@@ -62,7 +64,7 @@ Generation/eval:
 SGLang/runtime:
   --sglang-mem-fraction-static X       Default: 0.9.
   --sglang-server-concurrency N        Default: 60.
-  --sglang-max-running-requests N      Default: 96.
+  --sglang-max-running-requests N      Per-engine limit. Default: cot=4, agent=96.
   --router-policy NAME                 Default: manual.
   --router-assignment-mode NAME        Default: min_load.
   --ray-dashboard-address URL          Default: http://127.0.0.1:8265.
@@ -99,6 +101,7 @@ RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 FUSED_HARNESS="${FUSED_HARNESS:-cot}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
+DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
 MAX_STEPS="${MAX_STEPS:-128}"
 MCP_MAX_STEPS="${MCP_MAX_STEPS:-${MAX_STEPS}}"
 WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-${MAX_STEPS}}"
@@ -111,22 +114,25 @@ TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:-20}"
 #EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
 #EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
-EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-38000}"
-EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-2048}"
+#EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-38000}"
+#EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-2048}"
+#EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-65536}"
+EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-131072}"
+EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-4096}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
 LIMIT_PER_BENCHMARK="${LIMIT_PER_BENCHMARK:-0}"
 PREFER_VERL="${PREFER_VERL:-1}"
 RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-176}"
 RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE:-4096}"
-EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-384}"
-EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-576}"
+EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-}"
+EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-}"
 EVAL_ADAPTIVE_CONCURRENCY="${EVAL_ADAPTIVE_CONCURRENCY:-true}"
 EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-1}"
 EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES:-true}"
 NATIVE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION:-true}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.9}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-60}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-96}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-}"
 ROUTER_POLICY="${ROUTER_POLICY:-manual}"
 ROUTER_ASSIGNMENT_MODE="${ROUTER_ASSIGNMENT_MODE:-min_load}"
 RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
@@ -152,6 +158,7 @@ while [ "$#" -gt 0 ]; do
       --unified-system-prompt) UNIFIED_SYSTEM_PROMPT=True; if [ "${harness_explicit}" = "false" ]; then FUSED_HARNESS=unified_gem; fi; shift ;;
       --no-unified-system-prompt) UNIFIED_SYSTEM_PROMPT=False; if [ "${harness_explicit}" = "false" ]; then FUSED_HARNESS=gem; fi; shift ;;
       --disable-thinking) DISABLE_THINKING="${2:?Missing value for --disable-thinking}"; shift 2 ;;
+      --discard-historical-thinking) DISCARD_HISTORICAL_THINKING="${2:?Missing value for --discard-historical-thinking}"; shift 2 ;;
       --max-steps) MAX_STEPS="${2:?Missing value for --max-steps}"; shift 2 ;;
       --mcp-max-steps) MCP_MAX_STEPS="${2:?Missing value for --mcp-max-steps}"; shift 2 ;;
       --web-search-max-steps) WEB_SEARCH_MAX_STEPS="${2:?Missing value for --web-search-max-steps}"; shift 2 ;;
@@ -264,14 +271,6 @@ if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -lt 1 ]; then
    echo "--gpus-per-engine must be >= 1" >&2
    exit 2
 fi
-if [ "${RETRIEVAL_CONCURRENCY}" -lt 1 ] || [ "${EVAL_INITIAL_INFLIGHT_TASKS}" -lt 1 ] || [ "${EVAL_MAX_INFLIGHT_TASKS}" -lt 1 ]; then
-   echo "retrieval concurrency and eval inflight limits must be >= 1" >&2
-   exit 2
-fi
-if [ "${EVAL_INITIAL_INFLIGHT_TASKS}" -gt "${EVAL_MAX_INFLIGHT_TASKS}" ]; then
-   echo "--eval-initial-inflight-tasks must not exceed --eval-max-inflight-tasks" >&2
-   exit 2
-fi
 case "${ROUTER_POLICY}" in
    manual|consistent_hashing|cache_aware|round_robin|random|power_of_two|prefix_hash) ;;
    *) echo "Unsupported --router-policy ${ROUTER_POLICY}" >&2; exit 2 ;;
@@ -298,6 +297,7 @@ if [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
    echo "--gpus (${ROLLOUT_GPUS}) must be divisible by --gpus-per-engine (${ROLLOUT_NUM_GPUS_PER_ENGINE})." >&2
    exit 2
 fi
+ROLLOUT_NUM_ENGINES=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
 case "${FUSED_HARNESS}" in
    cot|bare) UNIFIED_SYSTEM_PROMPT=False ;;
 esac
@@ -307,6 +307,25 @@ if [ -z "${PER_STEP_MAX_TOKENS:-}" ]; then
    else
       PER_STEP_MAX_TOKENS=2048
    fi
+fi
+if [ "${FUSED_HARNESS}" = "cot" ]; then
+   # Long CoT requests retain generation state for the full response, so keep
+   # actual engine concurrency low even while the rollout queue stays buffered.
+   EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-$((4 * ROLLOUT_NUM_ENGINES))}"
+   EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-$((8 * ROLLOUT_NUM_ENGINES))}"
+   SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-4}"
+else
+   EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-384}"
+   EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-576}"
+   SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-96}"
+fi
+if [ "${RETRIEVAL_CONCURRENCY}" -lt 1 ] || [ "${EVAL_INITIAL_INFLIGHT_TASKS}" -lt 1 ] || [ "${EVAL_MAX_INFLIGHT_TASKS}" -lt 1 ] || [ "${SGLANG_MAX_RUNNING_REQUESTS}" -lt 1 ]; then
+   echo "retrieval concurrency, eval inflight limits, and SGLang running requests must be >= 1" >&2
+   exit 2
+fi
+if [ "${EVAL_INITIAL_INFLIGHT_TASKS}" -gt "${EVAL_MAX_INFLIGHT_TASKS}" ]; then
+   echo "--eval-initial-inflight-tasks must not exceed --eval-max-inflight-tasks" >&2
+   exit 2
 fi
 
 LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/evals/${EXPERIMENT_NAME}}"
@@ -357,6 +376,7 @@ else
 fi
 
 export SCRIPT_DIR REPO_ROOT
+export CUDA_HOME="/cm/shared/apps/cuda12.9"
 export MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
@@ -377,6 +397,7 @@ export FUSED_HARNESS="${FUSED_HARNESS}"
 export FUSED_MODEL_SERIES="${MODEL_SERIES}"
 export FUSED_UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT}"
 export FUSED_DISABLE_THINKING="${DISABLE_THINKING}"
+export FUSED_DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING}"
 export FUSED_MAX_STEPS="${MAX_STEPS}"
 export FUSED_MCP_MAX_STEPS="${MCP_MAX_STEPS}"
 export FUSED_WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS}"
@@ -411,7 +432,8 @@ keys = (
     "RETRIEVAL_MAX_RESULTS", "RLLM_RETRIEVAL_SUMMARIZE",
     "DOCKER_HOST", "DOCKER_API_VERSION", "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL",
     "OPENROUTER_APP_NAME", "FUSED_HARNESS", "FUSED_MODEL_SERIES", "FUSED_UNIFIED_SYSTEM_PROMPT",
-    "FUSED_DISABLE_THINKING", "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS",
+    "FUSED_DISABLE_THINKING", "FUSED_DISCARD_HISTORICAL_THINKING",
+    "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS",
     "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "PER_STEP_MAX_TOKENS",
     "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH", "SLIME_FUSED_TERMINAL_LOG_STYLE",
@@ -433,9 +455,9 @@ echo "Model: ${MODEL_DIR} (${MODEL_CONFIG}; series=${MODEL_SERIES})"
 echo "Benchmarks root: ${BENCHMARKS_ROOT}"
 echo "Eval config: ${EVAL_CONFIG}"
 echo "Log root: ${LOG_ROOT}"
-echo "GPUs: ${ROLLOUT_GPUS}; gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}"
-echo "Harness: ${FUSED_HARNESS}; disable_thinking=${DISABLE_THINKING}; n=${N_SAMPLES_PER_EVAL_PROMPT}; per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
-echo "Concurrency: eval=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS} adaptive=${EVAL_ADAPTIVE_CONCURRENCY}; sglang_per_engine=${SGLANG_SERVER_CONCURRENCY}; retrieval=${RETRIEVAL_CONCURRENCY}"
+echo "GPUs: ${ROLLOUT_GPUS}; gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}; engines=${ROLLOUT_NUM_ENGINES}"
+echo "Harness: ${FUSED_HARNESS}; disable_thinking=${DISABLE_THINKING}; discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}; n=${N_SAMPLES_PER_EVAL_PROMPT}; per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
+echo "Concurrency: eval=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS} adaptive=${EVAL_ADAPTIVE_CONCURRENCY}; sglang_http_per_engine=${SGLANG_SERVER_CONCURRENCY}; sglang_running_per_engine=${SGLANG_MAX_RUNNING_REQUESTS}; retrieval=${RETRIEVAL_CONCURRENCY}"
 
 EVAL_ADAPTIVE_CONCURRENCY_ARG="--eval-adaptive-concurrency"
 if ! is_truthy "${EVAL_ADAPTIVE_CONCURRENCY}"; then

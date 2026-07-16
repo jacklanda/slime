@@ -77,26 +77,21 @@ def get_sum_of_sample_mean(
     if sample_denoms is None:
         sample_denoms = [m.sum() for m in loss_masks]
 
+    def _safe_denom(denom: torch.Tensor) -> torch.Tensor:
+        # Guard only against a fully-dead sample (denom == 0, numerator is also
+        # 0). Prompt-equal denominators (M_P * N_P / GBS) are legitimately
+        # fractional and below 1; clamping them to 1 would silently cancel the
+        # up-weighting they encode.
+        return torch.where(denom > 0, denom, torch.ones_like(denom))
+
     cp_size = mpu.get_context_parallel_world_size()
     if cp_size == 1:
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
-            return sum(
-                [
-                    (x_i * loss_mask_i).sum() / torch.clamp_min(denom, 1)
-                    for x_i, loss_mask_i, denom in zip(
-                        x.split(response_lengths, dim=0), loss_masks, sample_denoms, strict=False
-                    )
-                ]
-            )
+            return sum([(x_i * loss_mask_i).sum() / _safe_denom(denom) for x_i, loss_mask_i, denom in zip(x.split(response_lengths, dim=0), loss_masks, sample_denoms, strict=False)])
 
         def sum_of_token(x: torch.Tensor) -> torch.Tensor:
-            return sum(
-                [
-                    (x_i * loss_mask_i).sum()
-                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
-                ]
-            )
+            return sum([(x_i * loss_mask_i).sum() for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)])
 
     else:
         cp_chunk_lengths: list[int] = []
@@ -114,24 +109,10 @@ def get_sum_of_sample_mean(
             cp_chunk_lengths.append(chunked_loss_mask.size(0))
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
-            return sum(
-                [
-                    (x_i * chunked_loss_mask).sum() / torch.clamp_min(denom, 1)
-                    for x_i, chunked_loss_mask, denom in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, sample_denoms, strict=False
-                    )
-                ]
-            )
+            return sum([(x_i * chunked_loss_mask).sum() / _safe_denom(denom) for x_i, chunked_loss_mask, denom in zip(x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, sample_denoms, strict=False)])
 
         def sum_of_token(x: torch.Tensor) -> torch.Tensor:
-            return sum(
-                [
-                    (x_i * chunked_loss_mask).sum()
-                    for x_i, chunked_loss_mask in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=False
-                    )
-                ]
-            )
+            return sum([(x_i * chunked_loss_mask).sum() for x_i, chunked_loss_mask in zip(x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=False)])
 
     return sum_of_sample_mean if not calculate_per_token_loss else sum_of_token
 
@@ -333,10 +314,7 @@ def slice_log_prob_with_cp(
     total_length: int,
     response_length: int,
 ) -> list[float] | torch.Tensor:
-    assert len(log_prob) == response_length, (
-        f"log_prob length mismatch: len(log_prob)={len(log_prob)}, "
-        f"response_length={response_length}, total_length={total_length}"
-    )
+    assert len(log_prob) == response_length, f"log_prob length mismatch: len(log_prob)={len(log_prob)}, " f"response_length={response_length}, total_length={total_length}"
 
     cp_size = mpu.get_context_parallel_world_size()
 
@@ -346,12 +324,8 @@ def slice_log_prob_with_cp(
     logit_start, _logit_end, response_offset = _response_logit_bounds(total_length, response_length)
     _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length)
 
-    chunk_1 = log_prob[
-        response_offset + logits_offset[0][0] - logit_start : response_offset + logits_offset[0][1] - logit_start
-    ]
-    chunk_2 = log_prob[
-        response_offset + logits_offset[1][0] - logit_start : response_offset + logits_offset[1][1] - logit_start
-    ]
+    chunk_1 = log_prob[response_offset + logits_offset[0][0] - logit_start : response_offset + logits_offset[0][1] - logit_start]
+    chunk_2 = log_prob[response_offset + logits_offset[1][0] - logit_start : response_offset + logits_offset[1][1] - logit_start]
 
     if isinstance(log_prob, list):
         return chunk_1 + chunk_2
@@ -400,10 +374,7 @@ def prepare_routed_experts_for_routing_replay(
         routed_experts = _pad_routed_experts(routed_experts, pad, num_experts)
         routed_experts = routed_experts.chunk(cp_size, dim=0)[cp_rank]
     else:
-        routed_experts = [
-            slice_with_cp(experts, lambda x, pad: _pad_routed_experts(x, pad, num_experts))
-            for experts in padded_experts
-        ]
+        routed_experts = [slice_with_cp(experts, lambda x, pad: _pad_routed_experts(x, pad, num_experts)) for experts in padded_experts]
         routed_experts = torch.cat(routed_experts, dim=0)
         pad = (pad_size - routed_experts.size(0) % pad_size) % pad_size
         routed_experts = _pad_routed_experts(routed_experts, pad, num_experts)

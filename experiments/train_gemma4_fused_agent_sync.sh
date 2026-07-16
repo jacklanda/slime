@@ -19,22 +19,17 @@ Options:
   --harness NAME                         Fused prompt harness: bare, cot, react, gem, unified_gem.
   --model PATH                           HF Gemma4 model path. Default: /share/nlp/share/plm/gemma-4-E2B-it.
   --disable-thinking BOOL                Stored in env for compatible fused code.
+  --discard-historical-thinking BOOL     Remove prior assistant <think> blocks before each new rollout step.
+                                         Effective only when --disable-thinking is false. Default: false.
   --mcp-disable-step-penalty BOOL        MCP verifier step-penalty env.
   --unified-system-prompt                Select unified_gem harness unless --harness is set later.
   --no-unified-system-prompt             Select gem harness unless --harness is set later.
-  --fully-async / --no-fully-async       Select fully-async rollout function. Default: disabled.
   --partial-rollout / --no-partial-rollout
                                          Recycle partial rollouts during abort/sync.
   --terminal-log-style STYLE             progress, rollouts, or both. Stored in env for compatible fused code.
   --show-rollout-progress-logs BOOL      Show periodic fused rollout request/progress logs. Default: false.
-  --accepted-group-update-min-groups N   Maps to ROLLOUT_BATCH_SIZE by default.
-  --accepted-group-update-max-groups N   Stored in env for compatible fused code.
   --micro-batch-size N                   Training micro-batch size.
   --update-weights-interval N            Rollout weight update interval. Default: 1.
-  --async-mini-batch-size N              Deprecated alias for --micro-batch-size.
-  --async-trigger-parameter-sync-step N  Deprecated alias for --update-weights-interval.
-  --async-fwd-bwd-group-size N           Deprecated no-op compatibility option.
-  --async-staleness-threshold X          Deprecated no-op compatibility option.
   --retrieval-mode MODE                  Retrieval mode env.
   --retrieval-max-words N                Retrieval max words env.
   --retrieval-retry-budget N             Retrieval retry env.
@@ -114,7 +109,6 @@ is_truthy() {
    esac
 }
 
-FULLY_ASYNC="${FULLY_ASYNC:-false}"
 PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
@@ -126,10 +120,9 @@ SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 COLOCATE="${COLOCATE:-false}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
-ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-16}"
-ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${ASYNC_MINI_BATCH_SIZE:-1}}"
-UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-1}}"
+DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 TAIL_GUARD="${TAIL_GUARD:-False}"
 TAIL_GUARD_TIME_GUARD="${TAIL_GUARD_TIME_GUARD:-True}"
@@ -204,23 +197,16 @@ while [ "$#" -gt 0 ]; do
       --harness) FUSED_HARNESS="${2:?Missing value for --harness}"; harness_explicit=true; shift 2 ;;
       --model) MODEL_DIR="${2:?Missing value for --model}"; shift 2 ;;
       --disable-thinking) DISABLE_THINKING="${2:?Missing value for --disable-thinking}"; shift 2 ;;
+      --discard-historical-thinking) DISCARD_HISTORICAL_THINKING="${2:?Missing value for --discard-historical-thinking}"; shift 2 ;;
       --mcp-disable-step-penalty) RLLM_MCP_DISABLE_STEP_PENALTY="${2:?Missing value for --mcp-disable-step-penalty}"; shift 2 ;;
       --unified-system-prompt) UNIFIED_SYSTEM_PROMPT=True; if [ "${harness_explicit}" = "false" ]; then FUSED_HARNESS=unified_gem; fi; shift ;;
       --no-unified-system-prompt) UNIFIED_SYSTEM_PROMPT=False; if [ "${harness_explicit}" = "false" ]; then FUSED_HARNESS=gem; fi; shift ;;
-      --fully-async) FULLY_ASYNC=true; shift ;;
-      --no-fully-async) FULLY_ASYNC=false; shift ;;
       --partial-rollout) PARTIAL_ROLLOUT=true; shift ;;
       --no-partial-rollout) PARTIAL_ROLLOUT=false; shift ;;
       --terminal-log-style) TERMINAL_LOG_STYLE="${2:?Missing value for --terminal-log-style}"; shift 2 ;;
       --show-rollout-progress-logs) SHOW_ROLLOUT_PROGRESS_LOGS="${2:?Missing value for --show-rollout-progress-logs}"; shift 2 ;;
-      --accepted-group-update-min-groups) ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${2:?Missing value for --accepted-group-update-min-groups}"; shift 2 ;;
-      --accepted-group-update-max-groups) ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${2:?Missing value for --accepted-group-update-max-groups}"; shift 2 ;;
       --micro-batch-size) MICRO_BATCH_SIZE="${2:?Missing value for --micro-batch-size}"; shift 2 ;;
       --update-weights-interval) UPDATE_WEIGHTS_INTERVAL="${2:?Missing value for --update-weights-interval}"; shift 2 ;;
-      --async-mini-batch-size) MICRO_BATCH_SIZE="${2:?Missing value for --async-mini-batch-size}"; shift 2 ;;
-      --async-trigger-parameter-sync-step) UPDATE_WEIGHTS_INTERVAL="${2:?Missing value for --async-trigger-parameter-sync-step}"; shift 2 ;;
-      --async-fwd-bwd-group-size) : "${2:?Missing value for --async-fwd-bwd-group-size}"; shift 2 ;;
-      --async-staleness-threshold) : "${2:?Missing value for --async-staleness-threshold}"; shift 2 ;;
       --retrieval-mode) RLLM_RETRIEVAL_MODE="${2:?Missing value for --retrieval-mode}"; shift 2 ;;
       --retrieval-max-words) RLLM_RETRIEVAL_MAX_WORDS="${2:?Missing value for --retrieval-max-words}"; shift 2 ;;
       --retrieval-retry-budget) RLLM_RETRIEVAL_RETRY_BUDGET="${2:?Missing value for --retrieval-retry-budget}"; shift 2 ;;
@@ -553,11 +539,7 @@ if ! is_truthy "${ENABLE_DYNAMIC_SAMPLING_FILTER}"; then
    DYNAMIC_SAMPLING_FILTER_PATH=""
 fi
 
-if [ "${FULLY_ASYNC,,}" = "true" ] || [ "${FULLY_ASYNC}" = "1" ]; then
-   ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.fully_async_rollout.generate_rollout_fully_async}"
-else
-   ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.sglang_rollout.generate_rollout}"
-fi
+ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.sglang_rollout.generate_rollout}"
 
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-${MAX_CONTEXT_LEN}}"
 if [ "${MAX_MODEL_LEN}" -ne "${MAX_CONTEXT_LEN}" ]; then
@@ -845,6 +827,7 @@ else
    export NUM_GPUS="${NUM_GPUS:-$((ACTOR_GPUS + ROLLOUT_GPUS))}"
 fi
 
+export CUDA_HOME="/cm/shared/apps/cuda12.9"
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-7200}"
@@ -892,6 +875,7 @@ export RLLM_MCP_DISABLE_STEP_PENALTY="${RLLM_MCP_DISABLE_STEP_PENALTY:-True}"
 export FUSED_HARNESS="${FUSED_HARNESS:-gem}"
 export FUSED_UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT}"
 export FUSED_DISABLE_THINKING="${DISABLE_THINKING}"
+export FUSED_DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING}"
 export FUSED_MAX_STEPS="${FUSED_MAX_STEPS:-${MAX_STEPS}}"
 export FUSED_MCP_MAX_STEPS="${FUSED_MCP_MAX_STEPS:-${MCP_MAX_STEPS}}"
 export FUSED_WEB_SEARCH_MAX_STEPS="${FUSED_WEB_SEARCH_MAX_STEPS:-${WEB_SEARCH_MAX_STEPS}}"
@@ -902,7 +886,6 @@ export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-2048}"
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE}"
 export SLIME_FUSED_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS}"
-export SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}"
 export SLIME_FUSED_TAIL_GUARD="${TAIL_GUARD}"
 export SLIME_FUSED_TAIL_GUARD_TIME_GUARD="${TAIL_GUARD_TIME_GUARD}"
 export SLIME_FUSED_TAIL_GUARD_TIME_MULTIPLIER="${TAIL_GUARD_TIME_MULTIPLIER}"
@@ -955,10 +938,11 @@ keys = (
     "RLLM_MCP_START_RETRIES", "RLLM_MCP_START_WAIT_TIMEOUT", "RLLM_MCP_TOOL_TIMEOUT",
     "RLLM_MCP_MAX_ACTIVE_SERVERS", "RLLM_MCP_PREFILTER_WORKERS", "RLLM_MCP_DISABLE_STEP_PENALTY",
     "FUSED_HARNESS", "FUSED_UNIFIED_SYSTEM_PROMPT", "FUSED_DISABLE_THINKING",
+    "FUSED_DISCARD_HISTORICAL_THINKING",
     "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS", "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "SLIME_ROLLOUT_GROUP_TIMEOUT", "SLIME_EVAL_ROLLOUT_GROUP_TIMEOUT",
     "PER_STEP_MAX_TOKENS", "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH",
-    "SLIME_FUSED_TERMINAL_LOG_STYLE", "SLIME_FUSED_PROGRESS_LOGS", "SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS",
+    "SLIME_FUSED_TERMINAL_LOG_STYLE", "SLIME_FUSED_PROGRESS_LOGS",
     "SLIME_FUSED_TAIL_GUARD", "SLIME_FUSED_TAIL_GUARD_TIME_GUARD",
     "SLIME_FUSED_TAIL_GUARD_TIME_MULTIPLIER", "SLIME_FUSED_TAIL_GUARD_TIME_SLACK_SECONDS",
     "SLIME_FUSED_TAIL_GUARD_MIN_COMPLETION_RATIO",
@@ -999,8 +983,8 @@ echo "Custom reward post-process: ${CUSTOM_REWARD_POST_PROCESS_PATH:-<vanilla>}"
 echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
 echo "Actor GPUs: ${ACTOR_GPUS}, rollout GPUs: ${ROLLOUT_GPUS}, colocate=${COLOCATE}, ray GPUs=${NUM_GPUS}"
 echo "SGLang concurrency: server=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}"
-echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
-echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; micro_batch=${MICRO_BATCH_SIZE}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}"
+echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
+echo "Training batches: micro_batch=${MICRO_BATCH_SIZE}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}"
 echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"
 echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, relax_after_groups=${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}"
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}"

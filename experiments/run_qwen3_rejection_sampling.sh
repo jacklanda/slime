@@ -40,6 +40,8 @@ Fused-agent options, aligned with train_fused_agent_sync.sh:
   --no-unified-system-prompt         Select gem harness unless --harness is set later.
   --model PATH                       HF model path.
   --disable-thinking BOOL            FUSED_DISABLE_THINKING. Default: true
+  --discard-historical-thinking BOOL Remove prior assistant <think> blocks before each new rollout step.
+                                     Effective only when --disable-thinking is false. Default: false
   --max-steps N                      Fused agent max steps. Default: 128
   --mcp-max-steps N                  MCP max steps. Default: 128
   --web-search-max-steps N           Web-search max steps. Default: 128
@@ -123,6 +125,7 @@ SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
+DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
 FUSED_HARNESS="${FUSED_HARNESS:-gem}"
 harness_explicit=false
 
@@ -197,6 +200,7 @@ while [ "$#" -gt 0 ]; do
       --no-unified-system-prompt) UNIFIED_SYSTEM_PROMPT=False; if [ "${harness_explicit}" = "false" ]; then FUSED_HARNESS=gem; fi; shift ;;
       --model) MODEL_DIR="${2:?Missing value for --model}"; shift 2 ;;
       --disable-thinking) DISABLE_THINKING="${2:?Missing value for --disable-thinking}"; shift 2 ;;
+      --discard-historical-thinking) DISCARD_HISTORICAL_THINKING="${2:?Missing value for --discard-historical-thinking}"; shift 2 ;;
       --max-steps) MAX_STEPS="${2:?Missing value for --max-steps}"; shift 2 ;;
       --mcp-max-steps) MCP_MAX_STEPS="${2:?Missing value for --mcp-max-steps}"; shift 2 ;;
       --web-search-max-steps) WEB_SEARCH_MAX_STEPS="${2:?Missing value for --web-search-max-steps}"; shift 2 ;;
@@ -406,6 +410,7 @@ fi
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l || true)
 HAS_NVLINK=$([ "${NVLINK_COUNT}" -gt 0 ] && echo 1 || echo 0)
 
+export CUDA_HOME="/cm/shared/apps/cuda12.9"
 export SCRIPT_DIR REPO_ROOT MEGATRON_LM_PATH HAS_NVLINK
 export SLIME_EPISODE_LOG_DIR="${EPISODE_LOG_DIR}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
@@ -451,6 +456,7 @@ export RLLM_MCP_DISABLE_STEP_PENALTY="${RLLM_MCP_DISABLE_STEP_PENALTY:-True}"
 export FUSED_HARNESS="${FUSED_HARNESS}"
 export FUSED_UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT}"
 export FUSED_DISABLE_THINKING="${DISABLE_THINKING}"
+export FUSED_DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING}"
 export FUSED_MAX_STEPS="${FUSED_MAX_STEPS:-${MAX_STEPS}}"
 export FUSED_MCP_MAX_STEPS="${FUSED_MCP_MAX_STEPS:-${MCP_MAX_STEPS}}"
 export FUSED_WEB_SEARCH_MAX_STEPS="${FUSED_WEB_SEARCH_MAX_STEPS:-${WEB_SEARCH_MAX_STEPS}}"
@@ -501,7 +507,8 @@ keys = (
     "RLLM_MCP_INIT_TIMEOUT", "RLLM_MCP_START_RETRIES", "RLLM_MCP_START_WAIT_TIMEOUT",
     "RLLM_MCP_TOOL_TIMEOUT", "RLLM_MCP_MAX_ACTIVE_SERVERS", "RLLM_MCP_PREFILTER_WORKERS",
     "RLLM_MCP_DISABLE_STEP_PENALTY", "FUSED_HARNESS", "FUSED_UNIFIED_SYSTEM_PROMPT",
-    "FUSED_DISABLE_THINKING", "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS",
+    "FUSED_DISABLE_THINKING", "FUSED_DISCARD_HISTORICAL_THINKING",
+    "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS",
     "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "PER_STEP_MAX_TOKENS",
     "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH", "SLIME_FUSED_TERMINAL_LOG_STYLE",
@@ -614,7 +621,7 @@ echo "Output: ${OUTPUT_DIR}"
 echo "Prompt data: ${PROMPT_DATA}; rows=${TRAIN_NUM_ROWS}; rollout_batch_size=${ROLLOUT_BATCH_SIZE}; sample_n=${SAMPLE_N}; num_rollout=${NUM_ROLLOUT}; start_rollout_id=${RESUME_START_ROLLOUT_ID}"
 echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
 echo "Rollout concurrency: fully_async_group_concurrency=${FULLY_ASYNC_GROUP_CONCURRENCY}; effective_group_concurrency=${FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY}; rollout_num_engines=${ROLLOUT_NUM_ENGINES}; sglang_server_concurrency=${SGLANG_SERVER_CONCURRENCY}; explicit_sglang_server_concurrency=${SGLANG_SERVER_CONCURRENCY_EXPLICIT}"
-echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${MAX_STEPS}, mcp_max_steps=${MCP_MAX_STEPS}, web_search_max_steps=${WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
+echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}, max_steps=${MAX_STEPS}, mcp_max_steps=${MCP_MAX_STEPS}, web_search_max_steps=${WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
 echo "Debug rollout dump: ${DUMP_DETAILS}/rollout_data/{rollout_id}.pt"
 echo "Per-batch trajectory shards: ${EPISODE_LOG_DIR}/global_steps_{rollout_id}.json"
 echo "Checkpoint: ${OFFLINE_RS_CHECKPOINT_PATH}"

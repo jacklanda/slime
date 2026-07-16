@@ -34,6 +34,7 @@ from slime.utils.metric_utils import (
     dict_add_prefix,
 )
 from slime.utils.misc import Box, group_by, load_function
+from slime.utils.prompt_equal import PROMPT_EQUAL_LOSS_ESTIMATORS, has_multi_segment_trajectories, process_segment_rewards, prompt_equal_mask_sums, uses_prompt_equal_loss
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -121,6 +122,11 @@ def _post_process_rewards(args, samples: list[Sample], custom_reward_post_proces
         return custom_reward_post_process_func(args, samples)
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    if uses_prompt_equal_loss(samples) or has_multi_segment_trajectories(samples):
+        # Trajectory-anchor normalization + sibling broadcast: needed both for
+        # the prompt-equal loss scheme and for plain TiTO forks, which must vote
+        # once per trajectory in group normalization.
+        return raw_rewards, process_segment_rewards(args, samples, raw_rewards, raw_rewards)
     if args.advantage_estimator in ["grpo", "gspo", "cispo", "reinforce_plus_plus_baseline"] and args.rewards_normalization:
         # group norm
         rewards = torch.tensor(raw_rewards, dtype=torch.float)
@@ -227,18 +233,27 @@ def convert_samples_to_train_data(
     #   sample in sample i's rollout. Used as the reducer's denominator
     #   so summing partial contributions across mbs yields one
     #   token-weighted mean per rollout.
+    # Prompt-equal multi-segment samples replace that denominator with
+    # M_P * N_P / global_batch_size for GRPO / Reinforce++ baseline.
     rollout_id_list = train_data["rollout_ids"]
     mask_sums_per_sample = [sum(m) for m in loss_masks]
-    rollout_total_mask: dict[int, int] = {}
-    for rid, ms in zip(rollout_id_list, mask_sums_per_sample, strict=True):
-        rollout_total_mask[rid] = rollout_total_mask.get(rid, 0) + ms
-    train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id_list]
+    prompt_equal_loss = uses_prompt_equal_loss(samples) and getattr(args, "advantage_estimator", None) in PROMPT_EQUAL_LOSS_ESTIMATORS
+    if prompt_equal_loss:
+        train_data["rollout_mask_sums"] = prompt_equal_mask_sums(args, samples, loss_masks, rollout_id_list)
+    else:
+        rollout_total_mask: dict[int, int] = {}
+        for rid, ms in zip(rollout_id_list, mask_sums_per_sample, strict=True):
+            rollout_total_mask[rid] = rollout_total_mask.get(rid, 0) + ms
+        train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id_list]
     if has_explicit_policy_mask:
-        policy_mask_sums_per_sample = [sum(m) for m in policy_loss_masks]
-        policy_rollout_total_mask: dict[int, int] = {}
-        for rid, ms in zip(rollout_id_list, policy_mask_sums_per_sample, strict=True):
-            policy_rollout_total_mask[rid] = policy_rollout_total_mask.get(rid, 0) + ms
-        train_data["policy_rollout_mask_sums"] = [policy_rollout_total_mask[rid] for rid in rollout_id_list]
+        if prompt_equal_loss:
+            train_data["policy_rollout_mask_sums"] = prompt_equal_mask_sums(args, samples, policy_loss_masks, rollout_id_list)
+        else:
+            policy_mask_sums_per_sample = [sum(m) for m in policy_loss_masks]
+            policy_rollout_total_mask: dict[int, int] = {}
+            for rid, ms in zip(rollout_id_list, policy_mask_sums_per_sample, strict=True):
+                policy_rollout_total_mask[rid] = policy_rollout_total_mask.get(rid, 0) + ms
+            train_data["policy_rollout_mask_sums"] = [policy_rollout_total_mask[rid] for rid in rollout_id_list]
     train_data["episode_metrics_data"] = {
         "group_indices": [sample.group_index for sample in samples],
         "rollout_ids": rollout_ids,
@@ -977,11 +992,7 @@ class RolloutManager:
             rollout_log_probs := _collect_optional_sample_attr(
                 samples,
                 "rollout_log_probs",
-                required=(
-                    getattr(self.args, "use_rollout_logprobs", False)
-                    or getattr(self.args, "use_tis", False)
-                    or getattr(self.args, "get_mismatch_metrics", False)
-                ),
+                required=(getattr(self.args, "use_rollout_logprobs", False) or getattr(self.args, "use_tis", False) or getattr(self.args, "get_mismatch_metrics", False)),
             )
         ) is not None:
             train_data["rollout_log_probs"] = rollout_log_probs
@@ -1452,20 +1463,9 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
 
     # Expose per-model router info for custom rollout functions.
     args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
-    args.sglang_model_engine_urls = {
-        name: [
-            url
-            for group in srv.server_groups
-            if group.worker_type == "regular"
-            for url in group.engine_urls
-            if url is not None
-        ]
-        for name, srv in servers.items()
-    }
+    args.sglang_model_engine_urls = {name: [url for group in srv.server_groups if group.worker_type == "regular" for url in group.engine_urls if url is not None] for name, srv in servers.items()}
     default_model_name = next(iter(servers), None)
-    args.sglang_engine_urls = (
-        args.sglang_model_engine_urls.get(default_model_name, []) if default_model_name is not None else []
-    )
+    args.sglang_engine_urls = args.sglang_model_engine_urls.get(default_model_name, []) if default_model_name is not None else []
 
     return servers, pending_init_handles
 
@@ -1544,10 +1544,7 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
 
 
 def _format_eval_log_dict_for_display(log_dict: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: round(float(value) * 100, 1) if _is_eval_percentage_metric(key, value) else value
-        for key, value in log_dict.items()
-    }
+    return {key: round(float(value) * 100, 1) if _is_eval_percentage_metric(key, value) else value for key, value in log_dict.items()}
 
 
 def _is_eval_percentage_metric(key: str, value: Any) -> bool:
@@ -1619,11 +1616,7 @@ def _compute_eval_source_metrics(samples: list[Sample], rewards: list[float], gr
 
 def _eval_sample_steps(sample: Sample) -> float | None:
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-    return _coerce_finite_float(
-        metadata.get("fused_traj_steps")
-        if metadata.get("fused_traj_steps") is not None
-        else metadata.get("traj_steps")
-    )
+    return _coerce_finite_float(metadata.get("fused_traj_steps") if metadata.get("fused_traj_steps") is not None else metadata.get("traj_steps"))
 
 
 def _eval_sample_tool_calls(sample: Sample) -> float | None:
@@ -1692,11 +1685,7 @@ def compute_metrics_from_samples(args, samples):
     for sample in samples:
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
         compact_prompt_length = metadata.get("fused_prompt_length_tokens")
-        prompt_lengths.append(
-            int(compact_prompt_length)
-            if compact_prompt_length is not None
-            else len(sample.tokens) - sample.response_length
-        )
+        prompt_lengths.append(int(compact_prompt_length) if compact_prompt_length is not None else len(sample.tokens) - sample.response_length)
 
     log_dict = {}
     response_length_stats = compute_statistics(response_lengths)
@@ -1770,6 +1759,26 @@ def _collect_fused_agent_stats(args, all_samples: list[Sample]):
     if not any(isinstance(sample.metadata, dict) and "fused_task_type" in sample.metadata for sample in all_samples):
         return None
 
+    # Segment metadata is trajectory-level, and raw reward lives on the terminal
+    # segment. Select exactly one terminal representative for each segmented
+    # trajectory before computing reward, termination, or workflow metrics.
+    representative_positions: dict[str, int] = {}
+    representative_segment_indices: dict[str, int] = {}
+    unsegmented_positions: list[int] = []
+    for pos, sample in enumerate(all_samples):
+        metadata = sample.metadata or {}
+        parent_traj_id = metadata.get("parent_traj_id")
+        if parent_traj_id is None:
+            unsegmented_positions.append(pos)
+            continue
+        trajectory_id = str(parent_traj_id)
+        segment_index = int(metadata.get("segment_index", 0) or 0)
+        if trajectory_id not in representative_positions or segment_index >= representative_segment_indices[trajectory_id]:
+            representative_positions[trajectory_id] = pos
+            representative_segment_indices[trajectory_id] = segment_index
+
+    metric_samples = [all_samples[pos] for pos in [*representative_positions.values(), *unsegmented_positions]]
+
     group_rewards: dict[Any, list[float]] = {}
     group_task_types: dict[Any, str] = {}
     terminations: list[str] = []
@@ -1778,10 +1787,12 @@ def _collect_fused_agent_stats(args, all_samples: list[Sample]):
     group_steps: dict[Any, float] = {}
     group_tool_call_turns: dict[Any, float] = {}
 
-    for pos, sample in enumerate(all_samples):
+    for pos, sample in enumerate(metric_samples):
         metadata = sample.metadata or {}
         reward = float(sample.get_reward_value(args))
-        group_id = sample.group_index if sample.group_index is not None else sample.rollout_id
+        group_id = metadata.get("parent_traj_id")
+        if group_id is None:
+            group_id = sample.group_index if sample.group_index is not None else sample.rollout_id
         if group_id is None:
             group_id = sample.index if sample.index is not None else pos
         group_rewards.setdefault(group_id, []).append(reward)
@@ -2016,9 +2027,7 @@ def _compute_top_p_kept_vocab_metrics(args, all_samples: list[Sample]):
         offsets = torch.as_tensor(offsets, dtype=torch.int64)
         if offsets.numel() == 0:
             continue
-        assert (
-            offsets.numel() == sample.response_length + 1
-        ), f"top-p token offsets length {offsets.numel()} != response length + 1 {sample.response_length + 1}"
+        assert offsets.numel() == sample.response_length + 1, f"top-p token offsets length {offsets.numel()} != response length + 1 {sample.response_length + 1}"
         if sample.remove_sample:
             continue
         if sample.loss_mask is None:
@@ -2026,9 +2035,7 @@ def _compute_top_p_kept_vocab_metrics(args, all_samples: list[Sample]):
             total_tokens += sample.response_length
             continue
         loss_mask = torch.as_tensor(sample.loss_mask, dtype=torch.bool, device=offsets.device)
-        assert (
-            loss_mask.numel() == sample.response_length
-        ), f"loss mask length {loss_mask.numel()} != response length {sample.response_length}"
+        assert loss_mask.numel() == sample.response_length, f"loss mask length {loss_mask.numel()} != response length {sample.response_length}"
         total_kept += int(torch.diff(offsets)[loss_mask].sum())
         total_tokens += int(loss_mask.sum())
     if total_tokens == 0:

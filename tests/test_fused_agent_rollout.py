@@ -88,18 +88,11 @@ class FakeGemma4Tokenizer:
                     body += f"<|tool>{Gemma4ToolParser._format_function_declaration(schema)}<tool|>"
             for tool_call in message.get("tool_calls") or []:
                 function = tool_call.get("function", tool_call)
-                body += (
-                    f"<|tool_call>call:{function['name']}"
-                    f"{Gemma4ToolParser._format_argument(function.get('arguments') or {}, escape_keys=False)}"
-                    "<tool_call|>"
-                )
+                body += f"<|tool_call>call:{function['name']}" f"{Gemma4ToolParser._format_argument(function.get('arguments') or {}, escape_keys=False)}" "<tool_call|>"
             if message.get("tool_responses"):
                 body += "<|tool_response>"
                 for response in message["tool_responses"]:
-                    body += (
-                        f"response:{response['name']}"
-                        f"{Gemma4ToolParser._format_argument(response.get('response') or {}, escape_keys=False)}"
-                    )
+                    body += f"response:{response['name']}" f"{Gemma4ToolParser._format_argument(response.get('response') or {}, escape_keys=False)}"
                 body += "<tool_response|>"
             body += content
             chunks.append(f"<|turn>{role}\n{body}<turn|>\n")
@@ -128,6 +121,7 @@ def _run_generate_with_fake_sglang(
     *,
     evaluation: bool = False,
     tokenizer=None,
+    prompt_ids_seen: list[list[int]] | None = None,
 ):
     async def fake_call_sglang(
         args,
@@ -141,6 +135,8 @@ def _run_generate_with_fake_sglang(
         context_token_count=None,
         server_url=None,
     ):
+        if prompt_ids_seen is not None:
+            prompt_ids_seen.append(list(prompt_ids))
         item = calls.pop(0)
         text = item["text"]
         return {
@@ -388,12 +384,7 @@ def test_qwen3_coder_parser_parses_xml_calls_with_schema_coercion():
     assert raw[calls[0].start : calls[0].end].startswith("<tool_call>")
 
     action_text = parser.format_action(calls[0])
-    assert action_text == (
-        "<tool_call>\n<function=web_search>\n"
-        "<parameter=query>\nsenior comic artist\n</parameter>\n"
-        "<parameter=max_results>\n4\n</parameter>\n"
-        "</function>\n</tool_call>"
-    )
+    assert action_text == ("<tool_call>\n<function=web_search>\n" "<parameter=query>\nsenior comic artist\n</parameter>\n" "<parameter=max_results>\n4\n</parameter>\n" "</function>\n</tool_call>")
     assert parser.parse(action_text)[0].arguments == {"query": "senior comic artist", "max_results": 4}
 
 
@@ -402,12 +393,7 @@ def test_initial_messages_configure_runtime_qwen35_parser_schema():
     parser = make_tool_parser("Qwen3.5-4B", valid_tools={"web_search", "finish", "submit"})
 
     _initial_messages("gem", "webqa", "question", tools, "Qwen3.5-4B", tool_parser=parser)
-    call = parser.parse(
-        "<tool_call>\n<function=web_search>\n"
-        "<parameter=query>\nquery\n</parameter>\n"
-        "<parameter=max_results>\n10\n</parameter>\n"
-        "</function>\n</tool_call>"
-    )[0]
+    call = parser.parse("<tool_call>\n<function=web_search>\n" "<parameter=query>\nquery\n</parameter>\n" "<parameter=max_results>\n10\n</parameter>\n" "</function>\n</tool_call>")[0]
 
     assert call.arguments == {"query": "query", "max_results": 10}
 
@@ -417,12 +403,7 @@ def test_qwen3_coder_parser_accepts_colon_before_integer_value():
     parser = make_tool_parser("Qwen3.5-4B", valid_tools={"web_search"})
     parser.get_tool_prompt("\n".join(json.dumps(t, indent=0, ensure_ascii=False) for t in tools))
 
-    call = parser.parse(
-        "<tool_call>\n<function=web_search>\n"
-        "<parameter=query>\n: 10\n</parameter>\n"
-        "<parameter=max_results>\n: 10\n</parameter>\n"
-        "</function>\n</tool_call>"
-    )[0]
+    call = parser.parse("<tool_call>\n<function=web_search>\n" "<parameter=query>\n: 10\n</parameter>\n" "<parameter=max_results>\n: 10\n</parameter>\n" "</function>\n</tool_call>")[0]
 
     assert call.arguments == {"query": ": 10", "max_results": 10}
 
@@ -446,7 +427,7 @@ def test_gemma4_tool_prompt_uses_native_declarations():
     prompt = parser.get_tool_prompt("\n".join(json.dumps(t, indent=0, ensure_ascii=False) for t in tools))
 
     assert "<|tool>declaration:web_search{" in prompt
-    assert "query:{description:<|\"|>Search query.<|\"|>,type:<|\"|>STRING<|\"|>}" in prompt
+    assert 'query:{description:<|"|>Search query.<|"|>,type:<|"|>STRING<|"|>}' in prompt
     assert "<|tool_call>call:TOOL_NAME{" in prompt
     assert "<tool_call|><|tool_response>" in prompt
 
@@ -500,24 +481,15 @@ def test_gemma4_tool_prompt_formats_complex_json_schema_without_python_repr():
     declaration = Gemma4ToolParser._format_function_declaration(schema)
 
     assert '<|"|>display name<|"|>:{description:<|"|>Human readable name<|"|>,type:<|"|>STRING<|"|>}' in declaration
-    assert "maybe:{description:<|\"|>Optional text<|\"|>,type:[<|\"|>STRING<|\"|>,<|\"|>NULL<|\"|>]}" in declaration
-    assert (
-        "nums:{description:<|\"|>Numbers<|\"|>,default:[1,2],items:{minimum:1,type:<|\"|>INTEGER<|\"|>},"
-        "minItems:1,maxItems:4,type:<|\"|>ARRAY<|\"|>}"
-    ) in declaration
-    assert "pair:{items:[{type:<|\"|>STRING<|\"|>},{type:<|\"|>INTEGER<|\"|>}],type:<|\"|>ARRAY<|\"|>}" in declaration
-    assert "mode:{anyOf:[{enum:[<|\"|>fast<|\"|>,<|\"|>safe<|\"|>],type:<|\"|>STRING<|\"|>},{type:<|\"|>NULL<|\"|>}]}" in declaration
-    assert "payload:{additionalProperties:{type:<|\"|>STRING<|\"|>},type:<|\"|>OBJECT<|\"|>}" in declaration
-    assert "profile:{$ref:<|\"|>#/$defs/Profile<|\"|>}" in declaration
-    assert "sealed:{additionalProperties:false,type:<|\"|>OBJECT<|\"|>}" in declaration
-    assert (
-        "token:{const:<|\"|>ok<|\"|>,$defs:{Alias:{description:<|\"|>Short name<|\"|>,type:<|\"|>STRING<|\"|>}},"
-        "pattern:<|\"|>^[a-z]+$<|\"|>,minLength:2,maxLength:8,type:<|\"|>STRING<|\"|>}"
-    ) in declaration
-    assert (
-        "$defs:{Profile:{properties:{age:{type:<|\"|>INTEGER<|\"|>},name:{type:<|\"|>STRING<|\"|>}},"
-        "required:[<|\"|>name<|\"|>],type:<|\"|>OBJECT<|\"|>}}"
-    ) in declaration
+    assert 'maybe:{description:<|"|>Optional text<|"|>,type:[<|"|>STRING<|"|>,<|"|>NULL<|"|>]}' in declaration
+    assert ('nums:{description:<|"|>Numbers<|"|>,default:[1,2],items:{minimum:1,type:<|"|>INTEGER<|"|>},' 'minItems:1,maxItems:4,type:<|"|>ARRAY<|"|>}') in declaration
+    assert 'pair:{items:[{type:<|"|>STRING<|"|>},{type:<|"|>INTEGER<|"|>}],type:<|"|>ARRAY<|"|>}' in declaration
+    assert 'mode:{anyOf:[{enum:[<|"|>fast<|"|>,<|"|>safe<|"|>],type:<|"|>STRING<|"|>},{type:<|"|>NULL<|"|>}]}' in declaration
+    assert 'payload:{additionalProperties:{type:<|"|>STRING<|"|>},type:<|"|>OBJECT<|"|>}' in declaration
+    assert 'profile:{$ref:<|"|>#/$defs/Profile<|"|>}' in declaration
+    assert 'sealed:{additionalProperties:false,type:<|"|>OBJECT<|"|>}' in declaration
+    assert ('token:{const:<|"|>ok<|"|>,$defs:{Alias:{description:<|"|>Short name<|"|>,type:<|"|>STRING<|"|>}},' 'pattern:<|"|>^[a-z]+$<|"|>,minLength:2,maxLength:8,type:<|"|>STRING<|"|>}') in declaration
+    assert ('$defs:{Profile:{properties:{age:{type:<|"|>INTEGER<|"|>},name:{type:<|"|>STRING<|"|>}},' 'required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}') in declaration
     assert 'definitions:{<|"|>legacy type<|"|>:{enum:[<|"|>old<|"|>],type:<|"|>STRING<|"|>}}' in declaration
     assert "['STRING', 'NULL']" not in declaration
 
@@ -525,9 +497,7 @@ def test_gemma4_tool_prompt_formats_complex_json_schema_without_python_repr():
 def test_gemma4_tool_parser_parses_native_calls_and_formats_observation():
     parser = make_tool_parser("gemma4", valid_tools={"web_search", "finish", "submit"})
 
-    calls = parser.parse(
-        '<|tool_call>call:web_search{query:<|"|>Tokyo weather<|"|>,max_results:3}<tool_call|><|tool_response>'
-    )
+    calls = parser.parse('<|tool_call>call:web_search{query:<|"|>Tokyo weather<|"|>,max_results:3}<tool_call|><|tool_response>')
 
     assert len(calls) == 1
     assert calls[0].name == "web_search"
@@ -611,9 +581,7 @@ def test_gemma4_tool_parser_formats_multiple_tool_responses():
 def test_gemma4_tool_parser_handles_nested_arguments_and_finish_alias():
     parser = make_tool_parser("gemma_4", valid_tools={"finish", "submit"})
 
-    calls = parser.parse(
-        '<|tool_call>call:submit{command:<|"|>submit<|"|>,result:{answer:<|"|>42<|"|>,sources:[<|"|>a<|"|>,<|"|>b<|"|>]}}<tool_call|>'
-    )
+    calls = parser.parse('<|tool_call>call:submit{command:<|"|>submit<|"|>,result:{answer:<|"|>42<|"|>,sources:[<|"|>a<|"|>,<|"|>b<|"|>]}}<tool_call|>')
 
     assert calls[0].name == "finish"
     assert calls[0].arguments == {"command": "submit", "result": {"answer": "42", "sources": ["a", "b"]}}
@@ -622,9 +590,7 @@ def test_gemma4_tool_parser_handles_nested_arguments_and_finish_alias():
 def test_gemma4_tool_parser_accepts_python_style_bare_literals():
     parser = make_tool_parser("gemma4", valid_tools={"set_flags"})
 
-    calls = parser.parse(
-        '<|tool_call>call:set_flags{enabled:True,disabled:False,missing:None,quoted:"True"}<tool_call|>'
-    )
+    calls = parser.parse('<|tool_call>call:set_flags{enabled:True,disabled:False,missing:None,quoted:"True"}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].name == "set_flags"
@@ -639,9 +605,7 @@ def test_gemma4_tool_parser_accepts_python_style_bare_literals():
 def test_gemma4_tool_parser_does_not_truncate_braces_inside_strings():
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
-    calls = parser.parse(
-        '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>The answer is \\boxed{Chacruna}. {"ok": true}<|"|>}<tool_call|><|tool_response>'
-    )
+    calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>The answer is \\boxed{Chacruna}. {"ok": true}<|"|>}<tool_call|><|tool_response>')
 
     assert len(calls) == 1
     assert calls[0].name == "finish"
@@ -649,9 +613,7 @@ def test_gemma4_tool_parser_does_not_truncate_braces_inside_strings():
         "command": "submit",
         "result": 'The answer is \\boxed{Chacruna}. {"ok": true}',
     }
-    assert calls[0].end == calls[0].start + len(
-        '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>The answer is \\boxed{Chacruna}. {"ok": true}<|"|>}<tool_call|>'
-    )
+    assert calls[0].end == calls[0].start + len('<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>The answer is \\boxed{Chacruna}. {"ok": true}<|"|>}<tool_call|>')
 
 
 def test_gemma4_tool_parser_parses_logged_finish_call():
@@ -668,9 +630,7 @@ def test_gemma4_tool_parser_repairs_finish_command_missing_native_quote_before_r
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:finish{command:<|"|>submit,result:<|"|>answer<|"|>}<tool_call|><|tool_response>'
-        )
+        calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit,result:<|"|>answer<|"|>}<tool_call|><|tool_response>')
 
     assert len(calls) == 1
     assert calls[0].name == "finish"
@@ -682,9 +642,7 @@ def test_gemma4_tool_parser_repairs_finish_command_value_before_result(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:finish{command:<|"|>finish,result:<|"|>answer<|"|>}<tool_call|><|tool_response>'
-        )
+        calls = parser.parse('<|tool_call>call:finish{command:<|"|>finish,result:<|"|>answer<|"|>}<tool_call|><|tool_response>')
 
     assert len(calls) == 1
     assert calls[0].name == "finish"
@@ -696,10 +654,7 @@ def test_gemma4_tool_parser_repairs_finish_result_with_extra_native_marker(caplo
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
-            'result:<|"|>The literal marker <|"|> appeared in prose.<|"|>}<tool_call|>'
-        )
+        calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit<|"|>,' 'result:<|"|>The literal marker <|"|> appeared in prose.<|"|>}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].arguments == {
@@ -713,9 +668,7 @@ def test_gemma4_tool_parser_repairs_missing_command_quote_with_json_quoted_resul
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:finish{command:<|"|>submit,result:"Could not identify \\"Creek E\\"."}<tool_call|>'
-        )
+        calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit,result:"Could not identify \\"Creek E\\"."}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "submit", "result": 'Could not identify \\"Creek E\\".'}
@@ -726,9 +679,7 @@ def test_gemma4_tool_parser_repairs_finish_function_like_command_payload(caplog)
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:finish{command:<|"|>finish(result="I am unable to identify it.")"}<tool_call|>'
-        )
+        calls = parser.parse('<|tool_call>call:finish{command:<|"|>finish(result="I am unable to identify it.")"}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "finish", "result": "I am unable to identify it."}
@@ -739,9 +690,7 @@ def test_gemma4_tool_parser_repairs_finish_newline_command_payload(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:finish{command:<|"|>finish\nThe question asks for a gene.}<tool_call|>'
-        )
+        calls = parser.parse('<|tool_call>call:finish{command:<|"|>finish\nThe question asks for a gene.}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "finish", "result": "The question asks for a gene."}
@@ -752,9 +701,7 @@ def test_gemma4_tool_parser_repairs_finish_braced_result_payload(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:finish{command:<|"|>finish{result:<|"|>Wordian formation<|"|>}}<tool_call|>'
-        )
+        calls = parser.parse('<|tool_call>call:finish{command:<|"|>finish{result:<|"|>Wordian formation<|"|>}}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "finish", "result": "Wordian formation"}
@@ -765,9 +712,7 @@ def test_gemma4_tool_parser_repairs_finish_json_answer_payload(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:finish{command:<|"|>submit,{"answer":"High Performance Fortran"}}<tool_call|>'
-        )
+        calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit,{"answer":"High Performance Fortran"}}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "submit", "result": "High Performance Fortran"}
@@ -778,9 +723,7 @@ def test_gemma4_tool_parser_repairs_incomplete_finish_json_answer_payload(caplog
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:finish{command:<|"|>submit,{"answer":"High Performance Fortran}<tool_call|>'
-        )
+        calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit,{"answer":"High Performance Fortran}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "submit", "result": "High Performance Fortran"}
@@ -791,10 +734,7 @@ def test_gemma4_tool_parser_repairs_instruction_like_finish_command(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:finish{command:<|"|>Finish the task and submit the final result with the synthesized answer.<|"|>,'
-            'result:<|"|>Journal of Hand Surgery<|"|>}<tool_call|>'
-        )
+        calls = parser.parse('<|tool_call>call:finish{command:<|"|>Finish the task and submit the final result with the synthesized answer.<|"|>,' 'result:<|"|>Journal of Hand Surgery<|"|>}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "submit", "result": "Journal of Hand Surgery"}
@@ -805,10 +745,7 @@ def test_gemma4_tool_parser_repairs_function_like_command_argument(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:finish{command:<|"|>finish(command="Which theory was used with Classical Laminate Theory?")<|"|>,'
-            'result="The provided search results do not name it}<tool_call|>'
-        )
+        calls = parser.parse('<|tool_call>call:finish{command:<|"|>finish(command="Which theory was used with Classical Laminate Theory?")<|"|>,' 'result="The provided search results do not name it}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].arguments == {
@@ -822,11 +759,7 @@ def test_gemma4_tool_parser_repairs_unclosed_finish_result(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:finish{command:<|"|>Please synthesize the search results to answer the question.<|"|>,'
-            'result:<|"|>Based on the search results, the relevant journal is Journal of Hand Surgery'
-            '<tool_call|>'
-        )
+        calls = parser.parse('<|tool_call>call:finish{command:<|"|>Please synthesize the search results to answer the question.<|"|>,' 'result:<|"|>Based on the search results, the relevant journal is Journal of Hand Surgery' "<tool_call|>")
 
     assert len(calls) == 1
     assert calls[0].arguments == {
@@ -840,9 +773,7 @@ def test_gemma4_tool_parser_repairs_web_search_query_equals(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"web_search"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:web_search{query="Greek phrase primary manuscript authority"}<tool_call|>'
-        )
+        calls = parser.parse('<|tool_call>call:web_search{query="Greek phrase primary manuscript authority"}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].arguments == {"query": "Greek phrase primary manuscript authority"}
@@ -853,9 +784,7 @@ def test_gemma4_tool_parser_repairs_web_search_query_with_extra_quotes(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"web_search"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse(
-            '<|tool_call>call:web_search{query:<|"|>EEG system adaptive gain control neuronal populations daily imaging"""}<tool_call|>'
-        )
+        calls = parser.parse('<|tool_call>call:web_search{query:<|"|>EEG system adaptive gain control neuronal populations daily imaging"""}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].arguments == {"query": "EEG system adaptive gain control neuronal populations daily imaging"}
@@ -881,9 +810,7 @@ def test_gemma4_tool_parser_accepts_json_like_quoted_arguments():
 def test_gemma4_tool_parser_decodes_json_like_unicode_escapes():
     parser = make_tool_parser("gemma4", valid_tools={"echo"})
 
-    calls = parser.parse(
-        '<|tool_call>call:echo{text:"\\u003cscript\\u003e",emoji:"\\ud83d\\ude00"}<tool_call|>'
-    )
+    calls = parser.parse('<|tool_call>call:echo{text:"\\u003cscript\\u003e",emoji:"\\ud83d\\ude00"}<tool_call|>')
 
     assert len(calls) == 1
     assert calls[0].arguments == {"text": "<script>", "emoji": "😀"}
@@ -1071,9 +998,7 @@ def test_explicit_model_series_overrides_noncanonical_checkpoint_path(monkeypatc
 
     monkeypatch.setenv("FUSED_MODEL_SERIES", "qwen3")
     assert type(make_tool_parser(checkpoint)) is QwenToolParser
-    assert '{"name": <function-name>, "arguments": <args-json-object>}' in build_system_prompt(
-        FUSED_SEARCH_SYSTEM_PROMPT, tools, checkpoint
-    )
+    assert '{"name": <function-name>, "arguments": <args-json-object>}' in build_system_prompt(FUSED_SEARCH_SYSTEM_PROMPT, tools, checkpoint)
 
 
 def test_invalid_explicit_model_series_fails_closed(monkeypatch):
@@ -1176,6 +1101,65 @@ BASE_DIR = Path(__file__).parent.parent
     env = FusedEnvironment({"question": "Read data", "tools_py": str(asset / "tools.py")})
 
     assert env.mcp_tools.call("read_first", {}) == json.dumps({"value": "first"})
+
+
+def test_local_mcp_tools_resolve_relative_data_paths_from_asset_directory(tmp_path: Path):
+    asset = tmp_path / "asset"
+    data = asset / "data"
+    data.mkdir(parents=True)
+    (data / "value.json").write_text('{"value": "asset"}', encoding="utf-8")
+    (asset / "tools.py").write_text(
+        """
+import json
+from pathlib import Path
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("Tools")
+
+@mcp.tool(description="Read a generated relative data path")
+def read_relative() -> dict:
+    with open(Path("data/value.json"), encoding="utf-8") as file:
+        return json.load(file)
+""",
+        encoding="utf-8",
+    )
+    original_cwd = Path.cwd()
+    env = FusedEnvironment({"question": "Read data", "tools_py": str(asset / "tools.py")})
+
+    assert env.mcp_tools.call("read_relative", {}) == json.dumps({"value": "asset"})
+    assert Path.cwd() == original_cwd
+
+
+def test_local_mcp_tools_keep_registered_tools_after_late_module_error(tmp_path: Path, caplog):
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    (asset / "tools.py").write_text(
+        """
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("Tools")
+
+@mcp.tool(description="Return value")
+def get_value() -> dict:
+    return {"answer": 3}
+
+@tool(description="Malformed generated suffix")
+def submit_result(result: dict) -> dict:
+    return result
+""",
+        encoding="utf-8",
+    )
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.env"):
+        env = FusedEnvironment({"question": "Return answer", "tools_py": str(asset / "tools.py")})
+        second_env = FusedEnvironment({"question": "Return answer", "tools_py": str(asset / "tools.py")})
+
+    _observation, info = env.reset()
+
+    assert "get_value" in _valid_tool_names(env.tools())
+    assert env.mcp_tools.call("get_value", {}) == json.dumps({"answer": 3})
+    assert second_env.mcp_tools.call("get_value", {}) == json.dumps({"answer": 3})
+    assert "env_error" not in info
+    assert "NameError" in info["env_warning"]
+    assert caplog.text.count("keeping the registered tools") == 1
 
 
 def test_mcp_verifier_reward_requires_a_tool_call(tmp_path: Path):
@@ -1300,6 +1284,205 @@ def test_render_prompt_ids_prepares_historical_assistant_empty_thinking_shell():
     rendered_messages = tokenizer.messages[0]
     assert rendered_messages[1]["content"] == messages[1]["content"]
     assert rendered_messages[1]["reasoning_content"] == "\n"
+
+
+def test_historical_thinking_compaction_removes_complete_assistant_blocks_without_mutation():
+    tool_call = '<tool_call>{"name":"web_search","arguments":{"query":"x"}}</tool_call>'
+    messages = [
+        {"role": "system", "content": "keep <think>system</think>"},
+        {"role": "assistant", "content": f"<think>first\nplan</think>\n\n{tool_call}"},
+        {"role": "user", "content": "keep <think>user</think>"},
+        {"role": "assistant", "content": "incomplete <think>must stay"},
+        {"role": "assistant", "content": "prefix<think>second</think>\n\nsuffix"},
+    ]
+
+    compacted = fused_generate._messages_without_historical_thinking(messages)
+
+    assert compacted[0] is messages[0]
+    assert compacted[1]["content"] == tool_call
+    assert compacted[2] is messages[2]
+    assert compacted[3] is messages[3]
+    assert compacted[4]["content"] == "prefix\n\nsuffix"
+    assert messages[1]["content"] == f"<think>first\nplan</think>\n\n{tool_call}"
+
+    rendered = FakeChatTemplateTokenizer().apply_chat_template(compacted, tokenize=False)
+    assert f"<|im_start|>assistant\n{tool_call}" in rendered
+    assert "<|im_start|>assistant\n\n\n<tool_call>" not in rendered
+
+
+def test_historical_thinking_compaction_removes_gemma_thought_channel_blocks():
+    messages = [
+        {"role": "assistant", "content": "<|channel>thought\nfirst\nplan\n<channel|>\naction"},
+        {"role": "user", "content": "keep <|channel>thought\nuser text\n<channel|>"},
+        {"role": "assistant", "content": "incomplete <|channel>thought\nmust stay"},
+        {"role": "assistant", "content": "<think>a</think><|channel>thought\nb\n<channel|>mixed"},
+    ]
+
+    compacted = fused_generate._messages_without_historical_thinking(messages)
+
+    assert compacted[0]["content"] == "action"
+    assert compacted[1] is messages[1]
+    assert compacted[2] is messages[2]
+    assert compacted[3]["content"] == "mixed"
+    assert messages[0]["content"] == "<|channel>thought\nfirst\nplan\n<channel|>\naction"
+
+
+def test_historical_thinking_compaction_strips_bare_closer_reasoning():
+    # Qwen3.5-style templates pre-open ``<think>\n`` in the generation prompt,
+    # so recorded assistant content carries the reasoning with NO opening tag:
+    # ``thought</think>\n\nanswer``. The template later re-extracts reasoning by
+    # splitting on the bare ``</think>``; the compaction must strip it the same
+    # way or historical thinking silently survives in every served prompt.
+    messages = [
+        {"role": "assistant", "content": "private plan\nstep two</think>\n\nfinal answer"},
+        {"role": "user", "content": "bare </think> in user text stays"},
+        {"role": "assistant", "content": "a</think>mid<think>closed</think>\n\ntail"},
+        {"role": "assistant", "content": "answer</think>\n\nreal<think>unclosed stays"},
+    ]
+
+    compacted = fused_generate._messages_without_historical_thinking(messages)
+
+    assert compacted[0]["content"] == "final answer"
+    assert compacted[1] is messages[1]
+    assert compacted[2]["content"] == "mid\n\ntail"
+    assert compacted[3]["content"] == "real<think>unclosed stays"
+    assert messages[0]["content"] == "private plan\nstep two</think>\n\nfinal answer"
+
+
+def test_enabled_thinking_discards_prior_thoughts_and_emits_prompt_equal_segments(tmp_path: Path):
+    first_thought = "<think>private first-round plan</think>\n"
+    second_thought = "<think>fresh second-round plan</think>\n"
+    first_action = _echo_call("alpha")
+    final_action = _finish_call()
+
+    samples = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Think independently on each turn"),
+        [{"text": first_thought + first_action}, {"text": second_thought + final_action}],
+        {"FUSED_DISABLE_THINKING": "False", "FUSED_DISCARD_HISTORICAL_THINKING": "True", "CREDIT_ASSIGNMENT_ENABLE": "False"},
+        tokenizer=FakeChatTemplateTokenizer(),
+    )
+
+    assert len(samples) == 2
+    second_segment = "".join(chr(token) for token in samples[1].tokens)
+    assert first_thought not in second_segment
+    assert first_action in second_segment
+    assert second_thought in second_segment
+    assert [sample.reward for sample in samples] == [0.0, 1.0]
+    assert len({sample.metadata["parent_traj_id"] for sample in samples}) == 1
+    assert samples[0].metadata["parent_traj_id"]
+    assert [sample.metadata["segment_index"] for sample in samples] == [0, 1]
+    assert all(sample.metadata["prompt_equal_loss"] for sample in samples)
+
+    # The dumped episode (shared by both segments) must carry the segment
+    # breakdown and the thinking-dropout marking for offline readers.
+    episode = samples[0].metadata["rllm_episode"]
+    assert episode["metadata"]["prompt_equal_loss"] is True
+    assert episode["metadata"]["segment_count"] == 2
+    assert episode["metadata"]["parent_traj_id"] == samples[0].metadata["parent_traj_id"]
+    assert episode["metadata"]["historical_thinking_discard_steps"] == 1
+    steps = episode["trajectories"][0]["steps"]
+    assert steps[0]["info"]["historical_thinking_discarded"] is False
+    assert steps[1]["info"]["historical_thinking_discarded"] is True
+    assert steps[1]["info"]["tito_context_reason"] == "historical_thinking_discard"
+    # chat_completions reflect the SERVED prompt (thinking stripped), not the
+    # raw history.
+    second_step_history = json.dumps(steps[1]["chat_completions"])
+    assert "private first-round plan" not in second_step_history
+
+
+def test_enabled_thinking_discards_gemma_thought_channel_and_emits_prompt_equal_segments(tmp_path: Path):
+    first_thought = "<|channel>thought\nprivate first-round plan\n<channel|>\n"
+    second_thought = "<|channel>thought\nfresh second-round plan\n<channel|>\n"
+    first_action = _gemma4_echo_call("alpha")
+    final_action = _gemma4_finish_call()
+    prompt_ids_seen = []
+
+    samples = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Think independently on each turn"),
+        [{"text": first_thought + first_action}, {"text": second_thought + final_action}],
+        {
+            "FUSED_DISABLE_THINKING": "False",
+            "FUSED_DISCARD_HISTORICAL_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+        prompt_ids_seen=prompt_ids_seen,
+    )
+
+    # Gemma4's tool flow rewrites the assistant turn into a structured
+    # tool_calls/tool_responses message; the strict TITO delta keeps the raw
+    # first-turn tokens training in place. Discarding the historical thought
+    # rewrites the served history, so the second turn forks into a fresh
+    # prompt-equal segment -- same shape as the Qwen3 discard flow.
+    second_prompt = "".join(chr(token) for token in prompt_ids_seen[1])
+    assert "private first-round plan" not in second_prompt
+    assert "call:echo" in second_prompt
+    assert len(samples) == 2
+    first_segment = "".join(chr(token) for token in samples[0].tokens)
+    second_segment = "".join(chr(token) for token in samples[1].tokens)
+    assert "private first-round plan" in first_segment  # raw turn keeps its tokens
+    assert "private first-round plan" not in second_segment
+    assert "fresh second-round plan" in second_segment
+    assert [sample.reward for sample in samples] == [0.0, 1.0]
+    assert len({sample.metadata["parent_traj_id"] for sample in samples}) == 1
+    assert samples[0].metadata["parent_traj_id"]
+    assert [sample.metadata["segment_index"] for sample in samples] == [0, 1]
+    assert all(sample.metadata["segment_count"] == 2 for sample in samples)
+    assert all(sample.metadata["prompt_equal_loss"] for sample in samples)
+
+
+def test_discard_flag_without_emitted_thinking_keeps_single_tito_segment(tmp_path: Path):
+    samples = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="No thoughts, straight answers"),
+        [{"text": _echo_call("alpha")}, {"text": _finish_call()}],
+        {
+            "FUSED_DISABLE_THINKING": "False",
+            "FUSED_DISCARD_HISTORICAL_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
+        tokenizer=FakeChatTemplateTokenizer(),
+    )
+
+    assert len(samples) == 1
+    assert samples[0].metadata["prompt_equal_loss"] is True
+    assert samples[0].metadata["segment_index"] == 0
+    assert samples[0].metadata["segment_count"] == 1
+
+
+def test_prompt_equal_is_independent_of_historical_thinking_discard(tmp_path: Path):
+    thought = "<think>model emitted this despite disable-thinking</think>\n"
+    samples = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Keep existing disable-thinking behavior"),
+        [{"text": thought + _echo_call("alpha")}, {"text": _finish_call()}],
+        {"FUSED_DISABLE_THINKING": "True", "FUSED_DISCARD_HISTORICAL_THINKING": "True", "CREDIT_ASSIGNMENT_ENABLE": "False"},
+        tokenizer=FakeChatTemplateTokenizer(),
+    )
+
+    assert len(samples) == 1
+    assert thought in "".join(chr(token) for token in samples[0].tokens)
+    assert samples[0].metadata["prompt_equal_loss"] is True
+    assert samples[0].metadata["segment_count"] == 1
+
+
+def test_eval_rollout_discards_prior_thinking_before_next_assistant_step(tmp_path: Path):
+    first_thought = "<think>private eval plan</think>\n"
+    first_action = _echo_call("eval-alpha")
+    prompt_ids_seen = []
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Compact eval history"),
+        [{"text": first_thought + first_action}, {"text": "<think>fresh eval plan</think>\n" + _finish_call()}],
+        {"FUSED_DISABLE_THINKING": "False", "FUSED_DISCARD_HISTORICAL_THINKING": "True"},
+        evaluation=True,
+        tokenizer=FakeChatTemplateTokenizer(),
+        prompt_ids_seen=prompt_ids_seen,
+    )
+
+    assert len(result) == 1
+    assert len(prompt_ids_seen) == 2
+    second_prompt = "".join(chr(token) for token in prompt_ids_seen[1])
+    assert first_thought not in second_prompt
+    assert first_action in second_prompt
 
 
 def test_render_prompt_ids_fallback_appends_empty_thinking_prefix():
@@ -1507,6 +1690,17 @@ def test_disable_thinking_loss_mask_no_misfired_think_trains_full(close_id):
 
 
 @pytest.mark.parametrize("close_id", [151668, 248069])
+def test_disable_thinking_loss_mask_stray_closer_after_tool_call_trains_full(close_id):
+    # A stray bare </think> AFTER a legitimate tool call is an artifact, not a
+    # mis-fired reasoning block; masking through it would zero-mask the action.
+    tokenizer = _ThinkTokenizer(close_id)
+    response = '<tool_call>{"name":"echo","arguments":{"value":"x"}}</tool_call> stray </think> tail'
+    output_ids = [800, 801, 802, close_id, 803]
+    mask = _default_response_loss_mask(tokenizer, response, output_len=len(output_ids), disable_thinking=True, output_ids=output_ids)
+    assert mask == [1, 1, 1, 1, 1]
+
+
+@pytest.mark.parametrize("close_id", [151668, 248069])
 def test_enable_thinking_loss_mask_trains_reasoning_and_answer(close_id):
     # enable-thinking: reasoning IS the learning signal, so the whole response is
     # trained regardless of model family or where </think> lands. None => all-ones
@@ -1649,7 +1843,7 @@ def test_cot_generate_ignores_tool_calls_and_scores_as_reasoning_only(monkeypatc
     monkeypatch.setattr(FusedEnvironment, "step", fail_step)
     result = _run_generate_with_fake_sglang(
         Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Find evidence"}),
-        [{"text": "\\boxed{answer}\n<tool_call>{\"name\":\"web_search\",\"arguments\":{\"query\":\"x\"}}</tool_call>"}],
+        [{"text": '\\boxed{answer}\n<tool_call>{"name":"web_search","arguments":{"query":"x"}}</tool_call>'}],
         {
             "FUSED_HARNESS": "cot",
             "CREDIT_ASSIGNMENT_ENABLE": "False",
@@ -1798,9 +1992,7 @@ def test_web_search_falls_back_to_one_for_malformed_max_results(monkeypatch):
     monkeypatch.setattr("slime.rollout.fused_agent.env.aiohttp.ClientSession", FakeSession)
     env = FusedEnvironment({"question": "Find evidence"})
 
-    observation, reward, done, info = asyncio.run(
-        env.step(fused_generate.ToolCall("web_search", {"query": "q", "max_results": "10\n</<|im_start|>user>"}))
-    )
+    observation, reward, done, info = asyncio.run(env.step(fused_generate.ToolCall("web_search", {"query": "q", "max_results": "10\n</<|im_start|>user>"})))
 
     assert observation.startswith("[Result 1] Title: Doc\nSnippet: fallback0 fallback1")
     assert reward == 0.0
@@ -2935,14 +3127,20 @@ def test_gemma4_tito_masks_tool_response_context_and_trains_only_actions(tmp_pat
     assert len(result) == 1
     sample = result[0]
     assert sample.reward == 1.0
-    assert _masked_text(sample) == finish
+    # Gemma4's structured tool rewrite replaces the assistant message, but the
+    # strict TITO delta proves token continuity, so the RAW first-turn action
+    # tokens stay in the sample and keep training (mask=1); only the rewritten
+    # replay (tool_call/tool_response markers) is context (mask=0).
+    assert _masked_text(sample) == first + finish
     full_text = "".join(chr(tok) for tok in sample.tokens)
-    assert "response:echo{echo:<|\"|>before-finish<|\"|>}" in full_text
+    assert first in full_text
+    assert 'response:echo{echo:<|"|>before-finish<|"|>}' in full_text
     assert "<tool_response>\nExecution output" not in full_text
-    assert first not in full_text
+    # The full served context is preserved: system/user prompt precedes the turns.
+    assert "system" in full_text
     assert "<|turn>model" not in _masked_text(sample)
     assert len(sample.loss_mask) == sample.response_length
-    assert sum(sample.loss_mask) == len(finish)
+    assert sum(sample.loss_mask) == len(first) + len(finish)
 
 
 def test_gemma4_batches_multiple_independent_tool_calls_in_one_turn(tmp_path: Path):
@@ -2967,10 +3165,12 @@ def test_gemma4_batches_multiple_independent_tool_calls_in_one_turn(tmp_path: Pa
     assert first_step["action"] == first_turn
     assert '{"echo": "alpha"}' in first_step["observation"]
     assert '{"echo": "beta"}' in first_step["observation"]
-    assert _masked_text(sample) == finish
+    # Raw first-turn tool calls keep training (strict TITO merge); only the
+    # structured replay and tool responses are context.
+    assert _masked_text(sample) == first_turn + finish
     full_text = "".join(chr(tok) for tok in sample.tokens)
-    assert "response:echo{echo:<|\"|>alpha<|\"|>}" in full_text
-    assert "response:echo{echo:<|\"|>beta<|\"|>}" in full_text
+    assert 'response:echo{echo:<|"|>alpha<|"|>}' in full_text
+    assert 'response:echo{echo:<|"|>beta<|"|>}' in full_text
     assert "<tool_response>\nExecution output" not in full_text
 
 
@@ -3655,13 +3855,16 @@ def test_mixed_tool_and_answer_credit_assignment_masks_only_error_turn():
 def test_credit_assignment_policy_mask_never_unmasks_base_loss_mask_tokens():
     base_loss_mask = [0, 0, 1, 1, 0, 1, 0]
 
-    assert fused_generate._credit_assignment_loss_mask(
-        output_len=len(base_loss_mask),
-        turn_index=0,
-        credit_event="mixed_tool_and_answer",
-        credit_step_index=0,
-        base_loss_mask=base_loss_mask,
-    ) == base_loss_mask
+    assert (
+        fused_generate._credit_assignment_loss_mask(
+            output_len=len(base_loss_mask),
+            turn_index=0,
+            credit_event="mixed_tool_and_answer",
+            credit_step_index=0,
+            base_loss_mask=base_loss_mask,
+        )
+        == base_loss_mask
+    )
 
     assert fused_generate._credit_assignment_loss_mask(
         output_len=len(base_loss_mask),
@@ -4107,5 +4310,12 @@ if __name__ == "__main__":
         test_mcp_tool_load_error_is_nonfatal(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_custom_generate_with_mocked_sglang(Path(tmp))
+    test_historical_thinking_compaction_removes_complete_assistant_blocks_without_mutation()
+    with tempfile.TemporaryDirectory() as tmp:
+        test_enabled_thinking_discards_prior_thoughts_and_emits_prompt_equal_segments(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_prompt_equal_is_independent_of_historical_thinking_discard(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_eval_rollout_discards_prior_thinking_before_next_assistant_step(Path(tmp))
     test_render_prompt_ids_accepts_batch_encoding_like_object()
     test_initial_messages_include_tool_prompt()

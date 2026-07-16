@@ -19,6 +19,8 @@ Options:
   --harness NAME                         Fused prompt harness: bare, cot, react, gem, unified_gem.
   --model PATH                           HF model path.
   --disable-thinking BOOL                Stored in env for compatible fused code.
+  --discard-historical-thinking BOOL     Remove prior assistant <think> blocks before each new rollout step.
+                                         Effective only when --disable-thinking is false. Default: false.
   --mcp-disable-step-penalty BOOL        MCP verifier step-penalty env.
   --unified-system-prompt                Select unified_gem harness unless --harness is set later.
   --no-unified-system-prompt             Select gem harness unless --harness is set later.
@@ -127,6 +129,7 @@ SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 COLOCATE="${COLOCATE:-false}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
+DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
 ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-16}"
 ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
 ASYNC_MINI_BATCH_SIZE="${ASYNC_MINI_BATCH_SIZE:-128}"
@@ -214,6 +217,7 @@ while [ "$#" -gt 0 ]; do
       --harness) FUSED_HARNESS="${2:?Missing value for --harness}"; harness_explicit=true; shift 2 ;;
       --model) MODEL_DIR="${2:?Missing value for --model}"; shift 2 ;;
       --disable-thinking) DISABLE_THINKING="${2:?Missing value for --disable-thinking}"; shift 2 ;;
+      --discard-historical-thinking) DISCARD_HISTORICAL_THINKING="${2:?Missing value for --discard-historical-thinking}"; shift 2 ;;
       --mcp-disable-step-penalty) RLLM_MCP_DISABLE_STEP_PENALTY="${2:?Missing value for --mcp-disable-step-penalty}"; shift 2 ;;
       --unified-system-prompt) UNIFIED_SYSTEM_PROMPT=True; if [ "${harness_explicit}" = "false" ]; then FUSED_HARNESS=unified_gem; fi; shift ;;
       --no-unified-system-prompt) UNIFIED_SYSTEM_PROMPT=False; if [ "${harness_explicit}" = "false" ]; then FUSED_HARNESS=gem; fi; shift ;;
@@ -879,6 +883,7 @@ else
    export NUM_GPUS="${NUM_GPUS:-$((ACTOR_GPUS + ROLLOUT_GPUS))}"
 fi
 
+export CUDA_HOME="/cm/shared/apps/cuda12.9"
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-7200}"
@@ -925,6 +930,7 @@ export RLLM_MCP_DISABLE_STEP_PENALTY="${RLLM_MCP_DISABLE_STEP_PENALTY:-True}"
 export FUSED_HARNESS="${FUSED_HARNESS:-gem}"
 export FUSED_UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT}"
 export FUSED_DISABLE_THINKING="${DISABLE_THINKING}"
+export FUSED_DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING}"
 export FUSED_MAX_STEPS="${FUSED_MAX_STEPS:-${MAX_STEPS}}"
 export FUSED_MCP_MAX_STEPS="${FUSED_MCP_MAX_STEPS:-${MCP_MAX_STEPS}}"
 export FUSED_WEB_SEARCH_MAX_STEPS="${FUSED_WEB_SEARCH_MAX_STEPS:-${WEB_SEARCH_MAX_STEPS}}"
@@ -989,6 +995,7 @@ keys = (
     "RLLM_MCP_START_RETRIES", "RLLM_MCP_START_WAIT_TIMEOUT", "RLLM_MCP_TOOL_TIMEOUT",
     "RLLM_MCP_MAX_ACTIVE_SERVERS", "RLLM_MCP_PREFILTER_WORKERS", "RLLM_MCP_DISABLE_STEP_PENALTY",
     "FUSED_HARNESS", "FUSED_UNIFIED_SYSTEM_PROMPT", "FUSED_DISABLE_THINKING",
+    "FUSED_DISCARD_HISTORICAL_THINKING",
     "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS", "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "SLIME_ROLLOUT_GROUP_TIMEOUT", "SLIME_EVAL_ROLLOUT_GROUP_TIMEOUT",
     "PER_STEP_MAX_TOKENS", "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH",
@@ -1035,7 +1042,7 @@ echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
 echo "Eval function: ${EVAL_FUNCTION_PATH}"
 echo "Actor GPUs: ${ACTOR_GPUS}, rollout GPUs: ${ROLLOUT_GPUS}, colocate=${COLOCATE}, ray GPUs=${NUM_GPUS}"
 echo "SGLang concurrency: server=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}, fully_async_group_concurrency=${FULLY_ASYNC_GROUP_CONCURRENCY}, effective_group_concurrency=${FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY}, rollout_num_engines=${ROLLOUT_NUM_ENGINES}, explicit_server_concurrency=${SGLANG_SERVER_CONCURRENCY_EXPLICIT}"
-echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
+echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
 echo "Actor update cadence: collect ${ROLLOUT_BATCH_SIZE} valid task groups x ${N_SAMPLES_PER_PROMPT} samples/group = ${EFFECTIVE_GLOBAL_BATCH_SIZE} samples, then update actor"
 echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}; micro_batch=${MICRO_BATCH_SIZE}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}, async_fwd_bwd_group_size=${ASYNC_FWD_BWD_GROUP_SIZE}, async_staleness_threshold=${ASYNC_STALENESS_THRESHOLD}"
 echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"

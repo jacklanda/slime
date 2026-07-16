@@ -3,6 +3,7 @@ import os
 import torch
 
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput
+from slime.utils.prompt_equal import has_multi_segment_trajectories, trajectory_level_rewards, uses_prompt_equal_loss
 from slime.utils.types import Sample
 
 __all__ = [
@@ -12,7 +13,12 @@ __all__ = [
 
 
 def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
-    rewards = [sample.get_reward_value(args) for sample in samples]
+    if uses_prompt_equal_loss(samples) or has_multi_segment_trajectories(samples):
+        # Judge variance on trajectory-level rewards so sparse placeholders or
+        # legacy duplicated segment rewards cannot fake or dilute the std.
+        rewards = trajectory_level_rewards(args, samples)
+    else:
+        rewards = [sample.get_reward_value(args) for sample in samples]
     keep = bool(torch.tensor(rewards, dtype=torch.float64).std() > 1e-6)
     return DynamicFilterOutput(
         keep=keep,
@@ -25,7 +31,11 @@ def check_reward_nonzero_std_and_fused_steps(args, samples: list[Sample], **kwar
     if not reward_filter_output.keep:
         return reward_filter_output
 
-    flat_samples = list(_iter_samples(samples))
+    # Segments of one multi-segment trajectory duplicate the trajectory-level
+    # metadata (fused_traj_steps, fused_termination); dedupe to one vote per
+    # trajectory so thinking-heavy (multi-segment) trajectories don't bias the
+    # step/abnormal statistics.
+    flat_samples = _dedupe_by_trajectory(_iter_samples(samples))
     min_mean_steps = _float_env("FUSED_FILTER_MIN_MEAN_STEPS", 0.0)
     min_mcp_mean_steps = _float_env("FUSED_FILTER_MIN_MCP_MEAN_STEPS", 0.0)
     max_abnormal_ratio = _float_env("FUSED_FILTER_MAX_ABNORMAL_RATIO", 0.0)
@@ -47,11 +57,7 @@ def check_reward_nonzero_std_and_fused_steps(args, samples: list[Sample], **kwar
             )
 
     if min_mcp_mean_steps > 0:
-        mcp_steps = _fused_steps(
-            sample
-            for sample in flat_samples
-            if (sample.metadata or {}).get("fused_task_type") == "mcp"
-        )
+        mcp_steps = _fused_steps(sample for sample in flat_samples if (sample.metadata or {}).get("fused_task_type") == "mcp")
         if mcp_steps and _mean(mcp_steps) < min_mcp_mean_steps:
             return DynamicFilterOutput(
                 keep=False,
@@ -69,6 +75,21 @@ def _iter_samples(samples):
             yield sample
 
 
+def _dedupe_by_trajectory(samples) -> list[Sample]:
+    """Keep one representative per trajectory (first segment seen); samples
+    without a parent_traj_id each stand alone."""
+    result = []
+    seen_trajectories = set()
+    for sample in samples:
+        parent_traj_id = (sample.metadata or {}).get("parent_traj_id")
+        if parent_traj_id is not None:
+            if parent_traj_id in seen_trajectories:
+                continue
+            seen_trajectories.add(parent_traj_id)
+        result.append(sample)
+    return result
+
+
 def _fused_steps(samples) -> list[float]:
     steps = []
     for sample in samples:
@@ -84,11 +105,7 @@ def _is_abnormal(sample: Sample) -> bool:
     metadata = sample.metadata or {}
     termination = metadata.get("fused_termination") or metadata.get("termination_reason") or ""
     termination = str(termination)
-    return (
-        termination.startswith("ABNORMAL")
-        or "exceeded" in termination
-        or termination in {"error", "timeout"}
-    )
+    return termination.startswith("ABNORMAL") or "exceeded" in termination or termination in {"error", "timeout"}
 
 
 def _metadata_float(sample: Sample, *keys: str) -> float:

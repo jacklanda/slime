@@ -152,7 +152,7 @@ HOOK_CASES = [
         "CUSTOM_REWARD_POST_PROCESS_PATH",
         "plugin_contracts.test_plugin_runtime_hook_contracts.reference_reward_post_process",
         "slime/ray/rollout.py",
-        "self.custom_reward_post_process_func(self.args, samples)",
+        "custom_reward_post_process_func(args, samples)",
         ("args", "samples"),
         invoke_reward_post_process,
     ),

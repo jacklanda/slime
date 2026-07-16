@@ -251,9 +251,7 @@ class _SampleBuilder:
         if policy_loss_mask is None:
             policy_loss_mask = loss_mask
         if isinstance(policy_loss_mask, list):
-            assert len(policy_loss_mask) == len(ids), (
-                f"policy_loss_mask length {len(policy_loss_mask)} != ids length {len(ids)}"
-            )
+            assert len(policy_loss_mask) == len(ids), f"policy_loss_mask length {len(policy_loss_mask)} != ids length {len(ids)}"
             self.policy_loss_mask.extend(policy_loss_mask)
         else:
             self.policy_loss_mask.extend([policy_loss_mask] * len(ids))
@@ -290,13 +288,9 @@ class _SampleBuilder:
         *,
         expected_num_tokens: int,
     ) -> None:
-        assert len(offsets) == expected_num_tokens + 1, (
-            f"top-p token offsets length {len(offsets)} != generated token count + 1 {expected_num_tokens + 1}"
-        )
+        assert len(offsets) == expected_num_tokens + 1, f"top-p token offsets length {len(offsets)} != generated token count + 1 {expected_num_tokens + 1}"
         assert offsets and offsets[0] == 0, f"top-p token offsets must start with 0, got {offsets[:1]}"
-        assert offsets[-1] == len(token_ids), (
-            f"top-p token offsets[-1] {offsets[-1]} != token ids length {len(token_ids)}"
-        )
+        assert offsets[-1] == len(token_ids), f"top-p token offsets[-1] {offsets[-1]} != token ids length {len(token_ids)}"
         if self.top_p_token_ids is None:
             self.top_p_token_ids = []
             prefix_len = len(self.tokens) - expected_num_tokens
@@ -333,9 +327,7 @@ class _SampleBuilder:
     def has_trained_response(self) -> bool:
         return any(self.loss_mask[self.leading_prompt_len :])
 
-    def to_sample(
-        self, base_sample: Sample, extra_metadata: dict[str, Any] | None, max_sample_tokens: int = 0
-    ) -> Sample:
+    def to_sample(self, base_sample: Sample, extra_metadata: dict[str, Any] | None, max_sample_tokens: int = 0) -> Sample:
         """Emit the accumulated tokens as one ``Sample``, stripping the first-turn
         prompt so loss_mask / logprobs cover only the response region."""
         start = self.leading_prompt_len  # first-turn prompt stripped; response region starts here
@@ -404,36 +396,19 @@ class TrajectoryManager:
         if not prompt_messages:
             logger.warning("record_turn(sid=%s): empty prompt_messages; skipping", sid)
             return
-        assert not turn.output_log_probs or len(turn.output_log_probs) == len(turn.output_ids), (
-            f"turn.output_log_probs length {len(turn.output_log_probs)} != "
-            f"turn.output_ids length {len(turn.output_ids)}"
-        )
-        assert turn.loss_mask is None or len(turn.loss_mask) == len(turn.output_ids), (
-            f"turn.loss_mask length {len(turn.loss_mask)} != "
-            f"turn.output_ids length {len(turn.output_ids)}"
-        )
-        assert turn.policy_loss_mask is None or len(turn.policy_loss_mask) == len(turn.output_ids), (
-            f"turn.policy_loss_mask length {len(turn.policy_loss_mask)} != "
-            f"turn.output_ids length {len(turn.output_ids)}"
-        )
+        assert not turn.output_log_probs or len(turn.output_log_probs) == len(turn.output_ids), f"turn.output_log_probs length {len(turn.output_log_probs)} != " f"turn.output_ids length {len(turn.output_ids)}"
+        assert turn.loss_mask is None or len(turn.loss_mask) == len(turn.output_ids), f"turn.loss_mask length {len(turn.loss_mask)} != " f"turn.output_ids length {len(turn.output_ids)}"
+        assert turn.policy_loss_mask is None or len(turn.policy_loss_mask) == len(turn.output_ids), f"turn.policy_loss_mask length {len(turn.policy_loss_mask)} != " f"turn.output_ids length {len(turn.output_ids)}"
         if turn.context_delta_ids is not None:
-            assert len(turn.context_delta_ids) <= len(turn.prompt_ids), (
-                f"turn.context_delta_ids length {len(turn.context_delta_ids)} exceeds "
-                f"turn.prompt_ids length {len(turn.prompt_ids)}"
-            )
-        assert (turn.rollout_top_p_token_ids is None) == (turn.rollout_top_p_token_offsets is None), (
-            "turn.rollout_top_p_token_ids and turn.rollout_top_p_token_offsets must be set together"
-        )
+            assert len(turn.context_delta_ids) <= len(turn.prompt_ids), f"turn.context_delta_ids length {len(turn.context_delta_ids)} exceeds " f"turn.prompt_ids length {len(turn.prompt_ids)}"
+        assert (turn.rollout_top_p_token_ids is None) == (turn.rollout_top_p_token_offsets is None), "turn.rollout_top_p_token_ids and turn.rollout_top_p_token_offsets must be set together"
         if turn.rollout_top_p_token_offsets is not None:
-            assert len(turn.rollout_top_p_token_offsets) == len(turn.output_ids) + 1, (
-                f"turn.rollout_top_p_token_offsets length {len(turn.rollout_top_p_token_offsets)} != "
-                f"turn.output_ids length + 1 {len(turn.output_ids) + 1}"
-            )
+            assert len(turn.rollout_top_p_token_offsets) == len(turn.output_ids) + 1, f"turn.rollout_top_p_token_offsets length {len(turn.rollout_top_p_token_offsets)} != " f"turn.output_ids length + 1 {len(turn.output_ids) + 1}"
 
         root = self._trees.setdefault(sid, MessageNode())
 
         node, depth = self._find_mount_point(root, prompt_messages)
-        node, depth = self._try_merge_assistant_rewrite(sid, node, prompt_messages, depth)
+        node, depth = self._try_merge_assistant_rewrite(sid, node, prompt_messages, depth, incoming_turn=turn)
         node = self._mount_prompt_messages(node, prompt_messages[depth:])
         self._attach_assistant_leaf(sid, node, turn=turn, response_message=response_message, metadata=metadata)
 
@@ -511,23 +486,35 @@ class TrajectoryManager:
         node: MessageNode,
         prompt_messages: list[dict[str, Any]],
         depth: int,
+        incoming_turn: TurnRecord | None = None,
     ) -> tuple[MessageNode, int]:
         """Merge a short assistant-rewrite onto its node instead of forking.
 
-        A harness may replay a prior assistant message slightly re-rendered (e.g.
-        whitespace) in a later prompt. It no longer matches the node we generated,
-        so it would fork -- stranding the original generated turn as a dead-end
-        leaf that still emits its own training Sample. Instead we overwrite that
-        node's message in place and stop training its generated content (demote to
-        routing-only), so only the live branch trains. This only applies below
-        ``fork_threshold``: a long abandoned response carries enough real signal
-        to fork and train standalone.
+        A harness may replay a prior assistant message re-rendered (e.g.
+        whitespace, or Gemma4's structured tool_calls/tool_responses form) in a
+        later prompt. It no longer matches the node we generated, so it would
+        fork -- stranding the original generated turn as a dead-end leaf that
+        still emits its own training Sample. Instead we swap the node's message
+        for the rewrite so routing follows the live branch.
 
-        Forking is always safe (a rewrite mounts as routing-only); this is purely
-        a cleanup. So we merge only when the mount point has exactly one assistant
-        child that is a leaf, generated (``turn`` set), and short (response <
-        ``fork_threshold``), and fork otherwise, since absorbing destroys a
-        generated TurnRecord irreversibly.
+        What happens to the node's generated turn depends on what we can prove:
+
+        * **strict TITO incoming turn** (``context_delta_ids`` set): the adapter
+          computed that delta against its running accumulator, which contains
+          this node's RAW output ids -- so the rewrite is purely a message-level
+          rename and the turn keeps training in place. Nulling the turn here
+          would leave the incoming delta dangling: the builder would drop this
+          turn's tokens while every later delta still assumes they precede it,
+          silently truncating the training context (and with it every
+          intermediate action token).
+        * **legacy incoming turn** (prefix-extension mode): the next prompt
+          re-supplies the full context including the rewrite text, so the raw
+          turn must vanish or its drifted tokens would force a fork. Demote to
+          routing-only (``turn = None``), exactly the original behavior.
+
+        This only applies below ``fork_threshold`` and when the mount point has
+        exactly one assistant child that is a generated leaf; anything else
+        forks, which is always safe (a rewrite mounts as routing-only).
         """
         if self._fork_threshold <= 0:
             return node, depth  # feature off
@@ -538,8 +525,7 @@ class TrajectoryManager:
         if len(asst_children) != 1:
             if len(asst_children) > 1:
                 logger.warning(
-                    "record_turn(sid=%s turn=%s): %d assistant children at mount "
-                    "point; can't tell which the rewrite targets, so forking.",
+                    "record_turn(sid=%s turn=%s): %d assistant children at mount " "point; can't tell which the rewrite targets, so forking.",
                     sid,
                     self._turn_count.get(sid, 0) + 1,
                     len(asst_children),
@@ -547,19 +533,20 @@ class TrajectoryManager:
             return node, depth
 
         rewritten_node = asst_children[0]
-        if (
-            rewritten_node.children
-            or rewritten_node.turn is None
-            or len(rewritten_node.turn.output_ids) >= self._fork_threshold
-        ):
+        if rewritten_node.children or rewritten_node.turn is None or len(rewritten_node.turn.output_ids) >= self._fork_threshold:
             return node, depth
 
+        retains_training = incoming_turn is not None and incoming_turn.context_delta_ids is not None
         rewritten_node.metadata["merged_rewrite"] = {
             "abandoned_turn_index": rewritten_node.turn_index,
             "abandoned_response_tokens": len(rewritten_node.turn.output_ids),
+            "retains_training": retains_training,
         }
-        rewritten_node.turn = None
-        rewritten_node.turn_index = None
+        if not retains_training:
+            # Legacy prefix-extension mode: abandon the generated turn so the
+            # rewrite text (re-tokenized in the next prompt) replaces it.
+            rewritten_node.turn = None
+            rewritten_node.turn_index = None
         rewritten_node.message = prompt_messages[depth]
         return rewritten_node, depth + 1
 
@@ -623,7 +610,6 @@ class TrajectoryManager:
         allow_fully_masked: bool = False,
         max_sample_tokens: int = 0,
     ) -> list[Sample]:
-
         asst_nodes = [n for n in chain if n.role == "assistant" and n.turn is not None]
         truncated = bool(asst_nodes) and asst_nodes[-1].turn.finish_reason == "length"
         use_tool = any(bool((n.message or {}).get("tool_calls")) for n in asst_nodes)
@@ -634,11 +620,7 @@ class TrajectoryManager:
             "use_tool": use_tool,
             "ill_formed": ill_formed,
         }
-        return [
-            builder.to_sample(base_sample, md, max_sample_tokens)
-            for builder in self._split_chain_into_builders(chain)
-            if allow_fully_masked or builder.has_trained_response()
-        ]
+        return [builder.to_sample(base_sample, md, max_sample_tokens) for builder in self._split_chain_into_builders(chain) if allow_fully_masked or builder.has_trained_response()]
 
 
 __all__ = [

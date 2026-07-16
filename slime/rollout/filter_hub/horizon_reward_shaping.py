@@ -4,17 +4,17 @@ from typing import Any
 
 import torch
 
+from slime.utils.prompt_equal import has_multi_segment_trajectories, process_segment_rewards, uses_prompt_equal_loss
 from slime.utils.types import Sample
 
 
 def post_process_rewards(args, samples: list[Sample], **kwargs):
     raw_rewards = [_reward_value(args, sample) for sample in samples]
     shaped_rewards = [_horizon_shaped_reward(reward, sample) for reward, sample in zip(raw_rewards, samples, strict=True)]
+    if uses_prompt_equal_loss(samples) or has_multi_segment_trajectories(samples):
+        return raw_rewards, process_segment_rewards(args, samples, raw_rewards, shaped_rewards)
 
-    if not (
-        args.advantage_estimator in ["grpo", "gspo", "cispo", "reinforce_plus_plus_baseline"]
-        and args.rewards_normalization
-    ):
+    if not (args.advantage_estimator in ["grpo", "gspo", "cispo", "reinforce_plus_plus_baseline"] and args.rewards_normalization):
         return raw_rewards, shaped_rewards
 
     normalized = [0.0] * len(samples)

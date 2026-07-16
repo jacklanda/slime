@@ -17,6 +17,7 @@ import httpx
 from slime.agent.trajectory import TrajectoryManager, TurnRecord
 from slime.rollout.sglang_rollout import GenerateState, _extract_rollout_top_p_token_data
 from slime.utils import http_utils
+from slime.utils.prompt_equal import PROMPT_EQUAL_LOSS_ESTIMATORS
 from slime.utils.types import Sample
 
 from .env import FusedEnvironment, _format_retrieval, normalize_task, resolve_task_mode
@@ -41,6 +42,9 @@ from .prompts import (
 
 logger = logging.getLogger(__name__)
 DEFAULT_SGLANG_CONTEXT_LENGTH_MARGIN = 256
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL)
+_THOUGHT_CHANNEL_BLOCK_RE = re.compile(r"<\|channel>thought\n.*?<channel\|>", re.DOTALL)
+_THINK_CLOSE_RE = re.compile(r"</think\s*>")
 _LAST_SGLANG_REQUEST_LOG_TS = 0.0
 _EVAL_ENGINE_POOL_LOOP: asyncio.AbstractEventLoop | None = None
 _EVAL_ENGINE_POOL: EvalSessionEnginePool | None = None
@@ -108,12 +112,7 @@ class EvalSessionEnginePool:
         if not self._active:
             return None
         now = time.monotonic()
-        eligible = [
-            url
-            for url, count in self._active.items()
-            if self._blocked_until[url] <= now
-            and (self._max_sessions_per_engine is None or count < self._max_sessions_per_engine)
-        ]
+        eligible = [url for url, count in self._active.items() if self._blocked_until[url] <= now and (self._max_sessions_per_engine is None or count < self._max_sessions_per_engine)]
         if not eligible:
             return None
         minimum = min(self._active[url] for url in eligible)
@@ -379,6 +378,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     base_max_steps = int(os.environ.get("FUSED_MAX_STEPS", getattr(args, "fused_max_steps", "16")))
     per_step_max_tokens = int(os.environ.get("PER_STEP_MAX_TOKENS", str(sampling_params.get("max_new_tokens", 2048))))
     disable_thinking = _env_bool("FUSED_DISABLE_THINKING", True)
+    discard_historical_thinking = not disable_thinking and _env_bool("FUSED_DISCARD_HISTORICAL_THINKING", False)
+    prompt_equal_loss = not evaluation and getattr(args, "advantage_estimator", "grpo") in PROMPT_EQUAL_LOSS_ESTIMATORS
     max_context_tokens = _effective_sglang_context_limit(args)
     max_tool_calls_per_turn = int(os.environ.get("FUSED_MAX_TOOL_CALLS_PER_TURN", os.environ.get("MAX_TOOL_CALLS_PER_TURN", "4")))
     credit_assignment_enable = _env_bool("CREDIT_ASSIGNMENT_ENABLE", True)
@@ -441,6 +442,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     credit_step_index: int | None = None
     try:
         for step_idx in range(max_steps):
+            rollout_messages = _messages_without_historical_thinking(messages) if discard_historical_thinking else messages
             # Run the chat-template render off the event loop. The HF fast
             # tokenizer releases the GIL during tokenize, so offloading lets the
             # many concurrent trajectory coroutines actually overlap instead of
@@ -449,7 +451,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             prompt_ids = await asyncio.to_thread(
                 _render_prompt_ids,
                 state.tokenizer,
-                messages,
+                rollout_messages,
                 tools=tools,
                 disable_thinking=disable_thinking,
             )
@@ -458,11 +460,28 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 tito_boundary_before = False
                 context_delta_ids = []
                 tito_context_reason = "evaluation"
+            elif discard_historical_thinking and step_idx > 0:
+                prompt_context_start_idx = None
+                if _has_token_prefix(prompt_ids, tito_prefix_ids):
+                    # Nothing was discarded from the served prefix this step
+                    # (e.g. no prior turn emitted a closed think block), so the
+                    # current TiTO segment extends cleanly.
+                    tito_boundary_before = False
+                    context_delta_ids = list(prompt_ids[len(tito_prefix_ids) :])
+                    tito_context_reason = "append_delta"
+                else:
+                    # The rewritten history is a new policy context. Start a fresh
+                    # TiTO segment so its tokens/logprobs match the served prompt.
+                    # Never downgrade to the assistant-tail recovery path here: the
+                    # mismatch is a semantic history rewrite, not cosmetic drift.
+                    tito_boundary_before = True
+                    context_delta_ids = list(prompt_ids)
+                    tito_context_reason = "historical_thinking_discard"
             else:
                 prompt_context_start_idx = await asyncio.to_thread(
                     _last_assistant_context_start_idx,
                     state.tokenizer,
-                    messages,
+                    rollout_messages,
                     tools=tools,
                     disable_thinking=disable_thinking,
                 )
@@ -523,14 +542,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     if eval_sglang_session is None or session_params is None:
                         raise
                     log_warning = True
-                    if (
-                        isinstance(exc, httpx.TransportError)
-                        and eval_sglang_session.engine_pool is not None
-                        and eval_sglang_session.server_url is not None
-                    ):
-                        log_warning = eval_sglang_session.engine_pool.record_transport_failure(
-                            eval_sglang_session.server_url
-                        )
+                    if isinstance(exc, httpx.TransportError) and eval_sglang_session.engine_pool is not None and eval_sglang_session.server_url is not None:
+                        log_warning = eval_sglang_session.engine_pool.record_transport_failure(eval_sglang_session.server_url)
                     await eval_sglang_session.disable(
                         f"session generation failed with {type(exc).__name__}: {exc!r}",
                         log_warning=log_warning,
@@ -652,7 +665,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action="",
                         reward=0.0,
                         done=True,
-                        messages=messages if capture_eval_details else [],
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -672,7 +686,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action="",
                         reward=final_reward,
                         done=True,
-                        messages=messages if capture_eval_details else [],
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -707,7 +722,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             action="",
                             reward=0.0,
                             done=True,
-                            messages=messages if capture_eval_details else [],
+                            messages=rollout_messages if capture_eval_details else [],
+                            tito_context_reason=tito_context_reason,
                             llm_time=step_llm_time,
                             env_time=0.0,
                             disable_thinking=disable_thinking,
@@ -715,12 +731,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     )
                     break
                 actions = [ToolCall("finish", {"command": "submit", "result": response})]
-            elif (
-                isinstance(parser, Gemma4ToolParser)
-                and detect_abnormal_trajectories
-                and credit_assignment_tool_parser_error
-                and _response_has_malformed_tool_call(response)
-            ):
+            elif isinstance(parser, Gemma4ToolParser) and detect_abnormal_trajectories and credit_assignment_tool_parser_error and _response_has_malformed_tool_call(response):
                 final_reward = 0.0
                 final_done = True
                 credit_event = "tool_parser_error"
@@ -745,7 +756,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action="",
                         reward=0.0,
                         done=True,
-                        messages=messages if capture_eval_details else [],
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -778,7 +790,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action="",
                         reward=0.0,
                         done=True,
-                        messages=messages if capture_eval_details else [],
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -810,7 +823,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action=parser.format_action(actions[0]),
                         reward=0.0,
                         done=True,
-                        messages=messages if capture_eval_details else [],
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -836,7 +850,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action=parser.format_action(actions[0]),
                         reward=0.0,
                         done=True,
-                        messages=messages if capture_eval_details else [],
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -863,7 +878,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             action=parser.format_action(actions[0]),
                             reward=0.0,
                             done=False,
-                            messages=messages if capture_eval_details else [],
+                            messages=rollout_messages if capture_eval_details else [],
+                            tito_context_reason=tito_context_reason,
                             llm_time=step_llm_time,
                             env_time=0.0,
                             disable_thinking=disable_thinking,
@@ -897,7 +913,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action=parser.format_action(actions[0]),
                         reward=0.0,
                         done=True,
-                        messages=messages if capture_eval_details else [],
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -945,7 +962,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action=parser.format_action(actions[0]),
                         reward=0.0,
                         done=True,
-                        messages=messages if capture_eval_details else [],
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -985,7 +1003,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         action="".join(parser.format_action(action) for action in executed_actions),
                         reward=final_reward if batch_done else 0.0,
                         done=batch_done,
-                        messages=messages if capture_eval_details else [],
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
                         llm_time=step_llm_time,
                         env_time=step_env_time,
                         disable_thinking=disable_thinking,
@@ -1052,7 +1071,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     action=parser.format_action(action),
                     reward=final_reward if done else 0.0,
                     done=done,
-                    messages=messages if capture_eval_details else [],
+                    messages=rollout_messages if capture_eval_details else [],
+                    tito_context_reason=tito_context_reason,
                     llm_time=step_llm_time,
                     env_time=step_env_time,
                     disable_thinking=disable_thinking,
@@ -1119,6 +1139,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         "fused_prompt_length_tokens": compact_prompt_length,
         "fused_completion_length_tokens": total_completion_tokens,
     }
+    if prompt_equal_loss:
+        instance_id = (base_sample.metadata or {}).get("instance_id")
+        if instance_id is None:
+            instance_id = base_sample.group_index if base_sample.group_index is not None else base_sample.index
+        common_metadata.update({"prompt_equal_loss": True, "parent_traj_id": session_id, "instance_id": str(instance_id)})
     if eval_sglang_session is not None:
         common_metadata.update(
             {
@@ -1201,6 +1226,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         extra_metadata={**common_metadata, "rllm_episode": episode_dict},
     )
     if not samples:
+        if prompt_equal_loss:
+            episode_dict["metadata"].update({"prompt_equal_loss": True, "parent_traj_id": session_id, "segment_count": 0})
         failed = Sample(
             index=base_sample.index,
             group_index=base_sample.group_index,
@@ -1210,8 +1237,23 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             reward=0.0,
             status=Sample.Status.FAILED,
             rollout_log_probs=[],
+            # Dead-prompt contract (Dressage's mark_aborted_no_grad): a prompt
+            # with zero trainable tokens must not count toward N_P in the
+            # prompt-equal denominators nor contribute gradient.
+            remove_sample=True,
             metadata={
                 **dict(base_sample.metadata or {}),
+                **(
+                    {
+                        "prompt_equal_loss": True,
+                        "parent_traj_id": session_id,
+                        "instance_id": common_metadata["instance_id"],
+                        "segment_index": 0,
+                        "segment_count": 1,
+                    }
+                    if prompt_equal_loss
+                    else {}
+                ),
                 "fused_error": "empty_trajectory",
                 "fused_task_type": env.mode,
                 "fused_termination": termination_reason,
@@ -1224,9 +1266,39 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             },
         )
         return failed
-    for sample in samples:
+    segment_count = len(samples)
+    if prompt_equal_loss:
+        # All sibling segments share this one episode dict (and the offline dump
+        # dedupes by episode id), so mark the segment breakdown once, in place.
+        episode_dict["metadata"].update(
+            {
+                "prompt_equal_loss": True,
+                "parent_traj_id": session_id,
+                "segment_count": segment_count,
+                "historical_thinking_discard_steps": sum(1 for step in trajectory_steps if (step.get("info") or {}).get("historical_thinking_discarded")),
+            }
+        )
+    for segment_index, sample in enumerate(samples):
         sample.response = final_response
-        sample.reward = final_reward
+        # Segment lineage is stamped in every mode so filters/metrics can
+        # aggregate at trajectory level.
+        sample.metadata.update(
+            {
+                "parent_traj_id": session_id,
+                "segment_index": segment_index,
+                "segment_count": segment_count,
+            }
+        )
+        if prompt_equal_loss:
+            sample.metadata.update(
+                {
+                    "prompt_equal_loss": True,
+                    "instance_id": common_metadata["instance_id"],
+                }
+            )
+        # Keep raw rewards sparse for every segment mode. The reward processor
+        # broadcasts the terminal anchor's advantage to all sibling segments.
+        sample.reward = final_reward if segment_index == segment_count - 1 else 0.0
         sample.status = Sample.Status.COMPLETED
         if sample.rollout_log_probs is None:
             sample.rollout_log_probs = [0.0] * sample.response_length
@@ -1338,10 +1410,7 @@ def _append_tool_observation_messages(
     formatted_observations: list[str],
     raw_observations: list[Any],
 ) -> None:
-    payloads = [
-        _tool_response_payload(action.name, raw_observation)
-        for action, raw_observation in zip(actions, raw_observations, strict=True)
-    ]
+    payloads = [_tool_response_payload(action.name, raw_observation) for action, raw_observation in zip(actions, raw_observations, strict=True)]
     assistant_message = parser.assistant_tool_results_message(actions, payloads)
     if assistant_message is not None:
         messages[-1] = assistant_message
@@ -1425,13 +1494,34 @@ def _strip_trailing_chat_template_stop(text: str) -> str:
         stripped = without_ws[: -len("<|im_end|>")]
 
 
-def _assistant_response_for_prompt_replay(response: str, disable_thinking: bool) -> str:
-    if not disable_thinking:
-        return response
-    empty_thinking_prefix = "<think>\n\n</think>\n\n"
-    if response.startswith(empty_thinking_prefix):
-        return response
-    return empty_thinking_prefix + response
+def _content_without_historical_thinking(content: str) -> str:
+    starts_with_thinking = _THINK_BLOCK_RE.match(content) is not None or _THOUGHT_CHANNEL_BLOCK_RE.match(content) is not None
+    stripped = _THINK_BLOCK_RE.sub("", content)
+    stripped = _THOUGHT_CHANNEL_BLOCK_RE.sub("", stripped)
+    # Qwen3.5-style chat templates pre-open ``<think>\n`` inside the generation
+    # prompt, so the recorded assistant content is ``thought</think>\n\nanswer``
+    # with no opening tag and the closed-block regex never matches. Mirror the
+    # template's own ``content.split('</think>')[-1]`` split: everything up to
+    # the last bare closer is reasoning. Any ``<think>`` opener still present
+    # here is an unclosed block (kept by design) and can only appear after the
+    # last closer, so it survives this cut.
+    closers = list(_THINK_CLOSE_RE.finditer(stripped))
+    if closers:
+        stripped = stripped[closers[-1].end() :].lstrip("\n")
+    elif starts_with_thinking:
+        stripped = stripped.lstrip("\r\n")
+    return stripped
+
+
+def _messages_without_historical_thinking(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    prepared = []
+    for message in messages:
+        if message.get("role") != "assistant" or not isinstance(message.get("content"), str):
+            prepared.append(message)
+            continue
+        content = _content_without_historical_thinking(message["content"])
+        prepared.append(message if content == message["content"] else {**message, "content": content})
+    return prepared
 
 
 def _has_repeated_search_query(actions: list[ToolCall], seen_queries: set[str]) -> bool:
@@ -1814,11 +1904,20 @@ def _default_response_loss_mask(
     # added token in both Qwen3 and Qwen3.5 tokenizers, so scanning output_ids
     # for its id gives an exact boundary and avoids the ±1 drift of re-encoding
     # a character substring (_encode_len(response[:think_end])).
+    #
+    # A mis-fired block need not open with <think> (Qwen3.5-shape: the model
+    # continues reasoning right after the prompt's empty shell and closes with a
+    # bare </think>), so a bare leading closer is masked too. But if real action
+    # content (a tool call) precedes the first </think>, the closer is a stray
+    # artifact -- masking through it would zero-mask legitimate action tokens.
     close_id = _think_close_token_id(tokenizer)
     if output_ids is not None and close_id is not None:
         try:
             j = output_ids.index(close_id)
         except ValueError:
+            return [1] * output_len
+        closer_pos = response.find("</think>")
+        if closer_pos >= 0 and "<tool_call" in response[:closer_pos]:
             return [1] * output_len
         # Mask the mis-fired think block through </think> itself; the answer
         # (everything after </think>) stays trainable. Any trailing "\n\n"
@@ -2132,7 +2231,24 @@ def _episode_step(
     llm_time: float,
     env_time: float,
     disable_thinking: bool = False,
+    tito_context_reason: str | None = None,
 ) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "disable_thinking": bool(disable_thinking),
+        "timing": {
+            "start_timestamp": _utc_timestamp(),
+            "end_timestamp": _utc_timestamp(),
+            "llm_time": llm_time,
+            "env_time": env_time,
+        },
+    }
+    if tito_context_reason is not None:
+        # How this step's served prompt relates to the TiTO accumulator; in
+        # particular "historical_thinking_discard" marks the turns where prior
+        # thinking was dropped from the served history (chat_completions above
+        # reflect that stripped view, i.e. what the policy actually saw).
+        info["tito_context_reason"] = tito_context_reason
+        info["historical_thinking_discarded"] = tito_context_reason == "historical_thinking_discard"
     return {
         "observation": observation,
         "thought": _extract_thought(response),
@@ -2141,15 +2257,7 @@ def _episode_step(
         "done": bool(done),
         "model_response": response,
         "chat_completions": _chat_completions_for_step(messages, response),
-        "info": {
-            "disable_thinking": bool(disable_thinking),
-            "timing": {
-                "start_timestamp": _utc_timestamp(),
-                "end_timestamp": _utc_timestamp(),
-                "llm_time": llm_time,
-                "env_time": env_time,
-            },
-        },
+        "info": info,
     }
 
 
@@ -2485,9 +2593,7 @@ async def _abort_sglang_request(args, rid: str, *, server_url: str | None = None
         return
     try:
         await client.post(
-            f"{server_url.rstrip('/')}/abort_request"
-            if server_url
-            else f"http://{args.sglang_router_ip}:{args.sglang_router_port}/abort_request",
+            f"{server_url.rstrip('/')}/abort_request" if server_url else f"http://{args.sglang_router_ip}:{args.sglang_router_port}/abort_request",
             json={"rid": rid},
             timeout=5.0,
         )

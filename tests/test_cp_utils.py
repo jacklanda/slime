@@ -120,10 +120,22 @@ def test_split_with_per_mb_denom_would_be_wrong():
     mb_b_wrong = get_sum_of_sample_mean(total_lengths[2:], response_lengths[2:], loss_masks[2:], _denoms(3, 3))
     wrong_total = mb_a_wrong(x[:6]).item() + mb_b_wrong(x[6:]).item()
 
-    assert wrong_total != pytest.approx(whole_value), (
-        "Expected the per-mb denom path to produce a different (incorrect) value; "
-        "if these match, the regression test is no longer guarding the precomputation contract."
-    )
+    assert wrong_total != pytest.approx(whole_value), "Expected the per-mb denom path to produce a different (incorrect) value; " "if these match, the regression test is no longer guarding the precomputation contract."
+
+
+@pytest.mark.unit
+def test_fractional_prompt_equal_denom_is_not_clamped_to_one():
+    """Prompt-equal denominators D_P = M_P * N_P / GBS are legitimately
+    fractional (< 1) for heavily-masked prompts; the reducer must divide by
+    the fractional value (up-weighting the sample), not clamp it to 1. Only a
+    fully-dead sample (denom == 0, zero numerator) falls back to 1."""
+    total_lengths, response_lengths, loss_masks = _make_inputs([2, 2])
+    sample_denoms = torch.tensor([0.5, 0.0], dtype=torch.float32)
+    loss_masks[1] = torch.zeros(2, dtype=torch.float32)  # dead sample
+    reducer = get_sum_of_sample_mean(total_lengths, response_lengths, loss_masks, sample_denoms)
+    x = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    # live sample: (1+2)/0.5 = 6; dead sample: 0/1 = 0
+    assert reducer(x).item() == pytest.approx(6.0)
 
 
 @pytest.mark.unit

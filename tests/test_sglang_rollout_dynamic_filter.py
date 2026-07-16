@@ -12,12 +12,16 @@ class _DoneTask:
     def result(self):
         return self._result
 
+    def done(self):
+        return True
+
 
 class _FakeGenerateState:
     def __init__(self, args):
         self.args = args
         self.remaining_batch_size = 0
         self.pendings = set()
+        self.pending_groups = {}
         self._submitted = False
 
     def submit_generate_tasks(self, samples):
@@ -52,7 +56,7 @@ def test_sync_dynamic_filter_receives_flattened_fanout_group(monkeypatch):
         assert all(isinstance(sample, Sample) for sample in samples)
         return True
 
-    async def fake_wait(pendings, return_when):
+    async def fake_wait(pendings, return_when, timeout=None):
         return {_DoneTask(group)}, set()
 
     monkeypatch.setattr(sglang_rollout, "GenerateState", _FakeGenerateState)
@@ -71,9 +75,7 @@ def test_sync_dynamic_filter_receives_flattened_fanout_group(monkeypatch):
         rollout_all_samples_process_path=None,
     )
 
-    output, aborted_samples = asyncio.run(
-        sglang_rollout.generate_rollout_async(args, rollout_id=0, data_source=lambda num_samples: [[_sample(0, 0.0)]])
-    )
+    output, aborted_samples = asyncio.run(sglang_rollout.generate_rollout_async(args, rollout_id=0, data_source=lambda num_samples: [[_sample(0, 0.0)]]))
 
     assert aborted_samples == []
     assert output.samples == [group]

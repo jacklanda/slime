@@ -86,6 +86,7 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
         return {}
 
     samples = []
+    segmented_samples: dict[str, tuple[int, dict]] = {}
     raw_rewards = rollout_data.get("raw_reward", metrics_data.get("raw_rewards", []))
     metadata_list = metrics_data.get("metadata", [])
     group_indices = metrics_data.get("group_indices", [])
@@ -107,18 +108,29 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
         metadata = metadata_list[i] if i < len(metadata_list) and isinstance(metadata_list[i], dict) else {}
         if "fused_task_type" not in metadata:
             continue
-        group_id = group_indices[i] if i < len(group_indices) else None
-        if group_id is None:
-            group_id = rollout_ids[i] if i < len(rollout_ids) else None
-        if group_id is None:
-            group_id = sample_indices[i] if i < len(sample_indices) else i
-        samples.append(
-            {
-                "group_id": group_id,
-                "reward": float(raw_rewards[i]),
-                "metadata": metadata,
-            }
-        )
+        parent_traj_id = metadata.get("parent_traj_id")
+        if parent_traj_id is not None:
+            group_id = str(parent_traj_id)
+        else:
+            group_id = group_indices[i] if i < len(group_indices) else None
+            if group_id is None:
+                group_id = rollout_ids[i] if i < len(rollout_ids) else None
+            if group_id is None:
+                group_id = sample_indices[i] if i < len(sample_indices) else i
+        sample = {
+            "group_id": group_id,
+            "reward": float(raw_rewards[i]),
+            "metadata": metadata,
+        }
+        if parent_traj_id is None:
+            samples.append(sample)
+            continue
+        segment_index = int(metadata.get("segment_index", 0) or 0)
+        previous = segmented_samples.get(group_id)
+        if previous is None or segment_index >= previous[0]:
+            segmented_samples[group_id] = (segment_index, sample)
+
+    samples.extend(sample for _, sample in segmented_samples.values())
 
     # response_length/* and prompt_length/* are logged
     # on the rollout side (rollout.py::compute_metrics_from_samples) to avoid
@@ -185,20 +197,29 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
                 if isinstance(value, (int, float)) and math.isfinite(value):
                     workflow_values.setdefault(key, []).append(float(value))
 
+    direct_tool_metric_groups = set()
     for i in valid_indices:
         metadata = metadata_list[i] if i < len(metadata_list) and isinstance(metadata_list[i], dict) else {}
-        group_id = group_indices[i] if i < len(group_indices) else None
-        if group_id is None:
-            group_id = rollout_ids[i] if i < len(rollout_ids) else None
-        if group_id is None:
-            group_id = sample_indices[i] if i < len(sample_indices) else i
+        parent_traj_id = metadata.get("parent_traj_id")
+        if parent_traj_id is not None:
+            group_id = str(parent_traj_id)
+        else:
+            group_id = group_indices[i] if i < len(group_indices) else None
+            if group_id is None:
+                group_id = rollout_ids[i] if i < len(rollout_ids) else None
+            if group_id is None:
+                group_id = sample_indices[i] if i < len(sample_indices) else i
         group_prompt_tokens[group_id] = group_prompt_tokens.get(group_id, 0) + int(prompt_lengths[i] if i < len(prompt_lengths) else 0)
         group_response_tokens[group_id] = group_response_tokens.get(group_id, 0) + int(response_lengths[i] if i < len(response_lengths) else 0)
-        reward_debug = metadata.get("fused_reward_debug")
+        if group_id in direct_tool_metric_groups:
+            continue
+        direct_tool_metric_groups.add(group_id)
         for key in _RLLM_EPISODE_TOOL_KEYS:
-            value = _metric_value_from_metadata(metadata, reward_debug, key)
-            if value is not None:
-                workflow_values.setdefault(key, []).append(value)
+            value = metadata.get(key)
+            if isinstance(value, bool):
+                value = int(value)
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                workflow_values.setdefault(key, []).append(float(value))
 
     if not samples:
         return metrics
@@ -292,18 +313,6 @@ _RLLM_TERMINATION_REASONS = (
     "error",
     "env_done",
 )
-
-
-def _metric_value_from_metadata(metadata: dict, reward_debug, key: str) -> float | None:
-    for source in (reward_debug, metadata):
-        if not isinstance(source, dict) or key not in source:
-            continue
-        value = source[key]
-        if isinstance(value, bool):
-            value = int(value)
-        if isinstance(value, (int, float)) and math.isfinite(value):
-            return float(value)
-    return None
 
 
 def _normalize_termination_reason(reason: str) -> str:
