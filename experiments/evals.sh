@@ -31,7 +31,10 @@ Core:
   --ray-num-cpus N                     Ray CPU resources. Default: 64.
 
 Generation/eval:
-  --harness NAME                       Fused harness: bare, cot, react, gem, unified_gem. Default: gem.
+  --harness NAME                       Harness: bare, cot, react, gem, unified_gem,
+                                       rllm_deepresearch (alias: rllm_dr). Default: cot.
+  --user_prompt long|short             Web-search user prompt. Default: short.
+  --rllm-dr-refine-server-url URLS     Comma-separated OpenAI-compatible Refine server base URLs.
   --unified-system-prompt              Sets harness to unified_gem unless --harness is later set.
   --no-unified-system-prompt           Sets harness to gem unless --harness is later set.
   --disable-thinking BOOL              Default: true.
@@ -92,13 +95,17 @@ MODEL_DIR="${MODEL_DIR:-}"
 BENCHMARKS_ROOT="${BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 #INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-2wiki,bamboogle,gpqa_diamond,medqa}"
 #INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-browsecomp_plus}"
-INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-search_r1}"
+#INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-search_r1}"
+INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-bamboogle}"
 EXCLUDE_BENCHMARKS="${EXCLUDE_BENCHMARKS:-}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-eval-$(date +%Y%m%d-%H%M%S)}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 FUSED_HARNESS="${FUSED_HARNESS:-cot}"
+USER_PROMPT="${USER_PROMPT:-short}"
+RLLM_DR_REFINE_SERVER_URL="${RLLM_DR_REFINE_SERVER_URL:-}"
+RLLM_DR_USE_REFINE="${RLLM_DR_USE_REFINE:-0}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
 DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
@@ -114,11 +121,13 @@ TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:-20}"
 #EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
 #EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
-#EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-38000}"
-#EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-2048}"
+EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-38000}"
+EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-2048}"
+#EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-38000}"
+#EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-2048}"
 #EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-65536}"
-EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-131072}"
-EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-4096}"
+#EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-131072}"
+#EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-4096}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
 LIMIT_PER_BENCHMARK="${LIMIT_PER_BENCHMARK:-0}"
 PREFER_VERL="${PREFER_VERL:-1}"
@@ -155,6 +164,8 @@ while [ "$#" -gt 0 ]; do
       --gpus-per-engine) ROLLOUT_NUM_GPUS_PER_ENGINE="${2:?Missing value for --gpus-per-engine}"; shift 2 ;;
       --ray-num-cpus) RAY_NUM_CPUS="${2:?Missing value for --ray-num-cpus}"; shift 2 ;;
       --harness) FUSED_HARNESS="${2:?Missing value for --harness}"; harness_explicit=true; shift 2 ;;
+      --user_prompt|--user-prompt) USER_PROMPT="${2:?Missing value for --user_prompt}"; shift 2 ;;
+      --rllm-dr-refine-server-url) RLLM_DR_REFINE_SERVER_URL="${2:?Missing value for --rllm-dr-refine-server-url}"; shift 2 ;;
       --unified-system-prompt) UNIFIED_SYSTEM_PROMPT=True; if [ "${harness_explicit}" = "false" ]; then FUSED_HARNESS=unified_gem; fi; shift ;;
       --no-unified-system-prompt) UNIFIED_SYSTEM_PROMPT=False; if [ "${harness_explicit}" = "false" ]; then FUSED_HARNESS=gem; fi; shift ;;
       --disable-thinking) DISABLE_THINKING="${2:?Missing value for --disable-thinking}"; shift 2 ;;
@@ -200,6 +211,10 @@ done
 case "${MODEL_SERIES}" in
    qwen3|qwen3.5) ;;
    *) echo "Unsupported --model-series ${MODEL_SERIES}; expected qwen3 or qwen3.5." >&2; exit 2 ;;
+esac
+case "${USER_PROMPT}" in
+   long|short) ;;
+   *) echo "Unsupported --user_prompt ${USER_PROMPT}; expected long or short." >&2; exit 2 ;;
 esac
 
 if [ -z "${MODEL_CONFIG}" ]; then
@@ -297,6 +312,14 @@ if [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
    echo "--gpus (${ROLLOUT_GPUS}) must be divisible by --gpus-per-engine (${ROLLOUT_NUM_GPUS_PER_ENGINE})." >&2
    exit 2
 fi
+case "${FUSED_HARNESS}" in
+   rllm_deepresearch|rllm_dr|rllm-dr|deepresearch)
+      if is_truthy "${RLLM_DR_USE_REFINE}" && [ -z "${RLLM_DR_REFINE_SERVER_URL}" ]; then
+         echo "rllm_deepresearch requires --rllm-dr-refine-server-url (or RLLM_DR_USE_REFINE=0)" >&2
+         exit 2
+      fi
+      ;;
+esac
 ROLLOUT_NUM_ENGINES=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
 case "${FUSED_HARNESS}" in
    cot|bare) UNIFIED_SYSTEM_PROMPT=False ;;
@@ -305,7 +328,7 @@ if [ -z "${PER_STEP_MAX_TOKENS:-}" ]; then
    if [ "${FUSED_HARNESS}" = "cot" ]; then
       PER_STEP_MAX_TOKENS="${EVAL_MAX_RESPONSE_LEN}"
    else
-      PER_STEP_MAX_TOKENS=2048
+      PER_STEP_MAX_TOKENS=38000
    fi
 fi
 if [ "${FUSED_HARNESS}" = "cot" ]; then
@@ -389,11 +412,17 @@ export RLLM_RETRIEVAL_MODE="${RLLM_RETRIEVAL_MODE:-hybrid}"
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
 export RLLM_RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY}"
 export RLLM_RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE}"
-export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-4}"
+case "${FUSED_HARNESS}" in
+   rllm_deepresearch|rllm_dr|rllm-dr|deepresearch) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-10}" ;;
+   *) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-4}" ;;
+esac
 export RLLM_RETRIEVAL_SUMMARIZE="${RLLM_RETRIEVAL_SUMMARIZE:-0}"
+export RLLM_DR_REFINE_SERVER_URL
+export RLLM_DR_USE_REFINE
 export DOCKER_HOST="${DOCKER_HOST:-tcp://10.2.152.50:2375}"
 export DOCKER_API_VERSION="${DOCKER_API_VERSION:-1.44}"
 export FUSED_HARNESS="${FUSED_HARNESS}"
+export FUSED_WEB_SEARCH_USER_PROMPT="${USER_PROMPT}"
 export FUSED_MODEL_SERIES="${MODEL_SERIES}"
 export FUSED_UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT}"
 export FUSED_DISABLE_THINKING="${DISABLE_THINKING}"
@@ -430,8 +459,13 @@ keys = (
     "PYTORCH_CUDA_ALLOC_CONF", "RETRIEVAL_SERVER_URL", "RLLM_RETRIEVAL_MODE",
     "RLLM_RETRIEVAL_MAX_WORDS", "RLLM_RETRIEVAL_CONCURRENCY", "RLLM_RETRIEVAL_CACHE_SIZE",
     "RETRIEVAL_MAX_RESULTS", "RLLM_RETRIEVAL_SUMMARIZE",
+    "RLLM_DR_REFINE_SERVER_URL", "RLLM_DR_REFINE_MODEL", "RLLM_DR_USE_REFINE",
+    "RLLM_DR_MAX_TURNS", "RLLM_DR_MAX_TOKENS", "RLLM_DR_MAX_CONTENT_LENGTH",
+    "RLLM_DR_RETRIEVAL_MAX_RETRIES", "RLLM_DR_REFINE_MAX_RETRIES",
+    "RLLM_DR_TEMPERATURE", "RLLM_DR_TOP_P", "RLLM_DR_TOP_K", "REFINE_SERVER_URL",
     "DOCKER_HOST", "DOCKER_API_VERSION", "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL",
-    "OPENROUTER_APP_NAME", "FUSED_HARNESS", "FUSED_MODEL_SERIES", "FUSED_UNIFIED_SYSTEM_PROMPT",
+    "OPENROUTER_APP_NAME", "FUSED_HARNESS", "FUSED_WEB_SEARCH_USER_PROMPT",
+    "FUSED_MODEL_SERIES", "FUSED_UNIFIED_SYSTEM_PROMPT",
     "FUSED_DISABLE_THINKING", "FUSED_DISCARD_HISTORICAL_THINKING",
     "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS",
     "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
@@ -456,7 +490,7 @@ echo "Benchmarks root: ${BENCHMARKS_ROOT}"
 echo "Eval config: ${EVAL_CONFIG}"
 echo "Log root: ${LOG_ROOT}"
 echo "GPUs: ${ROLLOUT_GPUS}; gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}; engines=${ROLLOUT_NUM_ENGINES}"
-echo "Harness: ${FUSED_HARNESS}; disable_thinking=${DISABLE_THINKING}; discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}; n=${N_SAMPLES_PER_EVAL_PROMPT}; per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
+echo "Harness: ${FUSED_HARNESS}; user_prompt=${USER_PROMPT}; disable_thinking=${DISABLE_THINKING}; discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}; n=${N_SAMPLES_PER_EVAL_PROMPT}; per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
 echo "Concurrency: eval=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS} adaptive=${EVAL_ADAPTIVE_CONCURRENCY}; sglang_http_per_engine=${SGLANG_SERVER_CONCURRENCY}; sglang_running_per_engine=${SGLANG_MAX_RUNNING_REQUESTS}; retrieval=${RETRIEVAL_CONCURRENCY}"
 
 EVAL_ADAPTIVE_CONCURRENCY_ARG="--eval-adaptive-concurrency"

@@ -12,7 +12,8 @@ RULES:
 2. If a search result is short, vague, or only echoes the query, issue a new query with different keywords.
 3. For multi-hop questions, decompose into sub-questions and search each sub-question separately.
 4. Synthesize the search results to form an accurate, concise answer.
-5. The finish tool's result should contain only the concise final answer; \\boxed{} is accepted but not required.
+5. Emit exactly one tool call per assistant response.
+6. Submit the final answer only by calling finish. Put only the concise answer in finish.result; do not use <answer> tags or \\boxed{}.
 """
 
 FUSED_SEARCH_USER_PROMPT = """Answer the following question by searching for relevant information.
@@ -22,6 +23,23 @@ FUSED_SEARCH_USER_PROMPT = """Answer the following question by searching for rel
 </question>
 
 Use web_search to gather evidence. When ready, call finish with result set to the concise final answer."""
+
+FUSED_SEARCH_LONG_USER_PROMPT = """Answer the following question by searching for relevant information.
+
+<question>
+{problem_statement}
+</question>
+
+Instructions:
+1. Use the web_search tool to find relevant information. Search as many times as needed and do not stop after a fixed number of searches - keep querying until you have concrete supporting evidence.
+2. If a search result is short, vague, or just echoes the question, issue a new query with different keywords or add named entities, dates, or numbers.
+3. For multi-hop questions, decompose into sub-questions and search each separately.
+4. Write queries in the same language as the question (e.g., Chinese question -> Chinese query).
+5. Synthesize the search results to form an accurate answer grounded in retrieved text.
+6. When you have found the answer, call finish exactly once with the concise answer in the result parameter. Do not also emit <answer> tags, \\boxed{{}}, or plain-text final-answer prose.
+
+IMPORTANT: Do NOT use file editing tools (file_editor, execute_bash, search) for this task — only use web_search and finish.
+"""
 
 FUSED_MCP_SYSTEM_PROMPT = """You are a tool agent. You are given a task to complete using the provided tools.
 
@@ -109,7 +127,7 @@ def finish_schema() -> dict:
             "command": {"type": "string", "description": "Use submit."},
             "result": {"type": "string", "description": "Final answer or JSON value."},
         },
-        ["command"],
+        ["command", "result"],
     )
 
 
@@ -141,8 +159,15 @@ def build_system_prompt(
 
 def normalize_harness(harness: str | None) -> str:
     value = (harness or "gem").strip().lower().replace("-", "_")
-    aliases = {"unified": "unified_gem", "fused": "gem", "chain_of_thought": "cot", "no_system": "bare"}
+    aliases = {
+        "unified": "unified_gem",
+        "fused": "gem",
+        "chain_of_thought": "cot",
+        "no_system": "bare",
+        "rllm_dr": "rllm_deepresearch",
+        "deepresearch": "rllm_deepresearch",
+    }
     value = aliases.get(value, value)
-    if value not in {"gem", "unified_gem", "react", "cot", "bare"}:
+    if value not in {"gem", "unified_gem", "react", "cot", "bare", "rllm_deepresearch"}:
         raise ValueError(f"Invalid fused harness: {harness!r}")
     return value

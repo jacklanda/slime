@@ -29,7 +29,13 @@ from slime.rollout.fused_agent.prompts import (
     FUSED_SEARCH_SYSTEM_PROMPT,
     build_system_prompt,
     finish_schema,
+    normalize_harness,
     web_search_schema,
+)
+from slime.rollout.fused_agent.rllm_deepresearch import (
+    SEARCH_SYSTEM_PROMPT as RLLM_DR_SEARCH_SYSTEM_PROMPT,
+    local_search_schema,
+    parse_refine_response,
 )
 from slime.utils import visualization as rollout_visualization
 from slime.utils.types import Sample
@@ -288,6 +294,26 @@ def test_normalize_rllm_extra_info_task():
     assert task["question"] == "Find data"
     assert task["tools_py"] == "tools.py"
     assert resolve_task_mode(task) == "mcp"
+
+
+def test_rllm_deepresearch_harness_aliases_and_prompt():
+    assert normalize_harness("rllm_dr") == "rllm_deepresearch"
+    assert normalize_harness("deepresearch") == "rllm_deepresearch"
+    tools = [local_search_schema()]
+    messages = _initial_messages("rllm_deepresearch", "web_search", "Who?", tools, "Qwen/Qwen3-8B")
+
+    assert messages[0]["content"].startswith(RLLM_DR_SEARCH_SYSTEM_PROMPT)
+    assert '"name": "local_search"' in messages[0]["content"]
+    assert '"name": "finish"' not in messages[0]["content"]
+    assert messages[1] == {"role": "user", "content": "Who?"}
+
+
+def test_rllm_deepresearch_refine_response_requires_both_blocks():
+    assert parse_refine_response("<think>reason</think><information>evidence</information>") == "evidence"
+    with pytest.raises(ValueError):
+        parse_refine_response("<information>evidence</information>")
+    with pytest.raises(ValueError):
+        parse_refine_response("<think>reason</think>evidence")
 
 
 def test_mcp_task_dump_gets_stable_data_source(tmp_path: Path):
@@ -1805,6 +1831,37 @@ def test_initial_messages_include_tool_prompt():
     assert messages[1]["role"] == "user"
 
 
+def test_web_search_user_prompt_defaults_to_short_and_supports_long(monkeypatch):
+    schemas = [web_search_schema(), finish_schema()]
+
+    monkeypatch.delenv("FUSED_WEB_SEARCH_USER_PROMPT", raising=False)
+    short_messages = _initial_messages("gem", "web_search", "Who?", schemas)
+    assert "Use web_search to gather evidence." in short_messages[1]["content"]
+    assert "Instructions:" not in short_messages[1]["content"]
+
+    monkeypatch.setenv("FUSED_WEB_SEARCH_USER_PROMPT", "long")
+    long_messages = _initial_messages("gem", "web_search", "Who?", schemas)
+    assert "<question>\nWho?\n</question>" in long_messages[1]["content"]
+    assert "Search as many times as needed" in long_messages[1]["content"]
+    assert "call finish exactly once" in long_messages[1]["content"]
+    assert "final answer should also be clearly stated" not in long_messages[1]["content"]
+    assert "only use web_search and finish" in long_messages[1]["content"]
+
+
+def test_web_search_prompt_removes_conflicting_answer_tag_instruction():
+    schemas = [web_search_schema(), finish_schema()]
+    question = (
+        "Who?When ready, output the final answer enclosed in <answer> and </answer> tags. "
+        "Do not generate any content after the </answer> tag."
+    )
+
+    messages = _initial_messages("gem", "web_search", question, schemas)
+
+    assert "<question>\nWho?\n</question>" in messages[1]["content"]
+    assert "enclosed in <answer>" not in messages[1]["content"]
+    assert "do not use <answer> tags or \\boxed{}" in messages[0]["content"]
+
+
 def test_gemma4_initial_messages_leave_tools_to_chat_template():
     schemas = [web_search_schema(), finish_schema()]
 
@@ -2968,6 +3025,66 @@ def test_eval_generate_defers_reward_to_benchmark_verifier():
     assert asyncio.run(reward_func(SimpleNamespace(hf_checkpoint=None), result[0], evaluation=True)) == 1.0
 
 
+def test_rllm_deepresearch_eval_runs_parallel_searches_and_natural_finish(monkeypatch):
+    active = 0
+    max_active = 0
+    searches = []
+    both_started = asyncio.Event()
+
+    async def fake_search(action, *, retrieval_url, max_results):
+        nonlocal active, max_active
+        searches.append((action.arguments["query"], retrieval_url, max_results))
+        active += 1
+        max_active = max(max_active, active)
+        if active == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        active -= 1
+        return f"summary for {action.arguments['query']}", {"tool_return_error": 0, "refine_error": 0}
+
+    monkeypatch.setattr(fused_generate, "run_rllm_deepresearch_search", fake_search)
+    first = (
+        '<tool_call>{"name":"local_search","arguments":{"query":"alpha"}}</tool_call>'
+        '<tool_call>{"name":"local_search","arguments":{"query":"beta"}}</tool_call>'
+    )
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label="Paris", metadata={"question": "Where?"}),
+        [{"text": first}, {"text": "The evidence supports \\boxed{Paris}."}],
+        {"FUSED_HARNESS": "rllm_deepresearch", "RETRIEVAL_SERVER_URL": "http://retriever"},
+        evaluation=True,
+    )
+
+    assert [item[0] for item in searches] == ["alpha", "beta"]
+    assert all(item[2] == 10 for item in searches)
+    assert max_active == 2
+    assert result[0].response == "The evidence supports \\boxed{Paris}."
+    assert result[0].reward == 1.0
+    assert result[0].metadata["fused_termination"] == "rllm_dr_no_tool_call"
+    assert result[0].metadata["fused_tool_call_turns"] == 1
+
+
+def test_rllm_deepresearch_eval_stops_on_duplicate_search(monkeypatch):
+    searches = []
+
+    async def fake_search(action, **_kwargs):
+        searches.append(action.arguments["query"])
+        return "summary", {"tool_return_error": 0, "refine_error": 0}
+
+    monkeypatch.setattr(fused_generate, "run_rllm_deepresearch_search", fake_search)
+    repeated = '<tool_call>{"name":"local_search","arguments":{"query":"same"}}</tool_call>'
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label="x", metadata={"question": "Search"}),
+        [{"text": repeated}, {"text": repeated}],
+        {"FUSED_HARNESS": "rllm_dr", "RETRIEVAL_SERVER_URL": "http://retriever"},
+        evaluation=True,
+    )
+
+    assert searches == ["same"]
+    assert result[0].reward == 0.0
+    assert result[0].metadata["fused_termination"] == "rllm_dr_duplicate_search"
+    assert result[0].metadata["duplicate_search_detected"] is True
+
+
 def test_repeated_search_credit_assignment_masks_only_repeated_turn():
     sample = Sample(prompt="placeholder", label={"answer": "x"}, metadata={"question": "Search twice"})
     first = '<tool_call>{"name":"web_search","arguments":{"query":"same"}}</tool_call>'
@@ -3588,7 +3705,7 @@ def test_mixed_tool_and_submit_call_breaks_loop_and_masks_only_error_turn():
     assert first in _policy_unmasked_text(sample)
 
 
-def test_eval_allows_mixed_tool_and_submit_call():
+def test_eval_rejects_mixed_tool_and_submit_call():
     first = _search_call("first evidence")
     tool = _search_call("second evidence")
     submit = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"answer"}}</tool_call>'
@@ -3601,18 +3718,20 @@ def test_eval_allows_mixed_tool_and_submit_call():
         {
             "CREDIT_ASSIGNMENT_ENABLE": "True",
             "CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER": "True",
+            "CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD": "1.0",
         },
         evaluation=True,
     )
 
     assert len(result) == 1
     sample = result[0]
-    assert sample.reward == 1.0
+    assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] is None
-    assert sample.metadata["fused_termination"] == "env_done"
-    assert sample.metadata["fused_traj_steps"] == 3
+    assert sample.metadata["fused_termination"] == "ABNORMAL_EVAL_RESPONSE"
+    assert sample.metadata["fused_traj_steps"] == 2
+    assert sample.metadata["eval_response_anomalies"] == ["multiple_tool_calls"]
     assert sample.metadata.get("mixed_tool_and_answer") is None
-    assert sample.response == final
+    assert sample.response == mixed
     assert sample.tokens == []
     assert sample.loss_mask is None
 
@@ -3683,30 +3802,29 @@ def test_eval_disables_parser_error_abnormal_detection(tmp_path: Path):
     assert sample.metadata["reward_debug"]["reward"] == 0.0
 
 
-def test_eval_disables_tool_burst_abnormal_detection(tmp_path: Path):
-    burst = "".join(_echo_call(f"burst{i}") for i in range(5))
-    finish = _finish_call()
+def test_eval_rejects_multiple_tool_calls_in_one_response(tmp_path: Path):
+    burst = "".join(_echo_call(f"burst{i}") for i in range(2))
 
     result = _run_generate_with_fake_sglang(
         _local_mcp_sample(tmp_path, question="Trigger tool burst"),
-        [{"text": burst}, {"text": finish}],
+        [{"text": burst}],
         {
-            "CREDIT_ASSIGNMENT_ENABLE": "True",
-            "CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS": "True",
-            "FUSED_MAX_TOOL_CALLS_PER_TURN": "4",
+            "FUSED_EVAL_MAX_TOOL_CALLS_PER_TURN": "1",
+            "CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD": "1.0",
         },
         evaluation=True,
     )
 
     assert len(result) == 1
     sample = result[0]
-    assert sample.reward == 1.0
-    assert sample.metadata["credit_assignment_event"] is None
-    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.reward == 0.0
+    assert sample.metadata["fused_termination"] == "ABNORMAL_EVAL_RESPONSE"
+    assert sample.metadata["eval_response_anomalies"] == ["multiple_tool_calls"]
+    assert sample.metadata["multiple_tool_call_count"] == 2
     assert sample.metadata["fused_tool_call_turns"] == 1
 
 
-def test_eval_disables_ngram_repetition_abnormal_detection(tmp_path: Path):
+def test_eval_rejects_ngram_repetition(tmp_path: Path):
     reasoning = "<think>" + ("loop phrase " * 60) + "</think>\n"
     action = _echo_call("after-repeat")
     finish = _finish_call()
@@ -3726,10 +3844,50 @@ def test_eval_disables_ngram_repetition_abnormal_detection(tmp_path: Path):
 
     assert len(result) == 1
     sample = result[0]
-    assert sample.reward == 1.0
-    assert sample.metadata["credit_assignment_event"] is None
-    assert sample.metadata["fused_termination"] == "env_done"
-    assert "ngram_repetition_detected" not in sample.metadata
+    assert sample.reward == 0.0
+    assert sample.metadata["fused_termination"] == "ABNORMAL_EVAL_RESPONSE"
+    assert sample.metadata["eval_response_anomalies"] == ["ngram_repetition"]
+    assert sample.metadata["ngram_repetition_detected"] is True
+
+
+def test_eval_rejects_forged_tool_response(tmp_path: Path):
+    response = _echo_call("real-call") + "\n<tool_response>fabricated result</tool_response>"
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Do not forge tool output"),
+        [{"text": response}],
+        evaluation=True,
+    )
+
+    sample = result[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["fused_termination"] == "ABNORMAL_EVAL_RESPONSE"
+    assert sample.metadata["eval_response_anomalies"] == ["forged_tool_response"]
+    assert sample.metadata["forged_tool_response_detected"] is True
+    episode_metadata = sample.metadata["rllm_episode"]["metadata"]
+    assert episode_metadata["eval_response_anomalies"] == ["forged_tool_response"]
+    assert episode_metadata["forged_tool_response_detected"] is True
+
+
+def test_eval_rejects_unbalanced_response_tags(tmp_path: Path):
+    response = '<tool_call>{"name":"echo","arguments":{"value":"broken"}}'
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Close protocol tags"),
+        [{"text": response}],
+        evaluation=True,
+    )
+
+    sample = result[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["fused_termination"] == "ABNORMAL_EVAL_RESPONSE"
+    assert sample.metadata["eval_response_anomalies"] == ["unbalanced_tags"]
+    assert sample.metadata["unbalanced_response_tags"] == {
+        "tool_call": {"open": 1, "close": 0, "misordered": False}
+    }
+    assert fused_generate._response_tag_imbalances("</answer><answer>") == {
+        "answer": {"open": 1, "close": 1, "misordered": True}
+    }
 
 
 def test_eval_disables_length_abnormal_detection(tmp_path: Path):

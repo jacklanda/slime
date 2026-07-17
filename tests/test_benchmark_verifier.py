@@ -122,6 +122,20 @@ def test_short_answer_benchmarks_accept_submit_alias_as_finish():
 
 
 @pytest.mark.unit
+def test_benchmark_verifier_rejects_detected_eval_response_anomaly():
+    response = (
+        '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"Marie Curie"}}</tool_call>'
+    )
+    sample = _sample(
+        response=response,
+        label="Marie Curie",
+        metadata={"data_source": "bamboogle", "eval_response_anomalies": ["ngram_repetition"]},
+    )
+
+    assert asyncio.run(reward_func(None, sample)) == 0.0
+
+
+@pytest.mark.unit
 def test_short_answer_benchmarks_accept_plain_final_response_after_parse_error():
     sample = _sample(
         response="The machine used to extract honey from honeycombs uses **centrifugal force**.",

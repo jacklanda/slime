@@ -11,8 +11,8 @@ logger = logging.getLogger(__name__)
 
 
 def save_rllm_episode_batch(args, *, rollout_id: int, samples: list[Sample], mode: str = "train", epoch: int = 0) -> None:
-    episodes = _collect_rllm_episodes(samples)
-    if not episodes:
+    episode_samples = _collect_rllm_episode_samples(samples)
+    if not episode_samples:
         return
 
     log_dir = _episode_log_dir(args, mode=mode)
@@ -22,17 +22,26 @@ def save_rllm_episode_batch(args, *, rollout_id: int, samples: list[Sample], mod
         "training_step": rollout_id,
         "epoch": epoch,
         "mode": mode,
-        "num_episodes": len(episodes),
-        "trajectories": [_episode_to_batch_dict(episode, rollout_id, mode, epoch) for episode in episodes],
+        "num_episodes": len(episode_samples),
+        "trajectories": [
+            _episode_to_batch_dict(
+                episode,
+                rollout_id,
+                mode,
+                epoch,
+                eval_reward=sample.reward if mode == "eval" else None,
+            )
+            for episode, sample in episode_samples
+        ],
     }
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(batch_data, f, indent=4, ensure_ascii=False, default=str)
         f.write("\n")
-    logger.info("Saved %s episode trajectories to %s", len(episodes), file_path)
+    logger.info("Saved %s episode trajectories to %s", len(episode_samples), file_path)
 
 
-def _collect_rllm_episodes(samples: list[Sample]) -> list[dict[str, Any]]:
-    episodes = []
+def _collect_rllm_episode_samples(samples: list[Sample]) -> list[tuple[dict[str, Any], Sample]]:
+    episode_samples = []
     seen_episode_ids = set()
     for sample in samples:
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
@@ -44,8 +53,8 @@ def _collect_rllm_episodes(samples: list[Sample]) -> list[dict[str, Any]]:
             continue
         if episode_id:
             seen_episode_ids.add(episode_id)
-        episodes.append(episode)
-    return episodes
+        episode_samples.append((episode, sample))
+    return episode_samples
 
 
 def _episode_log_dir(args, mode: str = "train") -> Path:
@@ -68,11 +77,23 @@ def _batch_filename(step: int, mode: str, epoch: int) -> str:
     return f"{mode}_global_steps_{step}_epoch_{epoch}.json"
 
 
-def _episode_to_batch_dict(episode: dict[str, Any], step: int, mode: str, epoch: int) -> dict[str, Any]:
+def _episode_to_batch_dict(
+    episode: dict[str, Any],
+    step: int,
+    mode: str,
+    epoch: int,
+    *,
+    eval_reward: float | None,
+) -> dict[str, Any]:
     task = _sanitize_task(episode.get("task"))
     metadata = episode.get("metadata") if isinstance(episode.get("metadata"), dict) else {}
     info = episode.get("info") if isinstance(episode.get("info"), dict) else {}
     timing = info.get("timing") if isinstance(info.get("timing"), dict) else {}
+    trajectories = [_trajectory_to_batch_dict(traj) for traj in episode.get("trajectories", []) if isinstance(traj, dict)]
+    workflow_reward = (
+        float(trajectories[0]["reward"]) if trajectories and trajectories[0]["reward"] is not None else None
+    )
+    final_reward = float(eval_reward) if eval_reward is not None else workflow_reward
     return {
         "training_step": step,
         "epoch": epoch,
@@ -81,12 +102,14 @@ def _episode_to_batch_dict(episode: dict[str, Any], step: int, mode: str, epoch:
         "session_id": episode.get("session_id"),
         "task": task,
         "task_hash": _compute_task_hash(task),
-        "is_correct": bool(episode.get("is_correct")),
+        "is_correct": bool(final_reward is not None and final_reward > 0),
+        "workflow_reward": workflow_reward,
+        "eval_reward": float(eval_reward) if eval_reward is not None else None,
         "termination_reason": episode.get("termination_reason"),
         "metrics": episode.get("metrics") or {},
         "metadata": metadata,
         "timing": timing,
-        "trajectories": [_trajectory_to_batch_dict(traj) for traj in episode.get("trajectories", []) if isinstance(traj, dict)],
+        "trajectories": trajectories,
     }
 
 

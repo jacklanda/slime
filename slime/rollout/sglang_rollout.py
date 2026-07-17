@@ -702,7 +702,7 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
     target_data_size = args.rollout_batch_size
 
     data = []
-    all_data = []
+    all_data = [] if args.rollout_all_samples_process_path is not None else None
     do_print = True
     filter_relax_after = int(getattr(args, "fully_async_filter_relax_after_groups", 0) or 0)
     completed_groups = 0
@@ -752,10 +752,12 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
                 logger.info(
                     f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
                 )
+                del sample
                 do_print = False
 
             assert len(group) == args.n_samples_per_prompt
-            all_data.append(group)
+            if all_data is not None:
+                all_data.append(group)
             completed_groups += 1
             dynamic_filter_output = call_dynamic_filter(
                 dynamic_filter,
@@ -810,7 +812,6 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
-    all_samples = sorted(all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
 
     # reset the global state to prevent effects on the next rollout or eval.
     state.reset()
@@ -820,6 +821,8 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
 
     # There can be circumstances where users want to process all samples including filtered ones.
     if args.rollout_all_samples_process_path is not None:
+        assert all_data is not None
+        all_samples = sorted(all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
         process_func = load_function(args.rollout_all_samples_process_path)
         process_func(args, all_samples, data_source)
 

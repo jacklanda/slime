@@ -41,9 +41,11 @@ def _sample_with_episode() -> Sample:
 def test_eval_episode_dump_uses_evals_global_steps_path(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     args = types.SimpleNamespace(wandb_project="FusedRL", wandb_group="run")
+    eval_sample = _sample_with_episode()
+    eval_sample.reward = 0.0
 
     save_rllm_episode_batch(args, rollout_id=0, samples=[_sample_with_episode()], mode="train")
-    save_rllm_episode_batch(args, rollout_id=0, samples=[_sample_with_episode()], mode="eval")
+    save_rllm_episode_batch(args, rollout_id=0, samples=[eval_sample], mode="eval")
 
     train_path = tmp_path / "experiments" / "logs" / "FusedRL" / "run" / "train" / "global_steps_0.json"
     eval_path = tmp_path / "experiments" / "logs" / "FusedRL" / "run" / "evals" / "global_steps_0.json"
@@ -52,7 +54,11 @@ def test_eval_episode_dump_uses_evals_global_steps_path(tmp_path, monkeypatch):
     assert eval_path.exists()
     dumped = json.loads(eval_path.read_text())
     assert dumped["mode"] == "eval"
-    step = dumped["trajectories"][0]["trajectories"][0]["steps"][0]
+    episode = dumped["trajectories"][0]
+    assert episode["workflow_reward"] == 1.0
+    assert episode["eval_reward"] == 0.0
+    assert episode["is_correct"] is False
+    step = episode["trajectories"][0]["steps"][0]
     assert step["thought"] == ""
     assert step["model_response"] == "plain response"
     assert step["disable_thinking"] is True

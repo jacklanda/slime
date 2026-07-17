@@ -83,6 +83,8 @@ async def reward_func(args, sample_or_samples: Sample | list[Sample], **kwargs):
 
 def _score_sample(sample: Sample) -> float:
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    if metadata.get("eval_response_anomalies"):
+        return 0.0
     data_source = str(metadata.get("data_source") or metadata.get("benchmark") or "").lower()
     label = sample.label
 

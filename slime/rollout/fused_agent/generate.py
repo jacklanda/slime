@@ -31,6 +31,7 @@ from .prompts import (
     FUSED_CLI_USER_PROMPT,
     FUSED_ET_SYSTEM_PROMPT,
     FUSED_ET_USER_PROMPT,
+    FUSED_SEARCH_LONG_USER_PROMPT,
     FUSED_SEARCH_SYSTEM_PROMPT,
     FUSED_SEARCH_USER_PROMPT,
     FUSED_UNIFIED_SYSTEM_PROMPT,
@@ -39,6 +40,8 @@ from .prompts import (
     build_system_prompt,
     normalize_harness,
 )
+from .rllm_deepresearch import SEARCH_SYSTEM_PROMPT as RLLM_DR_SEARCH_SYSTEM_PROMPT
+from .rllm_deepresearch import local_search_schema, run_search as run_rllm_deepresearch_search
 
 logger = logging.getLogger(__name__)
 DEFAULT_SGLANG_CONTEXT_LENGTH_MARGIN = 256
@@ -367,17 +370,27 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     state = GenerateState(args)
     task = _task_from_sample(base_sample)
     harness = normalize_harness(os.environ.get("FUSED_HARNESS", getattr(args, "fused_harness", "gem")))
+    rllm_deepresearch = harness == "rllm_deepresearch"
     reasoning_only = harness in {"cot", "bare"}
+    retrieval_max_results = int(os.environ.get("RETRIEVAL_MAX_RESULTS", "10" if rllm_deepresearch else "5"))
     env = FusedEnvironment(
         task,
         retrieval_url=os.environ.get("RETRIEVAL_SERVER_URL"),
-        retrieval_max_results=int(os.environ.get("RETRIEVAL_MAX_RESULTS", "5")),
+        retrieval_max_results=retrieval_max_results,
         enable_tools=not reasoning_only,
     )
     observation, info = env.reset()
-    base_max_steps = int(os.environ.get("FUSED_MAX_STEPS", getattr(args, "fused_max_steps", "16")))
+    if rllm_deepresearch and env.mode != "web_search":
+        env.close()
+        raise ValueError(f"rllm_deepresearch only supports web-search tasks, got task mode {env.mode!r}")
+    base_max_steps = int(
+        os.environ.get(
+            "RLLM_DR_MAX_TURNS" if rllm_deepresearch else "FUSED_MAX_STEPS",
+            "48" if rllm_deepresearch else getattr(args, "fused_max_steps", "16"),
+        )
+    )
     per_step_max_tokens = int(os.environ.get("PER_STEP_MAX_TOKENS", str(sampling_params.get("max_new_tokens", 2048))))
-    disable_thinking = _env_bool("FUSED_DISABLE_THINKING", True)
+    disable_thinking = False if rllm_deepresearch else _env_bool("FUSED_DISABLE_THINKING", True)
     discard_historical_thinking = not disable_thinking and _env_bool("FUSED_DISCARD_HISTORICAL_THINKING", False)
     prompt_equal_loss = not evaluation and getattr(args, "advantage_estimator", "grpo") in PROMPT_EQUAL_LOSS_ESTIMATORS
     max_context_tokens = _effective_sglang_context_limit(args)
@@ -398,13 +411,15 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     ngram_repetition_threshold = float(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD", "0.35"))
     ngram_repetition_min_tokens = int(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS", "128"))
     repeated_search_max_strikes = max(1, int(os.environ.get("FUSED_REPEATED_SEARCH_MAX_STRIKES", "2")))
-    detect_abnormal_trajectories = not evaluation
+    detect_abnormal_trajectories = not evaluation and not rllm_deepresearch
+    detect_eval_response_anomalies = evaluation and not rllm_deepresearch
+    eval_max_tool_calls_per_turn = int(os.environ.get("FUSED_EVAL_MAX_TOOL_CALLS_PER_TURN", "1"))
 
-    tools = env.tools()
+    tools = [local_search_schema()] if rllm_deepresearch else env.tools()
     model_name = getattr(state.tokenizer, "name_or_path", None) or getattr(args, "hf_checkpoint", None)
     parser = make_tool_parser(model_name, valid_tools=_valid_tool_names(tools))
     messages = _initial_messages(harness, info.get("task_type", ""), observation, tools, model_name, tool_parser=parser)
-    max_steps = _max_steps_for_mode(env.mode, base_max_steps)
+    max_steps = base_max_steps if rllm_deepresearch else _max_steps_for_mode(env.mode, base_max_steps)
     manager = None if evaluation else TrajectoryManager(fork_threshold_tokens=int(os.environ.get("SLIME_FUSED_FORK_THRESHOLD_TOKENS", "1024")))
     session_id = base_sample.session_id or uuid.uuid4().hex
     base_sample.session_id = session_id
@@ -432,6 +447,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     pending_turns: list[dict[str, Any]] = []
     tito_prefix_ids: list[int] = []
     seen_search_queries: set[str] = set()
+    seen_rllm_calls: set[tuple[str, str]] = set()
     repeated_search_strikes = 0
     used_non_finish_tool = False
     final_response = ""
@@ -440,6 +456,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     total_completion_tokens = 0
     credit_event: str | None = None
     credit_step_index: int | None = None
+    eval_response_anomaly_info: dict[str, Any] = {}
     try:
         for step_idx in range(max_steps):
             rollout_messages = _messages_without_historical_thinking(messages) if discard_historical_thinking else messages
@@ -506,7 +523,21 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 }
                 break
             step_sampling = dict(sampling_params)
-            step_sampling["max_new_tokens"] = max(0, min(int(step_sampling.get("max_new_tokens", per_step_max_tokens)), per_step_max_tokens))
+            if rllm_deepresearch:
+                step_sampling.update(
+                    {
+                        "temperature": float(os.environ.get("RLLM_DR_TEMPERATURE", "1.0")),
+                        "top_p": float(os.environ.get("RLLM_DR_TOP_P", "1.0")),
+                        "top_k": int(os.environ.get("RLLM_DR_TOP_K", "-1")),
+                        "repetition_penalty": 1.0,
+                        "max_new_tokens": max(
+                            0,
+                            int(os.environ.get("RLLM_DR_MAX_TOKENS", "32768")) - len(prompt_ids),
+                        ),
+                    }
+                )
+            else:
+                step_sampling["max_new_tokens"] = max(0, min(int(step_sampling.get("max_new_tokens", per_step_max_tokens)), per_step_max_tokens))
             if max_context_tokens:
                 step_sampling["max_new_tokens"] = min(step_sampling["max_new_tokens"], max_context_tokens - len(prompt_ids))
             if step_sampling["max_new_tokens"] <= 0:
@@ -615,7 +646,23 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             if any(action.name != "finish" for action in parsed_actions):
                 total_tool_call_turns += 1
 
-            assistant_msg = {"role": "assistant", "content": response}
+            assistant_content = response
+            if rllm_deepresearch and parsed_actions:
+                assistant_content = re.sub(r"<tool_call>.*?</tool_call>", "", assistant_content, flags=re.DOTALL).strip()
+                assistant_content = re.sub(r"<function=[^>]+>.*?(?:</function>|$)", "", assistant_content, flags=re.DOTALL).strip()
+            assistant_msg = {"role": "assistant", "content": assistant_content}
+            if rllm_deepresearch and parsed_actions:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": f"call_{step_idx}_{action_idx}",
+                        "type": "function",
+                        "function": {
+                            "name": action.name,
+                            "arguments": json.dumps(action.arguments or {}, ensure_ascii=False),
+                        },
+                    }
+                    for action_idx, action in enumerate(parsed_actions)
+                ]
             if not evaluation:
                 pending_turns.append(
                     {
@@ -696,6 +743,159 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 break
 
             actions = parsed_actions
+            if detect_eval_response_anomalies:
+                anomaly_info = await asyncio.to_thread(
+                    _eval_response_anomaly_info,
+                    response,
+                    actions,
+                    state.tokenizer,
+                    max_tool_calls_per_turn=eval_max_tool_calls_per_turn,
+                    ngram_n=ngram_repetition_n,
+                    ngram_threshold=ngram_repetition_threshold,
+                    ngram_min_tokens=ngram_repetition_min_tokens,
+                )
+                if anomaly_info:
+                    eval_response_anomaly_info = anomaly_info
+                    final_reward = 0.0
+                    final_done = True
+                    last_info = {"termination_reason": "ABNORMAL_EVAL_RESPONSE", **anomaly_info}
+                    trajectory_steps.append(
+                        _episode_step(
+                            observation=observation,
+                            response=response,
+                            action="".join(parser.format_action(action) for action in actions),
+                            reward=0.0,
+                            done=True,
+                            messages=rollout_messages if capture_eval_details else [],
+                            tito_context_reason=tito_context_reason,
+                            llm_time=step_llm_time,
+                            env_time=0.0,
+                            disable_thinking=disable_thinking,
+                        )
+                    )
+                    break
+            if rllm_deepresearch:
+                if not actions or all(action.name == "finish" for action in actions):
+                    env.answer = response
+                    final_reward = env.compute_final_reward(require_tool_evidence=False)
+                    final_done = True
+                    last_info = {"termination_reason": "rllm_dr_no_tool_call", "reward_debug": env.reward_debug}
+                    trajectory_steps.append(
+                        _episode_step(
+                            observation=observation,
+                            response=response,
+                            action="",
+                            reward=final_reward,
+                            done=True,
+                            messages=rollout_messages if capture_eval_details else [],
+                            tito_context_reason=tito_context_reason,
+                            llm_time=step_llm_time,
+                            env_time=0.0,
+                            disable_thinking=disable_thinking,
+                        )
+                    )
+                    break
+
+                if len(actions) >= 9:
+                    final_done = True
+                    last_info = {
+                        "termination_reason": "rllm_dr_excessive_parallel_calls",
+                        "excessive_parallel_calls": True,
+                    }
+                    break
+
+                call_keys = [
+                    (
+                        action.name,
+                        response[action.start : action.end]
+                        if action.start is not None and action.end is not None
+                        else json.dumps(action.arguments or {}, ensure_ascii=False),
+                    )
+                    for action in actions
+                ]
+                if any(key in seen_rllm_calls for key in call_keys) or len(set(call_keys)) != len(call_keys):
+                    final_done = True
+                    last_info = {
+                        "termination_reason": "rllm_dr_duplicate_search",
+                        "duplicate_search_detected": True,
+                    }
+                    break
+                seen_rllm_calls.update(call_keys)
+
+                batch_start = time.time()
+                results = await asyncio.gather(
+                    *(
+                        run_rllm_deepresearch_search(
+                            action,
+                            retrieval_url=env.retrieval_url,
+                            max_results=env.retrieval_max_results,
+                        )
+                        for action in actions
+                    )
+                )
+                step_env_time = time.time() - batch_start
+                env_time += step_env_time
+                env.tool_calls += len(actions)
+                raw_observations = [result[0] for result in results]
+                env_infos = [result[1] for result in results]
+                formatted_observations = [
+                    _format_tool_observation(parser, action.name, raw_observation)
+                    for action, raw_observation in zip(actions, raw_observations, strict=True)
+                ]
+                formatted_obs = "\n".join(formatted_observations)
+                tool_failed = any(info.get("tool_return_error") for info in env_infos)
+                refine_failed = any(info.get("refine_error") for info in env_infos)
+                final_done = tool_failed or refine_failed
+                last_info = {
+                    **_merge_tool_infos(env_infos),
+                    "termination_reason": (
+                        "rllm_dr_tool_error"
+                        if tool_failed
+                        else "rllm_dr_refine_error"
+                        if refine_failed
+                        else "rllm_dr_tools_complete"
+                    ),
+                }
+                trajectory_steps.append(
+                    _episode_step(
+                        observation=formatted_obs,
+                        response=response,
+                        action="".join(parser.format_action(action) for action in actions),
+                        reward=0.0,
+                        done=final_done,
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
+                        llm_time=step_llm_time,
+                        env_time=step_env_time,
+                        disable_thinking=disable_thinking,
+                    )
+                )
+                if rllm_deepresearch:
+                    messages.extend(
+                        {
+                            "role": "tool",
+                            "tool_call_id": f"call_{step_idx}_{action_idx}",
+                            "name": action.name,
+                            "content": str(raw_observation),
+                        }
+                        for action_idx, (action, raw_observation) in enumerate(zip(actions, raw_observations, strict=True))
+                    )
+                else:
+                    _append_tool_observation_messages(
+                        messages,
+                        parser,
+                        actions,
+                        formatted_observations,
+                        raw_observations,
+                    )
+                observation = formatted_obs
+                for action in actions:
+                    if action.name == "local_search":
+                        env.web_search_queries.add(_normalize_search_query((action.arguments or {}).get("query", "")))
+                if final_done:
+                    break
+                continue
+
             if not actions:
                 if detect_abnormal_trajectories and credit_assignment_tool_parser_error:
                     final_reward = 0.0
@@ -1166,6 +1366,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 reward_debug=reward_debug,
                 credit_event=credit_event,
                 credit_step_index=credit_step_index,
+                response_anomaly_info=eval_response_anomaly_info,
                 total_steps=total_steps,
                 total_tool_call_turns=total_tool_call_turns,
                 timing=episode_timing,
@@ -1211,6 +1412,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         reward_debug=reward_debug,
         credit_event=credit_event,
         credit_step_index=credit_step_index,
+        response_anomaly_info=eval_response_anomaly_info,
         total_steps=total_steps,
         total_tool_call_turns=total_tool_call_turns,
         timing=episode_timing,
@@ -1364,6 +1566,9 @@ def _initial_messages(
     *,
     tool_parser=None,
 ) -> list[dict[str, str]]:
+    if harness == "rllm_deepresearch":
+        system = build_system_prompt(RLLM_DR_SEARCH_SYSTEM_PROMPT, tools, model_name, tool_parser=tool_parser)
+        return [{"role": "system", "content": system}, {"role": "user", "content": observation}]
     if harness == "bare":
         return [{"role": "user", "content": observation}]
     if harness == "cot":
@@ -1389,7 +1594,19 @@ def _initial_messages(
     else:
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_SEARCH_SYSTEM_PROMPT
         system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser)
-        user = FUSED_SEARCH_USER_PROMPT.format(problem_statement=observation)
+        observation = re.sub(
+            r"\s*When ready, output the final answer enclosed in <answer> and </answer> tags\.\s*"
+            r"Do not generate any content after the </answer> tag\.\s*$",
+            "",
+            observation,
+            flags=re.IGNORECASE,
+        )
+        user_prompt = (
+            FUSED_SEARCH_LONG_USER_PROMPT
+            if os.environ.get("FUSED_WEB_SEARCH_USER_PROMPT", "short") == "long"
+            else FUSED_SEARCH_USER_PROMPT
+        )
+        user = user_prompt.format(problem_statement=observation)
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -1630,6 +1847,79 @@ def _ngram_repetition_stats(output_ids: list[int], *, n: int, min_tokens: int) -
     unique = len(set(ngrams))
     score = 1.0 - unique / total if total else 0.0
     return {"score": score, "n": n, "total": total, "unique": unique}
+
+
+def _eval_response_anomaly_info(
+    response: str,
+    actions: list[ToolCall],
+    tokenizer,
+    *,
+    max_tool_calls_per_turn: int,
+    ngram_n: int,
+    ngram_threshold: float,
+    ngram_min_tokens: int,
+) -> dict[str, Any]:
+    anomalies = []
+    info: dict[str, Any] = {}
+
+    if max_tool_calls_per_turn > 0 and len(actions) > max_tool_calls_per_turn:
+        anomalies.append("multiple_tool_calls")
+        info["multiple_tool_call_count"] = len(actions)
+
+    normalized_response = response.lower()
+    if any(marker in normalized_response for marker in ("<tool_response>", "</tool_response>", "<|tool_response>", "<tool_response|>")):
+        anomalies.append("forged_tool_response")
+        info["forged_tool_response_detected"] = True
+
+    tag_imbalances = _response_tag_imbalances(response)
+    if tag_imbalances:
+        anomalies.append("unbalanced_tags")
+        info["unbalanced_response_tags"] = tag_imbalances
+
+    try:
+        encoded = tokenizer.encode(response, add_special_tokens=False)
+        response_ids = list(encoded.ids if hasattr(encoded, "ids") else encoded)
+    except Exception:
+        response_ids = list(response.encode("utf-8"))
+    repetition = _ngram_repetition_stats(response_ids, n=ngram_n, min_tokens=ngram_min_tokens)
+    if repetition["score"] > ngram_threshold:
+        anomalies.append("ngram_repetition")
+        info.update(
+            {
+                "ngram_repetition_detected": True,
+                "ngram_repetition_score": repetition["score"],
+                "ngram_repetition_n": repetition["n"],
+                "ngram_repetition_total": repetition["total"],
+                "ngram_repetition_unique": repetition["unique"],
+            }
+        )
+
+    if not anomalies:
+        return {}
+    return {"eval_response_anomalies": anomalies, **info}
+
+
+def _response_tag_imbalances(response: str) -> dict[str, dict[str, int | bool]]:
+    imbalances = {}
+    for name, begin, end in (
+        ("think", "<think>", "</think>"),
+        ("answer", "<answer>", "</answer>"),
+        ("tool_call", "<tool_call>", "</tool_call>"),
+        ("tool_response", "<tool_response>", "</tool_response>"),
+        ("native_tool_call", "<|tool_call>", "<tool_call|>"),
+        ("native_tool_response", "<|tool_response>", "<tool_response|>"),
+    ):
+        markers = list(re.finditer(f"({re.escape(begin)}|{re.escape(end)})", response, flags=re.IGNORECASE))
+        opens = sum(match.group(0).lower() == begin.lower() for match in markers)
+        closes = len(markers) - opens
+        balance = 0
+        misordered = False
+        for match in markers:
+            balance += 1 if match.group(0).lower() == begin.lower() else -1
+            misordered = misordered or balance < 0
+        if opens != closes or misordered:
+            imbalances[name] = {"open": opens, "close": closes, "misordered": misordered}
+    return imbalances
 
 
 def _parser_error_action_span(response: str) -> tuple[int, int] | None:
@@ -2337,6 +2627,7 @@ def _rllm_episode_dict(
     reward_debug: dict[str, Any],
     credit_event: str | None,
     credit_step_index: int | None,
+    response_anomaly_info: dict[str, Any],
     total_steps: int,
     total_tool_call_turns: int,
     timing: dict[str, Any],
@@ -2370,6 +2661,7 @@ def _rllm_episode_dict(
     metadata = {
         "reward_debug": reward_debug or {},
         "timing": timing,
+        **response_anomaly_info,
     }
     if credit_event is not None:
         metadata["credit_assignment_event"] = credit_event
