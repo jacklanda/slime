@@ -47,15 +47,19 @@ Generation/eval:
   --trajectory-timeout N               Default: 7200.
   --eval-trajectory-timeout N          Default: trajectory-timeout.
   --n-samples-per-eval-prompt N        Default: 1.
-  --temperature X                      Default: 0.7.
-  --top-p X                            Default: 1.0.
-  --top-k N                            Default: 20.
+  --temperature X                      Default: 0.6.
+  --top-p X                            Default: 0.95.
+  --top-k N                            Default: -1 (disabled).
+  --per-step-max-tokens N              Per agent turn. Default: 38000 (cot uses eval response limit).
+  --rollout-seed N                     Sampling seed. Default: 42.
+  --deterministic-inference BOOL       Pass per-sample seeds to SGLang. Default: false.
   --eval-max-response-len N            Default: 38000; also the default cot per-step budget.
   --eval-max-prompt-len N              Default: 2048.
   --eval-max-context-len N             Default: prompt + response.
   --limit-per-benchmark N              Generate config with first N examples per benchmark. Default: 0 (all).
   --no-prefer-verl                     Normalize from raw files even when data_verl.parquet exists.
   --retrieval-concurrency N            Concurrent retrieval requests. Default: 176.
+  --retrieval-mode NAME                dense, lexical, or hybrid. Default: dense.
   --retrieval-cache-size N             Cross-episode retrieval LRU entries. Default: 4096.
   --eval-initial-inflight-tasks N      Initial scheduled eval trajectories. Default: cot=4/engine, agent=384.
   --eval-max-inflight-tasks N          Adaptive hard limit. Default: cot=8/engine, agent=576.
@@ -63,6 +67,13 @@ Generation/eval:
   --eval-trajectory-sample-rate X      Full trajectory dump fraction. Default: 1.
   --eval-dump-failures BOOL            Dump failed eval trajectories. Default: true.
   --native-sglang-session BOOL         Use verified incremental SGLang sessions. Default: true.
+  --enable-use-grm-evals BOOL          Rule-first verifier with OpenRouter semantic fallback. Default: true.
+  --grm-model NAME                     OpenRouter fallback judge. Default: deepseek/deepseek-v4-flash.
+  --grm-concurrency N                  Max concurrent judge requests. Default: 128.
+  --grm-timeout SECONDS                Judge request timeout. Default: 60.
+  --grm-max-retries N                  Judge request attempts. Default: 3.
+  --grm-max-input-tokens N             Maximum GRM input content tokens. Default: 131072.
+  --grm-max-new-tokens N               Maximum GRM-generated tokens. Default: 1024.
 
 SGLang/runtime:
   --sglang-mem-fraction-static X       Default: 0.9.
@@ -95,8 +106,8 @@ MODEL_DIR="${MODEL_DIR:-}"
 BENCHMARKS_ROOT="${BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 #INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-2wiki,bamboogle,gpqa_diamond,medqa}"
 #INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-browsecomp_plus}"
-#INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-search_r1}"
-INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-bamboogle}"
+INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-search_r1}"
+#INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-bamboogle}"
 EXCLUDE_BENCHMARKS="${EXCLUDE_BENCHMARKS:-}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-eval-$(date +%Y%m%d-%H%M%S)}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
@@ -116,9 +127,11 @@ CLI_MAX_STEPS="${CLI_MAX_STEPS:-${MAX_STEPS}}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-${TRAJECTORY_TIMEOUT}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
-TEMPERATURE="${TEMPERATURE:-0.7}"
-TOP_P="${TOP_P:-1.0}"
-TOP_K="${TOP_K:-20}"
+TEMPERATURE="${TEMPERATURE:-0.6}"
+TOP_P="${TOP_P:-0.95}"
+TOP_K="${TOP_K:--1}"
+ROLLOUT_SEED="${ROLLOUT_SEED:-42}"
+DETERMINISTIC_INFERENCE="${DETERMINISTIC_INFERENCE:-false}"
 #EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
 #EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
 EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-38000}"
@@ -132,6 +145,7 @@ EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
 LIMIT_PER_BENCHMARK="${LIMIT_PER_BENCHMARK:-0}"
 PREFER_VERL="${PREFER_VERL:-1}"
 RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-176}"
+RETRIEVAL_MODE="${RETRIEVAL_MODE:-dense}"
 RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE:-4096}"
 EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-}"
 EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-}"
@@ -139,6 +153,17 @@ EVAL_ADAPTIVE_CONCURRENCY="${EVAL_ADAPTIVE_CONCURRENCY:-true}"
 EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-1}"
 EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES:-true}"
 NATIVE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION:-true}"
+ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-true}"
+GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
+GRM_MODEL="${GRM_MODEL:-deepseek/deepseek-v4-flash}"
+GRM_CONCURRENCY="${GRM_CONCURRENCY:-128}"
+GRM_MAX_CONNECTIONS="${GRM_MAX_CONNECTIONS:-128}"
+GRM_TIMEOUT="${GRM_TIMEOUT:-60}"
+GRM_MAX_RETRIES="${GRM_MAX_RETRIES:-32}"
+GRM_MAX_INPUT_TOKENS="${GRM_MAX_INPUT_TOKENS:-131072}"
+GRM_MAX_NEW_TOKENS="${GRM_MAX_NEW_TOKENS:-1024}"
+GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.6}"
+GRM_FAILURE_REWARD="${GRM_FAILURE_REWARD:-0.0}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.9}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-60}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-}"
@@ -180,12 +205,16 @@ while [ "$#" -gt 0 ]; do
       --temperature) TEMPERATURE="${2:?Missing value for --temperature}"; shift 2 ;;
       --top-p) TOP_P="${2:?Missing value for --top-p}"; shift 2 ;;
       --top-k) TOP_K="${2:?Missing value for --top-k}"; shift 2 ;;
+      --per-step-max-tokens) PER_STEP_MAX_TOKENS="${2:?Missing value for --per-step-max-tokens}"; shift 2 ;;
+      --rollout-seed) ROLLOUT_SEED="${2:?Missing value for --rollout-seed}"; shift 2 ;;
+      --deterministic-inference) DETERMINISTIC_INFERENCE="${2:?Missing value for --deterministic-inference}"; shift 2 ;;
       --eval-max-response-len) EVAL_MAX_RESPONSE_LEN="${2:?Missing value for --eval-max-response-len}"; shift 2 ;;
       --eval-max-prompt-len) EVAL_MAX_PROMPT_LEN="${2:?Missing value for --eval-max-prompt-len}"; shift 2 ;;
       --eval-max-context-len) EVAL_MAX_CONTEXT_LEN="${2:?Missing value for --eval-max-context-len}"; shift 2 ;;
       --limit-per-benchmark) LIMIT_PER_BENCHMARK="${2:?Missing value for --limit-per-benchmark}"; shift 2 ;;
       --no-prefer-verl) PREFER_VERL=0; shift ;;
       --retrieval-concurrency) RETRIEVAL_CONCURRENCY="${2:?Missing value for --retrieval-concurrency}"; shift 2 ;;
+      --retrieval-mode) RETRIEVAL_MODE="${2:?Missing value for --retrieval-mode}"; shift 2 ;;
       --retrieval-cache-size) RETRIEVAL_CACHE_SIZE="${2:?Missing value for --retrieval-cache-size}"; shift 2 ;;
       --eval-initial-inflight-tasks) EVAL_INITIAL_INFLIGHT_TASKS="${2:?Missing value for --eval-initial-inflight-tasks}"; shift 2 ;;
       --eval-max-inflight-tasks) EVAL_MAX_INFLIGHT_TASKS="${2:?Missing value for --eval-max-inflight-tasks}"; shift 2 ;;
@@ -193,6 +222,13 @@ while [ "$#" -gt 0 ]; do
       --eval-trajectory-sample-rate) EVAL_TRAJECTORY_SAMPLE_RATE="${2:?Missing value for --eval-trajectory-sample-rate}"; shift 2 ;;
       --eval-dump-failures) EVAL_DUMP_FAILURES="${2:?Missing value for --eval-dump-failures}"; shift 2 ;;
       --native-sglang-session) NATIVE_SGLANG_SESSION="${2:?Missing value for --native-sglang-session}"; shift 2 ;;
+      --enable-use-grm-evals) ENABLE_USE_GRM_EVALS="${2:?Missing value for --enable-use-grm-evals}"; shift 2 ;;
+      --grm-model) GRM_MODEL="${2:?Missing value for --grm-model}"; shift 2 ;;
+      --grm-concurrency) GRM_CONCURRENCY="${2:?Missing value for --grm-concurrency}"; shift 2 ;;
+      --grm-timeout) GRM_TIMEOUT="${2:?Missing value for --grm-timeout}"; shift 2 ;;
+      --grm-max-retries) GRM_MAX_RETRIES="${2:?Missing value for --grm-max-retries}"; shift 2 ;;
+      --grm-max-input-tokens) GRM_MAX_INPUT_TOKENS="${2:?Missing value for --grm-max-input-tokens}"; shift 2 ;;
+      --grm-max-new-tokens) GRM_MAX_NEW_TOKENS="${2:?Missing value for --grm-max-new-tokens}"; shift 2 ;;
       --sglang-mem-fraction-static) SGLANG_MEM_FRACTION_STATIC="${2:?Missing value for --sglang-mem-fraction-static}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
@@ -215,6 +251,10 @@ esac
 case "${USER_PROMPT}" in
    long|short) ;;
    *) echo "Unsupported --user_prompt ${USER_PROMPT}; expected long or short." >&2; exit 2 ;;
+esac
+case "${RETRIEVAL_MODE}" in
+   dense|lexical|hybrid) ;;
+   *) echo "Unsupported --retrieval-mode ${RETRIEVAL_MODE}; expected dense, lexical, or hybrid." >&2; exit 2 ;;
 esac
 
 if [ -z "${MODEL_CONFIG}" ]; then
@@ -350,6 +390,10 @@ if [ "${EVAL_INITIAL_INFLIGHT_TASKS}" -gt "${EVAL_MAX_INFLIGHT_TASKS}" ]; then
    echo "--eval-initial-inflight-tasks must not exceed --eval-max-inflight-tasks" >&2
    exit 2
 fi
+if is_truthy "${ENABLE_USE_GRM_EVALS}" && [ -z "${OPENROUTER_API_KEY:-}" ]; then
+   echo "OPENROUTER_API_KEY is required when --enable-use-grm-evals is true" >&2
+   exit 2
+fi
 
 LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/evals/${EXPERIMENT_NAME}}"
 EVAL_CONFIG="${EVAL_CONFIG:-${LOG_ROOT}/eval_config.yaml}"
@@ -408,7 +452,7 @@ export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-10000
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
 export RETRIEVAL_SERVER_URL="${RETRIEVAL_SERVER_URL:-http://10.2.152.50:65432}"
-export RLLM_RETRIEVAL_MODE="${RLLM_RETRIEVAL_MODE:-hybrid}"
+export RLLM_RETRIEVAL_MODE="${RETRIEVAL_MODE}"
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
 export RLLM_RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY}"
 export RLLM_RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE}"
@@ -491,11 +535,39 @@ echo "Eval config: ${EVAL_CONFIG}"
 echo "Log root: ${LOG_ROOT}"
 echo "GPUs: ${ROLLOUT_GPUS}; gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}; engines=${ROLLOUT_NUM_ENGINES}"
 echo "Harness: ${FUSED_HARNESS}; user_prompt=${USER_PROMPT}; disable_thinking=${DISABLE_THINKING}; discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}; n=${N_SAMPLES_PER_EVAL_PROMPT}; per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
+echo "Sampling: temperature=${TEMPERATURE}; top_p=${TOP_P}; top_k=${TOP_K}; seed=${ROLLOUT_SEED}; deterministic=${DETERMINISTIC_INFERENCE}"
 echo "Concurrency: eval=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS} adaptive=${EVAL_ADAPTIVE_CONCURRENCY}; sglang_http_per_engine=${SGLANG_SERVER_CONCURRENCY}; sglang_running_per_engine=${SGLANG_MAX_RUNNING_REQUESTS}; retrieval=${RETRIEVAL_CONCURRENCY}"
+echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}; max_results=${RETRIEVAL_MAX_RESULTS}; cache_size=${RLLM_RETRIEVAL_CACHE_SIZE}"
+echo "Validation: hybrid=${ENABLE_USE_GRM_EVALS}; rule=benchmark_verifier; semantic_fallback=${GRM_MODEL}; temperature=${GRM_TEMPERATURE}; max_input_tokens=${GRM_MAX_INPUT_TOKENS}; max_new_tokens=${GRM_MAX_NEW_TOKENS}; concurrency=${GRM_CONCURRENCY}; timeout=${GRM_TIMEOUT}; retries=${GRM_MAX_RETRIES}"
 
 EVAL_ADAPTIVE_CONCURRENCY_ARG="--eval-adaptive-concurrency"
 if ! is_truthy "${EVAL_ADAPTIVE_CONCURRENCY}"; then
    EVAL_ADAPTIVE_CONCURRENCY_ARG="--no-eval-adaptive-concurrency"
+fi
+
+DETERMINISTIC_INFERENCE_ARGS=()
+if is_truthy "${DETERMINISTIC_INFERENCE}"; then
+   DETERMINISTIC_INFERENCE_ARGS+=(--sglang-enable-deterministic-inference)
+fi
+
+GRM_ARGS=()
+if is_truthy "${ENABLE_USE_GRM_EVALS}"; then
+   GRM_ARGS+=(
+      --enable-use-grm-evals
+      --grm-custom-rm-path "${GRM_CUSTOM_RM_PATH}"
+      --grm-model "${GRM_MODEL}"
+      --grm-concurrency "${GRM_CONCURRENCY}"
+      --grm-max-connections "${GRM_MAX_CONNECTIONS}"
+      --grm-timeout "${GRM_TIMEOUT}"
+      --grm-max-retries "${GRM_MAX_RETRIES}"
+      --grm-max-input-tokens "${GRM_MAX_INPUT_TOKENS}"
+      --grm-max-new-tokens "${GRM_MAX_NEW_TOKENS}"
+      --grm-temperature "${GRM_TEMPERATURE}"
+      --grm-failure-reward "${GRM_FAILURE_REWARD}"
+   )
+   if [ -n "${GRM_BASE_URL:-}" ]; then
+      GRM_ARGS+=(--grm-base-url "${GRM_BASE_URL}")
+   fi
 fi
 
 RAY_JOB_SUBMIT_ARGS=()
@@ -534,9 +606,11 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    --rollout-temperature "${TEMPERATURE}" \
    --rollout-top-p "${TOP_P}" \
    --rollout-top-k "${TOP_K}" \
+   --rollout-seed "${ROLLOUT_SEED}" \
    --custom-generate-function-path slime.rollout.fused_agent.generate.generate \
    --apply-chat-template \
    --rm-type benchmark_verifier \
+   "${GRM_ARGS[@]}" \
    --eval-interval 1 \
    --eval-config "${EVAL_CONFIG}" \
    --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}" \
@@ -559,6 +633,7 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    --router-assignment-mode "${ROUTER_ASSIGNMENT_MODE}" \
    --sglang-context-length "${EVAL_MAX_CONTEXT_LEN}" \
    --sglang-disable-custom-all-reduce \
+   "${DETERMINISTIC_INFERENCE_ARGS[@]}" \
    "${EXTRA_SLIME_ARGS[@]}"
 
 if ! is_truthy "${RAY_JOB_WAIT}" && is_truthy "${RAY_JOB_FOLLOW_LOGS}"; then

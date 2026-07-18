@@ -76,7 +76,7 @@ Options:
   --grm-concurrency N                    Max concurrent GRM requests. Default: 512.
   --grm-timeout SECONDS                  GRM request timeout. Default: 60.
   --grm-max-retries N                    GRM retry attempts. Default: 4.
-  --grm-max-trajectory-chars N           Trajectory chars sent to GRM. Default: 30000.
+  --grm-max-input-tokens N               Maximum GRM input content tokens. Default: 30000.
   --max-steps N                          Fused agent max steps. Default: 96.
   --mcp-max-steps N                      Fused MCP max steps. Default: 96.
   --web-search-max-steps N               Fused web-search max steps. Default: 96.
@@ -117,7 +117,7 @@ SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 COLOCATE="${COLOCATE:-false}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-false}"
-DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-true}"
+DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-8}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
@@ -158,10 +158,10 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Queued HTTP requests do not consume the running batch's KV allocation.
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-1024}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-512}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-300}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
-EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
-EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
+EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-35952}"
+EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-4096}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-false}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
@@ -182,8 +182,8 @@ GRM_TIMEOUT="${GRM_TIMEOUT:-60}"
 GRM_MAX_RETRIES="${GRM_MAX_RETRIES:-4}"
 GRM_RETRY_BASE_DELAY="${GRM_RETRY_BASE_DELAY:-1}"
 GRM_RETRY_MAX_DELAY="${GRM_RETRY_MAX_DELAY:-16.0}"
-GRM_MAX_TRAJECTORY_CHARS="${GRM_MAX_TRAJECTORY_CHARS:-30000}"
-GRM_MAX_TOKENS="${GRM_MAX_TOKENS:-128}"
+GRM_MAX_INPUT_TOKENS="${GRM_MAX_INPUT_TOKENS:-30000}"
+GRM_MAX_NEW_TOKENS="${GRM_MAX_NEW_TOKENS:-128}"
 GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.6}"
 GRM_FAILURE_REWARD="${GRM_FAILURE_REWARD:-0.0}"
 harness_explicit=false
@@ -249,8 +249,8 @@ while [ "$#" -gt 0 ]; do
       --grm-max-retries) GRM_MAX_RETRIES="${2:?Missing value for --grm-max-retries}"; shift 2 ;;
       --grm-retry-base-delay) GRM_RETRY_BASE_DELAY="${2:?Missing value for --grm-retry-base-delay}"; shift 2 ;;
       --grm-retry-max-delay) GRM_RETRY_MAX_DELAY="${2:?Missing value for --grm-retry-max-delay}"; shift 2 ;;
-      --grm-max-trajectory-chars) GRM_MAX_TRAJECTORY_CHARS="${2:?Missing value for --grm-max-trajectory-chars}"; shift 2 ;;
-      --grm-max-tokens) GRM_MAX_TOKENS="${2:?Missing value for --grm-max-tokens}"; shift 2 ;;
+      --grm-max-input-tokens) GRM_MAX_INPUT_TOKENS="${2:?Missing value for --grm-max-input-tokens}"; shift 2 ;;
+      --grm-max-new-tokens) GRM_MAX_NEW_TOKENS="${2:?Missing value for --grm-max-new-tokens}"; shift 2 ;;
       --grm-temperature) GRM_TEMPERATURE="${2:?Missing value for --grm-temperature}"; shift 2 ;;
       --grm-failure-reward) GRM_FAILURE_REWARD="${2:?Missing value for --grm-failure-reward}"; shift 2 ;;
       --max-steps) MAX_STEPS="${2:?Missing value for --max-steps}"; shift 2 ;;
@@ -305,7 +305,8 @@ BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 default_experiment_name() {
    #local prefix="fused-dapo-q3-4b-think-rft-pet-gem-sync-dev"  # w/ rft warmup
-   local prefix="fused-dapo-q3-4b-pet-gem-sync-dev"
+   local prefix="fused-dapo-q3-4b-think-gem-sync-dev"
+   #local prefix="fused-dapo-q3-4b-pet-gem-sync-dev"
    #local prefix="webqa-dapo-q3-4b-think-pet-gem-sync-dev"
    #local prefix="fused-dapo-q3-4b-no_think-gem-sync-dev"
    #local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
@@ -701,8 +702,8 @@ if is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTO
       --grm-max-retries "${GRM_MAX_RETRIES}"
       --grm-retry-base-delay "${GRM_RETRY_BASE_DELAY}"
       --grm-retry-max-delay "${GRM_RETRY_MAX_DELAY}"
-      --grm-max-trajectory-chars "${GRM_MAX_TRAJECTORY_CHARS}"
-      --grm-max-tokens "${GRM_MAX_TOKENS}"
+      --grm-max-input-tokens "${GRM_MAX_INPUT_TOKENS}"
+      --grm-max-new-tokens "${GRM_MAX_NEW_TOKENS}"
       --grm-temperature "${GRM_TEMPERATURE}"
       --grm-failure-reward "${GRM_FAILURE_REWARD}"
    )

@@ -94,7 +94,7 @@ Options:
   --grm-concurrency N                    Max concurrent GRM requests. Default: 128.
   --grm-timeout SECONDS                  GRM request timeout. Default: 60.
   --grm-max-retries N                    GRM retry attempts. Default: 3.
-  --grm-max-trajectory-chars N           Trajectory chars sent to GRM. Default: 24000.
+  --grm-max-input-tokens N               Maximum GRM input content tokens. Default: 24000.
   --max-tool-output-length N             Fused max tool output length env.
   --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 64.
   --sglang-max-running-requests N        SGLang max running requests. Default: 256.
@@ -171,8 +171,8 @@ GRM_TIMEOUT="${GRM_TIMEOUT:-60}"
 GRM_MAX_RETRIES="${GRM_MAX_RETRIES:-3}"
 GRM_RETRY_BASE_DELAY="${GRM_RETRY_BASE_DELAY:-0.5}"
 GRM_RETRY_MAX_DELAY="${GRM_RETRY_MAX_DELAY:-8.0}"
-GRM_MAX_TRAJECTORY_CHARS="${GRM_MAX_TRAJECTORY_CHARS:-24000}"
-GRM_MAX_TOKENS="${GRM_MAX_TOKENS:-128}"
+GRM_MAX_INPUT_TOKENS="${GRM_MAX_INPUT_TOKENS:-24000}"
+GRM_MAX_NEW_TOKENS="${GRM_MAX_NEW_TOKENS:-128}"
 GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.0}"
 GRM_FAILURE_REWARD="${GRM_FAILURE_REWARD:-0.0}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
@@ -266,8 +266,8 @@ while [ "$#" -gt 0 ]; do
       --grm-max-retries) GRM_MAX_RETRIES="${2:?Missing value for --grm-max-retries}"; shift 2 ;;
       --grm-retry-base-delay) GRM_RETRY_BASE_DELAY="${2:?Missing value for --grm-retry-base-delay}"; shift 2 ;;
       --grm-retry-max-delay) GRM_RETRY_MAX_DELAY="${2:?Missing value for --grm-retry-max-delay}"; shift 2 ;;
-      --grm-max-trajectory-chars) GRM_MAX_TRAJECTORY_CHARS="${2:?Missing value for --grm-max-trajectory-chars}"; shift 2 ;;
-      --grm-max-tokens) GRM_MAX_TOKENS="${2:?Missing value for --grm-max-tokens}"; shift 2 ;;
+      --grm-max-input-tokens) GRM_MAX_INPUT_TOKENS="${2:?Missing value for --grm-max-input-tokens}"; shift 2 ;;
+      --grm-max-new-tokens) GRM_MAX_NEW_TOKENS="${2:?Missing value for --grm-max-new-tokens}"; shift 2 ;;
       --grm-temperature) GRM_TEMPERATURE="${2:?Missing value for --grm-temperature}"; shift 2 ;;
       --grm-failure-reward) GRM_FAILURE_REWARD="${2:?Missing value for --grm-failure-reward}"; shift 2 ;;
       --max-tool-output-length) MAX_TOOL_OUTPUT_LENGTH="${2:?Missing value for --max-tool-output-length}"; shift 2 ;;
@@ -598,8 +598,8 @@ if is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTO
       --grm-max-retries "${GRM_MAX_RETRIES}"
       --grm-retry-base-delay "${GRM_RETRY_BASE_DELAY}"
       --grm-retry-max-delay "${GRM_RETRY_MAX_DELAY}"
-      --grm-max-trajectory-chars "${GRM_MAX_TRAJECTORY_CHARS}"
-      --grm-max-tokens "${GRM_MAX_TOKENS}"
+      --grm-max-input-tokens "${GRM_MAX_INPUT_TOKENS}"
+      --grm-max-new-tokens "${GRM_MAX_NEW_TOKENS}"
       --grm-temperature "${GRM_TEMPERATURE}"
       --grm-failure-reward "${GRM_FAILURE_REWARD}"
    )

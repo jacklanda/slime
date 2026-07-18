@@ -29,6 +29,8 @@ def save_rllm_episode_batch(args, *, rollout_id: int, samples: list[Sample], mod
                 rollout_id,
                 mode,
                 epoch,
+                args=args,
+                sample_metadata=sample.metadata,
                 eval_reward=sample.reward if mode == "eval" else None,
             )
             for episode, sample in episode_samples
@@ -83,6 +85,8 @@ def _episode_to_batch_dict(
     mode: str,
     epoch: int,
     *,
+    args: Any,
+    sample_metadata: dict[str, Any] | None,
     eval_reward: float | None,
 ) -> dict[str, Any]:
     task = _sanitize_task(episode.get("task"))
@@ -94,7 +98,7 @@ def _episode_to_batch_dict(
         float(trajectories[0]["reward"]) if trajectories and trajectories[0]["reward"] is not None else None
     )
     final_reward = float(eval_reward) if eval_reward is not None else workflow_reward
-    return {
+    result = {
         "training_step": step,
         "epoch": epoch,
         "mode": mode,
@@ -110,6 +114,27 @@ def _episode_to_batch_dict(
         "metadata": metadata,
         "timing": timing,
         "trajectories": trajectories,
+    }
+    if mode == "eval":
+        result.update(_eval_judge_record(args, sample_metadata))
+    return result
+
+
+def _eval_judge_record(args: Any, sample_metadata: dict[str, Any] | None) -> dict[str, Any]:
+    metadata = sample_metadata if isinstance(sample_metadata, dict) else {}
+    grm_result = metadata.get("grm") if isinstance(metadata.get("grm"), dict) else {}
+    model = grm_result.get("model")
+    used_grm = grm_result.get("judge") == "grm" or (model is not None and model != "benchmark_verifier")
+    if not used_grm:
+        return {"judge": "rule"}
+    return {
+        "judge": "grm",
+        "grm": {
+            "model": model or getattr(args, "grm_model", None),
+            "temperature": float(getattr(args, "grm_temperature", 0.0)),
+            "max_input_tokens": int(getattr(args, "grm_max_input_tokens", 24000)),
+            "max_new_tokens": int(getattr(args, "grm_max_new_tokens", 128)),
+        },
     }
 
 

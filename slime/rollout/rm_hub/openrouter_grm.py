@@ -17,6 +17,7 @@ import random
 from typing import Any
 
 import httpx
+import tiktoken
 
 from slime.rollout.rm_hub import benchmark_verifier
 from slime.rollout.rm_hub.deepscaler import get_deepscaler_rule_based_reward
@@ -33,10 +34,15 @@ logger = logging.getLogger(__name__)
 _CLIENT: httpx.AsyncClient | None = None
 _SEMAPHORE: asyncio.Semaphore | None = None
 _FINISH_PARSER = ActiveFinishParser(valid_tools={"finish", "submit"})
+_GRM_TOKENIZER = tiktoken.get_encoding("o200k_base")
 
 
 _DEFAULT_SYSTEM_PROMPT = (
-    'You are a strict binary answer judge. Return only JSON: {"score": 0} or {"score": 1}. ' "Score 1 if the trajectory contains, explicitly implies, or finally answers the ground truth correctly. " "Score 0 otherwise. Ignore style, verbosity, and irrelevant intermediate mistakes if the final answer is correct."
+    'You are a strict binary answer judge. Return only JSON: {"score": 0} or {"score": 1}. '
+    "Score 1 if the final submitted answer correctly answers the question given the accepted ground truth. "
+    "Accept semantic aliases, abbreviations, equivalent dates or numbers, and multiple-choice letters that map to the "
+    "correct option. Score 0 for contradictions, wrong alternatives, evasions, or no submitted answer. "
+    "Ignore style, verbosity, and irrelevant intermediate mistakes if the final answer is correct."
 )
 
 _SCORE_RESPONSE_FORMAT: dict[str, Any] = {
@@ -71,11 +77,29 @@ async def reward_func(args, sample_or_samples: Sample | list[Sample], **kwargs):
 
 
 async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
-    if not _has_answer_material(sample):
+    benchmark_eval = evaluation and _uses_benchmark_verifier(args, sample)
+    if benchmark_eval:
+        rule_reward = float(await benchmark_verifier.reward_func(args, sample))
+        if rule_reward > 0 and _benchmark_rule_match_is_decisive(sample):
+            sample.metadata.setdefault("grm", {})
+            sample.metadata["grm"].update(
+                {
+                    "model": "benchmark_verifier",
+                    "score": rule_reward,
+                    "evaluation": True,
+                    "fallback": False,
+                    "judge": "benchmark_verifier",
+                    "hybrid_rule_match": True,
+                }
+            )
+            return rule_reward
+
+    final_answer_step = _benchmark_final_answer_step(sample) if benchmark_eval else _final_answer_step(sample)
+    if sample.label is None or not final_answer_step:
         return float(getattr(args, "grm_failure_reward", 0.0))
 
     async with _get_semaphore(args):
-        payload = _build_payload(args, sample)
+        payload = _build_payload(args, sample, final_answer_step=final_answer_step, include_question=benchmark_eval)
         max_retries = max(1, int(getattr(args, "grm_max_retries", 3)))
         for attempt in range(max_retries):
             try:
@@ -100,6 +124,20 @@ async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
                         getattr(sample, "index", None),
                         exc,
                     )
+                    if benchmark_eval:
+                        reward = float(getattr(args, "grm_failure_reward", 0.0))
+                        sample.metadata.setdefault("grm", {})
+                        sample.metadata["grm"].update(
+                            {
+                                "model": getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+                                "score": reward,
+                                "evaluation": True,
+                                "fallback": True,
+                                "fallback_rm_type": "grm_failure_reward",
+                                "error": repr(exc),
+                            }
+                        )
+                        return reward
                     return await _fallback_rule_based_reward(args, sample, evaluation=evaluation, error=exc)
                 await asyncio.sleep(_retry_sleep(args, attempt))
 
@@ -143,26 +181,146 @@ def _get_semaphore(args) -> asyncio.Semaphore:
     return _SEMAPHORE
 
 
-def _build_payload(args, sample: Sample) -> dict[str, Any]:
-    return {
-        "model": getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+def _build_payload(
+    args,
+    sample: Sample,
+    *,
+    final_answer_step: str | None = None,
+    include_question: bool = False,
+) -> dict[str, Any]:
+    model = getattr(args, "grm_model", "deepseek/deepseek-v4-flash")
+    system_prompt = getattr(args, "grm_system_prompt", None) or _DEFAULT_SYSTEM_PROMPT
+    payload = {
+        "model": model,
         "messages": [
-            {"role": "system", "content": getattr(args, "grm_system_prompt", None) or _DEFAULT_SYSTEM_PROMPT},
-            {"role": "user", "content": _build_judge_prompt(args, sample)},
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": _build_judge_prompt(
+                    args,
+                    sample,
+                    final_answer_step=final_answer_step,
+                    include_question=include_question,
+                    system_prompt=system_prompt,
+                ),
+            },
         ],
         "temperature": float(getattr(args, "grm_temperature", 0.0)),
-        "max_tokens": int(getattr(args, "grm_max_tokens", 16)),
-        "response_format": _SCORE_RESPONSE_FORMAT,
+        "max_tokens": int(getattr(args, "grm_max_new_tokens", 16)),
+        "response_format": {"type": "json_object"} if str(model).startswith("google/") else _SCORE_RESPONSE_FORMAT,
         "provider": {"require_parameters": True},
     }
+    if str(model).startswith("deepseek/"):
+        payload["reasoning"] = {"effort": "none"}
+    return payload
 
 
-def _build_judge_prompt(args, sample: Sample) -> str:
-    max_chars = int(getattr(args, "grm_max_trajectory_chars", 24000))
-    final_answer_step = _final_answer_step(sample)
-    if len(final_answer_step) > max_chars:
-        final_answer_step = final_answer_step[-max_chars:]
-    return "Ground truth:\n" f"{_stringify(sample.label)}\n\n" "Final submitted answer step:\n" f"{final_answer_step}\n\n" "Does this final submitted answer correctly answer the ground truth? Return only JSON."
+def _build_judge_prompt(
+    args,
+    sample: Sample,
+    *,
+    final_answer_step: str | None = None,
+    include_question: bool = False,
+    system_prompt: str | None = None,
+) -> str:
+    max_input_tokens = int(getattr(args, "grm_max_input_tokens", 24000))
+    if max_input_tokens < 1:
+        raise ValueError("--grm-max-input-tokens must be >= 1")
+    system_prompt = (
+        system_prompt
+        if system_prompt is not None
+        else getattr(args, "grm_system_prompt", None) or _DEFAULT_SYSTEM_PROMPT
+    )
+    final_answer_step = final_answer_step if final_answer_step is not None else _final_answer_step(sample)
+    question = _judge_question(sample) if include_question else ""
+    question_section = f"Question:\n{question}\n\n" if question else ""
+    prefix = (
+        question_section
+        + "Accepted ground truth:\n"
+        + f"{_stringify(sample.label)}\n\n"
+        + "Final submitted answer:\n"
+    )
+    suffix = "\n\nDoes the final submitted answer correctly answer the question? Return only JSON."
+    fixed_tokens = len(_GRM_TOKENIZER.encode_ordinary(system_prompt)) + len(
+        _GRM_TOKENIZER.encode_ordinary(prefix + suffix)
+    )
+    if fixed_tokens > max_input_tokens:
+        raise ValueError(
+            f"--grm-max-input-tokens={max_input_tokens} is smaller than the fixed judge input ({fixed_tokens} tokens)"
+        )
+
+    answer_tokens = _GRM_TOKENIZER.encode_ordinary(final_answer_step)
+    answer_budget = max_input_tokens - fixed_tokens
+    answer_tokens = answer_tokens[-answer_budget:] if answer_budget else []
+    while True:
+        prompt = prefix + _GRM_TOKENIZER.decode(answer_tokens) + suffix
+        input_tokens = len(_GRM_TOKENIZER.encode_ordinary(system_prompt)) + len(
+            _GRM_TOKENIZER.encode_ordinary(prompt)
+        )
+        if input_tokens <= max_input_tokens:
+            return prompt
+        if not answer_tokens:
+            raise ValueError("Unable to fit the fixed judge input within --grm-max-input-tokens")
+        answer_tokens = answer_tokens[input_tokens - max_input_tokens :]
+
+
+def _uses_benchmark_verifier(args, sample: Sample) -> bool:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    rm_type = (metadata.get("rm_type") or getattr(args, "rm_type", None) or "").strip()
+    return rm_type == "benchmark_verifier" or bool(metadata.get("benchmark_eval"))
+
+
+def _judge_question(sample: Sample) -> str:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    question = ""
+    for key in ("question", "query", "input", "problem"):
+        value = metadata.get(key)
+        if value:
+            question = _stringify(value)
+            break
+    if not question:
+        question = _stringify(sample.prompt)
+
+    options = metadata.get("options") or metadata.get("choices")
+    if isinstance(options, dict):
+        options = list(options.values())
+    if isinstance(options, (list, tuple)) and options and not all(str(option) in question for option in options):
+        option_lines = [f"{chr(ord('A') + index)}. {option}" for index, option in enumerate(options)]
+        question = f"{question}\nOptions:\n" + "\n".join(option_lines)
+    return question
+
+
+def _benchmark_final_answer_step(sample: Sample) -> str | None:
+    answer = benchmark_verifier._extract_final_answer(_stringify(sample.response))
+    if answer:
+        return answer
+    episode_answer = _rllm_episode_final_answer_step(sample)
+    if not episode_answer:
+        return None
+    return benchmark_verifier._extract_final_answer(episode_answer) or episode_answer
+
+
+def _benchmark_rule_match_is_decisive(sample: Sample) -> bool:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    data_source = str(metadata.get("data_source") or metadata.get("benchmark") or "").lower()
+    if data_source in {"medqa", "scienceqa", "gpqa", "gpqa_diamond"}:
+        return True
+    if data_source in {"browsecomp_plus", "frontierscience_research"}:
+        return False
+
+    prediction = _benchmark_final_answer_step(sample)
+    if not prediction:
+        return False
+    for answer in benchmark_verifier._candidate_answers(sample.label, metadata):
+        if benchmark_verifier._normalize_answer_for_benchmark(
+            prediction
+        ) == benchmark_verifier._normalize_answer_for_benchmark(answer):
+            return True
+        prediction_dates = benchmark_verifier._date_variants(prediction)
+        answer_dates = benchmark_verifier._date_variants(answer)
+        if prediction_dates and answer_dates and prediction_dates & answer_dates:
+            return True
+    return False
 
 
 def _sample_trajectory(sample: Sample) -> str:
@@ -274,10 +432,24 @@ def _parse_reward(payload: dict[str, Any]) -> float:
     if isinstance(content, list):
         content = "".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
     text = str(content).strip()
+    parsed = None
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        raise ValueError(f"GRM response did not contain valid JSON: {text!r}") from None
+        decoder = json.JSONDecoder()
+        for start, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(text, start)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict) and "score" in candidate:
+                parsed = candidate
+        if parsed is None:
+            raise ValueError(f"GRM response did not contain valid JSON: {text!r}") from None
+    if not isinstance(parsed, dict):
+        raise ValueError(f"GRM response JSON must be an object, got {type(parsed).__name__}")
     score = parsed.get("score")
     if score in (0, 1, 0.0, 1.0, "0", "1"):
         return float(score)

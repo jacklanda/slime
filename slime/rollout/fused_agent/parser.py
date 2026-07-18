@@ -86,17 +86,19 @@ class QwenToolParser:
         return calls
 
     def _extract_payloads(self, text: str) -> list[tuple[str | tuple[str, str], int, int]]:
-        payloads = [(match.group(1), match.start(), match.end()) for match in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", text, flags=re.DOTALL)]
+        idx = text.rfind("</think>")
+        offset = idx + len("</think>") if idx >= 0 else 0
+        search_text = text[offset:]
+        payloads = [
+            (match.group(1), offset + match.start(), offset + match.end())
+            for match in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", search_text, flags=re.DOTALL)
+        ]
         if payloads:
             return payloads
         # Accept a bare JSON tool call after reasoning.
-        idx = text.rfind("</think>")
-        search_text = text[idx + len("</think>") :] if idx >= 0 else text
         m = re.search(r'\{\s*"name"\s*:\s*"[^"]+".*?\}', search_text, flags=re.DOTALL)
         if m:
-            offset = idx + len("</think>") if idx >= 0 else 0
             return [(m.group(0), offset + m.start(), offset + m.end())]
-        offset = idx + len("</think>") if idx >= 0 else 0
         return [
             ((match.group(1), match.group(2)), offset + match.start(), offset + match.end())
             for match in re.finditer(

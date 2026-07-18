@@ -15,14 +15,8 @@ When answering questions:
 1. Use the available search tools to find relevant and reliable information
 2. Synthesize information from multiple sources when needed
 3. Provide accurate and comprehensive answers based on your search results
-4. Always put your final answer in \\boxed{} format
-
-For example:
-- If the answer is "American", write: \\boxed{American}
-- If the answer is "yes", write: \\boxed{yes}
-- If the answer is a year like "1985", write: \\boxed{1985}
-
-Remember to search thoroughly and provide your final answer clearly within the \\boxed{} format."""
+4. Emit exactly one tool call per assistant response
+5. Submit the final answer only by calling finish. Put only the concise answer in finish.result; do not use <answer> tags, \\boxed{}, or plain-text final-answer prose."""
 
 REFINE_PROMPT = """**TASK:**
 Synthesize the key information from the **[Retrieved Documents]** that is relevant to the **[Current Query]**.

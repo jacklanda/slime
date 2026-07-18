@@ -107,7 +107,11 @@ def _score_sample(sample: Sample) -> float:
         return _score_multiple_choice(sample.response, label, metadata.get("options"))
 
     answers = _candidate_answers(label, metadata)
-    return _score_short_answer(sample.response, answers)
+    return _score_short_answer(
+        sample.response,
+        answers,
+        strict_exact_match=bool(metadata.get("strict_exact_match")),
+    )
 
 
 def _gpqa_metadata(metadata: dict[str, Any], label: Any) -> dict[str, Any]:
@@ -560,13 +564,17 @@ def _apply_anti_gibberish_penalty(score: float, pred: str) -> float:
     return float(max(0.0, min(1.0, score)))
 
 
-def _score_short_answer(response: str, answers: list[str]) -> float:
+def _score_short_answer(response: str, answers: list[str], *, strict_exact_match: bool = False) -> float:
     if not response or not answers:
         return 0.0
     final_text = _final_answer_text(response)
     if not final_text:
         return 0.0
     for answer in answers:
+        if strict_exact_match:
+            if _normalize_answer_for_benchmark(final_text) == _normalize_answer_for_benchmark(answer):
+                return 1.0
+            continue
         if _short_answer_match(final_text, answer):
             return 1.0
     return 0.0

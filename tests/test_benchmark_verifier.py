@@ -95,6 +95,55 @@ def test_short_answer_benchmarks_extract_finish_result(data_source):
 
 
 @pytest.mark.unit
+def test_bamboogle_strict_exact_match_rejects_answer_in_explanatory_text():
+    response = (
+        '<tool_call>{"name":"finish","arguments":{"command":"submit",'
+        '"result":"The answer is Pine Tree State"}}</tool_call>'
+    )
+    sample = _sample(
+        response=response,
+        label="Pine Tree State",
+        metadata={"data_source": "bamboogle", "strict_exact_match": True},
+    )
+
+    assert asyncio.run(reward_func(None, sample)) == 0.0
+
+
+@pytest.mark.unit
+def test_bamboogle_strict_exact_match_keeps_standard_normalization():
+    response = (
+        '<tool_call>{"name":"finish","arguments":{"command":"submit",'
+        '"result":"The Pine Tree State"}}</tool_call>'
+    )
+    sample = _sample(
+        response=response,
+        label="pine tree state",
+        metadata={"data_source": "bamboogle", "strict_exact_match": True},
+    )
+
+    assert asyncio.run(reward_func(None, sample)) == 1.0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "response",
+    [
+        r"\boxed{Pine Tree State}",
+        "<answer>Pine Tree State</answer>",
+        "Final answer: Pine Tree State",
+    ],
+)
+def test_bamboogle_strict_exact_match_accepts_supported_final_answer_formats(response):
+    sample = _sample(
+        response=response,
+        label="Pine Tree State",
+        metadata={"data_source": "bamboogle", "strict_exact_match": True},
+    )
+
+    assert asyncio.run(reward_func(None, sample)) == 1.0
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("data_source", ["2wiki", "bamboogle", "simpleqa_verified", "musique"])
 def test_short_answer_benchmarks_extract_raw_boxed_answer(data_source):
     sample = _sample(
@@ -413,3 +462,7 @@ def test_frontierscience_research_scores_long_answer_with_rouge_l():
 @pytest.mark.unit
 def test_extract_final_answer_supports_nested_boxed_braces():
     assert _extract_final_answer("Final: \\boxed{answer {with braces}}") == "answer {with braces}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

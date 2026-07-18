@@ -299,12 +299,18 @@ def test_normalize_rllm_extra_info_task():
 def test_rllm_deepresearch_harness_aliases_and_prompt():
     assert normalize_harness("rllm_dr") == "rllm_deepresearch"
     assert normalize_harness("deepresearch") == "rllm_deepresearch"
-    tools = [local_search_schema()]
-    messages = _initial_messages("rllm_deepresearch", "web_search", "Who?", tools, "Qwen/Qwen3-8B")
+    tools = [local_search_schema(), finish_schema()]
+    question = (
+        "Who?When ready, output the final answer enclosed in <answer> and </answer> tags. "
+        "Do not generate any content after the </answer> tag."
+    )
+    messages = _initial_messages("rllm_deepresearch", "web_search", question, tools, "Qwen/Qwen3-8B")
 
     assert messages[0]["content"].startswith(RLLM_DR_SEARCH_SYSTEM_PROMPT)
     assert '"name": "local_search"' in messages[0]["content"]
-    assert '"name": "finish"' not in messages[0]["content"]
+    assert '"name": "finish"' in messages[0]["content"]
+    assert "only by calling finish" in messages[0]["content"]
+    assert "\\boxed{} format" not in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": "Who?"}
 
 
@@ -353,6 +359,29 @@ def test_qwen_tool_parser_finish_and_answer_fallback():
     calls = parser.parse('<tool_call>{"name":"finish","arguments":{"command":"submit","result":"The answer is \\\\boxed{Fixed Answer}.}}</tool_call>')
     assert calls[0].name == "finish"
     assert calls[0].arguments["result"] == "The answer is \\\\boxed{Fixed Answer}."
+
+
+def test_qwen_tool_parser_ignores_tool_call_markup_inside_thinking():
+    parser = QwenToolParser(valid_tools={"web_search", "finish"})
+    hidden = '<tool_call>{"name":"web_search","arguments":{"query":"draft"}}</tool_call>'
+    action = '<tool_call>{"name":"web_search","arguments":{"query":"actual"}}</tool_call>'
+    response = f"<think>Next I will emit {hidden}</think>\n{action}"
+
+    calls = parser.parse(response)
+
+    assert [(call.name, call.arguments) for call in calls] == [("web_search", {"query": "actual"})]
+    assert calls[0].start == response.index(action)
+    assert calls[0].end == len(response)
+
+
+def test_qwen_tool_parser_keeps_multiple_actions_after_thinking():
+    parser = QwenToolParser(valid_tools={"web_search", "finish"})
+    first = '<tool_call>{"name":"web_search","arguments":{"query":"one"}}</tool_call>'
+    second = '<tool_call>{"name":"web_search","arguments":{"query":"two"}}</tool_call>'
+
+    calls = parser.parse(f"<think>plan</think>\n{first}{second}")
+
+    assert [call.arguments["query"] for call in calls] == ["one", "two"]
 
 
 def test_qwen_tool_parser_accepts_legacy_function_actions():
@@ -2060,6 +2089,33 @@ def test_web_search_falls_back_to_one_for_malformed_max_results(monkeypatch):
     assert FakeSession.calls[0][1]["max_results"] == 1
 
 
+def test_web_search_clamps_model_requested_results_to_environment_limit(monkeypatch):
+    payloads = []
+
+    async def fake_retrieve(_url, payload, *, retry_budget, episode_cache):
+        del retry_budget, episode_cache
+        payloads.append(payload)
+        content = (
+            "The retrieved document contains concrete historical evidence with named entities, dates, locations, and detailed context. "
+            "It identifies the relevant person, explains the relationship in the question, and cites the year in which the documented event occurred."
+        )
+        return {"results": [{"content": {"title": "Doc", "chunk_text": content}}]}, 0, None
+
+    monkeypatch.setattr("slime.rollout.fused_agent.env._retrieve_json_cached", fake_retrieve)
+    env = FusedEnvironment({"question": "Find evidence"}, retrieval_max_results=2)
+
+    observation, reward, done, _ = asyncio.run(
+        env.step(fused_generate.ToolCall("web_search", {"query": "q", "max_results": 5}))
+    )
+
+    assert observation.startswith("[Result 1] Title: Doc")
+    assert reward == 0.0
+    assert done is False
+    assert payloads[0]["top_k"] == 2
+    assert payloads[0]["topk"] == 2
+    assert payloads[0]["max_results"] == 2
+
+
 def test_no_ground_truth_reward_is_zero_even_after_tool_call():
     env = FusedEnvironment({"question": "Find evidence"})
     env.answer = "confident answer"
@@ -3025,42 +3081,52 @@ def test_eval_generate_defers_reward_to_benchmark_verifier():
     assert asyncio.run(reward_func(SimpleNamespace(hf_checkpoint=None), result[0], evaluation=True)) == 1.0
 
 
-def test_rllm_deepresearch_eval_runs_parallel_searches_and_natural_finish(monkeypatch):
-    active = 0
-    max_active = 0
+def test_rllm_deepresearch_eval_runs_searches_and_finish(monkeypatch):
     searches = []
-    both_started = asyncio.Event()
 
     async def fake_search(action, *, retrieval_url, max_results):
-        nonlocal active, max_active
         searches.append((action.arguments["query"], retrieval_url, max_results))
-        active += 1
-        max_active = max(max_active, active)
-        if active == 2:
-            both_started.set()
-        await asyncio.wait_for(both_started.wait(), timeout=1)
-        active -= 1
         return f"summary for {action.arguments['query']}", {"tool_return_error": 0, "refine_error": 0}
 
     monkeypatch.setattr(fused_generate, "run_rllm_deepresearch_search", fake_search)
-    first = (
-        '<tool_call>{"name":"local_search","arguments":{"query":"alpha"}}</tool_call>'
-        '<tool_call>{"name":"local_search","arguments":{"query":"beta"}}</tool_call>'
-    )
+    first = '<tool_call>{"name":"local_search","arguments":{"query":"alpha"}}</tool_call>'
+    second = '<tool_call>{"name":"local_search","arguments":{"query":"beta"}}</tool_call>'
+    finish = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"Paris"}}</tool_call>'
     result = _run_generate_with_fake_sglang(
         Sample(prompt="placeholder", label="Paris", metadata={"question": "Where?"}),
-        [{"text": first}, {"text": "The evidence supports \\boxed{Paris}."}],
+        [{"text": first}, {"text": second}, {"text": finish}],
         {"FUSED_HARNESS": "rllm_deepresearch", "RETRIEVAL_SERVER_URL": "http://retriever"},
         evaluation=True,
     )
 
     assert [item[0] for item in searches] == ["alpha", "beta"]
     assert all(item[2] == 10 for item in searches)
-    assert max_active == 2
-    assert result[0].response == "The evidence supports \\boxed{Paris}."
+    assert result[0].response == finish
     assert result[0].reward == 1.0
     assert result[0].metadata["fused_termination"] == "rllm_dr_no_tool_call"
-    assert result[0].metadata["fused_tool_call_turns"] == 1
+    assert result[0].metadata["fused_tool_call_turns"] == 2
+
+
+def test_rllm_deepresearch_eval_rejects_multiple_tool_calls(monkeypatch):
+    async def unexpected_search(*_args, **_kwargs):
+        raise AssertionError("anomalous multi-tool response must not execute searches")
+
+    monkeypatch.setattr(fused_generate, "run_rllm_deepresearch_search", unexpected_search)
+    response = (
+        '<tool_call>{"name":"local_search","arguments":{"query":"alpha"}}</tool_call>'
+        '<tool_call>{"name":"local_search","arguments":{"query":"beta"}}</tool_call>'
+    )
+
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label="Paris", metadata={"question": "Where?"}),
+        [{"text": response}],
+        {"FUSED_HARNESS": "rllm_deepresearch", "RETRIEVAL_SERVER_URL": "http://retriever"},
+        evaluation=True,
+    )
+
+    assert result[0].reward == 0.0
+    assert result[0].metadata["fused_termination"] == "ABNORMAL_EVAL_RESPONSE"
+    assert "multiple_tool_calls" in result[0].metadata["eval_response_anomalies"]
 
 
 def test_rllm_deepresearch_eval_stops_on_duplicate_search(monkeypatch):

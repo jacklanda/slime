@@ -60,3 +60,27 @@ def test_frontierscience_splits_are_discovered_as_separate_benchmarks(tmp_path: 
     assert datasets[1]["max_response_len"] == 38000
     normalized = Path(datasets[0]["path"]).read_text(encoding="utf-8")
     assert '"data_source": "frontierscience_olympiad"' in normalized
+
+
+@pytest.mark.unit
+def test_bamboogle_uses_strict_exact_match(tmp_path: Path):
+    benchmark = tmp_path / "benchmarks" / "bamboogle"
+    benchmark.mkdir(parents=True)
+    (benchmark / "data.json").write_text(
+        json.dumps([{"question": "Who?", "answer": "Ada Lovelace"}]),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        benchmarks_root=str(tmp_path / "benchmarks"),
+        cache_dir=str(tmp_path / "cache"),
+        include="bamboogle",
+        exclude="",
+        prefer_verl=False,
+        limit_per_benchmark=0,
+        custom_generate_function_path="slime.rollout.fused_agent.generate.generate",
+        long_response_len=38000,
+    )
+
+    datasets = discover_benchmarks(args)
+
+    assert datasets[0]["metadata_overrides"]["strict_exact_match"] is True

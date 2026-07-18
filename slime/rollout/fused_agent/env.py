@@ -430,9 +430,10 @@ class FusedEnvironment:
         if not query:
             return "Error: web_search requires query.", 0.0, False, {}
         try:
-            max_results = int(args.get("max_results") or self.retrieval_max_results)
+            requested_max_results = int(args.get("max_results") or self.retrieval_max_results)
         except (TypeError, ValueError):
-            max_results = 1
+            requested_max_results = 1
+        max_results = max(1, min(requested_max_results, self.retrieval_max_results))
         self.web_search_queries.add(_normalize_search_query(query))
         retrieval_mode = os.environ.get("RLLM_RETRIEVAL_MODE", "hybrid")
         retrieval_max_words = int(os.environ.get("RLLM_RETRIEVAL_MAX_WORDS", "4096"))

@@ -38,6 +38,7 @@ from .prompts import (
     REACT_SYSTEM_PROMPT,
     REACT_USER_PROMPT,
     build_system_prompt,
+    finish_schema,
     normalize_harness,
 )
 from .rllm_deepresearch import SEARCH_SYSTEM_PROMPT as RLLM_DR_SEARCH_SYSTEM_PROMPT
@@ -412,10 +413,10 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     ngram_repetition_min_tokens = int(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS", "128"))
     repeated_search_max_strikes = max(1, int(os.environ.get("FUSED_REPEATED_SEARCH_MAX_STRIKES", "2")))
     detect_abnormal_trajectories = not evaluation and not rllm_deepresearch
-    detect_eval_response_anomalies = evaluation and not rllm_deepresearch
+    detect_eval_response_anomalies = evaluation
     eval_max_tool_calls_per_turn = int(os.environ.get("FUSED_EVAL_MAX_TOOL_CALLS_PER_TURN", "1"))
 
-    tools = [local_search_schema()] if rllm_deepresearch else env.tools()
+    tools = [local_search_schema(), finish_schema()] if rllm_deepresearch else env.tools()
     model_name = getattr(state.tokenizer, "name_or_path", None) or getattr(args, "hf_checkpoint", None)
     parser = make_tool_parser(model_name, valid_tools=_valid_tool_names(tools))
     messages = _initial_messages(harness, info.get("task_type", ""), observation, tools, model_name, tool_parser=parser)
@@ -776,7 +777,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     break
             if rllm_deepresearch:
                 if not actions or all(action.name == "finish" for action in actions):
-                    env.answer = response
+                    env.answer = (
+                        str(actions[-1].arguments.get("result") or actions[-1].arguments.get("answer") or "")
+                        if actions
+                        else response
+                    )
                     final_reward = env.compute_final_reward(require_tool_evidence=False)
                     final_done = True
                     last_info = {"termination_reason": "rllm_dr_no_tool_call", "reward_debug": env.reward_debug}
@@ -1568,7 +1573,10 @@ def _initial_messages(
 ) -> list[dict[str, str]]:
     if harness == "rllm_deepresearch":
         system = build_system_prompt(RLLM_DR_SEARCH_SYSTEM_PROMPT, tools, model_name, tool_parser=tool_parser)
-        return [{"role": "system", "content": system}, {"role": "user", "content": observation}]
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": _strip_conflicting_answer_tag_instruction(observation)},
+        ]
     if harness == "bare":
         return [{"role": "user", "content": observation}]
     if harness == "cot":
@@ -1594,13 +1602,7 @@ def _initial_messages(
     else:
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_SEARCH_SYSTEM_PROMPT
         system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser)
-        observation = re.sub(
-            r"\s*When ready, output the final answer enclosed in <answer> and </answer> tags\.\s*"
-            r"Do not generate any content after the </answer> tag\.\s*$",
-            "",
-            observation,
-            flags=re.IGNORECASE,
-        )
+        observation = _strip_conflicting_answer_tag_instruction(observation)
         user_prompt = (
             FUSED_SEARCH_LONG_USER_PROMPT
             if os.environ.get("FUSED_WEB_SEARCH_USER_PROMPT", "short") == "long"
@@ -1608,6 +1610,16 @@ def _initial_messages(
         )
         user = user_prompt.format(problem_statement=observation)
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _strip_conflicting_answer_tag_instruction(text: str) -> str:
+    return re.sub(
+        r"\s*When ready, output the final answer enclosed in <answer> and </answer> tags\.\s*"
+        r"Do not generate any content after the </answer> tag\.\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 def _append_tool_observation_message(
