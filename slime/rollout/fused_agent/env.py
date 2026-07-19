@@ -23,6 +23,7 @@ from slime.rollout.rm_hub.f1 import normalize_answer
 from .docker_env import DockerTaskEnvironment, is_et_task
 from .parser import ToolCall, tool_schema
 from .prompts import finish_schema, web_search_schema
+from .search_gym import access_schema, search_schema
 
 logger = logging.getLogger(__name__)
 
@@ -317,12 +318,14 @@ class FusedEnvironment:
         retrieval_url: str | None = None,
         retrieval_max_results: int = 5,
         enable_tools: bool = True,
+        search_gym: bool = False,
     ):
         self.task = normalize_task(task)
         self.mode = resolve_task_mode(self.task)
         self.retrieval_url = retrieval_url or os.environ.get("RETRIEVAL_SERVER_URL", "http://127.0.0.1:65432")
         self.retrieval_max_results = retrieval_max_results
         self.enable_tools = enable_tools
+        self.search_gym = search_gym
         self.answer = ""
         self.tool_calls = 0
         self.web_search_queries: set[str] = set()
@@ -376,6 +379,8 @@ class FusedEnvironment:
         if self.mode in {"cli", "et"} and self.docker_env is not None:
             return self.docker_env.schemas()
         if self.mode == "web_search":
+            if self.search_gym:
+                return [search_schema(), access_schema(), finish_schema()]
             return [web_search_schema(), finish_schema()]
         return [finish_schema()]
 
@@ -405,8 +410,10 @@ class FusedEnvironment:
             reward = self.compute_final_reward()
             return "Submitted.", reward, True, {"reward_debug": self.reward_debug}
         self.tool_calls += 1
-        if self.mode == "web_search" and name == "web_search":
+        if self.mode == "web_search" and name in {"web_search", "search"}:
             return await self._step_web_search(args)
+        if self.mode == "web_search" and self.search_gym and name == "access":
+            return await self._step_web_access(args)
         if self.mode == "mcp" and self.mcp_tools is not None:
             if self.mcp_tools.load_error:
                 return f"Error: MCP tools failed to load: {self.mcp_tools.load_error}", 0.0, False, {"tools/load_error": 1}
@@ -424,6 +431,24 @@ class FusedEnvironment:
         if self.mode in {"cli", "et"} and self.docker_env is not None:
             return self.docker_env.step(name, args)
         return f"Error: tool {name} is not available for task mode {self.mode}", 0.0, False, {}
+
+    async def _step_web_access(self, args: dict[str, Any]) -> tuple[str, float, bool, dict[str, Any]]:
+        url = str(args.get("url") or "").strip()
+        if not url:
+            return "<information>\nNo More Information is Found for this URL.\n</information>", 0.0, False, {}
+        try:
+            async with _get_shared_http_session().post(
+                _normalize_access_url(self.retrieval_url), json={"urls": [url]}
+            ) as response:
+                response.raise_for_status()
+                payload = await response.json()
+            result = (payload.get("result") or [{}])[0] or {}
+            page = str(result.get("contents") or result.get("page") or "")[:250000]
+            if not page:
+                page = "No More Information is Found for this URL."
+            return f"<information>\n>>>> Page 1 >>>>\n\n{page}\n</information>", 0.0, False, {"tools/access_calls": self.tool_calls}
+        except Exception as exc:
+            return f"<information>\nNo More Information is Found for this URL.\n</information>\nAccess failed: {type(exc).__name__}: {exc}", 0.0, False, {"tools/access_failed": 1}
 
     async def _step_web_search(self, args: dict[str, Any]) -> tuple[str, float, bool, dict[str, Any]]:
         query = str(args.get("query") or "")
@@ -880,6 +905,12 @@ async def _summarize_with_retries(
 def _normalize_retrieve_url(retrieval_url: str) -> str:
     retrieval_url = retrieval_url.rstrip("/")
     return retrieval_url if retrieval_url.endswith("/retrieve") else f"{retrieval_url}/retrieve"
+
+
+def _normalize_access_url(retrieval_url: str) -> str:
+    retrieval_url = retrieval_url.rstrip("/")
+    base = retrieval_url[: -len("/retrieve")] if retrieval_url.endswith("/retrieve") else retrieval_url
+    return f"{base}/access"
 
 
 def _normalize_summary_url(retrieval_url: str) -> str:

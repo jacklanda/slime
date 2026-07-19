@@ -44,6 +44,7 @@ _DEFAULT_SYSTEM_PROMPT = (
     "correct option. Score 0 for contradictions, wrong alternatives, evasions, or no submitted answer. "
     "Ignore style, verbosity, and irrelevant intermediate mistakes if the final answer is correct."
 )
+_EQUIVALENCE_SYSTEM_PROMPT = "You are an evaluation assistant."
 
 _SCORE_RESPONSE_FORMAT: dict[str, Any] = {
     "type": "json_schema",
@@ -52,14 +53,29 @@ _SCORE_RESPONSE_FORMAT: dict[str, Any] = {
         "strict": True,
         "schema": {
             "type": "object",
-            "properties": {
-                "score": {
-                    "type": "integer",
-                    "enum": [0, 1],
-                    "description": "Binary reward: 1 for a correct final answer, 0 otherwise.",
-                }
-            },
+            "properties": {"score": {"type": "integer", "enum": [0, 1]}},
             "required": ["score"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+_EQUIVALENCE_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "answer_equivalence_judgement",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "rationale": {"type": "string", "description": "Brief rationale for the judgement."},
+                "judgement": {
+                    "type": "string",
+                    "enum": ["Correct", "Incorrect"],
+                    "description": "Whether the predicted answer is equivalent to the labeled answer.",
+                },
+            },
+            "required": ["rationale", "judgement"],
             "additionalProperties": False,
         },
     },
@@ -105,11 +121,20 @@ async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
             try:
                 response = await _get_client(args).post("/chat/completions", json=payload)
                 response.raise_for_status()
-                reward = _parse_reward(response.json())
+                response_json = response.json()
+                if _grm_mode(args) == "equivalence":
+                    judge_json = _parse_judge_json(response_json)
+                    reward = _judge_reward(judge_json)
+                else:
+                    judge_json = _parse_score_json(response_json)
+                    reward = float(judge_json["score"])
                 sample.metadata.setdefault("grm", {})
                 sample.metadata["grm"].update(
                     {
                         "model": getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+                        "judge": "grm",
+                        "mode": _grm_mode(args),
+                        "judge_json": judge_json,
                         "score": reward,
                         "evaluation": evaluation,
                         "fallback": False,
@@ -130,6 +155,8 @@ async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
                         sample.metadata["grm"].update(
                             {
                                 "model": getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+                                "judge": "grm",
+                                "mode": _grm_mode(args),
                                 "score": reward,
                                 "evaluation": True,
                                 "fallback": True,
@@ -189,7 +216,9 @@ def _build_payload(
     include_question: bool = False,
 ) -> dict[str, Any]:
     model = getattr(args, "grm_model", "deepseek/deepseek-v4-flash")
-    system_prompt = getattr(args, "grm_system_prompt", None) or _DEFAULT_SYSTEM_PROMPT
+    system_prompt = getattr(args, "grm_system_prompt", None) or (
+        _EQUIVALENCE_SYSTEM_PROMPT if _grm_mode(args) == "equivalence" else _DEFAULT_SYSTEM_PROMPT
+    )
     payload = {
         "model": model,
         "messages": [
@@ -207,7 +236,11 @@ def _build_payload(
         ],
         "temperature": float(getattr(args, "grm_temperature", 0.0)),
         "max_tokens": int(getattr(args, "grm_max_new_tokens", 16)),
-        "response_format": {"type": "json_object"} if str(model).startswith("google/") else _SCORE_RESPONSE_FORMAT,
+        "response_format": (
+            {"type": "json_object"}
+            if str(model).startswith("google/")
+            else (_EQUIVALENCE_RESPONSE_FORMAT if _grm_mode(args) == "equivalence" else _SCORE_RESPONSE_FORMAT)
+        ),
         "provider": {"require_parameters": True},
     }
     if str(model).startswith("deepseek/"):
@@ -229,18 +262,27 @@ def _build_judge_prompt(
     system_prompt = (
         system_prompt
         if system_prompt is not None
-        else getattr(args, "grm_system_prompt", None) or _DEFAULT_SYSTEM_PROMPT
+        else getattr(args, "grm_system_prompt", None)
+        or (_EQUIVALENCE_SYSTEM_PROMPT if _grm_mode(args) == "equivalence" else _DEFAULT_SYSTEM_PROMPT)
     )
     final_answer_step = final_answer_step if final_answer_step is not None else _final_answer_step(sample)
-    question = _judge_question(sample) if include_question else ""
-    question_section = f"Question:\n{question}\n\n" if question else ""
-    prefix = (
-        question_section
-        + "Accepted ground truth:\n"
-        + f"{_stringify(sample.label)}\n\n"
-        + "Final submitted answer:\n"
-    )
-    suffix = "\n\nDoes the final submitted answer correctly answer the question? Return only JSON."
+    if _grm_mode(args) != "equivalence":
+        question = _judge_question(sample) if include_question else ""
+        question_section = f"Question:\n{question}\n\n" if question else ""
+        prefix = question_section + "Accepted ground truth:\n" + f"{_stringify(sample.label)}\n\n" + "Final submitted answer:\n"
+        suffix = "\n\nDoes the final submitted answer correctly answer the question? Return only JSON."
+    else:
+        question = _judge_question(sample)
+        prefix = (
+            "You are an evaluation assistant. Please determine if the predicted answer is equivalent to the labeled answer.\n\n"
+            f"Question: {question}\n\nLabeled Answer: {_stringify(sample.label)}\n\nPredicted Answer: "
+        )
+        suffix = (
+            "\n\nDid the model give an answer **equivalent** to the labeled answer? Please respond with \"Correct\" if they are equivalent, or \"Incorrect\" if they are not equivalent.\n\n"
+            "The output should be in the following json format:\n"
+            "{\n    \"rationale\": your rationale for the judgement, as a text,\n"
+            "    \"judgement\": your judgement, can only be \"Correct\" or \"Incorrect\",\n}"
+        )
     fixed_tokens = len(_GRM_TOKENIZER.encode_ordinary(system_prompt)) + len(
         _GRM_TOKENIZER.encode_ordinary(prefix + suffix)
     )
@@ -424,14 +466,24 @@ def _last_nonempty_response_chunk(response: str, max_lines: int = 12) -> str:
     return "\n".join(lines[-max_lines:]).strip()
 
 
-def _parse_reward(payload: dict[str, Any]) -> float:
+def _grm_mode(args) -> str:
+    mode = str(getattr(args, "grm_mode", "score") or "score").strip().lower()
+    if mode not in {"score", "equivalence"}:
+        raise ValueError(f"Unsupported GRM mode {mode!r}; expected 'score' or 'equivalence'.")
+    return mode
+
+
+def _response_content(payload: dict[str, Any]) -> str:
     message = payload["choices"][0]["message"]
     content = message.get("content")
     if content is None:
         content = message.get("reasoning") or _reasoning_details_text(message.get("reasoning_details"))
     if isinstance(content, list):
         content = "".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
-    text = str(content).strip()
+    return str(content).strip()
+
+
+def _parse_json_object(text: str, required_key: str) -> dict[str, Any]:
     parsed = None
     try:
         parsed = json.loads(text)
@@ -444,16 +496,43 @@ def _parse_reward(payload: dict[str, Any]) -> float:
                 candidate, _ = decoder.raw_decode(text, start)
             except json.JSONDecodeError:
                 continue
-            if isinstance(candidate, dict) and "score" in candidate:
+            if isinstance(candidate, dict) and required_key in candidate:
                 parsed = candidate
         if parsed is None:
             raise ValueError(f"GRM response did not contain valid JSON: {text!r}") from None
     if not isinstance(parsed, dict):
         raise ValueError(f"GRM response JSON must be an object, got {type(parsed).__name__}")
+    if required_key not in parsed:
+        raise ValueError(f"GRM response JSON is missing required key {required_key!r}")
+    return parsed
+
+
+def _parse_score_json(payload: dict[str, Any]) -> dict[str, int]:
+    parsed = _parse_json_object(_response_content(payload), "score")
     score = parsed.get("score")
     if score in (0, 1, 0.0, 1.0, "0", "1"):
-        return float(score)
+        return {"score": int(float(score))}
     raise ValueError(f"GRM JSON score must be 0 or 1, got {score!r}")
+
+
+def _parse_judge_json(payload: dict[str, Any]) -> dict[str, str]:
+    parsed = _parse_json_object(_response_content(payload), "judgement")
+    judgement = str(parsed.get("judgement", "")).strip().strip("`*_.,:;!").lower()
+    if judgement not in {"correct", "incorrect"}:
+        raise ValueError(f'GRM JSON judgement must be "Correct" or "Incorrect", got {parsed.get("judgement")!r}')
+    rationale = parsed.get("rationale", "")
+    if not isinstance(rationale, str):
+        rationale = _stringify(rationale)
+    return {"rationale": rationale, "judgement": judgement.capitalize()}
+
+
+def _judge_reward(judge_json: dict[str, str]) -> float:
+    return 1.0 if judge_json["judgement"] == "Correct" else 0.0
+
+
+def _parse_reward(payload: dict[str, Any]) -> float:
+    """Compatibility helper for callers expecting a score-mode reward."""
+    return float(_parse_score_json(payload)["score"])
 
 
 def _reasoning_details_text(value: Any) -> str:

@@ -168,6 +168,6 @@ def normalize_harness(harness: str | None) -> str:
         "deepresearch": "rllm_deepresearch",
     }
     value = aliases.get(value, value)
-    if value not in {"gem", "unified_gem", "react", "cot", "bare", "rllm_deepresearch"}:
+    if value not in {"gem", "unified_gem", "react", "cot", "bare", "rllm_deepresearch", "search_gym"}:
         raise ValueError(f"Invalid fused harness: {harness!r}")
     return value

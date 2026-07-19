@@ -135,6 +135,8 @@ def _eval_judge_record(args: Any, sample_metadata: dict[str, Any] | None) -> dic
             "max_input_tokens": int(getattr(args, "grm_max_input_tokens", 24000)),
             "max_new_tokens": int(getattr(args, "grm_max_new_tokens", 128)),
         },
+        "judge_json": grm_result.get("judge_json"),
+        "mode": grm_result.get("mode", "score"),
     }
 
 

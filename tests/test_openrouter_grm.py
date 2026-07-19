@@ -20,6 +20,7 @@ class Args:
     grm_max_new_tokens = 128
     grm_max_input_tokens = 2000
     rm_type = "math"
+    grm_mode = "score"
 
 
 class FakeResponse:
@@ -87,6 +88,38 @@ def test_openrouter_grm_does_not_send_deepseek_reasoning_parameter_to_gemini():
 
     assert "reasoning" not in payload
     assert payload["response_format"] == {"type": "json_object"}
+
+
+def test_openrouter_grm_equivalence_mode_uses_judgement_schema_and_persists_json(monkeypatch):
+    args = Args()
+    args.grm_mode = "equivalence"
+    client = FakeClient(
+        {"choices": [{"message": {"content": '{"rationale":"Same answer.","judgement":"Correct"}'}}]}
+    )
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", client)
+    monkeypatch.setattr(openrouter_grm, "_SEMAPHORE", None)
+
+    sample = _sample()
+    reward = asyncio.run(openrouter_grm.reward_func(args, sample, evaluation=False))
+
+    assert reward == 1.0
+    request = client.requests[0]
+    schema = request["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["judgement"]["enum"] == ["Correct", "Incorrect"]
+    assert "Question: question" in request["messages"][1]["content"]
+    assert "Labeled Answer: 42" in request["messages"][1]["content"]
+    assert "Predicted Answer: \\boxed{42}" in request["messages"][1]["content"]
+    assert sample.metadata["grm"]["judge_json"] == {"rationale": "Same answer.", "judgement": "Correct"}
+
+
+def test_openrouter_grm_equivalence_parser_normalizes_judgement_case():
+    payload = {
+        "choices": [{"message": {"content": 'prefix {"rationale":"Equivalent.","judgement":" correct! "}'}}]
+    }
+    assert openrouter_grm._parse_judge_json(payload) == {
+        "rationale": "Equivalent.",
+        "judgement": "Correct",
+    }
 
 
 @pytest.mark.parametrize(

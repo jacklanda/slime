@@ -1530,6 +1530,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument("--grm-base-url", type=str, default="https://openrouter.ai/api/v1")
             parser.add_argument("--grm-model", type=str, default="deepseek/deepseek-v4-flash")
+            parser.add_argument(
+                "--grm-mode",
+                type=str,
+                choices=("score", "equivalence"),
+                default="score",
+                help="GRM protocol: legacy binary score JSON or answer-equivalence judgement JSON.",
+            )
             parser.add_argument("--grm-openrouter-api-key", type=str, default=None)
             parser.add_argument("--grm-openrouter-site-url", type=str, default=None)
             parser.add_argument("--grm-openrouter-app-name", type=str, default="GRM")

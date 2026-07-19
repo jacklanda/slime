@@ -43,6 +43,7 @@ from .prompts import (
 )
 from .rllm_deepresearch import SEARCH_SYSTEM_PROMPT as RLLM_DR_SEARCH_SYSTEM_PROMPT
 from .rllm_deepresearch import local_search_schema, run_search as run_rllm_deepresearch_search
+from .search_gym import SEARCH_GYM_SYSTEM_PROMPT, SEARCH_GYM_USER_PROMPT, SearchGymToolParser
 
 logger = logging.getLogger(__name__)
 DEFAULT_SGLANG_CONTEXT_LENGTH_MARGIN = 256
@@ -372,6 +373,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     task = _task_from_sample(base_sample)
     harness = normalize_harness(os.environ.get("FUSED_HARNESS", getattr(args, "fused_harness", "gem")))
     rllm_deepresearch = harness == "rllm_deepresearch"
+    search_gym = harness == "search_gym"
     reasoning_only = harness in {"cot", "bare"}
     retrieval_max_results = int(os.environ.get("RETRIEVAL_MAX_RESULTS", "10" if rllm_deepresearch else "5"))
     env = FusedEnvironment(
@@ -379,6 +381,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         retrieval_url=os.environ.get("RETRIEVAL_SERVER_URL"),
         retrieval_max_results=retrieval_max_results,
         enable_tools=not reasoning_only,
+        search_gym=search_gym,
     )
     observation, info = env.reset()
     if rllm_deepresearch and env.mode != "web_search":
@@ -418,7 +421,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
 
     tools = [local_search_schema(), finish_schema()] if rllm_deepresearch else env.tools()
     model_name = getattr(state.tokenizer, "name_or_path", None) or getattr(args, "hf_checkpoint", None)
-    parser = make_tool_parser(model_name, valid_tools=_valid_tool_names(tools))
+    parser = SearchGymToolParser(valid_tools=_valid_tool_names(tools)) if search_gym else make_tool_parser(model_name, valid_tools=_valid_tool_names(tools))
     messages = _initial_messages(harness, info.get("task_type", ""), observation, tools, model_name, tool_parser=parser)
     max_steps = base_max_steps if rllm_deepresearch else _max_steps_for_mode(env.mode, base_max_steps)
     manager = None if evaluation else TrajectoryManager(fork_threshold_tokens=int(os.environ.get("SLIME_FUSED_FORK_THRESHOLD_TOKENS", "1024")))
@@ -1577,6 +1580,10 @@ def _initial_messages(
             {"role": "system", "content": system},
             {"role": "user", "content": _strip_conflicting_answer_tag_instruction(observation)},
         ]
+    if harness == "search_gym":
+        schemas_str = "\n".join(json.dumps(schema, ensure_ascii=False) for schema in tools)
+        system = SEARCH_GYM_SYSTEM_PROMPT + "\n" + SearchGymToolParser().get_tool_prompt(schemas_str)
+        return [{"role": "system", "content": system}, {"role": "user", "content": SEARCH_GYM_USER_PROMPT.format(question=observation)}]
     if harness == "bare":
         return [{"role": "user", "content": observation}]
     if harness == "cot":

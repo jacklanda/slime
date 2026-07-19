@@ -32,7 +32,7 @@ Core:
 
 Generation/eval:
   --harness NAME                       Harness: bare, cot, react, gem, unified_gem,
-                                       rllm_deepresearch (alias: rllm_dr). Default: cot.
+                                       search_gym, rllm_deepresearch (alias: rllm_dr). Default: cot.
   --user_prompt long|short             Web-search user prompt. Default: short.
   --rllm-dr-refine-server-url URLS     Comma-separated OpenAI-compatible Refine server base URLs.
   --unified-system-prompt              Sets harness to unified_gem unless --harness is later set.
@@ -68,7 +68,8 @@ Generation/eval:
   --eval-dump-failures BOOL            Dump failed eval trajectories. Default: true.
   --native-sglang-session BOOL         Use verified incremental SGLang sessions. Default: true.
   --enable-use-grm-evals BOOL          Rule-first verifier with OpenRouter semantic fallback. Default: true.
-  --grm-model NAME                     OpenRouter fallback judge. Default: deepseek/deepseek-v4-flash.
+  --grm-model NAME                     OpenRouter fallback judge. Default: google/gemini-3-flash-preview.
+  --grm-mode score|equivalence          GRM protocol. Default: score (legacy).
   --grm-concurrency N                  Max concurrent judge requests. Default: 128.
   --grm-timeout SECONDS                Judge request timeout. Default: 60.
   --grm-max-retries N                  Judge request attempts. Default: 3.
@@ -155,14 +156,15 @@ EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES:-true}"
 NATIVE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION:-true}"
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-true}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
-GRM_MODEL="${GRM_MODEL:-deepseek/deepseek-v4-flash}"
+GRM_MODEL="${GRM_MODEL:-google/gemini-3-flash-preview}"
+GRM_MODE="${GRM_MODE:-score}"
 GRM_CONCURRENCY="${GRM_CONCURRENCY:-128}"
 GRM_MAX_CONNECTIONS="${GRM_MAX_CONNECTIONS:-128}"
 GRM_TIMEOUT="${GRM_TIMEOUT:-60}"
 GRM_MAX_RETRIES="${GRM_MAX_RETRIES:-32}"
 GRM_MAX_INPUT_TOKENS="${GRM_MAX_INPUT_TOKENS:-131072}"
-GRM_MAX_NEW_TOKENS="${GRM_MAX_NEW_TOKENS:-1024}"
-GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.6}"
+GRM_MAX_NEW_TOKENS="${GRM_MAX_NEW_TOKENS:-2048}"
+GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.0}"
 GRM_FAILURE_REWARD="${GRM_FAILURE_REWARD:-0.0}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.9}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-60}"
@@ -224,6 +226,7 @@ while [ "$#" -gt 0 ]; do
       --native-sglang-session) NATIVE_SGLANG_SESSION="${2:?Missing value for --native-sglang-session}"; shift 2 ;;
       --enable-use-grm-evals) ENABLE_USE_GRM_EVALS="${2:?Missing value for --enable-use-grm-evals}"; shift 2 ;;
       --grm-model) GRM_MODEL="${2:?Missing value for --grm-model}"; shift 2 ;;
+      --grm-mode) GRM_MODE="${2:?Missing value for --grm-mode}"; shift 2 ;;
       --grm-concurrency) GRM_CONCURRENCY="${2:?Missing value for --grm-concurrency}"; shift 2 ;;
       --grm-timeout) GRM_TIMEOUT="${2:?Missing value for --grm-timeout}"; shift 2 ;;
       --grm-max-retries) GRM_MAX_RETRIES="${2:?Missing value for --grm-max-retries}"; shift 2 ;;
@@ -556,6 +559,7 @@ if is_truthy "${ENABLE_USE_GRM_EVALS}"; then
       --enable-use-grm-evals
       --grm-custom-rm-path "${GRM_CUSTOM_RM_PATH}"
       --grm-model "${GRM_MODEL}"
+      --grm-mode "${GRM_MODE}"
       --grm-concurrency "${GRM_CONCURRENCY}"
       --grm-max-connections "${GRM_MAX_CONNECTIONS}"
       --grm-timeout "${GRM_TIMEOUT}"

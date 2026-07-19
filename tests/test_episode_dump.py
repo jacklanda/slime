@@ -50,7 +50,13 @@ def test_eval_episode_dump_uses_evals_global_steps_path(tmp_path, monkeypatch):
     )
     eval_sample = _sample_with_episode()
     eval_sample.reward = 0.0
-    eval_sample.metadata["grm"] = {"judge": "grm", "model": "judge/model", "score": 0.0}
+    eval_sample.metadata["grm"] = {
+        "judge": "grm",
+        "model": "judge/model",
+        "mode": "equivalence",
+        "judge_json": {"rationale": "Different answer.", "judgement": "Incorrect"},
+        "score": 0.0,
+    }
 
     save_rllm_episode_batch(args, rollout_id=0, samples=[_sample_with_episode()], mode="train")
     save_rllm_episode_batch(args, rollout_id=0, samples=[eval_sample], mode="eval")
@@ -73,6 +79,8 @@ def test_eval_episode_dump_uses_evals_global_steps_path(tmp_path, monkeypatch):
         "max_input_tokens": 131072,
         "max_new_tokens": 1024,
     }
+    assert episode["mode"] == "equivalence"
+    assert episode["judge_json"] == {"rationale": "Different answer.", "judgement": "Incorrect"}
     step = episode["trajectories"][0]["steps"][0]
     assert step["thought"] == ""
     assert step["model_response"] == "plain response"
