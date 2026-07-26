@@ -6,6 +6,7 @@ import warnings
 import wandb
 
 from . import wandb_utils
+from .metric_utils import compute_train_step
 from .tensorboard_utils import _TensorboardAdapter
 
 _LOGGER_CONFIGURED = False
@@ -203,10 +204,26 @@ def _drop_untracked_metrics(metrics):
 
 
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
-def log(args, metrics, step_key: str):
+def log(args, metrics, step_key: str, rollout_id: int | None = None):
     metrics = _drop_untracked_metrics(metrics)
     if args.use_wandb:
-        wandb.log(metrics)
+        skip_first_rollout = getattr(args, "wandb_skip_resume_first_step", False)
+        if skip_first_rollout and rollout_id is None:
+            raise ValueError("rollout_id is required when --wandb-skip-resume-first-step is enabled.")
+        skip_rollout_id = getattr(args, "_wandb_skip_resume_rollout_id", None)
+        if skip_first_rollout and skip_rollout_id is None:
+            skip_rollout_id = rollout_id
+            args._wandb_skip_resume_rollout_id = rollout_id
+            logging.getLogger(__name__).info(
+                "Skipping W&B metrics for the first rollout after resume (rollout_id=%s).", rollout_id
+            )
+        if not skip_first_rollout or rollout_id != skip_rollout_id:
+            wandb_metrics = dict(metrics)
+            if "train/step" not in wandb_metrics:
+                if rollout_id is None:
+                    raise ValueError("rollout_id is required to derive train/step for W&B logging.")
+                wandb_metrics["train/step"] = compute_train_step(args, rollout_id)
+            wandb.log(wandb_metrics)
 
     if args.use_tensorboard:
         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}

@@ -28,7 +28,11 @@ def _sample_with_episode() -> Sample:
                                 "model_response": "plain response",
                                 "reward": 1.0,
                                 "done": True,
-                                "info": {"disable_thinking": True},
+                                "info": {
+                                    "disable_thinking": True,
+                                    "tito_context_reason": "evaluation",
+                                    "historical_thinking_discarded": True,
+                                },
                             }
                         ],
                     }
@@ -85,6 +89,8 @@ def test_eval_episode_dump_uses_evals_global_steps_path(tmp_path, monkeypatch):
     assert step["thought"] == ""
     assert step["model_response"] == "plain response"
     assert step["disable_thinking"] is True
+    assert step["tito_context_reason"] == "evaluation"
+    assert step["historical_thinking_discarded"] is True
 
 
 def test_eval_episode_dump_records_rule_judge_without_grm_settings(tmp_path, monkeypatch):
@@ -101,6 +107,44 @@ def test_eval_episode_dump_records_rule_judge_without_grm_settings(tmp_path, mon
     episode = dumped["trajectories"][0]
     assert episode["judge"] == "rule"
     assert "grm" not in episode
+
+
+def test_eval_episode_dump_includes_verification_evidence(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    args = types.SimpleNamespace(wandb_project="FusedRL", wandb_group="run")
+    sample = _sample_with_episode()
+    sample.label = "expected answer"
+    sample.metadata["verification"] = {
+        "verifier": "model",
+        "model": "google/gemini-3-flash-preview",
+        "ground_truth": "expected answer",
+        "prediction": "submitted answer",
+        "prediction_source": "finish",
+        "score": 0.0,
+    }
+
+    save_rllm_episode_batch(args, rollout_id=0, samples=[sample], mode="eval")
+
+    path = tmp_path / "experiments" / "logs" / "FusedRL" / "run" / "evals" / "global_steps_0.json"
+    episode = json.loads(path.read_text())["trajectories"][0]
+    assert episode["verification"] == sample.metadata["verification"]
+    assert episode["eval_retry_count"] == 0
+    assert episode["eval_retry_termination_reasons"] == []
+
+
+def test_eval_episode_dump_includes_retry_details(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    args = types.SimpleNamespace(wandb_project="FusedRL", wandb_group="run")
+    sample = _sample_with_episode()
+    sample.metadata["eval_retry_count"] = 4
+    sample.metadata["eval_retry_termination_reasons"] = ["max_context_len_exceeded"] * 4
+
+    save_rllm_episode_batch(args, rollout_id=0, samples=[sample], mode="eval")
+
+    path = tmp_path / "experiments" / "logs" / "FusedRL" / "run" / "evals" / "global_steps_0.json"
+    episode = json.loads(path.read_text())["trajectories"][0]
+    assert episode["eval_retry_count"] == 4
+    assert episode["eval_retry_termination_reasons"] == ["max_context_len_exceeded"] * 4
 
 
 def test_eval_episode_dump_respects_episode_log_dir_sibling_evals(tmp_path, monkeypatch):

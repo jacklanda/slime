@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+NUM_GPUS = 0
+
 
 def load_logging_utils(monkeypatch):
     # Stub the optional tracking deps so importing logging_utils doesn't pull in
@@ -116,7 +118,14 @@ def test_filtered_stream_drops_only_linebreak_after_suppressed_fragment(monkeypa
 
 def test_log_drops_untracked_metric_namespaces(monkeypatch):
     mod = load_logging_utils(monkeypatch)
-    args = types.SimpleNamespace(use_wandb=True, use_tensorboard=False)
+    args = types.SimpleNamespace(
+        use_wandb=True,
+        use_tensorboard=False,
+        wandb_skip_resume_first_step=False,
+        rollout_batch_size=16,
+        n_samples_per_prompt=4,
+        global_batch_size=32,
+    )
 
     mod.log(
         args,
@@ -131,14 +140,105 @@ def test_log_drops_untracked_metric_namespaces(monkeypatch):
             "episode/training_reward/mean": 0.5,
         },
         step_key="rollout/step",
+        rollout_id=3,
     )
 
     assert sys.modules["wandb"].logged == [
         {
             "rollout/step": 3,
             "episode/training_reward/mean": 0.5,
+            "train/step": 6,
         }
     ]
+
+
+def test_log_skips_every_wandb_update_from_first_resumed_rollout(monkeypatch):
+    mod = load_logging_utils(monkeypatch)
+    args = types.SimpleNamespace(
+        use_wandb=True,
+        use_tensorboard=False,
+        wandb_skip_resume_first_step=True,
+        rollout_batch_size=16,
+        n_samples_per_prompt=4,
+        global_batch_size=32,
+    )
+
+    mod.log(args, {"rollout/step": 7, "rollout/reward": 0.1}, step_key="rollout/step", rollout_id=7)
+    mod.log(args, {"train/step": 21, "train/loss": 1.0}, step_key="train/step", rollout_id=7)
+    mod.log(args, {"rollout/step": 7, "perf/step_time": 2.0}, step_key="rollout/step", rollout_id=7)
+    mod.log(args, {"rollout/step": 8, "rollout/reward": 0.9}, step_key="rollout/step", rollout_id=8)
+
+    assert sys.modules["wandb"].logged == [{"rollout/step": 8, "rollout/reward": 0.9, "train/step": 16}]
+
+
+def test_log_does_not_skip_tensorboard_for_first_resumed_rollout(monkeypatch):
+    mod = load_logging_utils(monkeypatch)
+    tensorboard_logs = []
+
+    class TensorboardAdapter:
+        def __init__(self, args):
+            pass
+
+        def log(self, data, step):
+            tensorboard_logs.append((data, step))
+
+    monkeypatch.setattr(mod, "_TensorboardAdapter", TensorboardAdapter)
+    args = types.SimpleNamespace(
+        use_wandb=True,
+        use_tensorboard=True,
+        wandb_skip_resume_first_step=True,
+        rollout_batch_size=16,
+        n_samples_per_prompt=4,
+        global_batch_size=32,
+    )
+
+    mod.log(args, {"rollout/step": 7, "rollout/reward": 0.1}, step_key="rollout/step", rollout_id=7)
+
+    assert sys.modules["wandb"].logged == []
+    assert tensorboard_logs == [({"rollout/reward": 0.1}, 7)]
+
+
+def test_log_preserves_explicit_train_step(monkeypatch):
+    mod = load_logging_utils(monkeypatch)
+    args = types.SimpleNamespace(
+        use_wandb=True,
+        use_tensorboard=False,
+        wandb_skip_resume_first_step=False,
+        rollout_batch_size=16,
+        n_samples_per_prompt=4,
+        global_batch_size=32,
+    )
+
+    mod.log(args, {"train/step": 7, "train/loss": 0.25}, step_key="train/step", rollout_id=3)
+
+    assert sys.modules["wandb"].logged == [{"train/step": 7, "train/loss": 0.25}]
+
+
+def test_log_adds_train_step_only_to_wandb_payload(monkeypatch):
+    mod = load_logging_utils(monkeypatch)
+    tensorboard_logs = []
+
+    class TensorboardAdapter:
+        def __init__(self, args):
+            pass
+
+        def log(self, data, step):
+            tensorboard_logs.append((data, step))
+
+    monkeypatch.setattr(mod, "_TensorboardAdapter", TensorboardAdapter)
+    args = types.SimpleNamespace(
+        use_wandb=True,
+        use_tensorboard=True,
+        wandb_skip_resume_first_step=False,
+        rollout_batch_size=16,
+        n_samples_per_prompt=4,
+        global_batch_size=32,
+    )
+
+    mod.log(args, {"rollout/step": 3, "rollout/reward": 0.5}, step_key="rollout/step", rollout_id=3)
+
+    assert sys.modules["wandb"].logged == [{"rollout/step": 3, "rollout/reward": 0.5, "train/step": 6}]
+    assert tensorboard_logs == [({"rollout/reward": 0.5}, 3)]
 
 
 def test_suppress_is_idempotent_and_wraps_both_streams(monkeypatch):

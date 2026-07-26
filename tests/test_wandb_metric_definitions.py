@@ -2,8 +2,12 @@ import importlib
 import sys
 import types
 
+import pytest
 
-def test_wandb_common_defines_rollout_length_metrics(monkeypatch):
+NUM_GPUS = 0
+
+
+def test_wandb_common_uses_train_step_for_every_metric_namespace(monkeypatch):
     wandb_mod = types.ModuleType("wandb")
     calls = []
 
@@ -20,6 +24,14 @@ def test_wandb_common_defines_rollout_length_metrics(monkeypatch):
 
     mod._init_wandb_common()
 
-    assert ("response_length/*", {"step_metric": "rollout/step"}) in calls
-    assert ("prompt_length/*", {"step_metric": "rollout/step"}) in calls
-    assert ("response/*", {"step_metric": "rollout/step"}) in calls
+    custom_step_definitions = {
+        name: kwargs["step_metric"]
+        for name, kwargs in calls
+        if name.endswith("/*") and "step_metric" in kwargs
+    }
+    assert custom_step_definitions
+    assert set(custom_step_definitions.values()) == {"train/step"}
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import types
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,6 +39,99 @@ _retrieval_runtime_loop: asyncio.AbstractEventLoop | None = None
 _retrieval_semaphore: asyncio.Semaphore | None = None
 _retrieval_cache: OrderedDict[str, Any] = OrderedDict()
 _retrieval_inflight: dict[str, asyncio.Task] = {}
+_atlas_http_session: aiohttp.ClientSession | None = None
+_atlas_http_session_loop: asyncio.AbstractEventLoop | None = None
+_atlas_tool_cache: dict[str, list[dict[str, Any]]] = {}
+_atlas_tool_cache_lock = threading.Lock()
+_ATLAS_MUTATING_TOOLS = {
+    "airtable_create_field",
+    "airtable_create_record",
+    "airtable_create_table",
+    "airtable_delete_record",
+    "airtable_update_field",
+    "airtable_update_record",
+    "airtable_update_table",
+    "anili_add_list_entry",
+    "anili_delete_activity",
+    "anili_delete_thread",
+    "anili_favourite_anime",
+    "anili_favourite_character",
+    "anili_favourite_manga",
+    "anili_favourite_staff",
+    "anili_favourite_studio",
+    "anili_follow_user",
+    "anili_post_message_activity",
+    "anili_post_text_activity",
+    "anili_remove_list_entry",
+    "anili_update_list_entry",
+    "anili_update_user",
+    "desktop-commander_create_directory",
+    "desktop-commander_edit_block",
+    "desktop-commander_force_terminate",
+    "desktop-commander_give_feedback_to_desktop_commander",
+    "desktop-commander_interact_with_process",
+    "desktop-commander_kill_process",
+    "desktop-commander_move_file",
+    "desktop-commander_set_config_value",
+    "desktop-commander_write_file",
+    "filesystem_create_directory",
+    "filesystem_edit_file",
+    "filesystem_move_file",
+    "filesystem_write_file",
+    "git_git_add",
+    "git_git_checkout",
+    "git_git_commit",
+    "git_git_create_branch",
+    "git_git_reset",
+    "github_add_issue_comment",
+    "github_create_branch",
+    "github_create_issue",
+    "github_create_or_update_file",
+    "github_create_pull_request",
+    "github_create_pull_request_review_comment",
+    "github_create_repository",
+    "github_fork_repository",
+    "github_merge_pull_request",
+    "github_push_files",
+    "github_update_issue",
+    "github_update_pull_request",
+    "github_update_pull_request_branch",
+    "google-workspace_create_event",
+    "google-workspace_delete_event",
+    "google-workspace_modify_email",
+    "google-workspace_send_email",
+    "google-workspace_update_event",
+    "lara-translate_add_translation",
+    "lara-translate_create_memory",
+    "lara-translate_delete_memory",
+    "lara-translate_delete_translation",
+    "lara-translate_import_tmx",
+    "lara-translate_update_memory",
+    "memory_add_observations",
+    "memory_create_entities",
+    "memory_create_relations",
+    "memory_delete_entities",
+    "memory_delete_observations",
+    "memory_delete_relations",
+    "mongodb_create-collection",
+    "mongodb_create-index",
+    "mongodb_delete-many",
+    "mongodb_drop-collection",
+    "mongodb_drop-database",
+    "mongodb_insert-many",
+    "mongodb_rename-collection",
+    "mongodb_switch-connection",
+    "mongodb_update-many",
+    "notion_API-create-a-comment",
+    "notion_API-create-a-database",
+    "notion_API-delete-a-block",
+    "notion_API-patch-block-children",
+    "notion_API-patch-page",
+    "notion_API-post-page",
+    "notion_API-update-a-block",
+    "notion_API-update-a-database",
+    "slack_conversations_add_message",
+}
 _mcp_tool_cwd_lock = threading.RLock()
 _warned_partial_mcp_modules: set[Path] = set()
 
@@ -68,6 +162,35 @@ def _get_retrieval_runtime() -> tuple[asyncio.Semaphore, OrderedDict[str, Any], 
         _retrieval_inflight = {}
     assert _retrieval_semaphore is not None
     return _retrieval_semaphore, _retrieval_cache, _retrieval_inflight
+
+
+def _get_atlas_http_session() -> aiohttp.ClientSession:
+    global _atlas_http_session, _atlas_http_session_loop
+    loop = asyncio.get_running_loop()
+    if _atlas_http_session is None or _atlas_http_session.closed or _atlas_http_session_loop is not loop:
+        concurrency = max(1, int(os.environ.get("MCP_ATLAS_CONCURRENCY", "5")))
+        timeout = max(1.0, float(os.environ.get("MCP_ATLAS_TOOL_TIMEOUT", "120")))
+        _atlas_http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            connector=aiohttp.TCPConnector(
+                limit=concurrency,
+                limit_per_host=concurrency,
+                ttl_dns_cache=300,
+            ),
+        )
+        _atlas_http_session_loop = loop
+    return _atlas_http_session
+
+
+def _atlas_auth_headers() -> dict[str, str]:
+    token = os.environ.get("MCP_ATLAS_AUTH_TOKEN", "")
+    if not token:
+        raise RuntimeError("MCP_ATLAS_AUTH_TOKEN is required for the MCP-Atlas tool API")
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _atlas_read_only() -> bool:
+    return os.environ.get("MCP_ATLAS_READ_ONLY", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 
 WEB_SEARCH_OBSERVATION_MAX_WORDS = 256
@@ -102,9 +225,157 @@ def resolve_task_mode(task: dict[str, Any]) -> str:
         return "et"
     if task.get("docker_image"):
         return "cli"
+    if _is_atlas_mcp_task(task):
+        return "mcp"
     if task.get("tools_py") or task.get("data_root") or task.get("environment"):
         return "mcp"
     return "web_search"
+
+
+def _is_atlas_mcp_task(task: dict[str, Any]) -> bool:
+    transport = str(task.get("mcp_transport") or "").strip().lower()
+    source = str(task.get("data_source") or task.get("benchmark") or "").strip().lower()
+    normalized_source = source.replace("-", "_").replace(" ", "_")
+    return transport == "atlas" or normalized_source == "mcp_atlas" or bool(task.get("mcp_atlas_eval"))
+
+
+def _atlas_enabled_tool_names(task: dict[str, Any]) -> list[str]:
+    raw_tools = task.get("enabled_tools")
+    if raw_tools is None:
+        raw_tools = task.get("ENABLED_TOOLS")
+    if raw_tools is None:
+        raw_tools = []
+    if isinstance(raw_tools, str):
+        try:
+            raw_tools = json.loads(raw_tools)
+        except json.JSONDecodeError:
+            raw_tools = [raw_tools]
+    if hasattr(raw_tools, "tolist"):
+        raw_tools = raw_tools.tolist()
+    if not isinstance(raw_tools, (list, tuple)):
+        raw_tools = [raw_tools]
+    names = []
+    for item in raw_tools:
+        name = item.get("name") if isinstance(item, dict) else item
+        if name and str(name) not in names:
+            names.append(str(name))
+    return names
+
+
+def _load_atlas_tool_schemas(base_url: str) -> list[dict[str, Any]]:
+    base_url = base_url.rstrip("/")
+    with _atlas_tool_cache_lock:
+        cached = _atlas_tool_cache.get(base_url)
+        if cached is not None:
+            return cached
+        request = urllib.request.Request(
+            f"{base_url}/list-tools",
+            data=b"{}",
+            headers={"Content-Type": "application/json", **_atlas_auth_headers()},
+            method="POST",
+        )
+        timeout = max(1.0, float(os.environ.get("MCP_ATLAS_LIST_TOOLS_TIMEOUT", "180")))
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.load(response)
+        if not isinstance(payload, list):
+            raise ValueError(f"MCP-Atlas /list-tools returned {type(payload).__name__}, expected list")
+        _atlas_tool_cache[base_url] = payload
+        return payload
+
+
+class AtlasMCPToolset:
+    def __init__(self, task: dict[str, Any]):
+        self.task = task
+        self.base_url = str(
+            task.get("mcp_sandbox_url")
+            or os.environ.get("MCP_SANDBOX_URL")
+            or "http://127.0.0.1:1984"
+        ).rstrip("/")
+        self.enabled_tools = _atlas_enabled_tool_names(task)
+        self._schemas: dict[str, dict[str, Any]] = {}
+        self._dirty_servers: set[str] = set()
+        self.load_error = ""
+        self.load_warning = ""
+        try:
+            all_tools = _load_atlas_tool_schemas(self.base_url)
+            by_name = {str(tool.get("name")): tool for tool in all_tools if tool.get("name")}
+            missing = [name for name in self.enabled_tools if name not in by_name]
+            if missing:
+                self.load_warning = "MCP-Atlas tools not exposed by the sandbox: " + ", ".join(missing)
+            for name in self.enabled_tools:
+                if _atlas_read_only() and name in _ATLAS_MUTATING_TOOLS:
+                    continue
+                tool = by_name.get(name)
+                if tool is None:
+                    continue
+                parameters = tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else {"type": "object"}
+                self._schemas[name] = {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": str(tool.get("description") or ""),
+                        "parameters": parameters,
+                    },
+                }
+            if not self.enabled_tools:
+                self.load_error = "MCP-Atlas task does not define ENABLED_TOOLS"
+        except Exception as exc:
+            self.load_error = f"{type(exc).__name__}: {exc}"
+
+    def schemas(self) -> list[dict[str, Any]]:
+        return [self._schemas[name] for name in self.enabled_tools if name in self._schemas] + [finish_schema()]
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> str:
+        if _atlas_read_only() and name in _ATLAS_MUTATING_TOOLS:
+            return f"Error: MCP-Atlas read-only evaluation blocks mutating tool {name}"
+        if name not in self._schemas:
+            return f"Error: MCP-Atlas tool {name} is not enabled for this task"
+        server_name = name.split("_", 1)[0]
+        if name in _ATLAS_MUTATING_TOOLS:
+            self._dirty_servers.add(server_name)
+        try:
+            async with _get_atlas_http_session().post(
+                f"{self.base_url}/call-tool",
+                headers=_atlas_auth_headers(),
+                json={
+                    "tool_name": name,
+                    "tool_args": arguments,
+                    "use_cache": server_name not in self._dirty_servers,
+                },
+            ) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    return f"Error calling {name}: HTTP {response.status}: {body[:1000]}"
+                try:
+                    payload = json.loads(body)
+                except json.JSONDecodeError:
+                    return _cap_atlas_tool_result(body)
+                return _cap_atlas_tool_result(_format_atlas_tool_result(payload))
+        except Exception as exc:
+            return f"Error calling {name}: {type(exc).__name__}: {exc}"
+
+
+def _format_atlas_tool_result(payload: Any) -> str:
+    if not isinstance(payload, list):
+        return json.dumps(payload, ensure_ascii=False, default=str)
+    parts = []
+    for block in payload:
+        if not isinstance(block, dict):
+            parts.append(str(block))
+        elif block.get("type") == "text":
+            parts.append(str(block.get("text") or ""))
+        elif block.get("type") in {"image", "audio"}:
+            parts.append(f"[{block.get('type')} content omitted from text observation]")
+        else:
+            parts.append(json.dumps(block, ensure_ascii=False, default=str))
+    return "\n".join(part for part in parts if part)
+
+
+def _cap_atlas_tool_result(result: str) -> str:
+    limit = max(0, int(os.environ.get("SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH", "4096")))
+    if limit == 0 or len(result) <= limit:
+        return result
+    return result[:limit] + f"\n\n[MCP-Atlas tool output truncated to {limit} characters; original length: {len(result)}]"
 
 
 class LocalMCPToolset:
@@ -331,7 +602,10 @@ class FusedEnvironment:
         self.web_search_queries: set[str] = set()
         self.web_search_cache: dict[str, Any] = {}
         self.reward_debug: dict[str, Any] = {}
-        self.mcp_tools = LocalMCPToolset(self.task) if enable_tools and self.mode == "mcp" else None
+        if enable_tools and self.mode == "mcp":
+            self.mcp_tools = AtlasMCPToolset(self.task) if _is_atlas_mcp_task(self.task) else LocalMCPToolset(self.task)
+        else:
+            self.mcp_tools = None
         self.docker_env = DockerTaskEnvironment(self.task, mode=self.mode) if enable_tools and self.mode in {"cli", "et"} else None
 
     def reset(self) -> tuple[str, dict[str, Any]]:
@@ -418,7 +692,10 @@ class FusedEnvironment:
             if self.mcp_tools.load_error:
                 return f"Error: MCP tools failed to load: {self.mcp_tools.load_error}", 0.0, False, {"tools/load_error": 1}
             started_at = _now_monotonic()
-            result = self.mcp_tools.call(name, args)
+            if isinstance(self.mcp_tools, AtlasMCPToolset):
+                result = await self.mcp_tools.call(name, args)
+            else:
+                result = self.mcp_tools.call(name, args)
             return (
                 result,
                 0.0,

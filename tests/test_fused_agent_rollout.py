@@ -5,8 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import numpy as np
 import pytest
 
+import slime.rollout.fused_agent.env as fused_env
 from slime.rollout.fused_agent.env import FusedEnvironment, _exact_match_reward, _format_retrieval, normalize_task, resolve_task_mode
 import slime.rollout.fused_agent.generate as fused_generate
 from slime.rollout.fused_agent.generate import (
@@ -1270,6 +1272,259 @@ def get_value() -> dict:
     assert info["tools/mcp_tool_elapsed_s"] == pytest.approx(0.15)
 
 
+def test_mcp_atlas_task_filters_schemas_and_calls_http_tool(monkeypatch):
+    monkeypatch.setenv("MCP_ATLAS_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr(
+        fused_env,
+        "_load_atlas_tool_schemas",
+        lambda _url: [
+            {
+                "name": "calculator_add",
+                "description": "Add numbers",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+                    "required": ["a", "b"],
+                },
+            },
+            {
+                "name": "filesystem_read_text_file",
+                "description": "Read a file",
+                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}},
+            },
+        ],
+    )
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def text(self):
+            return json.dumps([{"type": "text", "text": '{"result":5}'}])
+
+    class Session:
+        def __init__(self):
+            self.requests = []
+
+        def post(self, url, headers, json):
+            self.requests.append((url, json))
+            assert headers == {"Authorization": "Bearer test-token"}
+            return Response()
+
+    session = Session()
+    monkeypatch.setattr(fused_env, "_get_atlas_http_session", lambda: session)
+    task = {
+        "question": "Add two numbers",
+        "data_source": "mcp_atlas",
+        "mcp_transport": "atlas",
+        "mcp_sandbox_url": "http://atlas.test:1984",
+        "enabled_tools": ["calculator_add"],
+    }
+    env = FusedEnvironment(task)
+
+    observation, info = env.reset()
+    result, reward, done, metrics = asyncio.run(env.step(ToolCall("calculator_add", {"a": 2, "b": 3})))
+
+    assert resolve_task_mode(task) == "mcp"
+    assert observation == "Add two numbers"
+    assert info["task_type"] == "mcp"
+    assert _valid_tool_names(env.tools()) == {"calculator_add", "finish", "submit"}
+    assert result == '{"result":5}'
+    assert reward == 0.0
+    assert done is False
+    assert metrics["tools/calls"] == 1
+    assert session.requests == [
+        (
+            "http://atlas.test:1984/call-tool",
+            {"tool_name": "calculator_add", "tool_args": {"a": 2, "b": 3}, "use_cache": True},
+        )
+    ]
+
+
+def test_mcp_atlas_bypasses_sandbox_cache_after_mutating_a_server(monkeypatch):
+    monkeypatch.setenv("MCP_ATLAS_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("MCP_ATLAS_READ_ONLY", "false")
+    monkeypatch.setattr(
+        fused_env,
+        "_load_atlas_tool_schemas",
+        lambda _url: [
+            {
+                "name": "slack_conversations_add_message",
+                "description": "Post a message",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "slack_channels_list",
+                "description": "List channels",
+                "inputSchema": {"type": "object", "properties": {}},
+            }
+        ],
+    )
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def text(self):
+            return json.dumps([{"type": "text", "text": "channels"}])
+
+    class Session:
+        def __init__(self):
+            self.requests = []
+
+        def post(self, url, headers, json):
+            self.requests.append((url, json))
+            assert headers == {"Authorization": "Bearer test-token"}
+            return Response()
+
+    session = Session()
+    monkeypatch.setattr(fused_env, "_get_atlas_http_session", lambda: session)
+    env = FusedEnvironment(
+        {
+            "mcp_atlas_eval": True,
+            "enabled_tools": ["slack_conversations_add_message", "slack_channels_list"],
+        }
+    )
+
+    asyncio.run(env.step(ToolCall("slack_conversations_add_message", {"channel_id": "C1", "text": "test"})))
+    asyncio.run(env.step(ToolCall("slack_channels_list", {})))
+
+    assert [request[1]["use_cache"] for request in session.requests] == [False, False]
+
+
+def test_mcp_atlas_read_only_hides_and_blocks_mutating_tools(monkeypatch):
+    monkeypatch.setenv("MCP_ATLAS_READ_ONLY", "true")
+    monkeypatch.setattr(
+        fused_env,
+        "_load_atlas_tool_schemas",
+        lambda _url: [
+            {
+                "name": "slack_conversations_add_message",
+                "description": "Post a message",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "slack_channels_list",
+                "description": "List channels",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        fused_env,
+        "_get_atlas_http_session",
+        lambda: pytest.fail("read-only rejection must happen before an HTTP request"),
+    )
+    env = FusedEnvironment(
+        {
+            "mcp_atlas_eval": True,
+            "enabled_tools": ["slack_conversations_add_message", "slack_channels_list"],
+        }
+    )
+
+    assert _valid_tool_names(env.tools()) == {"slack_channels_list", "finish", "submit"}
+    observation, reward, done, _metrics = asyncio.run(
+        env.step(ToolCall("slack_conversations_add_message", {"channel_id": "C1", "text": "test"}))
+    )
+
+    assert observation == "Error: MCP-Atlas read-only evaluation blocks mutating tool slack_conversations_add_message"
+    assert reward == 0.0
+    assert done is False
+
+
+def test_mcp_atlas_reports_tools_missing_from_sandbox(monkeypatch):
+    monkeypatch.setattr(fused_env, "_load_atlas_tool_schemas", lambda _url: [])
+    env = FusedEnvironment(
+        {
+            "question": "Use an unavailable tool",
+            "mcp_atlas_eval": True,
+            "enabled_tools": ["anili_get_anime"],
+        }
+    )
+
+    _observation, info = env.reset()
+
+    assert "anili_get_anime" in info["env_warning"]
+    assert _valid_tool_names(env.tools()) == {"finish", "submit"}
+
+
+def test_mcp_atlas_accepts_parquet_ndarray_enabled_tools(monkeypatch):
+    monkeypatch.setattr(
+        fused_env,
+        "_load_atlas_tool_schemas",
+        lambda _url: [
+            {
+                "name": "wikipedia_search_wikipedia",
+                "description": "Search Wikipedia",
+                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}},
+            }
+        ],
+    )
+    env = FusedEnvironment(
+        {
+            "question": "Find an article",
+            "mcp_atlas_eval": True,
+            "enabled_tools": np.array(["wikipedia_search_wikipedia"], dtype=object),
+        }
+    )
+
+    _observation, info = env.reset()
+
+    assert "env_warning" not in info
+    assert _valid_tool_names(env.tools()) == {"wikipedia_search_wikipedia", "finish", "submit"}
+
+
+def test_mcp_atlas_caps_large_tool_output(monkeypatch):
+    monkeypatch.setenv("MCP_ATLAS_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH", "8")
+    monkeypatch.setattr(
+        fused_env,
+        "_load_atlas_tool_schemas",
+        lambda _url: [
+            {
+                "name": "anili_get_anime",
+                "description": "Get anime",
+                "inputSchema": {"type": "object", "properties": {"id": {"type": "number"}}},
+            }
+        ],
+    )
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def text(self):
+            return json.dumps([{"type": "text", "text": "abcdefghijklmnop"}])
+
+    class Session:
+        def post(self, _url, headers, json):
+            assert headers == {"Authorization": "Bearer test-token"}
+            return Response()
+
+    monkeypatch.setattr(fused_env, "_get_atlas_http_session", lambda: Session())
+    env = FusedEnvironment({"mcp_atlas_eval": True, "enabled_tools": ["anili_get_anime"]})
+
+    output, *_ = asyncio.run(env.step(ToolCall("anili_get_anime", {"id": 1})))
+
+    assert output.startswith("abcdefgh\n\n[MCP-Atlas tool output truncated to 8 characters")
+    assert "original length: 16" in output
+
+
 def test_render_prompt_ids_accepts_batch_encoding_like_object():
     class FakeBatch:
         data = {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]}
@@ -1347,7 +1602,7 @@ def test_historical_thinking_compaction_removes_complete_assistant_blocks_withou
         {"role": "system", "content": "keep <think>system</think>"},
         {"role": "assistant", "content": f"<think>first\nplan</think>\n\n{tool_call}"},
         {"role": "user", "content": "keep <think>user</think>"},
-        {"role": "assistant", "content": "incomplete <think>must stay"},
+        {"role": "assistant", "content": "incomplete <think>must be removed"},
         {"role": "assistant", "content": "prefix<think>second</think>\n\nsuffix"},
     ]
 
@@ -1356,7 +1611,7 @@ def test_historical_thinking_compaction_removes_complete_assistant_blocks_withou
     assert compacted[0] is messages[0]
     assert compacted[1]["content"] == tool_call
     assert compacted[2] is messages[2]
-    assert compacted[3] is messages[3]
+    assert compacted[3]["content"] == "incomplete"
     assert compacted[4]["content"] == "prefix\n\nsuffix"
     assert messages[1]["content"] == f"<think>first\nplan</think>\n\n{tool_call}"
 
@@ -1369,7 +1624,7 @@ def test_historical_thinking_compaction_removes_gemma_thought_channel_blocks():
     messages = [
         {"role": "assistant", "content": "<|channel>thought\nfirst\nplan\n<channel|>\naction"},
         {"role": "user", "content": "keep <|channel>thought\nuser text\n<channel|>"},
-        {"role": "assistant", "content": "incomplete <|channel>thought\nmust stay"},
+        {"role": "assistant", "content": "incomplete <|channel>thought\nmust be removed"},
         {"role": "assistant", "content": "<think>a</think><|channel>thought\nb\n<channel|>mixed"},
     ]
 
@@ -1377,7 +1632,7 @@ def test_historical_thinking_compaction_removes_gemma_thought_channel_blocks():
 
     assert compacted[0]["content"] == "action"
     assert compacted[1] is messages[1]
-    assert compacted[2] is messages[2]
+    assert compacted[2]["content"] == "incomplete"
     assert compacted[3]["content"] == "mixed"
     assert messages[0]["content"] == "<|channel>thought\nfirst\nplan\n<channel|>\naction"
 
@@ -1392,7 +1647,7 @@ def test_historical_thinking_compaction_strips_bare_closer_reasoning():
         {"role": "assistant", "content": "private plan\nstep two</think>\n\nfinal answer"},
         {"role": "user", "content": "bare </think> in user text stays"},
         {"role": "assistant", "content": "a</think>mid<think>closed</think>\n\ntail"},
-        {"role": "assistant", "content": "answer</think>\n\nreal<think>unclosed stays"},
+        {"role": "assistant", "content": "answer</think>\n\nreal<think>unclosed is removed"},
     ]
 
     compacted = fused_generate._messages_without_historical_thinking(messages)
@@ -1400,8 +1655,33 @@ def test_historical_thinking_compaction_strips_bare_closer_reasoning():
     assert compacted[0]["content"] == "final answer"
     assert compacted[1] is messages[1]
     assert compacted[2]["content"] == "mid\n\ntail"
-    assert compacted[3]["content"] == "real<think>unclosed stays"
+    assert compacted[3]["content"] == "real"
     assert messages[0]["content"] == "private plan\nstep two</think>\n\nfinal answer"
+
+
+def test_unclosed_thinking_rebuilds_only_parsed_actions_without_raw_fallback():
+    raw_action = '<tool_call>\n{"name": "echo", "arguments": {"value": "alpha"}}\n</tool_call>'
+    structured_calls = [{"function": {"name": "echo", "arguments": {"value": "beta"}}}]
+    messages = [
+        {"role": "assistant", "content": "<think>private\n" + raw_action},
+        {"role": "assistant", "content": "public prefix<think>private with no action"},
+        {
+            "role": "assistant",
+            "content": "visible prefix<think>private structured content",
+            "tool_calls": structured_calls,
+        },
+    ]
+
+    compacted = fused_generate._messages_without_historical_thinking(
+        messages,
+        parser=QwenToolParser(valid_tools={"echo"}),
+    )
+
+    assert compacted[0]["content"] == _echo_call("alpha")
+    assert compacted[1]["content"] == ""
+    assert compacted[2]["content"] == "visible prefix"
+    assert compacted[2]["tool_calls"] is structured_calls
+    assert messages[0]["content"] == "<think>private\n" + raw_action
 
 
 def test_enabled_thinking_discards_prior_thoughts_and_emits_prompt_equal_segments(tmp_path: Path):
@@ -1445,6 +1725,36 @@ def test_enabled_thinking_discards_prior_thoughts_and_emits_prompt_equal_segment
     assert "private first-round plan" not in second_step_history
 
 
+def test_unclosed_thinking_is_discarded_without_losing_qwen_tool_call(tmp_path: Path):
+    private_thought = "<think>private unclosed plan\n"
+    raw_first_action = '<tool_call>\n{"name": "echo", "arguments": {"value": "alpha"}}\n</tool_call>'
+    canonical_first_action = _echo_call("alpha")
+    prompt_ids_seen = []
+
+    samples = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Recover the action after malformed thinking"),
+        [{"text": private_thought + raw_first_action}, {"text": _finish_call()}],
+        {
+            "FUSED_DISABLE_THINKING": "False",
+            "FUSED_DISCARD_HISTORICAL_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
+        tokenizer=FakeChatTemplateTokenizer(),
+        prompt_ids_seen=prompt_ids_seen,
+    )
+
+    second_prompt = "".join(chr(token) for token in prompt_ids_seen[1])
+    assert "private unclosed plan" not in second_prompt
+    assert canonical_first_action in second_prompt
+    assert raw_first_action not in second_prompt
+    assert len(samples) == 2
+    assert [sample.metadata["segment_index"] for sample in samples] == [0, 1]
+    assert all(sample.metadata["prompt_equal_loss"] for sample in samples)
+    steps = samples[0].metadata["rllm_episode"]["trajectories"][0]["steps"]
+    assert steps[1]["info"]["historical_thinking_discarded"] is True
+    assert steps[1]["info"]["tito_context_reason"] == "historical_thinking_discard"
+
+
 def test_enabled_thinking_discards_gemma_thought_channel_and_emits_prompt_equal_segments(tmp_path: Path):
     first_thought = "<|channel>thought\nprivate first-round plan\n<channel|>\n"
     second_thought = "<|channel>thought\nfresh second-round plan\n<channel|>\n"
@@ -1483,6 +1793,30 @@ def test_enabled_thinking_discards_gemma_thought_channel_and_emits_prompt_equal_
     assert samples[0].metadata["parent_traj_id"]
     assert [sample.metadata["segment_index"] for sample in samples] == [0, 1]
     assert all(sample.metadata["segment_count"] == 2 for sample in samples)
+    assert all(sample.metadata["prompt_equal_loss"] for sample in samples)
+
+
+def test_unclosed_gemma_thinking_is_discarded_without_losing_tool_call(tmp_path: Path):
+    private_thought = "<|channel>thought\nprivate unclosed plan\n"
+    prompt_ids_seen = []
+
+    samples = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Recover the Gemma action after malformed thinking"),
+        [{"text": private_thought + _gemma4_echo_call("alpha")}, {"text": _gemma4_finish_call()}],
+        {
+            "FUSED_DISABLE_THINKING": "False",
+            "FUSED_DISCARD_HISTORICAL_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+        prompt_ids_seen=prompt_ids_seen,
+    )
+
+    second_prompt = "".join(chr(token) for token in prompt_ids_seen[1])
+    assert "private unclosed plan" not in second_prompt
+    assert "call:echo" in second_prompt
+    assert len(samples) == 2
+    assert [sample.metadata["segment_index"] for sample in samples] == [0, 1]
     assert all(sample.metadata["prompt_equal_loss"] for sample in samples)
 
 
@@ -1527,7 +1861,11 @@ def test_eval_rollout_discards_prior_thinking_before_next_assistant_step(tmp_pat
     result = _run_generate_with_fake_sglang(
         _local_mcp_sample(tmp_path, question="Compact eval history"),
         [{"text": first_thought + first_action}, {"text": "<think>fresh eval plan</think>\n" + _finish_call()}],
-        {"FUSED_DISABLE_THINKING": "False", "FUSED_DISCARD_HISTORICAL_THINKING": "True"},
+        {
+            "FUSED_DISABLE_THINKING": "False",
+            "FUSED_DISCARD_HISTORICAL_THINKING": "True",
+            "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE": "1",
+        },
         evaluation=True,
         tokenizer=FakeChatTemplateTokenizer(),
         prompt_ids_seen=prompt_ids_seen,
@@ -1538,6 +1876,14 @@ def test_eval_rollout_discards_prior_thinking_before_next_assistant_step(tmp_pat
     second_prompt = "".join(chr(token) for token in prompt_ids_seen[1])
     assert first_thought not in second_prompt
     assert first_action in second_prompt
+    episode = result[0].metadata["rllm_episode"]
+    assert episode["metadata"]["discard_historical_thinking_enabled"] is True
+    assert episode["metadata"]["historical_thinking_discard_steps"] == 1
+    steps = episode["trajectories"][0]["steps"]
+    assert steps[0]["info"]["tito_context_reason"] == "evaluation"
+    assert steps[0]["info"]["historical_thinking_discarded"] is False
+    assert steps[1]["info"]["tito_context_reason"] == "evaluation"
+    assert steps[1]["info"]["historical_thinking_discarded"] is True
 
 
 def test_render_prompt_ids_fallback_appends_empty_thinking_prefix():
@@ -3095,7 +3441,10 @@ def test_rllm_deepresearch_eval_runs_searches_and_finish(monkeypatch):
     result = _run_generate_with_fake_sglang(
         Sample(prompt="placeholder", label="Paris", metadata={"question": "Where?"}),
         [{"text": first}, {"text": second}, {"text": finish}],
-        {"FUSED_HARNESS": "rllm_deepresearch", "RETRIEVAL_SERVER_URL": "http://retriever"},
+        {
+            "FUSED_HARNESS": "rllm_deepresearch",
+            "RETRIEVAL_SERVER_URL": "http://retriever",
+        },
         evaluation=True,
     )
 
@@ -3107,11 +3456,14 @@ def test_rllm_deepresearch_eval_runs_searches_and_finish(monkeypatch):
     assert result[0].metadata["fused_tool_call_turns"] == 2
 
 
-def test_rllm_deepresearch_eval_rejects_multiple_tool_calls(monkeypatch):
-    async def unexpected_search(*_args, **_kwargs):
-        raise AssertionError("anomalous multi-tool response must not execute searches")
+def test_rllm_deepresearch_eval_accepts_multiple_tool_calls(monkeypatch):
+    searches = []
 
-    monkeypatch.setattr(fused_generate, "run_rllm_deepresearch_search", unexpected_search)
+    async def fake_search(action, **_kwargs):
+        searches.append(action.arguments["query"])
+        return f"result for {action.arguments['query']}", {"tool_return_error": 0, "refine_error": 0}
+
+    monkeypatch.setattr(fused_generate, "run_rllm_deepresearch_search", fake_search)
     response = (
         '<tool_call>{"name":"local_search","arguments":{"query":"alpha"}}</tool_call>'
         '<tool_call>{"name":"local_search","arguments":{"query":"beta"}}</tool_call>'
@@ -3119,14 +3471,20 @@ def test_rllm_deepresearch_eval_rejects_multiple_tool_calls(monkeypatch):
 
     result = _run_generate_with_fake_sglang(
         Sample(prompt="placeholder", label="Paris", metadata={"question": "Where?"}),
-        [{"text": response}],
-        {"FUSED_HARNESS": "rllm_deepresearch", "RETRIEVAL_SERVER_URL": "http://retriever"},
+        [
+            {"text": response},
+            {"text": '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"Paris"}}</tool_call>'},
+        ],
+        {
+            "FUSED_HARNESS": "rllm_deepresearch",
+            "RETRIEVAL_SERVER_URL": "http://retriever",
+            "CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD": "1.0",
+        },
         evaluation=True,
     )
 
-    assert result[0].reward == 0.0
-    assert result[0].metadata["fused_termination"] == "ABNORMAL_EVAL_RESPONSE"
-    assert "multiple_tool_calls" in result[0].metadata["eval_response_anomalies"]
+    assert searches == ["alpha", "beta"]
+    assert result[0].metadata["fused_termination"] == "rllm_dr_no_tool_call"
 
 
 def test_rllm_deepresearch_eval_stops_on_duplicate_search(monkeypatch):
@@ -3771,7 +4129,7 @@ def test_mixed_tool_and_submit_call_breaks_loop_and_masks_only_error_turn():
     assert first in _policy_unmasked_text(sample)
 
 
-def test_eval_rejects_mixed_tool_and_submit_call():
+def test_eval_accepts_mixed_tool_and_submit_call():
     first = _search_call("first evidence")
     tool = _search_call("second evidence")
     submit = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"answer"}}</tool_call>'
@@ -3791,13 +4149,13 @@ def test_eval_rejects_mixed_tool_and_submit_call():
 
     assert len(result) == 1
     sample = result[0]
-    assert sample.reward == 0.0
+    assert sample.reward == 1.0
     assert sample.metadata["credit_assignment_event"] is None
-    assert sample.metadata["fused_termination"] == "ABNORMAL_EVAL_RESPONSE"
-    assert sample.metadata["fused_traj_steps"] == 2
-    assert sample.metadata["eval_response_anomalies"] == ["multiple_tool_calls"]
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["fused_traj_steps"] == 3
+    assert "eval_response_anomalies" not in sample.metadata
     assert sample.metadata.get("mixed_tool_and_answer") is None
-    assert sample.response == mixed
+    assert sample.response == final
     assert sample.tokens == []
     assert sample.loss_mask is None
 
@@ -3868,14 +4226,13 @@ def test_eval_disables_parser_error_abnormal_detection(tmp_path: Path):
     assert sample.metadata["reward_debug"]["reward"] == 0.0
 
 
-def test_eval_rejects_multiple_tool_calls_in_one_response(tmp_path: Path):
+def test_eval_accepts_multiple_tool_calls_in_one_response(tmp_path: Path):
     burst = "".join(_echo_call(f"burst{i}") for i in range(2))
 
     result = _run_generate_with_fake_sglang(
         _local_mcp_sample(tmp_path, question="Trigger tool burst"),
-        [{"text": burst}],
+        [{"text": burst}, {"text": _finish_call()}],
         {
-            "FUSED_EVAL_MAX_TOOL_CALLS_PER_TURN": "1",
             "CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD": "1.0",
         },
         evaluation=True,
@@ -3883,10 +4240,8 @@ def test_eval_rejects_multiple_tool_calls_in_one_response(tmp_path: Path):
 
     assert len(result) == 1
     sample = result[0]
-    assert sample.reward == 0.0
-    assert sample.metadata["fused_termination"] == "ABNORMAL_EVAL_RESPONSE"
-    assert sample.metadata["eval_response_anomalies"] == ["multiple_tool_calls"]
-    assert sample.metadata["multiple_tool_call_count"] == 2
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert "eval_response_anomalies" not in sample.metadata
     assert sample.metadata["fused_tool_call_turns"] == 1
 
 

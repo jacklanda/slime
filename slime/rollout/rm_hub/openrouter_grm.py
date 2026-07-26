@@ -9,6 +9,7 @@ The function is fully async and supports both single-sample and batched
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -45,6 +46,10 @@ _DEFAULT_SYSTEM_PROMPT = (
     "Ignore style, verbosity, and irrelevant intermediate mistakes if the final answer is correct."
 )
 _EQUIVALENCE_SYSTEM_PROMPT = "You are an evaluation assistant."
+_MCP_ATLAS_SYSTEM_PROMPT = (
+    "You are evaluating whether a model response covers one expert-defined claim. "
+    "Return a rigorous structured judgement based only on the claim and response."
+)
 
 _SCORE_RESPONSE_FORMAT: dict[str, Any] = {
     "type": "json_schema",
@@ -81,6 +86,34 @@ _EQUIVALENCE_RESPONSE_FORMAT: dict[str, Any] = {
     },
 }
 
+_MCP_ATLAS_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "mcp_atlas_claim_evaluation",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "claim_text": {"type": "string"},
+                "coverage_outcome": {
+                    "type": "string",
+                    "enum": ["fulfilled", "partially_fulfilled", "not_fulfilled"],
+                },
+                "justification": {"type": "string"},
+                "confidence_level": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            },
+            "required": ["claim_text", "coverage_outcome", "justification", "confidence_level"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+_MCP_ATLAS_COVERAGE_SCORES = {
+    "fulfilled": 1.0,
+    "partially_fulfilled": 0.5,
+    "not_fulfilled": 0.0,
+}
+
 
 async def reward_func(args, sample_or_samples: Sample | list[Sample], **kwargs):
     _FINISH_PARSER.set(getattr(args, "hf_checkpoint", None))
@@ -93,6 +126,9 @@ async def reward_func(args, sample_or_samples: Sample | list[Sample], **kwargs):
 
 
 async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
+    if evaluation and _is_mcp_atlas_sample(sample):
+        return await _score_mcp_atlas_sample(args, sample)
+
     benchmark_eval = evaluation and _uses_benchmark_verifier(args, sample)
     if benchmark_eval:
         rule_reward = float(await benchmark_verifier.reward_func(args, sample))
@@ -108,11 +144,22 @@ async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
                     "hybrid_rule_match": True,
                 }
             )
+            sample.metadata["verification"] = benchmark_verifier.get_verification_details(
+                sample, score=rule_reward, verifier="rule", model="benchmark_verifier"
+            )
             return rule_reward
 
     final_answer_step = _benchmark_final_answer_step(sample) if benchmark_eval else _final_answer_step(sample)
     if sample.label is None or not final_answer_step:
-        return float(getattr(args, "grm_failure_reward", 0.0))
+        reward = float(getattr(args, "grm_failure_reward", 0.0))
+        if evaluation:
+            sample.metadata["verification"] = benchmark_verifier.get_verification_details(
+                sample,
+                score=reward,
+                verifier="model",
+                model=getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+            )
+        return reward
 
     async with _get_semaphore(args):
         payload = _build_payload(args, sample, final_answer_step=final_answer_step, include_question=benchmark_eval)
@@ -140,6 +187,13 @@ async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
                         "fallback": False,
                     }
                 )
+                sample.metadata["verification"] = benchmark_verifier.get_verification_details(
+                    sample,
+                    score=reward,
+                    verifier="model",
+                    model=getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+                    judge_json=judge_json,
+                )
                 return reward
             except Exception as exc:  # noqa: BLE001
                 if attempt + 1 >= max_retries:
@@ -164,11 +218,208 @@ async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
                                 "error": repr(exc),
                             }
                         )
+                        sample.metadata["verification"] = benchmark_verifier.get_verification_details(
+                            sample,
+                            score=reward,
+                            verifier="model",
+                            model=getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+                        )
                         return reward
                     return await _fallback_rule_based_reward(args, sample, evaluation=evaluation, error=exc)
                 await asyncio.sleep(_retry_sleep(args, attempt))
 
     return await _fallback_rule_based_reward(args, sample, evaluation=evaluation)
+
+
+async def _score_mcp_atlas_sample(args, sample: Sample) -> float:
+    claims = _mcp_atlas_claims(sample)
+    if not claims:
+        raise ValueError("MCP-Atlas evaluation requires GTFA_CLAIMS in the sample label or metadata.")
+
+    final_answer = _benchmark_final_answer_step(sample)
+    if not final_answer:
+        return _record_mcp_atlas_result(args, sample, claims, [], score=0.0, failure="missing_submission")
+
+    results = await asyncio.gather(
+        *[_evaluate_mcp_atlas_claim(args, claim, final_answer) for claim in claims]
+    )
+    score = round(sum(result["score"] for result in results) / len(claims), 3)
+    return _record_mcp_atlas_result(args, sample, claims, results, score=score)
+
+
+async def _evaluate_mcp_atlas_claim(args, claim: str, response: str) -> dict[str, Any]:
+    payload = _build_mcp_atlas_payload(args, claim, response)
+    max_retries = max(1, int(getattr(args, "grm_max_retries", 3)))
+    async with _get_semaphore(args):
+        for attempt in range(max_retries):
+            try:
+                api_response = await _get_client(args).post("/chat/completions", json=payload)
+                api_response.raise_for_status()
+                judgement = _parse_mcp_atlas_judgement(api_response.json())
+                return {
+                    "claim": claim,
+                    "score": _MCP_ATLAS_COVERAGE_SCORES[judgement["coverage_outcome"]],
+                    **judgement,
+                }
+            except Exception as exc:  # noqa: BLE001
+                if attempt + 1 >= max_retries:
+                    logger.warning("MCP-Atlas claim judge failed after %d attempts: %r", max_retries, exc)
+                    return {
+                        "claim": claim,
+                        "score": 0.0,
+                        "coverage_outcome": "not_fulfilled",
+                        "justification": f"Evaluation failed: {exc!r}",
+                        "confidence_level": 0.1,
+                        "error": repr(exc),
+                    }
+                await asyncio.sleep(_retry_sleep(args, attempt))
+
+    raise AssertionError("unreachable")
+
+
+def _build_mcp_atlas_payload(args, claim: str, response: str) -> dict[str, Any]:
+    model = getattr(args, "grm_model", "deepseek/deepseek-v4-flash")
+    prompt = _fit_mcp_atlas_prompt(args, claim, response)
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _MCP_ATLAS_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": float(getattr(args, "grm_temperature", 0.0)),
+        "max_tokens": int(getattr(args, "grm_max_new_tokens", 128)),
+        "response_format": (
+            {"type": "json_object"} if str(model).startswith("google/") else _MCP_ATLAS_RESPONSE_FORMAT
+        ),
+        "provider": {"require_parameters": True},
+    }
+    if str(model).startswith("deepseek/"):
+        payload["reasoning"] = {"effort": "none"}
+    return payload
+
+
+def _fit_mcp_atlas_prompt(args, claim: str, response: str) -> str:
+    prefix = f"""SCORING CRITERIA:
+- fulfilled: The response completely and accurately covers all key details in the claim.
+- partially_fulfilled: The response covers some, but not all, key details in the claim.
+- not_fulfilled: The response does not substantively cover the claim.
+
+NUMERICAL GUIDELINES:
+- Treat values within 5% as matching unless exact precision is essential.
+- For percentages, allow a difference of 1 percentage point.
+- Treat mathematically equivalent expressions as matching.
+
+CLAIM TO EVALUATE:
+{claim}
+
+MODEL RESPONSE TO ANALYZE:
+"""
+    suffix = """
+
+Return JSON with claim_text, coverage_outcome, a concise justification, and confidence_level from 0 to 1."""
+    max_input_tokens = int(getattr(args, "grm_max_input_tokens", 24000))
+    fixed_tokens = len(_GRM_TOKENIZER.encode_ordinary(_MCP_ATLAS_SYSTEM_PROMPT + prefix + suffix))
+    if fixed_tokens > max_input_tokens:
+        raise ValueError(
+            f"--grm-max-input-tokens={max_input_tokens} is smaller than the MCP-Atlas fixed judge input "
+            f"({fixed_tokens} tokens)"
+        )
+    response_tokens = _GRM_TOKENIZER.encode_ordinary(response)
+    response_tokens = response_tokens[: max_input_tokens - fixed_tokens]
+    return prefix + _GRM_TOKENIZER.decode(response_tokens) + suffix
+
+
+def _parse_mcp_atlas_judgement(payload: dict[str, Any]) -> dict[str, Any]:
+    parsed = _parse_json_object(_response_content(payload), "coverage_outcome")
+    outcome = str(parsed.get("coverage_outcome", "")).strip().lower()
+    if outcome not in _MCP_ATLAS_COVERAGE_SCORES:
+        raise ValueError(f"Unsupported MCP-Atlas coverage_outcome: {outcome!r}")
+    try:
+        confidence = float(parsed.get("confidence_level", 0.5))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid MCP-Atlas confidence_level: {parsed.get('confidence_level')!r}") from exc
+    return {
+        "coverage_outcome": outcome,
+        "justification": str(parsed.get("justification", "")).strip(),
+        "confidence_level": min(1.0, max(0.0, confidence)),
+    }
+
+
+def _record_mcp_atlas_result(
+    args,
+    sample: Sample,
+    claims: list[str],
+    results: list[dict[str, Any]],
+    *,
+    score: float,
+    failure: str | None = None,
+) -> float:
+    fully_covered = sum(result.get("score") == 1.0 for result in results)
+    partially_covered = sum(result.get("score") == 0.5 for result in results)
+    details = {
+        "model": getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+        "judge": "mcp_atlas_claims",
+        "mode": "claim_coverage",
+        "score": score,
+        "evaluation": True,
+        "fallback": failure is not None or any("error" in result for result in results),
+        "total_claims": len(claims),
+        "fully_covered_claims": fully_covered,
+        "partially_covered_claims": partially_covered,
+        "per_claim": results,
+    }
+    if failure:
+        details["failure"] = failure
+    sample.metadata.setdefault("grm", {}).update(details)
+    sample.metadata["verification"] = {
+        "verifier": "model",
+        "model": details["model"],
+        "protocol": "mcp_atlas_claim_coverage",
+        "score": score,
+        "total_claims": len(claims),
+        "fully_covered_claims": fully_covered,
+        "partially_covered_claims": partially_covered,
+        "per_claim": results,
+        **({"failure": failure} if failure else {}),
+    }
+    return score
+
+
+def _is_mcp_atlas_sample(sample: Sample) -> bool:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    source = str(metadata.get("data_source") or metadata.get("benchmark") or "").lower()
+    normalized_source = source.replace("-", "_").replace(" ", "_")
+    return normalized_source == "mcp_atlas" or bool(metadata.get("mcp_atlas_eval"))
+
+
+def _mcp_atlas_claims(sample: Sample) -> list[str]:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    raw_claims = metadata.get("GTFA_CLAIMS") or metadata.get("gtfa_claims") or metadata.get("claims")
+    if raw_claims is None:
+        raw_claims = sample.label
+    if raw_claims is None:
+        return []
+    if isinstance(raw_claims, (list, tuple)):
+        return [str(claim).strip() for claim in raw_claims if str(claim).strip()]
+    if not isinstance(raw_claims, str):
+        raw_claims = str(raw_claims)
+    raw_claims = raw_claims.strip()
+    if not raw_claims:
+        return []
+    if raw_claims.startswith("[") and raw_claims.endswith("]"):
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(raw_claims)
+            except (ValueError, SyntaxError, json.JSONDecodeError):
+                continue
+            if isinstance(parsed, list):
+                return [str(claim).strip() for claim in parsed if str(claim).strip()]
+    claims = []
+    for line in raw_claims.replace("||", "\n").splitlines():
+        claim = line.strip().lstrip("-*• ").strip()
+        if claim:
+            claims.append(claim)
+    return claims or [raw_claims]
 
 
 def _get_client(args) -> httpx.AsyncClient:

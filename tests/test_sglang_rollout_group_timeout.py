@@ -1,4 +1,5 @@
 import asyncio
+import io
 from argparse import Namespace
 from contextlib import nullcontext
 
@@ -10,6 +11,15 @@ from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.types import Sample
 
 NUM_GPUS = 0
+
+
+def test_eval_progress_log_stream_emits_complete_lines():
+    sink = io.StringIO()
+    stream = sglang_rollout._EvalProgressLogStream(sink)
+
+    stream.write("\rEval mixed (3 datasets): 2%| | 85/3622")
+
+    assert sink.getvalue() == "Eval mixed (3 datasets): 2%| | 85/3622\n"
 
 
 async def _fake_generate_and_rm(_args, sample, _sampling_params, evaluation=False):
@@ -342,6 +352,51 @@ def test_eval_datasets_share_one_global_inflight_budget(monkeypatch):
     assert list(output.data) == ["first", "second"]
 
 
+def test_mixed_eval_round_robins_datasets_with_one_global_budget(monkeypatch):
+    active = 0
+    max_active = 0
+    started = []
+
+    async def fake_generate(_args, sample, sampling_params, evaluation=False):
+        nonlocal active, max_active
+        assert evaluation is True
+        active += 1
+        max_active = max(max_active, active)
+        started.append(sample.prompt)
+        await asyncio.sleep(0.01)
+        active -= 1
+        sample.reward = 1.0
+        sample.status = Sample.Status.COMPLETED
+        sample.response = sampling_params["dataset"]
+        return sample
+
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", fake_generate)
+    first = type("DatasetStub", (), {"samples": [Sample(prompt=f"first-{i}") for i in range(4)]})()
+    second = type("DatasetStub", (), {"samples": [Sample(prompt=f"second-{i}") for i in range(4)]})()
+    first_cfg = EvalDatasetConfig(name="first", path="unused", n_samples_per_eval_prompt=1)
+    second_cfg = EvalDatasetConfig(name="second", path="unused", n_samples_per_eval_prompt=1)
+    args = Namespace(
+        eval_max_inflight_tasks=2,
+        eval_adaptive_concurrency=False,
+        enable_use_grm_evals=False,
+        sglang_enable_deterministic_inference=False,
+    )
+
+    data = asyncio.run(
+        sglang_rollout._generate_mixed_eval_samples_bounded(
+            args,
+            [(first, {"dataset": "first"}, first_cfg), (second, {"dataset": "second"}, second_cfg)],
+        )
+    )
+
+    assert max_active == 2
+    assert started[:2] == ["first-0", "second-0"]
+    assert [sample.index for sample in data["first"]] == [0, 1, 2, 3]
+    assert [sample.index for sample in data["second"]] == [0, 1, 2, 3]
+    assert {sample.response for sample in data["first"]} == {"first"}
+    assert {sample.response for sample in data["second"]} == {"second"}
+
+
 def test_eval_custom_generator_can_manage_request_concurrency(monkeypatch):
     async def custom_generate(_args, sample, _sampling_params, evaluation=False):
         assert evaluation is True
@@ -380,6 +435,98 @@ def test_eval_custom_generator_can_manage_request_concurrency(monkeypatch):
     )
 
     assert sample.response == "done"
+    assert sample.metadata["eval_retry_count"] == 0
+    assert sample.metadata["eval_retry_termination_reasons"] == []
+
+
+def test_eval_retries_non_env_done_termination_before_reward(monkeypatch):
+    attempts = 0
+    scored_responses = []
+
+    async def custom_generate(_args, sample, sampling_params, evaluation=False):
+        nonlocal attempts
+        assert evaluation is True
+        attempts += 1
+        sample.response = f"attempt-{attempts}"
+        sample.status = Sample.Status.COMPLETED
+        sample.metadata["fused_termination"] = "max_context_len_exceeded" if attempts < 3 else "env_done"
+        return sample
+
+    async def fake_rm(_args, sample, evaluation=False):
+        assert evaluation is True
+        scored_responses.append(sample.response)
+        return 1.0
+
+    class UnblockedState:
+        aborted = False
+        semaphore = asyncio.Semaphore(1)
+
+        def __init__(self, _args):
+            pass
+
+        def dp_rank_context(self):
+            return nullcontext()
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", UnblockedState)
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda _path: custom_generate)
+    monkeypatch.setattr(sglang_rollout, "async_rm", fake_rm)
+    args = Namespace(
+        custom_generate_function_path="custom",
+        eval_termination_retry_times=4,
+        group_rm=False,
+        rm_type="",
+        partial_rollout=False,
+        mask_offpolicy_in_partial_rollout=False,
+    )
+
+    sample = asyncio.run(sglang_rollout.generate_and_rm(args, Sample(index=7, prompt="q"), {}, evaluation=True))
+
+    assert attempts == 3
+    assert scored_responses == ["attempt-3"]
+    assert sample.metadata["eval_retry_count"] == 2
+    assert sample.metadata["eval_retry_termination_reasons"] == [
+        "max_context_len_exceeded",
+        "max_context_len_exceeded",
+    ]
+
+
+def test_eval_stops_after_configured_termination_retries(monkeypatch):
+    attempts = 0
+
+    async def custom_generate(_args, sample, _sampling_params, evaluation=False):
+        nonlocal attempts
+        attempts += 1
+        sample.reward = 0.0
+        sample.status = Sample.Status.COMPLETED
+        sample.metadata["termination_reason"] = "ABNORMAL_EVAL_RESPONSE"
+        return sample
+
+    class UnblockedState:
+        aborted = False
+        semaphore = asyncio.Semaphore(1)
+
+        def __init__(self, _args):
+            pass
+
+        def dp_rank_context(self):
+            return nullcontext()
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", UnblockedState)
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda _path: custom_generate)
+    args = Namespace(
+        custom_generate_function_path="custom",
+        eval_termination_retry_times=4,
+        group_rm=False,
+        rm_type="",
+        partial_rollout=False,
+        mask_offpolicy_in_partial_rollout=False,
+    )
+
+    sample = asyncio.run(sglang_rollout.generate_and_rm(args, Sample(prompt="q"), {}, evaluation=True))
+
+    assert attempts == 5
+    assert sample.metadata["eval_retry_count"] == 4
+    assert sample.metadata["eval_retry_termination_reasons"] == ["ABNORMAL_EVAL_RESPONSE"] * 4
 
 
 if __name__ == "__main__":

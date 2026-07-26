@@ -117,6 +117,14 @@ def _episode_to_batch_dict(
     }
     if mode == "eval":
         result.update(_eval_judge_record(args, sample_metadata))
+        sample_metadata = sample_metadata if isinstance(sample_metadata, dict) else {}
+        result["eval_retry_count"] = int(sample_metadata.get("eval_retry_count", 0))
+        result["eval_retry_termination_reasons"] = list(
+            sample_metadata.get("eval_retry_termination_reasons") or []
+        )
+        verification = sample_metadata.get("verification")
+        if isinstance(verification, dict):
+            result["verification"] = verification
     return result
 
 
@@ -169,9 +177,8 @@ def _step_to_batch_dict(step: dict[str, Any]) -> dict[str, Any]:
         "timing": timing,
     }
     if "tito_context_reason" in info:
-        # Marks how the served prompt related to the TiTO accumulator; in
-        # particular whether historical thinking was dropped before this step.
         result["tito_context_reason"] = info["tito_context_reason"]
+    if "historical_thinking_discarded" in info:
         result["historical_thinking_discarded"] = bool(info.get("historical_thinking_discarded"))
     return result
 

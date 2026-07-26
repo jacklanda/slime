@@ -881,6 +881,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Adjust evaluation trajectory concurrency from SGLang engine load metrics.",
             )
             parser.add_argument(
+                "--eval-mix-datasets",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help="Interleave samples from all eval datasets under one global inflight budget.",
+            )
+            parser.add_argument(
+                "--eval-termination-retry-times",
+                type=int,
+                default=0,
+                help=(
+                    "Number of retries for an eval trajectory whose termination_reason is present and not env_done. "
+                    "The initial attempt is not included."
+                ),
+            )
+            parser.add_argument(
                 "--eval-concurrency-step",
                 type=int,
                 default=32,
@@ -1295,9 +1310,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help=(
-                    "Whether to always use train step as the step metric in wandb. "
-                    "If set, we will always use the train steps for wandb logging, "
-                    "otherwise, will use rollout step for most info other than train/*. "
+                    "Whether the legacy rollout/step and eval/step fields should mirror train/step. "
+                    "W&B charts use train/step as their step metric regardless of this option."
                 ),
             )
             parser.add_argument(
@@ -1377,6 +1391,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to turn on passrate logging, which will log the pass@n of the responses in the rollout.",
             )
             parser.add_argument("--wandb-run-id", type=str, default=None)
+            parser.add_argument(
+                "--wandb-skip-resume-first-step",
+                action="store_true",
+                default=False,
+                help=(
+                    "Skip all W&B metrics associated with the first rollout after resuming an existing run. "
+                    "Requires --wandb-run-id. TensorBoard logging is unaffected."
+                ),
+            )
             return parser
 
         # tensorboard
@@ -1909,6 +1932,14 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    if getattr(args, "eval_termination_retry_times", 0) < 0:
+        raise ValueError("--eval-termination-retry-times must be a non-negative integer.")
+
+    if getattr(args, "wandb_skip_resume_first_step", False) and (
+        not args.use_wandb or args.wandb_run_id is None
+    ):
+        raise ValueError("--wandb-skip-resume-first-step requires --use-wandb and --wandb-run-id.")
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):

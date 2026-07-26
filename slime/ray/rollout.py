@@ -399,7 +399,7 @@ class ServerGroup:
 
         # Compute base_port from the maximum cursor across all nodes that
         # this group's engines may land on (conservative: just use global max).
-        base_port = max(port_cursors.values()) if port_cursors else 15000
+        base_port = max(port_cursors.values()) if port_cursors else int(os.environ.get("SLIME_SGLANG_BASE_PORT", "15000"))
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
             args=self.args,
             rollout_engines=rollout_engines,
@@ -1509,6 +1509,11 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
+        if str(key).lower().replace("-", "_") == "mcp_atlas":
+            log_dict |= dict_add_prefix(
+                _compute_mcp_atlas_coverage_metrics(rewards, samples),
+                f"eval/{key}/",
+            )
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
@@ -1538,9 +1543,36 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["eval/step"] = step
-    logging_utils.log(args, log_dict, step_key="eval/step")
+    logging_utils.log(args, log_dict, step_key="eval/step", rollout_id=rollout_id)
 
     return log_dict
+
+
+def _compute_mcp_atlas_coverage_metrics(rewards: list[float], samples: list[Sample] | None) -> dict[str, float]:
+    """Report the official coverage thresholds and judge health separately from pass@k."""
+    if not rewards:
+        return {}
+    values = np.asarray(rewards, dtype=float)
+    metrics = {
+        "coverage/mean": round(float(np.mean(values)), 4),
+        "coverage/pass_rate_0.50": round(float(np.mean(values >= 0.50)), 4),
+        "coverage/pass_rate_0.75": round(float(np.mean(values >= 0.75)), 4),
+    }
+    if not samples or len(samples) != len(rewards):
+        return metrics
+
+    judge_failures = 0
+    missing_submissions = 0
+    for sample in samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        grm = metadata.get("grm") if isinstance(metadata.get("grm"), dict) else {}
+        verification = metadata.get("verification") if isinstance(metadata.get("verification"), dict) else {}
+        per_claim = verification.get("per_claim") if isinstance(verification.get("per_claim"), list) else []
+        judge_failures += any(isinstance(result, dict) and result.get("error") for result in per_claim)
+        missing_submissions += grm.get("failure") == "missing_submission"
+    metrics["coverage/judge_failure_ratio"] = round(judge_failures / len(samples), 4)
+    metrics["coverage/missing_submission_ratio"] = round(missing_submissions / len(samples), 4)
+    return metrics
 
 
 def _format_eval_log_dict_for_display(log_dict: dict[str, Any]) -> dict[str, Any]:
@@ -1675,7 +1707,7 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     logger.info(f"perf {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
-    logging_utils.log(args, log_dict, step_key="rollout/step")
+    logging_utils.log(args, log_dict, step_key="rollout/step", rollout_id=rollout_id)
     return log_dict
 
 

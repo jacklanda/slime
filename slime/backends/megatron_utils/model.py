@@ -1182,7 +1182,7 @@ def train(
                 if "train/lr" not in log_dict and "train/lr-pg_0" in log_dict:
                     log_dict["train/lr"] = log_dict["train/lr-pg_0"]
                 log_dict.update(_episode_metrics_for_actor_update(rollout_data))
-            logging_utils.log(args, log_dict, step_key="train/step")
+            logging_utils.log(args, log_dict, step_key="train/step", rollout_id=rollout_id)
 
             if args.ci_test and "train/train_rollout_logprob_abs_diff" in log_dict:
                 assert log_dict["train/train_rollout_logprob_abs_diff"] <= 0.1, f"{log_dict=}"

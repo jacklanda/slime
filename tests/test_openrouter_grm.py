@@ -50,6 +50,18 @@ class FakeClient:
         return FakeResponse(self.payload)
 
 
+class SequencedFakeClient(FakeClient):
+    def __init__(self, payloads):
+        super().__init__(None)
+        self.payloads = list(payloads)
+
+    async def post(self, path, json):
+        self.calls += 1
+        self.requests.append(json)
+        assert path == "/chat/completions"
+        return FakeResponse(self.payloads.pop(0))
+
+
 def _sample():
     return Sample(
         index=0,
@@ -88,6 +100,91 @@ def test_openrouter_grm_does_not_send_deepseek_reasoning_parameter_to_gemini():
 
     assert "reasoning" not in payload
     assert payload["response_format"] == {"type": "json_object"}
+
+
+def test_mcp_atlas_grm_scores_each_claim_and_averages_partial_credit(monkeypatch):
+    client = SequencedFakeClient(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"claim_text":"claim one","coverage_outcome":"fulfilled","justification":"Covered.","confidence_level":0.9}'
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"claim_text":"claim two","coverage_outcome":"partially_fulfilled","justification":"Incomplete.","confidence_level":0.8}'
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"claim_text":"claim three","coverage_outcome":"not_fulfilled","justification":"Missing.","confidence_level":0.95}'
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", client)
+    monkeypatch.setattr(openrouter_grm, "_SEMAPHORE", None)
+    sample = Sample(
+        prompt="Use the available MCP tools.",
+        response='<tool_call>{"name":"finish","arguments":{"result":"final report"}}</tool_call>',
+        label='["claim one", "claim two", "claim three"]',
+        metadata={"benchmark_eval": True, "rm_type": "benchmark_verifier", "data_source": "mcp_atlas"},
+    )
+
+    reward = asyncio.run(openrouter_grm.reward_func(Args(), sample, evaluation=True))
+
+    assert reward == 0.5
+    assert client.calls == 3
+    assert sample.metadata["grm"]["judge"] == "mcp_atlas_claims"
+    assert sample.metadata["grm"]["total_claims"] == 3
+    assert sample.metadata["grm"]["fully_covered_claims"] == 1
+    assert sample.metadata["grm"]["partially_covered_claims"] == 1
+    assert sample.metadata["verification"]["protocol"] == "mcp_atlas_claim_coverage"
+    assert "CLAIM TO EVALUATE:\nclaim one" in client.requests[0]["messages"][1]["content"]
+    assert "MODEL RESPONSE TO ANALYZE:\nfinal report" in client.requests[0]["messages"][1]["content"]
+
+
+def test_mcp_atlas_grm_missing_submission_scores_zero_without_judge_call(monkeypatch):
+    client = SequencedFakeClient([])
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", client)
+    monkeypatch.setattr(openrouter_grm, "_SEMAPHORE", None)
+    sample = Sample(
+        prompt="Use the available MCP tools.",
+        response="",
+        label=["claim one", "claim two"],
+        metadata={"data_source": "mcp-atlas", "mcp_atlas_eval": True},
+    )
+
+    reward = asyncio.run(openrouter_grm.reward_func(Args(), sample, evaluation=True))
+
+    assert reward == 0.0
+    assert client.calls == 0
+    assert sample.metadata["grm"]["failure"] == "missing_submission"
+    assert sample.metadata["grm"]["total_claims"] == 2
+
+
+def test_mcp_atlas_grm_requires_claims():
+    sample = Sample(
+        prompt="Use the available MCP tools.",
+        response='<tool_call>{"name":"finish","arguments":{"result":"final report"}}</tool_call>',
+        label=None,
+        metadata={"data_source": "mcp_atlas"},
+    )
+
+    with pytest.raises(ValueError, match="requires GTFA_CLAIMS"):
+        asyncio.run(openrouter_grm.reward_func(Args(), sample, evaluation=True))
 
 
 def test_openrouter_grm_equivalence_mode_uses_judgement_schema_and_persists_json(monkeypatch):

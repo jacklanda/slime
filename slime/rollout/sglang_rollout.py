@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import uuid
 from argparse import Namespace
@@ -48,6 +49,24 @@ _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
 _TOP_P_TOKEN_ID_META_KEYS = ("top_p_token_ids", "top_p_kept_token_ids")
 _TOP_P_TOKEN_OFFSET_META_KEYS = ("top_p_token_offsets", "top_p_kept_token_offsets")
 _ENGINE_METRIC_RE = re.compile(r"^(sglang[:_](?:num_running_reqs|num_queue_reqs|token_usage|cache_hit_rate))(?:\{([^}]*)\})?\s+([-+0-9.eE]+)$")
+
+
+class _EvalProgressLogStream:
+    """Render tqdm carriage-return refreshes as complete Ray log lines."""
+
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    def write(self, text):
+        if text.startswith("\r"):
+            text = text[1:] + "\n"
+        return self._wrapped.write(text)
+
+    def flush(self):
+        return self._wrapped.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -162,7 +181,7 @@ class EvalConcurrencyController:
                 self.update(load)
                 if self.target != previous:
                     logger.info(
-                        "Adaptive eval concurrency changed %d -> %d " "(engines=%d running=%.0f waiting=%.0f kv=%.3f cache_hit=%.3f)",
+                        "Adaptive concurrency changed %d -> %d " "(engines=%d running=%.0f waiting=%.0f kv=%.3f cache_hit=%.3f)",
                         previous,
                         self.target,
                         load.engine_count,
@@ -465,6 +484,10 @@ async def generate_and_rm(
         return sample
 
     state = GenerateState(args)
+    retry_base_sample = copy.deepcopy(sample)
+    retry_times = max(0, int(getattr(args, "eval_termination_retry_times", 0))) if evaluation else 0
+    base_sampling_seed = sampling_params.get("sampling_seed")
+    retry_reasons: list[str] = []
 
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
     custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
@@ -472,27 +495,58 @@ async def generate_and_rm(
         custom_generate_func, "manages_eval_request_concurrency", False
     )
 
-    if manages_eval_request_concurrency:
-        if state.aborted:
-            sample.status = Sample.Status.ABORTED
-            return sample
-        with state.dp_rank_context() as _:
-            sample = await custom_generate_func(args, sample, sampling_params, evaluation=True)
-    else:
-        async with state.semaphore:
+    for attempt in range(retry_times + 1):
+        current_sampling_params = sampling_params
+        if base_sampling_seed is not None and attempt > 0:
+            current_sampling_params = sampling_params.copy()
+            current_sampling_params["sampling_seed"] = int(base_sampling_seed) + attempt * 1_000_003
+
+        if manages_eval_request_concurrency:
             if state.aborted:
                 sample.status = Sample.Status.ABORTED
                 return sample
-
             with state.dp_rank_context() as _:
-                if custom_generate_func is not None:
-                    # if signature has evaluation, pass evaluation
-                    if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                        sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
+                sample = await custom_generate_func(args, sample, current_sampling_params, evaluation=True)
+        else:
+            async with state.semaphore:
+                if state.aborted:
+                    sample.status = Sample.Status.ABORTED
+                    return sample
+
+                with state.dp_rank_context() as _:
+                    if custom_generate_func is not None:
+                        # if signature has evaluation, pass evaluation
+                        if "evaluation" in inspect.signature(custom_generate_func).parameters:
+                            sample = await custom_generate_func(
+                                args, sample, current_sampling_params, evaluation=evaluation
+                            )
+                        else:
+                            sample = await custom_generate_func(args, sample, current_sampling_params)
                     else:
-                        sample = await custom_generate_func(args, sample, sampling_params)
-                else:
-                    sample = await generate(args, sample, sampling_params)
+                        sample = await generate(args, sample, current_sampling_params)
+
+        generated_samples = sample if isinstance(sample, list) else [sample]
+        termination_reason = _eval_termination_reason(generated_samples)
+        if termination_reason is None or termination_reason == "env_done" or attempt >= retry_times:
+            if evaluation:
+                for generated_sample in generated_samples:
+                    generated_sample.metadata = {
+                        **dict(generated_sample.metadata or {}),
+                        "eval_retry_count": attempt,
+                        "eval_retry_termination_reasons": retry_reasons,
+                    }
+            break
+
+        retry_reasons.append(termination_reason)
+        logger.warning(
+            "Retrying trace index=%s after termination_reason=%s (retry %d/%d)",
+            retry_base_sample.index,
+            termination_reason,
+            attempt + 1,
+            retry_times,
+        )
+        sample = copy.deepcopy(retry_base_sample)
+        sample.session_id = None
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -530,6 +584,15 @@ async def generate_and_rm(
                 sample.reward = await async_rm(args, sample, evaluation=evaluation)
 
     return sample
+
+
+def _eval_termination_reason(samples: list[Sample]) -> str | None:
+    for sample in reversed(samples):
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        reason = metadata.get("fused_termination") or metadata.get("termination_reason")
+        if reason:
+            return str(reason)
+    return None
 
 
 def _should_rescore_eval_sample(args: Namespace, sample: Sample, evaluation: bool) -> bool:
@@ -839,8 +902,12 @@ EVAL_PROMPT_DATASET = {}
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
     assert not args.group_rm, "Group RM is not supported for eval rollout"
 
+    dataset_configs = getattr(args, "eval_datasets", []) or []
+    if getattr(args, "eval_mix_datasets", False) and len(dataset_configs) > 1:
+        return RolloutFnEvalOutput(data=await eval_rollout_mixed_datasets(args, dataset_configs)), []
+
     results = {}
-    for dataset_cfg in getattr(args, "eval_datasets", []) or []:
+    for dataset_cfg in dataset_configs:
         results.update(await eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
     return RolloutFnEvalOutput(data=results), []
 
@@ -854,30 +921,26 @@ async def eval_rollout_single_dataset(args: Namespace, rollout_id: int, dataset_
         dataset_cfg: configuration of the dataset
     """
     assert not args.group_rm, "Group RM is not supported for eval rollout"
+    dataset, sampling_params = _prepare_eval_dataset(args, dataset_cfg)
+    data = await _generate_eval_samples_bounded(args, dataset, dataset_cfg, sampling_params)
+    return _format_eval_dataset_result(args, dataset_cfg, data)
 
+
+def _prepare_eval_dataset(args: Namespace, dataset_cfg: EvalDatasetConfig) -> tuple[Dataset, dict[str, Any]]:
     global EVAL_PROMPT_DATASET
 
-    eval_multimodal_keys = (
-        dataset_cfg.multimodal_keys if dataset_cfg.multimodal_keys is not None else args.multimodal_keys
-    )
-    eval_apply_chat_template = (
-        dataset_cfg.apply_chat_template if dataset_cfg.apply_chat_template is not None else args.apply_chat_template
-    )
+    eval_multimodal_keys = dataset_cfg.multimodal_keys if dataset_cfg.multimodal_keys is not None else args.multimodal_keys
+    eval_apply_chat_template = dataset_cfg.apply_chat_template if dataset_cfg.apply_chat_template is not None else args.apply_chat_template
     eval_apply_chat_template_kwargs = (
         dataset_cfg.apply_chat_template_kwargs
         if dataset_cfg.apply_chat_template_kwargs is not None
         else args.apply_chat_template_kwargs
     )
-
     cache_key = dataset_cfg.cache_key + (
         args.hf_checkpoint,
         eval_apply_chat_template,
         json.dumps(eval_multimodal_keys, sort_keys=True) if eval_multimodal_keys is not None else None,
-        (
-            json.dumps(eval_apply_chat_template_kwargs, sort_keys=True)
-            if eval_apply_chat_template_kwargs is not None
-            else None
-        ),
+        json.dumps(eval_apply_chat_template_kwargs, sort_keys=True) if eval_apply_chat_template_kwargs is not None else None,
     )
     if cache_key not in EVAL_PROMPT_DATASET:
         tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
@@ -895,28 +958,31 @@ async def eval_rollout_single_dataset(args: Namespace, rollout_id: int, dataset_
             apply_chat_template=eval_apply_chat_template,
             apply_chat_template_kwargs=eval_apply_chat_template_kwargs,
         )
-    dataset = EVAL_PROMPT_DATASET[cache_key]
-
-    base_sampling_params = dict(
-        temperature=dataset_cfg.temperature,
-        top_p=dataset_cfg.top_p,
-        top_k=dataset_cfg.top_k,
-        max_new_tokens=dataset_cfg.max_response_len,
-        stop=args.rollout_stop,
-        stop_token_ids=args.rollout_stop_token_ids,
-        skip_special_tokens=(
+    sampling_params = {
+        "temperature": dataset_cfg.temperature,
+        "top_p": dataset_cfg.top_p,
+        "top_k": dataset_cfg.top_k,
+        "max_new_tokens": dataset_cfg.max_response_len,
+        "stop": args.rollout_stop,
+        "stop_token_ids": args.rollout_stop_token_ids,
+        "skip_special_tokens": (
             dataset_cfg.skip_special_tokens
             if dataset_cfg.skip_special_tokens is not None
             else args.rollout_skip_special_tokens
         ),
-        no_stop_trim=dataset_cfg.no_stop_trim if dataset_cfg.no_stop_trim is not None else True,
-        spaces_between_special_tokens=False,
-    )
+        "no_stop_trim": dataset_cfg.no_stop_trim if dataset_cfg.no_stop_trim is not None else True,
+        "spaces_between_special_tokens": False,
+    }
     if dataset_cfg.repetition_penalty is not None:
-        base_sampling_params["repetition_penalty"] = dataset_cfg.repetition_penalty
+        sampling_params["repetition_penalty"] = dataset_cfg.repetition_penalty
+    return EVAL_PROMPT_DATASET[cache_key], sampling_params
 
-    data = await _generate_eval_samples_bounded(args, dataset, dataset_cfg, base_sampling_params)
 
+def _format_eval_dataset_result(
+    args: Namespace,
+    dataset_cfg: EvalDatasetConfig,
+    data: list[Sample],
+) -> dict[str, dict[str, list[Any]]]:
     reward_key = args.eval_reward_key or args.reward_key
     return {
         dataset_cfg.name: {
@@ -925,6 +991,143 @@ async def eval_rollout_single_dataset(args: Namespace, rollout_id: int, dataset_
             "samples": data,
         }
     }
+
+
+async def _generate_one_eval_sample(
+    args: Namespace,
+    dataset_cfg: EvalDatasetConfig,
+    base_sampling_params: dict[str, Any],
+    sample_index: int,
+    prompt_sample: Sample,
+    sample_offset: int,
+):
+    sample = copy.deepcopy(prompt_sample)
+    sample.index = sample_index
+    sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
+    sample.custom_rm_path = dataset_cfg.custom_rm_path
+    sample.generate_function_path = dataset_cfg.custom_generate_function_path
+    if getattr(args, "enable_use_grm_evals", False):
+        sample.custom_rm_path = getattr(args, "grm_custom_rm_path", None)
+    sampling_params = base_sampling_params
+    if getattr(args, "sglang_enable_deterministic_inference", False):
+        sampling_params = base_sampling_params.copy()
+        sampling_params["sampling_seed"] = args.rollout_seed + sample_offset
+    return await generate_and_rm(args, sample, sampling_params=sampling_params, evaluation=True)
+
+
+async def eval_rollout_mixed_datasets(
+    args: Namespace,
+    dataset_configs: list[EvalDatasetConfig],
+) -> dict[str, dict[str, list[Any]]]:
+    names = [dataset_cfg.name for dataset_cfg in dataset_configs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"Mixed eval dataset names must be unique, got {names}")
+    contexts = [(*_prepare_eval_dataset(args, dataset_cfg), dataset_cfg) for dataset_cfg in dataset_configs]
+    generated = await _generate_mixed_eval_samples_bounded(args, contexts)
+    results: dict[str, dict[str, list[Any]]] = {}
+    for dataset_cfg in dataset_configs:
+        results.update(_format_eval_dataset_result(args, dataset_cfg, generated[dataset_cfg.name]))
+    return results
+
+
+async def _generate_mixed_eval_samples_bounded(
+    args: Namespace,
+    contexts: list[tuple[Dataset, dict[str, Any], EvalDatasetConfig]],
+) -> dict[str, list[Sample]]:
+    """Generate datasets round-robin under one global inflight budget."""
+    from collections import deque
+
+    total = sum(len(dataset.samples) * dataset_cfg.n_samples_per_eval_prompt for dataset, _, dataset_cfg in contexts)
+    controller = None
+    if total == 0:
+        max_inflight = 0
+    elif getattr(args, "eval_adaptive_concurrency", False):
+        controller = EvalConcurrencyController(args, total)
+        max_inflight = controller.target
+    else:
+        max_inflight = max(1, min(total, int(getattr(args, "eval_max_inflight_tasks", 384))))
+
+    def specs_for(dataset: Dataset, sampling_params: dict[str, Any], dataset_cfg: EvalDatasetConfig):
+        sample_index = 0
+        for prompt_sample in dataset.samples:
+            for sample_offset in range(dataset_cfg.n_samples_per_eval_prompt):
+                yield dataset_cfg, sampling_params, sample_index, prompt_sample, sample_offset
+                sample_index += 1
+
+    remaining = deque(
+        iter(specs_for(dataset, sampling_params, dataset_cfg))
+        for dataset, sampling_params, dataset_cfg in contexts
+        if dataset.samples and dataset_cfg.n_samples_per_eval_prompt
+    )
+
+    def next_spec():
+        while remaining:
+            iterator = remaining.popleft()
+            try:
+                spec = next(iterator)
+            except StopIteration:
+                continue
+            remaining.append(iterator)
+            return spec
+        return None
+
+    async def generate_one(spec):
+        dataset_cfg, sampling_params, sample_index, prompt_sample, sample_offset = spec
+        generated = await _generate_one_eval_sample(
+            args,
+            dataset_cfg,
+            sampling_params,
+            sample_index,
+            prompt_sample,
+            sample_offset,
+        )
+        return dataset_cfg.name, generated
+
+    pending: set[asyncio.Task] = set()
+
+    def schedule_until(target: int) -> None:
+        while len(pending) < target:
+            spec = next_spec()
+            if spec is None:
+                return
+            pending.add(asyncio.create_task(generate_one(spec)))
+
+    schedule_until(max_inflight)
+    data = {dataset_cfg.name: [] for _, _, dataset_cfg in contexts}
+    logged_datasets: set[str] = set()
+    pbar = tqdm(total=total, desc=f"Eval mixed ({len(contexts)} datasets)", file=_EvalProgressLogStream(sys.stderr))
+    try:
+        while pending:
+            completed, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in completed:
+                dataset_name, generated = task.result()
+                generated_samples = generated if isinstance(generated, list) else [generated]
+                data[dataset_name].extend(generated_samples)
+                if dataset_name not in logged_datasets and generated_samples:
+                    sample = generated_samples[0]
+                    logger.info(
+                        "eval_rollout_mixed_datasets example %s data: %s reward=%s",
+                        dataset_name,
+                        [str(sample.prompt) + sample.response],
+                        sample.reward,
+                    )
+                    logged_datasets.add(dataset_name)
+                pbar.update(1)
+            target = controller.poll(args) if controller is not None else max_inflight
+            schedule_until(target)
+    except BaseException:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        raise
+    finally:
+        if controller is not None:
+            await controller.close()
+        pbar.close()
+
+    for samples in data.values():
+        samples.sort(key=lambda sample: sample.index)
+    return data
 
 
 async def _generate_eval_samples_bounded(
@@ -951,22 +1154,13 @@ async def _generate_eval_samples_bounded(
                 sample_index += 1
 
     async def generate_one(sample_index: int, prompt_sample: Sample, sample_offset: int):
-        sample = copy.deepcopy(prompt_sample)
-        sample.index = sample_index
-        sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
-        sample.custom_rm_path = dataset_cfg.custom_rm_path
-        sample.generate_function_path = dataset_cfg.custom_generate_function_path
-        if getattr(args, "enable_use_grm_evals", False):
-            sample.custom_rm_path = getattr(args, "grm_custom_rm_path", None)
-        sampling_params = base_sampling_params
-        if getattr(args, "sglang_enable_deterministic_inference", False):
-            sampling_params = base_sampling_params.copy()
-            sampling_params["sampling_seed"] = args.rollout_seed + sample_offset
-        return await generate_and_rm(
+        return await _generate_one_eval_sample(
             args,
-            sample,
-            sampling_params=sampling_params,
-            evaluation=True,
+            dataset_cfg,
+            base_sampling_params,
+            sample_index,
+            prompt_sample,
+            sample_offset,
         )
 
     specs = iter(sample_specs())
@@ -987,7 +1181,7 @@ async def _generate_eval_samples_bounded(
 
     data: list[Sample] = []
     log_example = True
-    pbar = tqdm(total=total, desc=f"Eval {dataset_cfg.name}", disable=not log_example)
+    pbar = tqdm(total=total, desc=f"Eval {dataset_cfg.name}", file=_EvalProgressLogStream(sys.stderr))
     try:
         while pending:
             completed, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)

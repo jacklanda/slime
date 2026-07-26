@@ -2,7 +2,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from slime.ray.rollout import _format_eval_log_dict_for_display, _log_eval_rollout_data, compute_metrics_from_samples
+from slime.ray.rollout import (
+    _compute_mcp_atlas_coverage_metrics,
+    _format_eval_log_dict_for_display,
+    _log_eval_rollout_data,
+    compute_metrics_from_samples,
+)
 from slime.utils.metric_utils import compute_pass_at_k_and_pass_all
 from slime.utils.types import Sample
 
@@ -92,6 +97,30 @@ def test_compute_pass_at_k_and_pass_all_rounds_to_three_decimals():
         "pass@1/std": 0.0,
         "pass^1/mean": 0.333,
         "pass^1/std": 0.0,
+    }
+
+
+def test_mcp_atlas_coverage_metrics_report_official_thresholds_and_judge_health():
+    samples = [
+        Sample(metadata={"verification": {"per_claim": [{"score": 1.0}]}, "grm": {}}),
+        Sample(
+            metadata={
+                "verification": {"per_claim": [{"score": 0.0, "error": "judge timeout"}]},
+                "grm": {},
+            }
+        ),
+        Sample(metadata={"verification": {"per_claim": []}, "grm": {"failure": "missing_submission"}}),
+        Sample(metadata={"verification": {"per_claim": [{"score": 0.5}]}, "grm": {}}),
+    ]
+
+    metrics = _compute_mcp_atlas_coverage_metrics([1.0, 0.75, 0.5, 0.0], samples)
+
+    assert metrics == {
+        "coverage/mean": 0.5625,
+        "coverage/pass_rate_0.50": 0.75,
+        "coverage/pass_rate_0.75": 0.5,
+        "coverage/judge_failure_ratio": 0.25,
+        "coverage/missing_submission_ratio": 0.25,
     }
 
 

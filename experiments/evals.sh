@@ -46,7 +46,7 @@ Generation/eval:
   --cli-max-steps N                    Default: max-steps.
   --trajectory-timeout N               Default: 7200.
   --eval-trajectory-timeout N          Default: trajectory-timeout.
-  --n-samples-per-eval-prompt N        Default: 1.
+  --n-samples-per-prompt N             Number of responses per eval prompt. Default: 1.
   --temperature X                      Default: 0.6.
   --top-p X                            Default: 0.95.
   --top-k N                            Default: -1 (disabled).
@@ -55,26 +55,39 @@ Generation/eval:
   --deterministic-inference BOOL       Pass per-sample seeds to SGLang. Default: false.
   --eval-max-response-len N            Default: 38000; also the default cot per-step budget.
   --eval-max-prompt-len N              Default: 2048.
-  --eval-max-context-len N             Default: prompt + response.
+  --eval-max-context-len N             Default: 40960 for Qwen3; prompt + response otherwise.
   --limit-per-benchmark N              Generate config with first N examples per benchmark. Default: 0 (all).
-  --no-prefer-verl                     Normalize from raw files even when data_verl.parquet exists.
+  --retrieval-backend local|serper     Retrieval service to use. Default: local.
+                                       Serper requires SERPER_API_KEY unless RETRIEVAL_SERVER_URL is set.
   --retrieval-concurrency N            Concurrent retrieval requests. Default: 176.
   --retrieval-mode NAME                dense, lexical, or hybrid. Default: dense.
   --retrieval-cache-size N             Cross-episode retrieval LRU entries. Default: 4096.
   --eval-initial-inflight-tasks N      Initial scheduled eval trajectories. Default: cot=4/engine, agent=384.
   --eval-max-inflight-tasks N          Adaptive hard limit. Default: cot=8/engine, agent=576.
   --eval-adaptive-concurrency BOOL     Adjust inflight work from engine metrics. Default: true.
+  --eval-mix-datasets BOOL            Interleave multiple benchmarks under one inflight budget. Default: true.
+  --eval-termination-retry-times N     Retry an eval trajectory when termination_reason is not env_done.
+                                       Default: 4 retries after the initial attempt; 0 disables retries.
   --eval-trajectory-sample-rate X      Full trajectory dump fraction. Default: 1.
   --eval-dump-failures BOOL            Dump failed eval trajectories. Default: true.
   --native-sglang-session BOOL         Use verified incremental SGLang sessions. Default: true.
   --enable-use-grm-evals BOOL          Rule-first verifier with OpenRouter semantic fallback. Default: true.
   --grm-model NAME                     OpenRouter fallback judge. Default: google/gemini-3-flash-preview.
+  --grm-base-url URL                   OpenRouter-compatible judge endpoint.
   --grm-mode score|equivalence          GRM protocol. Default: score (legacy).
-  --grm-concurrency N                  Max concurrent judge requests. Default: 128.
+  --grm-concurrency N                  Max concurrent judge requests. Default: 128; MCP-Atlas: 8.
+  --grm-max-connections N              Max pooled judge HTTP connections. Default: 128; MCP-Atlas: 16.
   --grm-timeout SECONDS                Judge request timeout. Default: 60.
-  --grm-max-retries N                  Judge request attempts. Default: 3.
+  --grm-max-retries N                  Judge request attempts. Default: 32; MCP-Atlas: 8.
   --grm-max-input-tokens N             Maximum GRM input content tokens. Default: 131072.
-  --grm-max-new-tokens N               Maximum GRM-generated tokens. Default: 1024.
+  --grm-max-new-tokens N               Maximum GRM-generated tokens. Default: 2048.
+  --mcp-sandbox-url URL                 MCP-Atlas HTTP endpoint. Default: http://10.2.152.51:30176.
+  --mcp-atlas-expected-servers N        Required online MCP-Atlas server count. Default: 39.
+  --mcp-atlas-concurrency N             Max concurrent Atlas tool calls. Default: 5.
+  --mcp-atlas-baseline-state PATH       External-state baseline used to block contaminated reruns.
+  --mcp-atlas-create-baseline           Explicitly create a missing external-state baseline.
+  --mcp-atlas-skip-state-check BOOL     Skip baseline comparison. Default: false.
+  --mcp-atlas-allow-busy-ray BOOL       Allow submission to a Ray cluster with a running job. Default: false.
 
 SGLang/runtime:
   --sglang-mem-fraction-static X       Default: 0.9.
@@ -86,6 +99,7 @@ SGLang/runtime:
   --ray-job-wait BOOL                  Default: false.
   --ray-job-follow-logs BOOL           Default: true.
   --cleanup BOOL                       Stop old Ray head first when true. Default: false.
+  --preflight-only                     Validate model, dataset, sandbox, and secrets without launching Ray.
   -h, --help                           Show this help.
 EOF
 }
@@ -101,14 +115,27 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
-MODEL_SERIES="${MODEL_SERIES:-qwen3.5}"
+MCP_ATLAS_SECRETS_FILE="${MCP_ATLAS_SECRETS_FILE:-${SCRIPT_DIR}/artifacts/benchmarks/mcp-atlas/mcp-atlas-secrets.yaml}"
+MCP_SANDBOX_URL="${MCP_SANDBOX_URL:-http://10.2.152.51:30176}"
+MCP_ATLAS_EXPECTED_SERVERS="${MCP_ATLAS_EXPECTED_SERVERS:-39}"
+MCP_ATLAS_CONCURRENCY="${MCP_ATLAS_CONCURRENCY:-5}"
+MCP_ATLAS_TOOL_TIMEOUT="${MCP_ATLAS_TOOL_TIMEOUT:-120}"
+MCP_ATLAS_LIST_TOOLS_TIMEOUT="${MCP_ATLAS_LIST_TOOLS_TIMEOUT:-180}"
+MCP_ATLAS_READ_ONLY=true
+MCP_ATLAS_BASELINE_STATE="${MCP_ATLAS_BASELINE_STATE:-${SCRIPT_DIR}/artifacts/benchmarks/mcp-atlas/state_snapshots/baseline.json}"
+MCP_ATLAS_CREATE_BASELINE="${MCP_ATLAS_CREATE_BASELINE:-false}"
+MCP_ATLAS_SKIP_STATE_CHECK="${MCP_ATLAS_SKIP_STATE_CHECK:-false}"
+MCP_ATLAS_ALLOW_BUSY_RAY="${MCP_ATLAS_ALLOW_BUSY_RAY:-false}"
+
+MODEL_SERIES="${MODEL_SERIES:-qwen3}"
+#MODEL_SERIES="${MODEL_SERIES:-qwen3.5}"
 MODEL_CONFIG="${MODEL_CONFIG:-}"
 MODEL_DIR="${MODEL_DIR:-}"
 BENCHMARKS_ROOT="${BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 #INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-2wiki,bamboogle,gpqa_diamond,medqa}"
 #INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-browsecomp_plus}"
-INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-search_r1}"
-#INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-bamboogle}"
+INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-search_r1,medqa,gpqa_diamond}"
+#INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-bamboogle,2wiki}"
 EXCLUDE_BENCHMARKS="${EXCLUDE_BENCHMARKS:-}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-eval-$(date +%Y%m%d-%H%M%S)}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
@@ -127,7 +154,7 @@ WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-${MAX_STEPS}}"
 CLI_MAX_STEPS="${CLI_MAX_STEPS:-${MAX_STEPS}}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-${TRAJECTORY_TIMEOUT}}"
-N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-1}"
 TEMPERATURE="${TEMPERATURE:-0.6}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:--1}"
@@ -144,19 +171,34 @@ EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-2048}"
 #EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-4096}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
 LIMIT_PER_BENCHMARK="${LIMIT_PER_BENCHMARK:-0}"
-PREFER_VERL="${PREFER_VERL:-1}"
+RETRIEVAL_BACKEND="${RETRIEVAL_BACKEND:-local}"
+if [ -n "${RETRIEVAL_SERVER_URL+x}" ]; then retrieval_url_explicit=true; else retrieval_url_explicit=false; fi
+SERPER_SERVER_HOST="${SERPER_SERVER_HOST:-127.0.0.1}"
+SERPER_SERVER_PORT="${SERPER_SERVER_PORT:-65433}"
+SERPER_SERVICE_PID=""
 RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-176}"
 RETRIEVAL_MODE="${RETRIEVAL_MODE:-dense}"
 RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE:-4096}"
 EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-}"
 EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-}"
 EVAL_ADAPTIVE_CONCURRENCY="${EVAL_ADAPTIVE_CONCURRENCY:-true}"
+EVAL_MIX_DATASETS="${EVAL_MIX_DATASETS:-true}"
+EVAL_TERMINATION_RETRY_TIMES="${EVAL_TERMINATION_RETRY_TIMES:-4}"
 EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-1}"
 EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES:-true}"
 NATIVE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION:-true}"
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-true}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
+if [ -n "${GRM_MODEL+x}" ]; then
+   grm_model_explicit=true
+else
+   grm_model_explicit=false
+fi
+if [ -n "${GRM_CONCURRENCY+x}" ]; then grm_concurrency_explicit=true; else grm_concurrency_explicit=false; fi
+if [ -n "${GRM_MAX_CONNECTIONS+x}" ]; then grm_max_connections_explicit=true; else grm_max_connections_explicit=false; fi
+if [ -n "${GRM_MAX_RETRIES+x}" ]; then grm_max_retries_explicit=true; else grm_max_retries_explicit=false; fi
 GRM_MODEL="${GRM_MODEL:-google/gemini-3-flash-preview}"
+GRM_BASE_URL="${GRM_BASE_URL:-}"
 GRM_MODE="${GRM_MODE:-score}"
 GRM_CONCURRENCY="${GRM_CONCURRENCY:-128}"
 GRM_MAX_CONNECTIONS="${GRM_MAX_CONNECTIONS:-128}"
@@ -175,6 +217,7 @@ RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
 RAY_JOB_WAIT="${RAY_JOB_WAIT:-0}"
 RAY_JOB_FOLLOW_LOGS="${RAY_JOB_FOLLOW_LOGS:-1}"
 CLEANUP="${CLEANUP:-false}"
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-false}"
 harness_explicit=false
 EXTRA_SLIME_ARGS=()
 
@@ -203,7 +246,7 @@ while [ "$#" -gt 0 ]; do
       --cli-max-steps) CLI_MAX_STEPS="${2:?Missing value for --cli-max-steps}"; shift 2 ;;
       --trajectory-timeout) TRAJECTORY_TIMEOUT="${2:?Missing value for --trajectory-timeout}"; shift 2 ;;
       --eval-trajectory-timeout) EVAL_TRAJECTORY_TIMEOUT="${2:?Missing value for --eval-trajectory-timeout}"; shift 2 ;;
-      --n-samples-per-eval-prompt) N_SAMPLES_PER_EVAL_PROMPT="${2:?Missing value for --n-samples-per-eval-prompt}"; shift 2 ;;
+      --n-samples-per-prompt) N_SAMPLES_PER_PROMPT="${2:?Missing value for --n-samples-per-prompt}"; shift 2 ;;
       --temperature) TEMPERATURE="${2:?Missing value for --temperature}"; shift 2 ;;
       --top-p) TOP_P="${2:?Missing value for --top-p}"; shift 2 ;;
       --top-k) TOP_K="${2:?Missing value for --top-k}"; shift 2 ;;
@@ -214,24 +257,35 @@ while [ "$#" -gt 0 ]; do
       --eval-max-prompt-len) EVAL_MAX_PROMPT_LEN="${2:?Missing value for --eval-max-prompt-len}"; shift 2 ;;
       --eval-max-context-len) EVAL_MAX_CONTEXT_LEN="${2:?Missing value for --eval-max-context-len}"; shift 2 ;;
       --limit-per-benchmark) LIMIT_PER_BENCHMARK="${2:?Missing value for --limit-per-benchmark}"; shift 2 ;;
-      --no-prefer-verl) PREFER_VERL=0; shift ;;
+      --retrieval-backend) RETRIEVAL_BACKEND="${2:?Missing value for --retrieval-backend}"; shift 2 ;;
       --retrieval-concurrency) RETRIEVAL_CONCURRENCY="${2:?Missing value for --retrieval-concurrency}"; shift 2 ;;
       --retrieval-mode) RETRIEVAL_MODE="${2:?Missing value for --retrieval-mode}"; shift 2 ;;
       --retrieval-cache-size) RETRIEVAL_CACHE_SIZE="${2:?Missing value for --retrieval-cache-size}"; shift 2 ;;
       --eval-initial-inflight-tasks) EVAL_INITIAL_INFLIGHT_TASKS="${2:?Missing value for --eval-initial-inflight-tasks}"; shift 2 ;;
       --eval-max-inflight-tasks) EVAL_MAX_INFLIGHT_TASKS="${2:?Missing value for --eval-max-inflight-tasks}"; shift 2 ;;
       --eval-adaptive-concurrency) EVAL_ADAPTIVE_CONCURRENCY="${2:?Missing value for --eval-adaptive-concurrency}"; shift 2 ;;
+      --eval-mix-datasets) EVAL_MIX_DATASETS="${2:?Missing value for --eval-mix-datasets}"; shift 2 ;;
+      --eval-termination-retry-times) EVAL_TERMINATION_RETRY_TIMES="${2:?Missing value for --eval-termination-retry-times}"; shift 2 ;;
       --eval-trajectory-sample-rate) EVAL_TRAJECTORY_SAMPLE_RATE="${2:?Missing value for --eval-trajectory-sample-rate}"; shift 2 ;;
       --eval-dump-failures) EVAL_DUMP_FAILURES="${2:?Missing value for --eval-dump-failures}"; shift 2 ;;
       --native-sglang-session) NATIVE_SGLANG_SESSION="${2:?Missing value for --native-sglang-session}"; shift 2 ;;
       --enable-use-grm-evals) ENABLE_USE_GRM_EVALS="${2:?Missing value for --enable-use-grm-evals}"; shift 2 ;;
-      --grm-model) GRM_MODEL="${2:?Missing value for --grm-model}"; shift 2 ;;
+      --grm-model) GRM_MODEL="${2:?Missing value for --grm-model}"; grm_model_explicit=true; shift 2 ;;
+      --grm-base-url) GRM_BASE_URL="${2:?Missing value for --grm-base-url}"; shift 2 ;;
       --grm-mode) GRM_MODE="${2:?Missing value for --grm-mode}"; shift 2 ;;
-      --grm-concurrency) GRM_CONCURRENCY="${2:?Missing value for --grm-concurrency}"; shift 2 ;;
+      --grm-concurrency) GRM_CONCURRENCY="${2:?Missing value for --grm-concurrency}"; grm_concurrency_explicit=true; shift 2 ;;
+      --grm-max-connections) GRM_MAX_CONNECTIONS="${2:?Missing value for --grm-max-connections}"; grm_max_connections_explicit=true; shift 2 ;;
       --grm-timeout) GRM_TIMEOUT="${2:?Missing value for --grm-timeout}"; shift 2 ;;
-      --grm-max-retries) GRM_MAX_RETRIES="${2:?Missing value for --grm-max-retries}"; shift 2 ;;
+      --grm-max-retries) GRM_MAX_RETRIES="${2:?Missing value for --grm-max-retries}"; grm_max_retries_explicit=true; shift 2 ;;
       --grm-max-input-tokens) GRM_MAX_INPUT_TOKENS="${2:?Missing value for --grm-max-input-tokens}"; shift 2 ;;
       --grm-max-new-tokens) GRM_MAX_NEW_TOKENS="${2:?Missing value for --grm-max-new-tokens}"; shift 2 ;;
+      --mcp-sandbox-url) MCP_SANDBOX_URL="${2:?Missing value for --mcp-sandbox-url}"; shift 2 ;;
+      --mcp-atlas-expected-servers) MCP_ATLAS_EXPECTED_SERVERS="${2:?Missing value for --mcp-atlas-expected-servers}"; shift 2 ;;
+      --mcp-atlas-concurrency) MCP_ATLAS_CONCURRENCY="${2:?Missing value for --mcp-atlas-concurrency}"; shift 2 ;;
+      --mcp-atlas-baseline-state) MCP_ATLAS_BASELINE_STATE="${2:?Missing value for --mcp-atlas-baseline-state}"; shift 2 ;;
+      --mcp-atlas-create-baseline) MCP_ATLAS_CREATE_BASELINE=true; shift ;;
+      --mcp-atlas-skip-state-check) MCP_ATLAS_SKIP_STATE_CHECK="${2:?Missing value for --mcp-atlas-skip-state-check}"; shift 2 ;;
+      --mcp-atlas-allow-busy-ray) MCP_ATLAS_ALLOW_BUSY_RAY="${2:?Missing value for --mcp-atlas-allow-busy-ray}"; shift 2 ;;
       --sglang-mem-fraction-static) SGLANG_MEM_FRACTION_STATIC="${2:?Missing value for --sglang-mem-fraction-static}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
@@ -241,11 +295,78 @@ while [ "$#" -gt 0 ]; do
       --ray-job-wait) RAY_JOB_WAIT="${2:?Missing value for --ray-job-wait}"; shift 2 ;;
       --ray-job-follow-logs) RAY_JOB_FOLLOW_LOGS="${2:?Missing value for --ray-job-follow-logs}"; shift 2 ;;
       --cleanup) CLEANUP="${2:?Missing value for --cleanup}"; shift 2 ;;
+      --preflight-only) PREFLIGHT_ONLY=true; shift ;;
       -h|--help) usage; exit 0 ;;
       --) shift; EXTRA_SLIME_ARGS=("$@"); break ;;
       *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
    esac
 done
+
+MCP_ATLAS_SELECTED=false
+MCP_ATLAS_ONLY=false
+case ",${INCLUDE_BENCHMARKS//_/-}," in
+   *,all,*|*,mcp-atlas,*) MCP_ATLAS_SELECTED=true ;;
+esac
+case "${INCLUDE_BENCHMARKS//_/-}" in
+   mcp-atlas) MCP_ATLAS_ONLY=true ;;
+esac
+case ",${EXCLUDE_BENCHMARKS//_/-}," in
+   *,mcp-atlas,*) MCP_ATLAS_SELECTED=false ;;
+esac
+
+if is_truthy "${MCP_ATLAS_SELECTED}"; then
+   if ! is_truthy "${grm_concurrency_explicit}"; then GRM_CONCURRENCY=8; fi
+   if ! is_truthy "${grm_max_connections_explicit}"; then GRM_MAX_CONNECTIONS=16; fi
+   if ! is_truthy "${grm_max_retries_explicit}"; then GRM_MAX_RETRIES=8; fi
+fi
+
+read_k8s_secret_value() {
+   python3 - "${MCP_ATLAS_SECRETS_FILE}" "$1" <<'PY'
+import base64
+import sys
+import yaml
+
+path, key = sys.argv[1:]
+with open(path, encoding="utf-8") as f:
+    for document in yaml.safe_load_all(f):
+        if not isinstance(document, dict):
+            continue
+        string_data = document.get("stringData") or {}
+        if key in string_data:
+            print(string_data[key], end="")
+            raise SystemExit
+        data = document.get("data") or {}
+        if key in data:
+            print(base64.b64decode(data[key]).decode(), end="")
+            raise SystemExit
+PY
+}
+
+if is_truthy "${MCP_ATLAS_SELECTED}" && [ -f "${MCP_ATLAS_SECRETS_FILE}" ]; then
+   if [ -z "${MCP_ATLAS_AUTH_TOKEN:-}" ]; then
+      MCP_ATLAS_AUTH_TOKEN="$(read_k8s_secret_value MCP_ATLAS_AUTH_TOKEN)"
+   fi
+   if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+      OPENROUTER_API_KEY="$(read_k8s_secret_value EVAL_LLM_API_KEY)"
+   fi
+   if [ -z "${GRM_BASE_URL}" ]; then
+      GRM_BASE_URL="$(read_k8s_secret_value EVAL_LLM_BASE_URL)"
+   fi
+   if ! is_truthy "${grm_model_explicit}"; then
+      secret_grm_model="$(read_k8s_secret_value EVAL_LLM_MODEL)"
+      GRM_MODEL="${secret_grm_model:-google/gemini-3.1-pro-preview}"
+   fi
+fi
+
+if is_truthy "${MCP_ATLAS_SELECTED}" && [ -z "${MCP_ATLAS_AUTH_TOKEN:-}" ]; then
+   echo "MCP_ATLAS_AUTH_TOKEN is required for MCP-Atlas evaluation" >&2
+   exit 2
+fi
+if is_truthy "${MCP_ATLAS_SELECTED}" && is_truthy "${MCP_ATLAS_SKIP_STATE_CHECK}"; then
+   echo "MCP-Atlas formal evaluation refuses --mcp-atlas-skip-state-check true; restore the golden state instead." >&2
+   exit 2
+fi
+export MCP_ATLAS_AUTH_TOKEN
 
 case "${MODEL_SERIES}" in
    qwen3|qwen3.5) ;;
@@ -259,6 +380,21 @@ case "${RETRIEVAL_MODE}" in
    dense|lexical|hybrid) ;;
    *) echo "Unsupported --retrieval-mode ${RETRIEVAL_MODE}; expected dense, lexical, or hybrid." >&2; exit 2 ;;
 esac
+case "${RETRIEVAL_BACKEND}" in
+   local|serper) ;;
+   *) echo "Unsupported --retrieval-backend ${RETRIEVAL_BACKEND}; expected local or serper." >&2; exit 2 ;;
+esac
+if ! [[ "${SERPER_SERVER_PORT}" =~ ^[1-9][0-9]*$ ]] || [ "${SERPER_SERVER_PORT}" -gt 65535 ]; then
+   echo "SERPER_SERVER_PORT must be an integer in [1, 65535]" >&2
+   exit 2
+fi
+if [ "${RETRIEVAL_BACKEND}" = "serper" ] && ! is_truthy "${retrieval_url_explicit}"; then
+   RETRIEVAL_SERVER_URL="http://${SERPER_SERVER_HOST}:${SERPER_SERVER_PORT}"
+   if [ -z "${SERPER_API_KEY:-}" ]; then
+      echo "SERPER_API_KEY is required for the managed Serper retrieval service" >&2
+      exit 2
+   fi
+fi
 
 if [ -z "${MODEL_CONFIG}" ]; then
    if [ "${MODEL_SERIES}" = "qwen3.5" ]; then
@@ -319,7 +455,13 @@ PY
 
 source "${MODEL_CONFIG_PATH}"
 
-EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-$((EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN))}"
+if [ -z "${EVAL_MAX_CONTEXT_LEN}" ]; then
+   if [ "${MODEL_SERIES}" = "qwen3" ]; then
+      EVAL_MAX_CONTEXT_LEN=40960
+   else
+      EVAL_MAX_CONTEXT_LEN="$((EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN))"
+   fi
+fi
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
 if [ "${ROLLOUT_GPUS}" -lt 1 ]; then
    echo "--gpus must be >= 1" >&2
@@ -374,7 +516,11 @@ if [ -z "${PER_STEP_MAX_TOKENS:-}" ]; then
       PER_STEP_MAX_TOKENS=38000
    fi
 fi
-if [ "${FUSED_HARNESS}" = "cot" ]; then
+if is_truthy "${MCP_ATLAS_ONLY}"; then
+   EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-${MCP_ATLAS_CONCURRENCY}}"
+   EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-${MCP_ATLAS_CONCURRENCY}}"
+   SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-${MCP_ATLAS_CONCURRENCY}}"
+elif [ "${FUSED_HARNESS}" = "cot" ]; then
    # Long CoT requests retain generation state for the full response, so keep
    # actual engine concurrency low even while the rollout queue stays buffered.
    EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-$((4 * ROLLOUT_NUM_ENGINES))}"
@@ -393,9 +539,44 @@ if [ "${EVAL_INITIAL_INFLIGHT_TASKS}" -gt "${EVAL_MAX_INFLIGHT_TASKS}" ]; then
    echo "--eval-initial-inflight-tasks must not exceed --eval-max-inflight-tasks" >&2
    exit 2
 fi
+if ! [[ "${EVAL_TERMINATION_RETRY_TIMES}" =~ ^[0-9]+$ ]]; then
+   echo "--eval-termination-retry-times must be a non-negative integer" >&2
+   exit 2
+fi
+if ! [[ "${MCP_ATLAS_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+   echo "--mcp-atlas-concurrency must be a positive integer" >&2
+   exit 2
+fi
+if ! [[ "${MCP_ATLAS_EXPECTED_SERVERS}" =~ ^[1-9][0-9]*$ ]]; then
+   echo "--mcp-atlas-expected-servers must be a positive integer" >&2
+   exit 2
+fi
 if is_truthy "${ENABLE_USE_GRM_EVALS}" && [ -z "${OPENROUTER_API_KEY:-}" ]; then
    echo "OPENROUTER_API_KEY is required when --enable-use-grm-evals is true" >&2
    exit 2
+fi
+
+if is_truthy "${MCP_ATLAS_SELECTED}"; then
+   python3 - "${MCP_SANDBOX_URL}" "${MCP_ATLAS_EXPECTED_SERVERS}" <<'PY' || exit 2
+import json
+import sys
+import urllib.request
+
+base_url = sys.argv[1].rstrip("/")
+expected_servers = int(sys.argv[2])
+with urllib.request.urlopen(f"{base_url}/health", timeout=15) as response:
+    health = json.load(response)
+if health.get("status") != "health_and_client_connection_ok":
+    raise SystemExit(f"MCP-Atlas health check failed: {health}")
+with urllib.request.urlopen(f"{base_url}/enabled-servers", timeout=30) as response:
+    enabled = json.load(response)
+offline = [name for name, status in enabled.get("servers", []) if status != "OK"]
+total = int(enabled.get("total", 0))
+online = int(enabled.get("online", 0))
+if offline or total != expected_servers or online != total:
+    raise SystemExit(f"MCP-Atlas server readiness failed: online={online}, total={total}, offline={offline}")
+print(f"MCP-Atlas preflight: {online}/{total} servers online")
+PY
 fi
 
 LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/evals/${EXPERIMENT_NAME}}"
@@ -404,9 +585,47 @@ EVAL_CACHE_DIR="${EVAL_CACHE_DIR:-${LOG_ROOT}/normalized_benchmarks}"
 DUMP_DETAILS="${DUMP_DETAILS:-${LOG_ROOT}/debug}"
 mkdir -p "${LOG_ROOT}" "${EVAL_CACHE_DIR}" "${DUMP_DETAILS}"
 
-PREFER_VERL_ARG="--prefer-verl"
-if ! is_truthy "${PREFER_VERL}"; then
-   PREFER_VERL_ARG="--no-prefer-verl"
+if is_truthy "${MCP_ATLAS_SELECTED}" && ! is_truthy "${MCP_ATLAS_SKIP_STATE_CHECK}"; then
+   state_tool="${SCRIPT_DIR}/artifacts/benchmarks/mcp-atlas/ops/external_state.py"
+   if [ ! -f "${MCP_ATLAS_BASELINE_STATE}" ]; then
+      if ! is_truthy "${MCP_ATLAS_CREATE_BASELINE}"; then
+         echo "MCP-Atlas baseline is missing: ${MCP_ATLAS_BASELINE_STATE}" >&2
+         echo "Restore the golden environment, then explicitly pass --mcp-atlas-create-baseline once." >&2
+         exit 2
+      fi
+      python3 "${state_tool}" snapshot --url "${MCP_SANDBOX_URL}" --output "${MCP_ATLAS_BASELINE_STATE}"
+   else
+      python3 "${state_tool}" compare \
+         --url "${MCP_SANDBOX_URL}" \
+         --baseline "${MCP_ATLAS_BASELINE_STATE}" || {
+         echo "MCP-Atlas external state has drifted. Restore it before a formal evaluation." >&2
+         exit 2
+      }
+   fi
+   python3 "${state_tool}" snapshot \
+      --url "${MCP_SANDBOX_URL}" \
+      --output "${LOG_ROOT}/mcp_atlas_state_before.json"
+   python3 - "${MCP_SANDBOX_URL}" <<'PY'
+import json
+import os
+import sys
+import urllib.request
+
+request = urllib.request.Request(
+    f"{sys.argv[1].rstrip('/')}/cache-clear",
+    data=b"{}",
+    headers={
+        "Authorization": f"Bearer {os.environ['MCP_ATLAS_AUTH_TOKEN']}",
+        "Content-Type": "application/json",
+    },
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=30) as response:
+    payload = json.load(response)
+if payload.get("cache_size") != 0:
+    raise SystemExit(f"MCP-Atlas cache clear failed: {payload}")
+print("MCP-Atlas cache cleared after clean-state verification")
+PY
 fi
 
 PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" python3 -m slime_plugins.evals.fused_benchmark_config \
@@ -415,9 +634,8 @@ PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" python3 -m slime_plugins.evals.fused_b
    --cache-dir "${EVAL_CACHE_DIR}" \
    --include "${INCLUDE_BENCHMARKS}" \
    --exclude "${EXCLUDE_BENCHMARKS}" \
-   ${PREFER_VERL_ARG} \
    --limit-per-benchmark "${LIMIT_PER_BENCHMARK}" \
-   --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}" \
+   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}" \
    --temperature "${TEMPERATURE}" \
    --top-p "${TOP_P}" \
    --top-k "${TOP_K}" \
@@ -434,15 +652,155 @@ print(datasets[0]["path"])
 PY
 )"
 
+if is_truthy "${MCP_ATLAS_SELECTED}"; then
+   python3 - "${EVAL_CONFIG}" "${MCP_SANDBOX_URL}" <<'PY' || exit 2
+import json
+import pathlib
+import sys
+import urllib.request
+
+import pandas as pd
+
+config_path = pathlib.Path(sys.argv[1])
+base_url = sys.argv[2].rstrip("/")
+with config_path.open(encoding="utf-8") as f:
+    import yaml
+    datasets = yaml.safe_load(f)["eval"]["datasets"]
+mcp_datasets = [
+    item for item in datasets
+    if str((item.get("metadata_overrides") or {}).get("data_source", "")).replace("-", "_") == "mcp_atlas"
+    or bool((item.get("metadata_overrides") or {}).get("mcp_atlas_eval"))
+]
+if not mcp_datasets:
+    raise SystemExit("MCP-Atlas was selected but no MCP-Atlas dataset exists in the generated eval config")
+records = []
+for dataset in mcp_datasets:
+    dataset_path = pathlib.Path(dataset["path"])
+    if dataset_path.suffix == ".parquet":
+        records.extend(pd.read_parquet(dataset_path).to_dict(orient="records"))
+    else:
+        with dataset_path.open(encoding="utf-8") as f:
+            records.extend(json.loads(line) for line in f if line.strip())
+request = urllib.request.Request(
+    f"{base_url}/list-tools",
+    data=b"{}",
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {__import__('os').environ['MCP_ATLAS_AUTH_TOKEN']}",
+    },
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=180) as response:
+    available = {str(tool["name"]) for tool in json.load(response)}
+missing_rows = 0
+missing_tools = set()
+for record in records:
+    metadata = record.get("extra_info") if isinstance(record.get("extra_info"), dict) else record
+    enabled = metadata.get("enabled_tools")
+    if enabled is None:
+        enabled = metadata.get("ENABLED_TOOLS")
+    if enabled is None:
+        enabled = []
+    if isinstance(enabled, str):
+        enabled = json.loads(enabled)
+    if hasattr(enabled, "tolist"):
+        enabled = enabled.tolist()
+    if not isinstance(enabled, (list, tuple)):
+        enabled = [enabled]
+    names = [item.get("name") if isinstance(item, dict) else str(item) for item in enabled]
+    missing = [name for name in names if name not in available]
+    if missing:
+        missing_rows += 1
+        missing_tools.update(missing)
+print(
+    f"MCP-Atlas task compatibility: {len(records) - missing_rows}/{len(records)} fully supported; "
+    f"{missing_rows} tasks reference {len(missing_tools)} unavailable tools"
+)
+if missing_tools:
+    print("MCP-Atlas unavailable tools: " + ", ".join(sorted(missing_tools)))
+    raise SystemExit("Refusing to evaluate MCP-Atlas tasks with unavailable tools")
+PY
+fi
+
+if is_truthy "${PREFLIGHT_ONLY}"; then
+   echo "Preflight complete: model=${MODEL_DIR}; config=${EVAL_CONFIG}; first_dataset=${PROMPT_DATA}"
+   echo "Retrieval: backend=${RETRIEVAL_BACKEND}; url=${RETRIEVAL_SERVER_URL:-http://10.2.152.50:65432}"
+   echo "MCP-Atlas: selected=${MCP_ATLAS_SELECTED}; sandbox=${MCP_SANDBOX_URL}; expected_servers=${MCP_ATLAS_EXPECTED_SERVERS}; concurrency=${MCP_ATLAS_CONCURRENCY}; judge=${GRM_MODEL}"
+   exit 0
+fi
+
+if [ "${RETRIEVAL_BACKEND}" = "serper" ] && ! is_truthy "${retrieval_url_explicit}" && \
+   ! is_truthy "${RAY_JOB_WAIT}" && ! is_truthy "${RAY_JOB_FOLLOW_LOGS}"; then
+   echo "The managed Serper service requires --ray-job-wait true or --ray-job-follow-logs true so it stays alive for the Ray job." >&2
+   echo "Alternatively, start the service separately and set RETRIEVAL_SERVER_URL." >&2
+   exit 2
+fi
+
 if is_truthy "${CLEANUP}"; then
    ray stop --force 2>/dev/null || true
 fi
 
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 if ray job list --address="${RAY_DASHBOARD_ADDRESS}" >/dev/null 2>&1; then
+   if is_truthy "${MCP_ATLAS_SELECTED}" && ! is_truthy "${MCP_ATLAS_ALLOW_BUSY_RAY}"; then
+      python3 - "${RAY_DASHBOARD_ADDRESS}" <<'PY' || exit 2
+import json
+import sys
+import urllib.request
+
+address = sys.argv[1].rstrip("/")
+with urllib.request.urlopen(f"{address}/api/jobs/", timeout=10) as response:
+    jobs = json.load(response)
+active = [job.get("submission_id") or job.get("job_id") for job in jobs if job.get("status") in {"PENDING", "RUNNING"}]
+if active:
+    raise SystemExit(
+        f"Ray cluster {address} already has {len(active)} active job(s). "
+        "Wait for them to finish or use a separate pre-started Ray cluster; "
+        "pass --mcp-atlas-allow-busy-ray true only when resource sharing is intentional."
+    )
+PY
+   fi
    echo "Reusing existing Ray head at ${RAY_DASHBOARD_ADDRESS}"
 else
    ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${ROLLOUT_GPUS}" --num-cpus "${RAY_NUM_CPUS}" --disable-usage-stats
+fi
+
+cleanup_managed_serper() {
+   local exit_status=$?
+   if [ -n "${SERPER_SERVICE_PID}" ]; then
+      kill "${SERPER_SERVICE_PID}" 2>/dev/null || true
+      wait "${SERPER_SERVICE_PID}" 2>/dev/null || true
+   fi
+   return "${exit_status}"
+}
+
+if [ "${RETRIEVAL_BACKEND}" = "serper" ] && ! is_truthy "${retrieval_url_explicit}"; then
+   trap cleanup_managed_serper EXIT
+   python3 "${REPO_ROOT}/examples/search-r1/serper_search_server.py" \
+      --host "${SERPER_SERVER_HOST}" \
+      --port "${SERPER_SERVER_PORT}" \
+      >"${LOG_ROOT}/serper_search_server.log" 2>&1 &
+   SERPER_SERVICE_PID=$!
+   python3 - "${RETRIEVAL_SERVER_URL}" "${SERPER_SERVICE_PID}" <<'PY' || exit 2
+import json
+import os
+import sys
+import time
+import urllib.request
+
+url = sys.argv[1].rstrip("/") + "/health"
+pid = int(sys.argv[2])
+for _ in range(50):
+    if not os.path.exists(f"/proc/{pid}"):
+        break
+    try:
+        with urllib.request.urlopen(url, timeout=1) as response:
+            if json.load(response).get("status") == "ok":
+                raise SystemExit(0)
+    except Exception:
+        time.sleep(0.1)
+raise SystemExit(f"Managed Serper service failed to start at {url}")
+PY
 fi
 
 export SCRIPT_DIR REPO_ROOT
@@ -468,6 +826,8 @@ export RLLM_DR_REFINE_SERVER_URL
 export RLLM_DR_USE_REFINE
 export DOCKER_HOST="${DOCKER_HOST:-tcp://10.2.152.50:2375}"
 export DOCKER_API_VERSION="${DOCKER_API_VERSION:-1.44}"
+export OPENROUTER_API_KEY
+export MCP_SANDBOX_URL MCP_ATLAS_AUTH_TOKEN MCP_ATLAS_CONCURRENCY MCP_ATLAS_TOOL_TIMEOUT MCP_ATLAS_LIST_TOOLS_TIMEOUT MCP_ATLAS_READ_ONLY
 export FUSED_HARNESS="${FUSED_HARNESS}"
 export FUSED_WEB_SEARCH_USER_PROMPT="${USER_PROMPT}"
 export FUSED_MODEL_SERIES="${MODEL_SERIES}"
@@ -501,7 +861,7 @@ import json
 import os
 
 keys = (
-    "HYDRA_FULL_ERROR", "TOKENIZERS_PARALLELISM", "VLLM_ALLOW_LONG_MAX_MODEL_LEN",
+    "CUDA_HOME", "HYDRA_FULL_ERROR", "TOKENIZERS_PARALLELISM", "VLLM_ALLOW_LONG_MAX_MODEL_LEN",
     "VLLM_ENGINE_ITERATION_TIMEOUT_S", "VLLM_WORKER_MULTIPROC_METHOD",
     "PYTORCH_CUDA_ALLOC_CONF", "RETRIEVAL_SERVER_URL", "RLLM_RETRIEVAL_MODE",
     "RLLM_RETRIEVAL_MAX_WORDS", "RLLM_RETRIEVAL_CONCURRENCY", "RLLM_RETRIEVAL_CACHE_SIZE",
@@ -510,7 +870,9 @@ keys = (
     "RLLM_DR_MAX_TURNS", "RLLM_DR_MAX_TOKENS", "RLLM_DR_MAX_CONTENT_LENGTH",
     "RLLM_DR_RETRIEVAL_MAX_RETRIES", "RLLM_DR_REFINE_MAX_RETRIES",
     "RLLM_DR_TEMPERATURE", "RLLM_DR_TOP_P", "RLLM_DR_TOP_K", "REFINE_SERVER_URL",
-    "DOCKER_HOST", "DOCKER_API_VERSION", "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL",
+    "DOCKER_HOST", "DOCKER_API_VERSION", "MCP_SANDBOX_URL", "MCP_ATLAS_AUTH_TOKEN", "MCP_ATLAS_CONCURRENCY",
+    "MCP_ATLAS_TOOL_TIMEOUT", "MCP_ATLAS_LIST_TOOLS_TIMEOUT", "MCP_ATLAS_READ_ONLY",
+    "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL",
     "OPENROUTER_APP_NAME", "FUSED_HARNESS", "FUSED_WEB_SEARCH_USER_PROMPT",
     "FUSED_MODEL_SERIES", "FUSED_UNIFIED_SYSTEM_PROMPT",
     "FUSED_DISABLE_THINKING", "FUSED_DISCARD_HISTORICAL_THINKING",
@@ -522,7 +884,7 @@ keys = (
     "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE", "SLIME_FUSED_EVAL_DUMP_FAILURES",
     "SLIME_FUSED_EVAL_USE_SGLANG_SESSION", "SLIME_FUSED_SESSION_CONTROL_TIMEOUT",
     "SLIME_FUSED_SESSION_IDLE_TIMEOUT", "SGLANG_TIMEOUT_KEEP_ALIVE",
-    "SLIME_HTTP_KEEPALIVE_EXPIRY",
+    "SLIME_HTTP_KEEPALIVE_EXPIRY", "SLIME_SGLANG_BASE_PORT",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["PYTHONPATH"] = f"{os.environ['MEGATRON_LM_PATH']}:{os.environ['REPO_ROOT']}:{os.environ['SCRIPT_DIR']}"
@@ -537,15 +899,20 @@ echo "Benchmarks root: ${BENCHMARKS_ROOT}"
 echo "Eval config: ${EVAL_CONFIG}"
 echo "Log root: ${LOG_ROOT}"
 echo "GPUs: ${ROLLOUT_GPUS}; gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}; engines=${ROLLOUT_NUM_ENGINES}"
-echo "Harness: ${FUSED_HARNESS}; user_prompt=${USER_PROMPT}; disable_thinking=${DISABLE_THINKING}; discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}; n=${N_SAMPLES_PER_EVAL_PROMPT}; per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
+echo "Harness: ${FUSED_HARNESS}; user_prompt=${USER_PROMPT}; disable_thinking=${DISABLE_THINKING}; discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}; n=${N_SAMPLES_PER_PROMPT}; per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
 echo "Sampling: temperature=${TEMPERATURE}; top_p=${TOP_P}; top_k=${TOP_K}; seed=${ROLLOUT_SEED}; deterministic=${DETERMINISTIC_INFERENCE}"
 echo "Concurrency: eval=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS} adaptive=${EVAL_ADAPTIVE_CONCURRENCY}; sglang_http_per_engine=${SGLANG_SERVER_CONCURRENCY}; sglang_running_per_engine=${SGLANG_MAX_RUNNING_REQUESTS}; retrieval=${RETRIEVAL_CONCURRENCY}"
-echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}; max_results=${RETRIEVAL_MAX_RESULTS}; cache_size=${RLLM_RETRIEVAL_CACHE_SIZE}"
+echo "Eval termination retries: ${EVAL_TERMINATION_RETRY_TIMES} (termination_reason != env_done)"
+echo "Retrieval: backend=${RETRIEVAL_BACKEND}; url=${RETRIEVAL_SERVER_URL}; mode=${RLLM_RETRIEVAL_MODE}; max_results=${RETRIEVAL_MAX_RESULTS}; cache_size=${RLLM_RETRIEVAL_CACHE_SIZE}"
 echo "Validation: hybrid=${ENABLE_USE_GRM_EVALS}; rule=benchmark_verifier; semantic_fallback=${GRM_MODEL}; temperature=${GRM_TEMPERATURE}; max_input_tokens=${GRM_MAX_INPUT_TOKENS}; max_new_tokens=${GRM_MAX_NEW_TOKENS}; concurrency=${GRM_CONCURRENCY}; timeout=${GRM_TIMEOUT}; retries=${GRM_MAX_RETRIES}"
 
 EVAL_ADAPTIVE_CONCURRENCY_ARG="--eval-adaptive-concurrency"
 if ! is_truthy "${EVAL_ADAPTIVE_CONCURRENCY}"; then
    EVAL_ADAPTIVE_CONCURRENCY_ARG="--no-eval-adaptive-concurrency"
+fi
+EVAL_MIX_DATASETS_ARG="--eval-mix-datasets"
+if ! is_truthy "${EVAL_MIX_DATASETS}"; then
+   EVAL_MIX_DATASETS_ARG="--no-eval-mix-datasets"
 fi
 
 DETERMINISTIC_INFERENCE_ARGS=()
@@ -582,6 +949,37 @@ fi
 SAFE_EXPERIMENT_NAME="$(printf '%s' "${EXPERIMENT_NAME}" | tr -c '[:alnum:]_' '_' | cut -c1-120)"
 RAY_SUBMISSION_ID="${RAY_SUBMISSION_ID:-eval_${SAFE_EXPERIMENT_NAME}_$(date +%Y%m%d_%H%M%S)}"
 
+MCP_ATLAS_POST_AUDIT=false
+if is_truthy "${MCP_ATLAS_SELECTED}" && { is_truthy "${RAY_JOB_WAIT}" || is_truthy "${RAY_JOB_FOLLOW_LOGS}"; }; then
+   MCP_ATLAS_POST_AUDIT=true
+fi
+
+post_audit_mcp_atlas() {
+   if ! is_truthy "${MCP_ATLAS_POST_AUDIT}"; then
+      return
+   fi
+   local state_tool="${SCRIPT_DIR}/artifacts/benchmarks/mcp-atlas/ops/external_state.py"
+   local report_tool="${SCRIPT_DIR}/artifacts/benchmarks/mcp-atlas/ops/mutation_report.py"
+   local after_state="${LOG_ROOT}/mcp_atlas_state_after.json"
+   python3 "${state_tool}" snapshot --url "${MCP_SANDBOX_URL}" --output "${after_state}" || true
+   python3 "${report_tool}" \
+      --eval-root "${LOG_ROOT}" \
+      --before-state "${LOG_ROOT}/mcp_atlas_state_before.json" \
+      --after-state "${after_state}" \
+      --output "${LOG_ROOT}/mcp_atlas_mutations.json" || true
+}
+if is_truthy "${MCP_ATLAS_SELECTED}" && ! is_truthy "${MCP_ATLAS_POST_AUDIT}"; then
+   echo "Warning: MCP-Atlas post-run state audit is disabled because neither Ray wait nor log following is enabled." >&2
+fi
+
+cleanup_eval_services() {
+   local exit_status=$?
+   post_audit_mcp_atlas
+   cleanup_managed_serper
+   return "${exit_status}"
+}
+trap cleanup_eval_services EXIT
+
 cd "${REPO_ROOT}"
 ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    --submission-id="${RAY_SUBMISSION_ID}" \
@@ -602,7 +1000,7 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    --metadata-key extra_info \
    --num-rollout 0 \
    --rollout-batch-size 1 \
-   --n-samples-per-prompt 1 \
+   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}" \
    --global-batch-size 1 \
    --rollout-max-context-len "${EVAL_MAX_CONTEXT_LEN}" \
    --rollout-max-prompt-len "${EVAL_MAX_PROMPT_LEN}" \
@@ -617,7 +1015,6 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    "${GRM_ARGS[@]}" \
    --eval-interval 1 \
    --eval-config "${EVAL_CONFIG}" \
-   --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}" \
    --eval-temperature "${TEMPERATURE}" \
    --eval-top-p "${TOP_P}" \
    --eval-top-k "${TOP_K}" \
@@ -626,7 +1023,9 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    --eval-max-context-len "${EVAL_MAX_CONTEXT_LEN}" \
    --eval-initial-inflight-tasks "${EVAL_INITIAL_INFLIGHT_TASKS}" \
    --eval-max-inflight-tasks "${EVAL_MAX_INFLIGHT_TASKS}" \
+   --eval-termination-retry-times "${EVAL_TERMINATION_RETRY_TIMES}" \
    "${EVAL_ADAPTIVE_CONCURRENCY_ARG}" \
+   "${EVAL_MIX_DATASETS_ARG}" \
    --custom-eval-rollout-log-function-path slime_plugins.evals.results_table.log_eval_results_table \
    --dump-details "${DUMP_DETAILS}" \
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}" \

@@ -212,7 +212,7 @@ def discover_benchmarks(args: argparse.Namespace) -> list[dict[str, Any]]:
             continue
 
         verl_path = bench_dir / "data_verl.parquet"
-        if args.prefer_verl and verl_path.is_file():
+        if verl_path.is_file():
             path = verl_path
         else:
             sources = _source_files(bench_dir)
@@ -248,6 +248,15 @@ def discover_benchmarks(args: argparse.Namespace) -> list[dict[str, Any]]:
         }
         if name == "bamboogle":
             entry["metadata_overrides"]["strict_exact_match"] = True
+        if name in {"mcp-atlas", "mcp_atlas"}:
+            entry["metadata_overrides"].update(
+                {
+                    "data_source": "mcp_atlas",
+                    "mcp_transport": "atlas",
+                    "mcp_atlas_eval": True,
+                }
+            )
+            entry["max_response_len"] = args.long_response_len
         if name in {"browsecomp_plus", "browse_comp", "frontierscience_research"}:
             entry["max_response_len"] = args.long_response_len
         datasets.append(entry)
@@ -264,7 +273,7 @@ def write_config(args: argparse.Namespace) -> None:
     config = {
         "eval": {
             "defaults": {
-                "n_samples_per_eval_prompt": args.n_samples_per_eval_prompt,
+                "n_samples_per_eval_prompt": args.n_samples_per_prompt,
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "top_k": args.top_k,
@@ -295,9 +304,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", required=True)
     parser.add_argument("--include", default="all")
     parser.add_argument("--exclude", default="")
-    parser.add_argument("--prefer-verl", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--limit-per-benchmark", type=int, default=0)
-    parser.add_argument("--n-samples-per-eval-prompt", type=int, default=1)
+    parser.add_argument("--n-samples-per-prompt", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=20)

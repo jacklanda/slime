@@ -49,6 +49,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_SGLANG_CONTEXT_LENGTH_MARGIN = 256
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL)
 _THOUGHT_CHANNEL_BLOCK_RE = re.compile(r"<\|channel>thought\n.*?<channel\|>", re.DOTALL)
+_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>")
+_THOUGHT_CHANNEL_OPEN_RE = re.compile(r"<\|channel>thought\n")
 _THINK_CLOSE_RE = re.compile(r"</think\s*>")
 _LAST_SGLANG_REQUEST_LOG_TS = 0.0
 _EVAL_ENGINE_POOL_LOOP: asyncio.AbstractEventLoop | None = None
@@ -417,7 +419,6 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     repeated_search_max_strikes = max(1, int(os.environ.get("FUSED_REPEATED_SEARCH_MAX_STRIKES", "2")))
     detect_abnormal_trajectories = not evaluation and not rllm_deepresearch
     detect_eval_response_anomalies = evaluation
-    eval_max_tool_calls_per_turn = int(os.environ.get("FUSED_EVAL_MAX_TOOL_CALLS_PER_TURN", "1"))
 
     tools = [local_search_schema(), finish_schema()] if rllm_deepresearch else env.tools()
     model_name = getattr(state.tokenizer, "name_or_path", None) or getattr(args, "hf_checkpoint", None)
@@ -463,7 +464,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     eval_response_anomaly_info: dict[str, Any] = {}
     try:
         for step_idx in range(max_steps):
-            rollout_messages = _messages_without_historical_thinking(messages) if discard_historical_thinking else messages
+            rollout_messages = (
+                _messages_without_historical_thinking(messages, parser=parser)
+                if discard_historical_thinking
+                else messages
+            )
+            historical_thinking_discarded = rollout_messages != messages
             # Run the chat-template render off the event loop. The HF fast
             # tokenizer releases the GIL during tokenize, so offloading lets the
             # many concurrent trajectory coroutines actually overlap instead of
@@ -718,6 +724,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         done=True,
                         messages=rollout_messages if capture_eval_details else [],
                         tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -739,6 +746,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         done=True,
                         messages=rollout_messages if capture_eval_details else [],
                         tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -753,7 +761,6 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     response,
                     actions,
                     state.tokenizer,
-                    max_tool_calls_per_turn=eval_max_tool_calls_per_turn,
                     ngram_n=ngram_repetition_n,
                     ngram_threshold=ngram_repetition_threshold,
                     ngram_min_tokens=ngram_repetition_min_tokens,
@@ -772,6 +779,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             done=True,
                             messages=rollout_messages if capture_eval_details else [],
                             tito_context_reason=tito_context_reason,
+                            historical_thinking_discarded=historical_thinking_discarded,
                             llm_time=step_llm_time,
                             env_time=0.0,
                             disable_thinking=disable_thinking,
@@ -797,6 +805,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             done=True,
                             messages=rollout_messages if capture_eval_details else [],
                             tito_context_reason=tito_context_reason,
+                            historical_thinking_discarded=historical_thinking_discarded,
                             llm_time=step_llm_time,
                             env_time=0.0,
                             disable_thinking=disable_thinking,
@@ -873,6 +882,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         done=final_done,
                         messages=rollout_messages if capture_eval_details else [],
                         tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
                         llm_time=step_llm_time,
                         env_time=step_env_time,
                         disable_thinking=disable_thinking,
@@ -932,6 +942,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             done=True,
                             messages=rollout_messages if capture_eval_details else [],
                             tito_context_reason=tito_context_reason,
+                            historical_thinking_discarded=historical_thinking_discarded,
                             llm_time=step_llm_time,
                             env_time=0.0,
                             disable_thinking=disable_thinking,
@@ -966,6 +977,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         done=True,
                         messages=rollout_messages if capture_eval_details else [],
                         tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -1000,6 +1012,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         done=True,
                         messages=rollout_messages if capture_eval_details else [],
                         tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -1033,6 +1046,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         done=True,
                         messages=rollout_messages if capture_eval_details else [],
                         tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -1060,6 +1074,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         done=True,
                         messages=rollout_messages if capture_eval_details else [],
                         tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -1088,6 +1103,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             done=False,
                             messages=rollout_messages if capture_eval_details else [],
                             tito_context_reason=tito_context_reason,
+                            historical_thinking_discarded=historical_thinking_discarded,
                             llm_time=step_llm_time,
                             env_time=0.0,
                             disable_thinking=disable_thinking,
@@ -1123,6 +1139,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         done=True,
                         messages=rollout_messages if capture_eval_details else [],
                         tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -1172,6 +1189,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         done=True,
                         messages=rollout_messages if capture_eval_details else [],
                         tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
                         llm_time=step_llm_time,
                         env_time=0.0,
                         disable_thinking=disable_thinking,
@@ -1213,6 +1231,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         done=batch_done,
                         messages=rollout_messages if capture_eval_details else [],
                         tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
                         llm_time=step_llm_time,
                         env_time=step_env_time,
                         disable_thinking=disable_thinking,
@@ -1281,6 +1300,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     done=done,
                     messages=rollout_messages if capture_eval_details else [],
                     tito_context_reason=tito_context_reason,
+                    historical_thinking_discarded=historical_thinking_discarded,
                     llm_time=step_llm_time,
                     env_time=step_env_time,
                     disable_thinking=disable_thinking,
@@ -1380,6 +1400,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 timing=episode_timing,
                 steps=trajectory_steps,
                 task_type=env.mode,
+                discard_historical_thinking_enabled=discard_historical_thinking,
             )
         return [
             Sample(
@@ -1426,6 +1447,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         timing=episode_timing,
         steps=trajectory_steps,
         task_type=env.mode,
+        discard_historical_thinking_enabled=discard_historical_thinking,
     )
     samples = await asyncio.to_thread(
         manager.get_trajectory,
@@ -1485,7 +1507,6 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 "prompt_equal_loss": True,
                 "parent_traj_id": session_id,
                 "segment_count": segment_count,
-                "historical_thinking_discard_steps": sum(1 for step in trajectory_steps if (step.get("info") or {}).get("historical_thinking_discarded")),
             }
         )
     for segment_index, sample in enumerate(samples):
@@ -1730,7 +1751,7 @@ def _strip_trailing_chat_template_stop(text: str) -> str:
         stripped = without_ws[: -len("<|im_end|>")]
 
 
-def _content_without_historical_thinking(content: str) -> str:
+def _strip_historical_thinking(content: str) -> tuple[str, bool]:
     starts_with_thinking = _THINK_BLOCK_RE.match(content) is not None or _THOUGHT_CHANNEL_BLOCK_RE.match(content) is not None
     stripped = _THINK_BLOCK_RE.sub("", content)
     stripped = _THOUGHT_CHANNEL_BLOCK_RE.sub("", stripped)
@@ -1738,24 +1759,33 @@ def _content_without_historical_thinking(content: str) -> str:
     # prompt, so the recorded assistant content is ``thought</think>\n\nanswer``
     # with no opening tag and the closed-block regex never matches. Mirror the
     # template's own ``content.split('</think>')[-1]`` split: everything up to
-    # the last bare closer is reasoning. Any ``<think>`` opener still present
-    # here is an unclosed block (kept by design) and can only appear after the
-    # last closer, so it survives this cut.
+    # the last bare closer is reasoning.
     closers = list(_THINK_CLOSE_RE.finditer(stripped))
     if closers:
         stripped = stripped[closers[-1].end() :].lstrip("\n")
     elif starts_with_thinking:
         stripped = stripped.lstrip("\r\n")
-    return stripped
+
+    openers = [match for regex in (_THINK_OPEN_RE, _THOUGHT_CHANNEL_OPEN_RE) if (match := regex.search(stripped))]
+    if not openers:
+        return stripped, False
+    return stripped[: min(match.start() for match in openers)].rstrip(), True
 
 
-def _messages_without_historical_thinking(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _content_without_historical_thinking(content: str) -> str:
+    return _strip_historical_thinking(content)[0]
+
+
+def _messages_without_historical_thinking(messages: list[dict[str, Any]], *, parser=None) -> list[dict[str, Any]]:
     prepared = []
     for message in messages:
         if message.get("role") != "assistant" or not isinstance(message.get("content"), str):
             prepared.append(message)
             continue
-        content = _content_without_historical_thinking(message["content"])
+        original_content = message["content"]
+        content, had_unclosed_thinking = _strip_historical_thinking(original_content)
+        if had_unclosed_thinking and parser is not None and not message.get("tool_calls"):
+            content = "".join(parser.format_action(action) for action in parser.parse(original_content))
         prepared.append(message if content == message["content"] else {**message, "content": content})
     return prepared
 
@@ -1873,17 +1903,12 @@ def _eval_response_anomaly_info(
     actions: list[ToolCall],
     tokenizer,
     *,
-    max_tool_calls_per_turn: int,
     ngram_n: int,
     ngram_threshold: float,
     ngram_min_tokens: int,
 ) -> dict[str, Any]:
     anomalies = []
     info: dict[str, Any] = {}
-
-    if max_tool_calls_per_turn > 0 and len(actions) > max_tool_calls_per_turn:
-        anomalies.append("multiple_tool_calls")
-        info["multiple_tool_call_count"] = len(actions)
 
     normalized_response = response.lower()
     if any(marker in normalized_response for marker in ("<tool_response>", "</tool_response>", "<|tool_response>", "<tool_response|>")):
@@ -2541,6 +2566,7 @@ def _episode_step(
     env_time: float,
     disable_thinking: bool = False,
     tito_context_reason: str | None = None,
+    historical_thinking_discarded: bool = False,
 ) -> dict[str, Any]:
     info: dict[str, Any] = {
         "disable_thinking": bool(disable_thinking),
@@ -2552,12 +2578,9 @@ def _episode_step(
         },
     }
     if tito_context_reason is not None:
-        # How this step's served prompt relates to the TiTO accumulator; in
-        # particular "historical_thinking_discard" marks the turns where prior
-        # thinking was dropped from the served history (chat_completions above
-        # reflect that stripped view, i.e. what the policy actually saw).
+        # How this step's served prompt relates to the TiTO accumulator.
         info["tito_context_reason"] = tito_context_reason
-        info["historical_thinking_discarded"] = tito_context_reason == "historical_thinking_discard"
+    info["historical_thinking_discarded"] = bool(historical_thinking_discarded)
     return {
         "observation": observation,
         "thought": _extract_thought(response),
@@ -2652,6 +2675,7 @@ def _rllm_episode_dict(
     timing: dict[str, Any],
     steps: list[dict[str, Any]],
     task_type: str,
+    discard_historical_thinking_enabled: bool,
 ) -> dict[str, Any]:
     task_for_dump = _task_for_dump(task)
     episode_id = _episode_id(base_sample, task_for_dump)
@@ -2680,6 +2704,10 @@ def _rllm_episode_dict(
     metadata = {
         "reward_debug": reward_debug or {},
         "timing": timing,
+        "discard_historical_thinking_enabled": bool(discard_historical_thinking_enabled),
+        "historical_thinking_discard_steps": sum(
+            1 for step in steps if (step.get("info") or {}).get("historical_thinking_discarded")
+        ),
         **response_anomaly_info,
     }
     if credit_event is not None:

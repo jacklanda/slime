@@ -77,8 +77,52 @@ class AnswerExtraction:
 async def reward_func(args, sample_or_samples: Sample | list[Sample], **kwargs):
     _FINISH_PARSER.set(getattr(args, "hf_checkpoint", None))
     samples = sample_or_samples if isinstance(sample_or_samples, list) else [sample_or_samples]
-    rewards = [_score_sample(sample) for sample in samples]
+    rewards = []
+    for sample in samples:
+        reward = _score_sample(sample)
+        sample.metadata.setdefault("verification", get_verification_details(sample, score=reward))
+        rewards.append(reward)
     return rewards if isinstance(sample_or_samples, list) else rewards[0]
+
+
+def get_verification_details(
+    sample: Sample,
+    *,
+    score: float,
+    verifier: str = "rule",
+    model: str | None = None,
+    judge_json: Any = None,
+) -> dict[str, Any]:
+    """Return the answer evidence used by an evaluation verifier."""
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    data_source = str(metadata.get("data_source") or metadata.get("benchmark") or "").lower()
+    allow_plain_text = data_source not in {"browsecomp_plus", "frontierscience_research"}
+    extraction = _extract_final_answer_with_source(str(sample.response or ""), allow_plain_text=allow_plain_text)
+    prediction = extraction.text if extraction is not None else None
+    source = extraction.source if extraction is not None else None
+    if extraction is None:
+        episode = metadata.get("rllm_episode")
+        if isinstance(episode, dict):
+            episode_text = "\n".join(
+                str(step.get("model_response") or step.get("action") or "")
+                for trajectory in episode.get("trajectories", []) if isinstance(trajectory, dict)
+                for step in trajectory.get("steps", []) if isinstance(step, dict)
+            )
+            extraction = _extract_final_answer_with_source(episode_text, allow_plain_text=allow_plain_text)
+            if extraction is not None:
+                prediction, source = extraction.text, extraction.source
+    details: dict[str, Any] = {
+        "verifier": verifier,
+        "ground_truth": _reward_ground_truth(sample.label, metadata),
+        "prediction": prediction,
+        "prediction_source": source,
+        "score": float(score),
+    }
+    if model is not None:
+        details["model"] = model
+    if judge_json is not None:
+        details["judge_json"] = judge_json
+    return details
 
 
 def _score_sample(sample: Sample) -> float:

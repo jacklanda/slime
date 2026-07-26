@@ -86,7 +86,7 @@ Options:
   --eval-prompt-data NAME PATH [...]     Legacy eval dataset name/path pairs.
   --eval-max-response-len N              Eval-only max generated tokens. Default: 16384.
   --eval-max-prompt-len N                Eval-only max prompt tokens. Default: 23616.
-  --eval-max-context-len N               Eval-only context length. Default: prompt + response.
+  --eval-max-context-len N               Eval-only context length. Default: 40960.
   --val_before_train BOOL                Run one eval before training starts. Default: true.
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
   --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: false.
@@ -156,9 +156,9 @@ TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-3600}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-3600}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
-EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
-EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
-EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
+EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-38000}"
+EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-2048}"
+EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-40960}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
@@ -279,7 +279,7 @@ while [ "$#" -gt 0 ]; do
    esac
 done
 
-EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-$((EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN))}"
+EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-40960}"
 
 # Keep the option/env name for compatibility with older launch commands, but do
 # not allow this launcher to enable LexRank-based retrieval summaries.
@@ -475,9 +475,9 @@ if [ ! -d "${REF_LOAD}" ]; then
       --save "${REF_LOAD}"
 fi
 
-MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-38000}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
-MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-15472}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-24576}"
+MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
@@ -499,7 +499,7 @@ fi
 
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-${MAX_CONTEXT_LEN}}"
 if [ "${MAX_MODEL_LEN}" -ne "${MAX_CONTEXT_LEN}" ]; then
-   echo "MAX_MODEL_LEN=${MAX_MODEL_LEN} must equal MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH (${MAX_CONTEXT_LEN}) for this slime launcher." >&2
+   echo "MAX_MODEL_LEN=${MAX_MODEL_LEN} must equal MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN} for this slime launcher." >&2
    exit 2
 fi
 if [ "${MAX_TOKENS_PER_GPU}" -lt "${MAX_CONTEXT_LEN}" ]; then
@@ -726,6 +726,13 @@ if [ "${USE_WANDB:-1}" = "1" ]; then
       --wandb-group "${WANDB_GROUP:-${EXPERIMENT_NAME}}"
       --disable-wandb-random-suffix
    )
+   # Resume an existing wandb run (same curves) instead of creating a new one.
+   if [ -n "${WANDB_RUN_ID:-}" ]; then
+      WANDB_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")
+      if is_truthy "${WANDB_SKIP_RESUME_FIRST_STEP:-1}"; then
+         WANDB_ARGS+=(--wandb-skip-resume-first-step)
+      fi
+   fi
 fi
 
 MISC_ARGS=(
@@ -799,7 +806,7 @@ export FUSED_WEB_SEARCH_MAX_STEPS="${FUSED_WEB_SEARCH_MAX_STEPS:-${WEB_SEARCH_MA
 export FUSED_CLI_MAX_STEPS="${CLI_MAX_STEPS}"
 export FUSED_TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT}"
 export FUSED_EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT}"
-export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-1024}"
+export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-24576}"
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE}"
 export SLIME_FUSED_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS}"
@@ -848,7 +855,7 @@ export SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER="${SLIME_FUSED_QUOTA_CANDIDATE_MUL
 RUNTIME_ENV_JSON=$(python3 - <<PY
 import json, os
 keys = (
-    "HYDRA_FULL_ERROR", "NCCL_IB_DISABLE", "NCCL_TIMEOUT",
+    "CUDA_HOME", "HYDRA_FULL_ERROR", "NCCL_IB_DISABLE", "NCCL_TIMEOUT",
     "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL", "OPENROUTER_APP_NAME",
     "SLIME_EPISODE_LOG_DIR",
     "RAY_WARN_BLOCKING_GET_INSIDE_ASYNC", "TOKENIZERS_PARALLELISM",

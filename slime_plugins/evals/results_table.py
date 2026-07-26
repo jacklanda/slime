@@ -9,6 +9,7 @@ import numpy as np
 from slime.ray.rollout import (
     _compute_eval_source_metrics,
     _eval_dataset_group_size,
+    _eval_source_from_sample,
     _eval_sample_steps,
     _eval_sample_tool_calls,
 )
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 _BENCHMARK_COLUMN = ("Benchmark", 21, "<")
 _METRIC_COLUMN_WIDTH = 15
 _COUNT_COLUMNS = (("# steps", "steps", 10, ">"), ("# tool calls", "tool_calls", 12, ">"))
+_ABNORMAL_COLUMN = ("# abnormal / all", "abnormal", 16, ">")
 
 
 def log_eval_results_table(rollout_id: int, args: Any, data: dict[str, Any], extra_metrics: dict[str, Any] | None) -> bool:
@@ -29,14 +31,16 @@ def log_eval_results_table(rollout_id: int, args: Any, data: dict[str, Any], ext
 
 
 def format_eval_results_table(args: Any, data: dict[str, Any]) -> str:
-    rows: list[tuple[str, dict[str, float]]] = []
+    rows: list[tuple[str, dict[str, float | str]]] = []
     for dataset_name, dataset_data in data.items():
         rewards = dataset_data["rewards"]
         group_size = _eval_dataset_group_size(args, dataset_name)
         dataset_metrics = compute_pass_at_k_and_pass_all(flat_rewards=rewards, group_size=group_size)
-        source_metrics = {}
+        source_metrics: dict[str, float | str] = {}
         if (samples := dataset_data.get("samples")) is not None:
             source_metrics = _compute_eval_source_metrics(samples, rewards, group_size)
+            dataset_metrics["abnormal"] = _format_abnormal_count(samples, group_size)
+            source_metrics.update(_source_abnormal_counts(samples, group_size))
             steps = [value for sample in samples if (value := _eval_sample_steps(sample)) is not None]
             if steps:
                 dataset_metrics["steps"] = float(np.mean(steps))
@@ -54,7 +58,7 @@ def format_eval_results_table(args: Any, data: dict[str, Any]) -> str:
     return _render_table(rows)
 
 
-def _source_rows(metrics: dict[str, float]) -> list[tuple[str, dict[str, float]]]:
+def _source_rows(metrics: dict[str, float | str]) -> list[tuple[str, dict[str, float | str]]]:
     source_names: list[str] = []
     for key in metrics:
         parts = key.split("/")
@@ -65,11 +69,11 @@ def _source_rows(metrics: dict[str, float]) -> list[tuple[str, dict[str, float]]
 
 def _result_row(
     name: str,
-    metrics: dict[str, float],
+    metrics: dict[str, float | str],
     prefix: str = "",
-) -> tuple[str, dict[str, float]] | None:
+) -> tuple[str, dict[str, float | str]] | None:
     row_metrics = {
-        key.removeprefix(prefix): float(value)
+        key.removeprefix(prefix): value if key.removeprefix(prefix) == "abnormal" else float(value)
         for key, value in metrics.items()
         if key.startswith(prefix) and _is_table_metric_key(key.removeprefix(prefix))
     }
@@ -78,12 +82,13 @@ def _result_row(
     return (name, row_metrics)
 
 
-def _render_table(rows: list[tuple[str, dict[str, float]]]) -> str:
+def _render_table(rows: list[tuple[str, dict[str, float | str]]]) -> str:
     metric_keys = _table_metric_keys(rows)
     columns = (
         _BENCHMARK_COLUMN,
         *[(f"{key.replace('/', ' ')} (%)", _METRIC_COLUMN_WIDTH, ">") for key in metric_keys],
         *[(header, width, align) for header, _, width, align in _COUNT_COLUMNS],
+        (_ABNORMAL_COLUMN[0], _ABNORMAL_COLUMN[2], _ABNORMAL_COLUMN[3]),
     )
     header = _render_cells(tuple(column[0] for column in columns), columns)
     heavy_rule = "  ".join("━" * width for _, width, _ in columns)
@@ -93,7 +98,8 @@ def _render_table(rows: list[tuple[str, dict[str, float]]]) -> str:
         name, metrics = row
         values = tuple(_format_metric(metrics[key]) if key in metrics else "" for key in metric_keys)
         counts = tuple(_format_count(metrics[key]) if key in metrics else "" for _, key, _, _ in _COUNT_COLUMNS)
-        lines.append(_render_cells((name, *values, *counts), columns))
+        abnormal = str(metrics.get(_ABNORMAL_COLUMN[1], ""))
+        lines.append(_render_cells((name, *values, *counts, abnormal), columns))
         if index != len(rows) - 1:
             lines.append(light_rule)
     return "\n".join(lines)
@@ -106,20 +112,24 @@ def _render_cells(values: tuple[str, ...], columns: tuple[tuple[str, int, str], 
     return "  ".join(cells)
 
 
-def _format_metric(value: float) -> str:
-    return f"{value * 100:.1f}"
+def _format_metric(value: float | str) -> str:
+    return f"{float(value) * 100:.1f}"
 
 
-def _format_count(value: float) -> str:
-    return f"{value:.1f}"
+def _format_count(value: float | str) -> str:
+    return f"{float(value):.1f}"
 
 
 def _is_table_metric_key(key: str) -> bool:
-    return re.fullmatch(r"pass[@^]\d+/(mean|std)", key) is not None or key in {"steps", "tool_calls"}
+    return re.fullmatch(r"pass[@^]\d+/(mean|std)", key) is not None or key in {
+        "steps",
+        "tool_calls",
+        "abnormal",
+    }
 
 
-def _table_metric_keys(rows: list[tuple[str, dict[str, float]]]) -> list[str]:
-    keys = {key for _, metrics in rows for key in metrics if key not in {"steps", "tool_calls"}}
+def _table_metric_keys(rows: list[tuple[str, dict[str, float | str]]]) -> list[str]:
+    keys = {key for _, metrics in rows for key in metrics if key not in {"steps", "tool_calls", "abnormal"}}
     return sorted(keys, key=_metric_key_sort_key)
 
 
@@ -131,3 +141,27 @@ def _metric_key_sort_key(key: str) -> tuple[int, int, int]:
     symbol_order = 0 if symbol == "@" else 1
     stat_order = 0 if stat == "mean" else 1
     return (symbol_order, int(k), stat_order)
+
+
+def _format_abnormal_count(samples: list[Any], group_size: int) -> str:
+    group_size = max(1, group_size)
+    groups = [samples[start : start + group_size] for start in range(0, len(samples), group_size)]
+    abnormal = sum(any(_eval_sample_is_abnormal(sample) for sample in group) for group in groups)
+    return f"{abnormal} / {len(groups)}"
+
+
+def _source_abnormal_counts(samples: list[Any], group_size: int) -> dict[str, str]:
+    samples_by_source: dict[str, list[Any]] = {}
+    for sample in samples:
+        if source := _eval_source_from_sample(sample):
+            samples_by_source.setdefault(source, []).append(sample)
+    return {
+        f"{source}/abnormal": _format_abnormal_count(source_samples, group_size)
+        for source, source_samples in samples_by_source.items()
+    }
+
+
+def _eval_sample_is_abnormal(sample: Any) -> bool:
+    metadata = sample.metadata if isinstance(getattr(sample, "metadata", None), dict) else {}
+    reason = metadata.get("fused_termination") or metadata.get("termination_reason")
+    return reason is not None and str(reason).strip().lower() != "env_done"

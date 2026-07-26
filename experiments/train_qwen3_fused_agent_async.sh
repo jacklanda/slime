@@ -20,7 +20,7 @@ Options:
   --model PATH                           HF model path.
   --disable-thinking BOOL                Stored in env for compatible fused code.
   --discard-historical-thinking BOOL     Remove prior assistant <think> blocks before each new rollout step.
-                                         Effective only when --disable-thinking is false. Default: false.
+                                         Effective only when --disable-thinking is false. Default: true.
   --mcp-disable-step-penalty BOOL        MCP verifier step-penalty env.
   --unified-system-prompt                Select unified_gem harness unless --harness is set later.
   --no-unified-system-prompt             Select gem harness unless --harness is set later.
@@ -29,7 +29,7 @@ Options:
                                          Recycle partial rollouts during abort/sync.
   --terminal-log-style STYLE             progress, rollouts, or both. Stored in env for compatible fused code.
   --show-rollout-progress-logs BOOL      Show periodic fused rollout request/progress logs. Default: false.
-  --accepted-group-update-min-groups N   Maps to ROLLOUT_BATCH_SIZE by default.
+  --accepted-group-update-min-groups N   Also sets ROLLOUT_BATCH_SIZE when explicitly passed.
   --accepted-group-update-max-groups N   Stored in env for compatible fused code.
   --micro-batch-size N                   Training micro-batch size.
   --update-weights-interval N            Rollout weight update interval. Default: 1.
@@ -69,37 +69,39 @@ Options:
                                          Penalize turns that contain both a non-finish tool call and boxed/submit answer. Default: true.
   --credit-assignment-tail-guard-early-stop BOOL
                                          Stored in env for compatible fused code.
-  --horizon-reward-shaping BOOL         Enable bounded horizon penalty reward shaping. Default: false.
+  --horizon-reward-shaping BOOL         Enable bounded horizon penalty reward shaping. Default: true.
   --horizon-reward-min-multiplier X      Correct low-horizon reward multiplier floor. Default: 0.2.
   --horizon-reward-gamma X               Horizon progress exponent. Default: 1.0.
   --horizon-reward-step-weight X         Step progress weight. Default: 0.7.
   --horizon-reward-tool-call-weight X    Tool-call progress weight. Default: 0.3.
-  --horizon-reward-target-steps X        Target steps for no horizon penalty. Default: 8.
+  --horizon-reward-target-steps X        Target steps for no horizon penalty. Default: 32.
   --horizon-reward-target-tool-calls X   Target tool calls for no horizon penalty. Default: target_steps - 1.
   --enable-dynamic-sampling-filter BOOL  Enable DAPO-style non-zero reward variance dynamic filtering. Default: true.
+  --normalize-advantages / --no-normalize-advantages
+                                         Whiten advantages across the data-parallel batch. Default: enabled.
   --max-steps N                          Fused agent max steps. Default: 128.
   --mcp-max-steps N                      Fused MCP max steps. Default: 128.
   --web-search-max-steps N               Fused web-search max steps. Default: 128.
   --cli-max-steps N                      CLI fused agent max steps env.
   --trajectory-timeout N                 Fused trajectory timeout env.
   --eval-trajectory-timeout N            Fused eval trajectory timeout env.
-  --eval-interval N                      Run interval eval every N rollout steps. Default: 300.
+  --eval-interval N                      Run interval eval every N rollout steps. Default: 10.
   --eval-config PATH                     Structured slime eval dataset config. Default: experiments/eval_fused_agent_benchmarks.yaml.
   --eval-prompt-data NAME PATH [...]     Legacy eval dataset name/path pairs.
-  --eval-max-response-len N              Eval-only max generated tokens. Default: 16384.
-  --eval-max-prompt-len N                Eval-only max prompt tokens. Default: 23616.
-  --eval-max-context-len N               Eval-only context length. Default: prompt + response.
+  --eval-max-response-len N              Eval-only max generated tokens. Default: 4096.
+  --eval-max-prompt-len N                Eval-only max prompt tokens. Default: 35952.
+  --eval-max-context-len N               Eval-only context length. Default: 40960.
   --val_before_train BOOL                Run one eval before training starts. Default: false.
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
   --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
-  --grm-model NAME                       OpenRouter judge model. Default: deepseek/deepseek-v4-flash.
+  --grm-model NAME                       OpenRouter judge model. Default: google/gemini-3-flash-preview.
   --grm-concurrency N                    Max concurrent GRM requests. Default: 512.
   --grm-timeout SECONDS                  GRM request timeout. Default: 60.
-  --grm-max-retries N                    GRM retry attempts. Default: 4.
+  --grm-max-retries N                    GRM retry attempts. Default: 8.
   --grm-max-input-tokens N               Maximum GRM input content tokens. Default: 30000.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 2048.
-  --sglang-max-running-requests N        SGLang max running requests. Default: 2048.
+  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 1024.
+  --sglang-max-running-requests N        SGLang max running requests. Default: 512.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
 EOF
@@ -117,8 +119,8 @@ PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-true}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
-DISABLE_THINKING="${DISABLE_THINKING:-true}"
-DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
+DISABLE_THINKING="${DISABLE_THINKING:-false}"
+DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-true}"
 ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS:-128}"  # 128 for w/o group filtering
 ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
 ASYNC_MINI_BATCH_SIZE="${ASYNC_MINI_BATCH_SIZE:-128}"
@@ -145,12 +147,13 @@ CREDIT_ASSIGNMENT_SEARCH_BYPASS="${CREDIT_ASSIGNMENT_SEARCH_BYPASS:-True}"
 CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL:-True}"
 CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER:-True}"
 CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP:-False}"
-HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
+HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-true}"
+NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
 FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT="${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT:-0.3}"
-FUSED_HORIZON_REWARD_TARGET_STEPS="${FUSED_HORIZON_REWARD_TARGET_STEPS:-8}"
+FUSED_HORIZON_REWARD_TARGET_STEPS="${FUSED_HORIZON_REWARD_TARGET_STEPS:-32}"
 FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS="${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-}"
 MAX_STEPS="${MAX_STEPS:-128}"
 MCP_MAX_STEPS="${MCP_MAX_STEPS:-128}"
@@ -158,21 +161,21 @@ WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-128}"
 CLI_MAX_STEPS="${CLI_MAX_STEPS:-128}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-7200}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-300}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
 EVAL_CONFIG="${EVAL_CONFIG:-experiments/eval_fused_agent_benchmarks.yaml}"
-EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
-EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-23616}"
+EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-2048}"
+EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-38000}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-false}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
-GRM_MODEL="${GRM_MODEL:-deepseek/deepseek-v4-flash}"
+GRM_MODEL="${GRM_MODEL:-google/gemini-3-flash-preview}"
 GRM_CONCURRENCY="${GRM_CONCURRENCY:-512}"
-GRM_MAX_CONNECTIONS="${GRM_MAX_CONNECTIONS:-128}"
+GRM_MAX_CONNECTIONS="${GRM_MAX_CONNECTIONS:-512}"
 GRM_TIMEOUT="${GRM_TIMEOUT:-60}"
-GRM_MAX_RETRIES="${GRM_MAX_RETRIES:-4}"
+GRM_MAX_RETRIES="${GRM_MAX_RETRIES:-8}"
 GRM_RETRY_BASE_DELAY="${GRM_RETRY_BASE_DELAY:-1}"
 GRM_RETRY_MAX_DELAY="${GRM_RETRY_MAX_DELAY:-16.0}"
 GRM_MAX_INPUT_TOKENS="${GRM_MAX_INPUT_TOKENS:-30000}"
@@ -180,8 +183,8 @@ GRM_MAX_NEW_TOKENS="${GRM_MAX_NEW_TOKENS:-128}"
 GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.6}"
 GRM_FAILURE_REWARD="${GRM_FAILURE_REWARD:-0.0}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-2048}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-2048}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-1024}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-512}"
 harness_explicit=false
 
 while [ "$#" -gt 0 ]; do
@@ -199,7 +202,7 @@ while [ "$#" -gt 0 ]; do
       --no-partial-rollout) PARTIAL_ROLLOUT=false; shift ;;
       --terminal-log-style) TERMINAL_LOG_STYLE="${2:?Missing value for --terminal-log-style}"; shift 2 ;;
       --show-rollout-progress-logs) SHOW_ROLLOUT_PROGRESS_LOGS="${2:?Missing value for --show-rollout-progress-logs}"; shift 2 ;;
-      --accepted-group-update-min-groups) ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${2:?Missing value for --accepted-group-update-min-groups}"; shift 2 ;;
+      --accepted-group-update-min-groups) ACCEPTED_GROUP_UPDATE_MIN_GROUPS="${2:?Missing value for --accepted-group-update-min-groups}"; ROLLOUT_BATCH_SIZE="${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}"; shift 2 ;;
       --accepted-group-update-max-groups) ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${2:?Missing value for --accepted-group-update-max-groups}"; shift 2 ;;
       --micro-batch-size) MICRO_BATCH_SIZE="${2:?Missing value for --micro-batch-size}"; shift 2 ;;
       --update-weights-interval) UPDATE_WEIGHTS_INTERVAL="${2:?Missing value for --update-weights-interval}"; shift 2 ;;
@@ -243,6 +246,8 @@ while [ "$#" -gt 0 ]; do
       --horizon-reward-target-steps) FUSED_HORIZON_REWARD_TARGET_STEPS="${2:?Missing value for --horizon-reward-target-steps}"; shift 2 ;;
       --horizon-reward-target-tool-calls) FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS="${2:?Missing value for --horizon-reward-target-tool-calls}"; shift 2 ;;
       --enable-dynamic-sampling-filter) ENABLE_DYNAMIC_SAMPLING_FILTER="${2:?Missing value for --enable-dynamic-sampling-filter}"; shift 2 ;;
+      --normalize-advantages) NORMALIZE_ADVANTAGES=true; shift ;;
+      --no-normalize-advantages) NORMALIZE_ADVANTAGES=false; shift ;;
       --max-steps) MAX_STEPS="${2:?Missing value for --max-steps}"; shift 2 ;;
       --mcp-max-steps) MCP_MAX_STEPS="${2:?Missing value for --mcp-max-steps}"; shift 2 ;;
       --web-search-max-steps) WEB_SEARCH_MAX_STEPS="${2:?Missing value for --web-search-max-steps}"; shift 2 ;;
@@ -285,7 +290,7 @@ while [ "$#" -gt 0 ]; do
    esac
 done
 
-EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-$((EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN))}"
+EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-40960}"
 
 # Keep the option/env name for compatibility with older launch commands, but do
 # not allow this launcher to enable LexRank-based retrieval summaries.
@@ -306,8 +311,9 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 default_experiment_name() {
+   local prefix="fused-dapo-q3-4b-rft-dht-gem-async-dev"  # w/ rft warmup
    #local prefix="fused-dapo-q3-4b-no_think-gem-async-dev"
-   local prefix="asearcher-dapo-q3-4b-no_think-gem-async-dev"
+   #local prefix="asearcher-dapo-q3-4b-no_think-gem-async-dev"
    #local prefix="asearcher-dapo-q3-8b-no_think-gem-async-dev"
    #local prefix="webqa-dapo-q3-4b-no_think-gem-async-dev0"
    local max_dev=-1
@@ -358,8 +364,10 @@ if [ "${DEFAULT_TP_SIZE}" -gt "${ACTOR_GPUS}" ]; then
 fi
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/GEM/Qwen3-4B-RFT-Warmup-v0}"  # init RL training with a self-distil warmup ckpt
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/checkpoints/FusedRL/${EXPERIMENT_NAME}}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
@@ -374,9 +382,10 @@ else
    # TRAIN_FILES as the source of truth; only build a prepared parquet when
    # multiple source files need to be merged.
    TRAIN_FILES=(
-      #"${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
-      #"${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
-      "${SCRIPT_DIR}/artifacts/asearcher.parquet"
+      "${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
+      "${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
+      #"${SCRIPT_DIR}/artifacts/asearcher.parquet"
+      #"${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet"
    )
 fi
 SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
@@ -429,8 +438,9 @@ if [ "${#RESOLVED_TRAIN_FILES[@]}" -eq 1 ]; then
 else
    PROMPT_DATA_FOR_SLIME="${PREPARED_PROMPT_DATA:-${LOG_ROOT}/prepared_train.parquet}"
    mkdir -p "$(dirname "${PROMPT_DATA_FOR_SLIME}")"
-   python3 - "${PROMPT_DATA_FOR_SLIME}" "${SHUFFLE_TRAIN_DATA}" "${SHUFFLE_SEED}" "${RESOLVED_TRAIN_FILES[@]}" <<'PY'
+   python3 - "${PROMPT_DATA_FOR_SLIME}" "${SHUFFLE_TRAIN_DATA}" "${SHUFFLE_SEED}" "${REPO_ROOT}" "${BASE_DIR}/rllm" "${RESOLVED_TRAIN_FILES[@]}" <<'PY'
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -440,7 +450,9 @@ import pyarrow.parquet as pq
 output = Path(sys.argv[1])
 shuffle = sys.argv[2].lower() in {"1", "true", "yes", "on"}
 seed = int(sys.argv[3])
-paths = [Path(p) for p in sys.argv[4:]]
+repo_root = Path(sys.argv[4])
+rllm_root = Path(sys.argv[5])
+paths = [Path(p) for p in sys.argv[6:]]
 
 tables = [pq.read_table(path) for path in paths]
 schema = pa.unify_schemas([table.schema for table in tables], promote_options="permissive")
@@ -461,6 +473,37 @@ for table in tables:
     aligned.append(pa.table(arrays, names=all_columns))
 
 combined = pa.concat_tables(aligned, promote_options="default")
+
+missing_mcp_tools = Counter()
+keep_rows = []
+for data_source, extra_info in zip(combined["data_source"].to_pylist(), combined["extra_info"].to_pylist()):
+    if str(data_source).lower() != "mcp":
+        keep_rows.append(True)
+        continue
+
+    extra_info = extra_info or {}
+    tools_py = extra_info.get("tools_py")
+    if not tools_py and extra_info.get("data_root"):
+        tools_py = str(Path(extra_info["data_root"]) / "tools.py")
+    if not tools_py:
+        missing_mcp_tools["<missing tools_py>"] += 1
+        keep_rows.append(False)
+        continue
+
+    tools_path = Path(tools_py)
+    candidates = [tools_path] if tools_path.is_absolute() else [
+        repo_root / tools_path,
+        repo_root / "experiments" / "fused" / "assets" / tools_path.name,
+        rllm_root / tools_path,
+    ]
+    resolved = any(candidate.is_file() for candidate in candidates)
+    keep_rows.append(resolved)
+    if not resolved:
+        missing_mcp_tools[str(tools_py)] += 1
+
+if missing_mcp_tools:
+    combined = combined.filter(pa.array(keep_rows, type=pa.bool_()))
+
 if shuffle and combined.num_rows:
     indices = pa.array(np.random.default_rng(seed).permutation(combined.num_rows), type=pa.int64())
     combined = combined.take(indices)
@@ -475,6 +518,10 @@ print(f"Rows: {combined.num_rows}")
 print("Inputs:")
 for path, table in zip(paths, tables):
     print(f"  {path}: {table.num_rows}")
+if missing_mcp_tools:
+    print(f"Dropped unresolved MCP rows: {sum(missing_mcp_tools.values())}")
+    for tools_py, count in sorted(missing_mcp_tools.items()):
+        print(f"  {tools_py}: {count}")
 print(f"Shuffle: {shuffle} seed={seed}")
 PY
 fi
@@ -503,15 +550,15 @@ if [ ! -d "${REF_LOAD}" ]; then
       --save "${REF_LOAD}"
 fi
 
-MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-38000}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
-MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-15472}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-24576}"
+MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-64}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
-NUM_EPOCH="${NUM_EPOCH:-100}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
 EFFECTIVE_GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT / NUM_STEPS_PER_ROLLOUT))}"
 ENABLE_DYNAMIC_SAMPLING_FILTER="${ENABLE_DYNAMIC_SAMPLING_FILTER:-true}"
 DYNAMIC_SAMPLING_FILTER_PATH="${DYNAMIC_SAMPLING_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
@@ -528,7 +575,7 @@ fi
 
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-${MAX_CONTEXT_LEN}}"
 if [ "${MAX_MODEL_LEN}" -ne "${MAX_CONTEXT_LEN}" ]; then
-   echo "MAX_MODEL_LEN=${MAX_MODEL_LEN} must equal MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH (${MAX_CONTEXT_LEN}) for this slime launcher." >&2
+   echo "MAX_MODEL_LEN=${MAX_MODEL_LEN} must equal MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN} for this slime launcher." >&2
    exit 2
 fi
 if [ "${MAX_TOKENS_PER_GPU}" -lt "${MAX_CONTEXT_LEN}" ]; then
@@ -551,9 +598,6 @@ if [ "${TRAIN_NUM_ROWS}" -le 0 ]; then
    echo "Prompt data has no rows: ${PROMPT_DATA_FOR_SLIME}" >&2
    exit 2
 fi
-AUTO_NUM_ROLLOUT=$(( (TRAIN_NUM_ROWS + ROLLOUT_BATCH_SIZE - 1) / ROLLOUT_BATCH_SIZE * NUM_EPOCH ))
-NUM_ROLLOUT="${NUM_ROLLOUT:-${AUTO_NUM_ROLLOUT}}"
-
 CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}"
    --ref-load "${REF_LOAD}"
@@ -596,7 +640,7 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len "${MAX_CONTEXT_LEN}"
    --rollout-max-prompt-len "${MAX_PROMPT_LENGTH}"
    --rollout-max-response-len "${MAX_RESPONSE_LENGTH}"
-   --rollout-temperature "${TEMPERATURE:-1.0}"
+   --rollout-temperature "${TEMPERATURE:-0.8}"
    --rollout-top-p "${TOP_P:-1.0}"
 
    --global-batch-size "${EFFECTIVE_GLOBAL_BATCH_SIZE}"
@@ -719,13 +763,16 @@ fi
 
 GRPO_ARGS=(
    --advantage-estimator "${ADVANTAGE_ESTIMATOR:-grpo}"
-   --kl-coef "${KL_COEF:-0.01}"
+   --kl-coef "${KL_COEF:-0.03}"
    --kl-loss-coef "${KL_LOSS_COEF:-0.00}"
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF:-0.00}"
    --eps-clip "${EPS_CLIP:-0.2}"
    --eps-clip-high "${EPS_CLIP_HIGH:-0.28}"
 )
+if is_truthy "${NORMALIZE_ADVANTAGES}"; then
+   GRPO_ARGS+=(--normalize-advantages)
+fi
 
 # Rollout correction defaults:
 # - TIS (Truncated Importance Sampling): soft correction. It multiplies pg_loss
@@ -777,6 +824,9 @@ if [ "${USE_WANDB:-1}" = "1" ]; then
    # Resume an existing wandb run (same curves) instead of creating a new one.
    if [ -n "${WANDB_RUN_ID:-}" ]; then
       WANDB_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")
+      if is_truthy "${WANDB_SKIP_RESUME_FIRST_STEP:-1}"; then
+         WANDB_ARGS+=(--wandb-skip-resume-first-step)
+      fi
    fi
 fi
 
@@ -819,7 +869,7 @@ export RETRIEVAL_SERVER_URL="${RETRIEVAL_SERVER_URL:-http://10.2.152.50:65432}"
 export RLLM_RETRIEVAL_MODE="${RLLM_RETRIEVAL_MODE:-hybrid}"
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
 export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-${RLLM_RETRIEVAL_MAX_RESULTS:-4}}"
-export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-1}"
+export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-3}"
 export RLLM_RETRIEVAL_SUMMARIZE="${RLLM_RETRIEVAL_SUMMARIZE:-0}"
 export RLLM_RETRIEVAL_RETRY_BUDGET="${RLLM_RETRIEVAL_RETRY_BUDGET:-8}"
 export RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET="${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET:-32}"
@@ -850,7 +900,7 @@ export FUSED_WEB_SEARCH_MAX_STEPS="${FUSED_WEB_SEARCH_MAX_STEPS:-${WEB_SEARCH_MA
 export FUSED_CLI_MAX_STEPS="${CLI_MAX_STEPS}"
 export FUSED_TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT}"
 export FUSED_EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT}"
-export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-2048}"
+export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-24576}"
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE}"
 export SLIME_FUSED_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS}"
@@ -874,15 +924,6 @@ export CREDIT_ASSIGNMENT_SEARCH_BYPASS="${CREDIT_ASSIGNMENT_SEARCH_BYPASS}"
 export CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL}"
 export CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER}"
 export CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_ENABLE="${CREDIT_ASSIGNMENT_ENABLE}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR="${CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY="${CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS="${CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_NGRAM_REPETITION="${CREDIT_ASSIGNMENT_NGRAM_REPETITION}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_SEARCH_BYPASS="${CREDIT_ASSIGNMENT_SEARCH_BYPASS}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER}"
-export SLIME_FUSED_CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP}"
 export FUSED_FILTER_MIN_MEAN_STEPS="${FUSED_FILTER_MIN_MEAN_STEPS:-0}"
 export FUSED_FILTER_MIN_MCP_MEAN_STEPS="${FUSED_FILTER_MIN_MCP_MEAN_STEPS:-0}"
 export FUSED_FILTER_MAX_ABNORMAL_RATIO="${FUSED_FILTER_MAX_ABNORMAL_RATIO:-0}"
@@ -899,7 +940,7 @@ export SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER="${SLIME_FUSED_QUOTA_CANDIDATE_MUL
 RUNTIME_ENV_JSON=$(python3 - <<PY
 import json, os
 keys = (
-    "HYDRA_FULL_ERROR", "NCCL_IB_DISABLE", "NCCL_TIMEOUT",
+    "CUDA_HOME", "HYDRA_FULL_ERROR", "NCCL_IB_DISABLE", "NCCL_TIMEOUT",
     "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL", "OPENROUTER_APP_NAME",
     "SLIME_EPISODE_LOG_DIR",
     "RAY_WARN_BLOCKING_GET_INSIDE_ASYNC", "TOKENIZERS_PARALLELISM",
@@ -932,14 +973,6 @@ keys = (
     "CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD", "CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS",
     "CREDIT_ASSIGNMENT_SEARCH_BYPASS", "CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL",
     "CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER", "CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_ENABLE", "SLIME_FUSED_CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_NGRAM_REPETITION",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_SEARCH_BYPASS",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER",
-    "SLIME_FUSED_CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP",
     "FUSED_FILTER_MIN_MEAN_STEPS", "FUSED_FILTER_MIN_MCP_MEAN_STEPS",
     "FUSED_FILTER_MAX_ABNORMAL_RATIO",
     "FUSED_HORIZON_REWARD_MIN_MULTIPLIER", "FUSED_HORIZON_REWARD_GAMMA",
@@ -960,7 +993,7 @@ echo "Experiment: ${EXPERIMENT_NAME}"
 echo "Model: ${MODEL_DIR}"
 echo "Ref: ${REF_LOAD}"
 echo "Prompt data: ${PROMPT_DATA_FOR_SLIME}"
-echo "Train rows: ${TRAIN_NUM_ROWS}; rollout_batch_size=${ROLLOUT_BATCH_SIZE}; num_epoch=${NUM_EPOCH}; num_rollout=${NUM_ROLLOUT}"
+echo "Train rows: ${TRAIN_NUM_ROWS}; rollout_batch_size=${ROLLOUT_BATCH_SIZE}; over_sampling_batch_size=${OVER_SAMPLING_BATCH_SIZE}; samples_per_prompt=${N_SAMPLES_PER_PROMPT}; num_rollout=${NUM_ROLLOUT}"
 echo "Save dir: ${SAVE_DIR}"
 echo "Log root: ${LOG_ROOT}"
 echo "Episode dump root: ${EPISODE_LOG_DIR} (train/ and evals/)"
@@ -977,6 +1010,7 @@ echo "Accepted groups: min=${ACCEPTED_GROUP_UPDATE_MIN_GROUPS}, max=${ACCEPTED_G
 echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}, grm=${ENABLE_USE_GRM_EVALS}"
 echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, relax_after_groups=${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}"
+echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, normalize_advantages=${NORMALIZE_ADVANTAGES}, kl_coef=${KL_COEF:-0.03}, lr=${LR:-2e-6}, eps_clip=${EPS_CLIP:-0.2}, eps_clip_high=${EPS_CLIP_HIGH:-0.28}"
 echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING:-0}, path=${BUFFER_FILTER_PATH:-${ENABLE_QUOTA_BUCKET_SAMPLING:+slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps}}"
 echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}"
 echo "Horizon reward shaping: enable=${HORIZON_REWARD_SHAPING}, min_multiplier=${FUSED_HORIZON_REWARD_MIN_MULTIPLIER}, gamma=${FUSED_HORIZON_REWARD_GAMMA}, step_weight=${FUSED_HORIZON_REWARD_STEP_WEIGHT}, tool_call_weight=${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT}, target_steps=${FUSED_HORIZON_REWARD_TARGET_STEPS}, target_tool_calls=${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-target_steps-1}"

@@ -54,7 +54,7 @@ def log_perf_data_raw(
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
-    logging_utils.log(args, log_dict, step_key="rollout/step")
+    logging_utils.log(args, log_dict, step_key="rollout/step", rollout_id=rollout_id)
 
 
 def _compute_rllm_timing_metrics(log_dict: dict, seq_lens: list[int]) -> dict[str, float]:

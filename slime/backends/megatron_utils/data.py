@@ -233,7 +233,7 @@ def gather_log_data(
     # Calculate step once to avoid duplication
     step = compute_rollout_step(args, rollout_id)
     reduced_log_dict["rollout/step"] = step
-    logging_utils.log(args, reduced_log_dict, step_key="rollout/step")
+    logging_utils.log(args, reduced_log_dict, step_key="rollout/step", rollout_id=rollout_id)
     return reduced_log_dict
 
 

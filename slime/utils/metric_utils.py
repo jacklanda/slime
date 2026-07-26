@@ -160,7 +160,11 @@ def has_repetition(text: str):
         return False
 
 
+def compute_train_step(args, rollout_id):
+    return rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+
+
 def compute_rollout_step(args, rollout_id):
     if args.wandb_always_use_train_step:
-        return rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+        return compute_train_step(args, rollout_id)
     return rollout_id
