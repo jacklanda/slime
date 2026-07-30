@@ -1,0 +1,20 @@
+# Optional A/B policy: vanilla-style token TIS with a deliberately wide RS
+# guardrail. Select with ROLLOUT_CORRECTION_CONFIG=experiments/fused_agent_tis_wide_rs.yaml.
+# The default launcher does not use hard rejection.
+
+use_tis: true
+tis_level: "token"
+tis_mode: "truncate"
+tis_lower_bound: 0.5
+tis_upper_bound: 2.0
+
+use_rs: true
+rs_level: "token"
+rs_lower_bound: 0.25
+rs_upper_bound: 4.0
+rs_veto_threshold: null
+
+# Keep raw TIS scale comparable with the vanilla implementation. Batch
+# normalization can couple otherwise independent samples and amplify a sparse
+# batch after rejection, so it remains disabled in this conservative variant.
+tis_batch_normalize: false

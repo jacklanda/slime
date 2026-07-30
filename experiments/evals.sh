@@ -21,10 +21,79 @@ Core:
   --model-series qwen3|qwen3.5         Default: qwen3.5.
   --benchmarks-root PATH               Default: experiments/artifacts/benchmarks.
   --include LIST                       Comma-separated benchmark names, or all.
+                                       Use bfcl-v3 or bfcl-v4 to select the BFCL version.
                                        frontierscience expands to
                                        frontierscience_olympiad,frontierscience_research.
                                        Default: search_r1.
   --exclude LIST                       Extra comma-separated benchmark names to skip.
+  --tau2-domain all|LIST                Domains: airline,retail,telecom. Default: all.
+  --tau2-user-model NAME               User simulator model. Default: deepseek/deepseek-v4-flash.
+  --tau2-user-base-url URL             User simulator OpenAI-compatible endpoint.
+  --tau2-user-api-key KEY              Default: OPENROUTER_API_KEY.
+  --tau2-evaluator-model NAME          NL-assertion/interface model. Default: user model.
+  --tau2-evaluator-base-url URL        Default: user simulator endpoint.
+  --tau2-evaluator-api-key KEY         Default: user simulator key.
+  --tau2-max-concurrency N|auto        Global budget shared by selected domains. Default: 8 per DP replica.
+  --tau2-concurrency-sweep LIST        Benchmark multiple global budgets, e.g. 64,96,128,192.
+                                       Planned tasks x trials must cover the largest budget.
+  --tau2-max-tokens N                  Agent output limit. Default: 8192.
+  --tau2-max-steps N                   Conversation turn limit. Default: --max-steps.
+  --tau2-max-retries N                 Retry exceptions and max_steps trajectories. Default: 3.
+  --tau2-use-sglang-session BOOL       Reuse incremental KV state. Default: true.
+  --tau2-python-bin PATH               Python 3.12 used for its isolated venv.
+  --tau2-sglang-python-bin PATH        Python with SGLang installed. Default: current python.
+  --tau2-sglang-libstdcxx PATH         Optional compatible libstdc++.so.6 override.
+  --tau2-venv-dir PATH                 Default: tau^2-bench/.venv-slime-evals.
+  --tau2-port N                        Local SGLang HTTP port. Default: 18081.
+  --tau2-overwrite BOOL                Replace an existing result. Default: false.
+  --vitabench-domain LIST              VitaBench domains. Default: delivery,instore,ota.
+  --vitabench-language chinese|english Default: chinese.
+                                       VitaBench keeps its official domain policy;
+                                       --harness does not replace benchmark prompts.
+  --vitabench-user-model NAME          Simulated user model. Default: openai/gpt-4.1.
+  --vitabench-user-base-url URL        Simulated user OpenAI-compatible endpoint.
+  --vitabench-user-api-key KEY         Default: OPENROUTER_API_KEY.
+  --vitabench-evaluator-model NAME     Rubric judge model. Default: openai/gpt-4.1.
+  --vitabench-evaluator-base-url URL   Rubric judge OpenAI-compatible endpoint.
+  --vitabench-evaluator-api-key KEY    Default: OPENROUTER_API_KEY.
+  --vitabench-max-concurrency N|auto   Default: 2 per DP replica, capped at 16.
+  --vitabench-use-sglang-session BOOL Reuse incremental KV state. Default: true.
+  --vitabench-max-tokens N             Agent output limit. Default: eval response limit.
+  --vitabench-context-length N         SGLang context limit. Default: 131072.
+  --vitabench-max-steps N              VitaBench state-transition limit. Default: 300.
+  --vitabench-evaluation-type NAME     VitaBench evaluator protocol. Default: trajectory.
+  --vitabench-venv-dir PATH            Default: vitabench/.venv-slime-evals.
+  --vitabench-sglang-python-bin PATH   Python with SGLang installed. Default: current python.
+  --vitabench-port N                   Local SGLang HTTP port. Default: 18080.
+  --vitabench-overwrite BOOL           Replace an existing result. Default: false.
+  --bfcl-model-key NAME                BFCL handler key. Inferred from --model-config for supported Qwen sizes.
+  --bfcl-python-bin PATH               Base Python used to create an isolated BFCL venv.
+  --bfcl-venv-dir PATH                 BFCL dependency venv. Default: Gorilla/.venv-slime-evals.
+  --bfcl-num-threads N|auto            BFCL request concurrency. Default: 8 per DP replica.
+  --bfcl-sticky-engine-routing BOOL    Launch one single-GPU SGLang server per DP replica and
+                                       route each trajectory to one server. Default: true.
+  --bfcl-agent-mode MODE               auto, bfcl, or slime_fused_gem. Default: auto.
+                                       auto maps --harness gem to slime_fused_gem.
+  --bfcl-use-fc-interface BOOL         Select BFCL's Qwen FC transport. Default: true.
+  --bfcl-overwrite BOOL                Recompute generation and scores. Default: false.
+  --bfcl-max-tokens N                  Optional per-request output limit.
+  --bfcl-seed N|none                   Deterministic generation seed. Default: --rollout-seed.
+  --bfcl-discard-historical-thinking BOOL
+                                       Drop prior CoT from BFCL requests. Defaults to
+                                       --discard-historical-thinking.
+  --acebench-language zh|en|both       ACEBench language. Default: both.
+  --acebench-category NAME             ACEBench category group. Default: test_all.
+  --acebench-num-threads N|auto        ACEBench generation concurrency. Default: 8 per DP replica.
+  --acebench-overwrite BOOL            Remove matching ACEBench cache before running. Default: false.
+  --acebench-max-dialog-turns N        ACEBench agent turn limit. Default: 40.
+  --acebench-max-tokens N              Optional per-request output limit. Default: endpoint decides.
+  --acebench-agent-backend NAME        acebench or rllm_tool_agent. Default: rllm_tool_agent.
+  --acebench-protocol MODE             auto, official_acebench, or slime_fused_gem.
+                                       auto maps --harness gem to slime_fused_gem.
+  --acebench-user-model NAME           Simulated user model for agent tasks.
+  --acebench-user-base-url URL         Simulated user OpenAI-compatible endpoint.
+  --acebench-user-api-key KEY          Simulated user endpoint key.
+  --acebench-sglang-python-bin PATH    Python with SGLang installed. Default: current python.
   --experiment-name NAME               Log/run name.
   --gpus N                             Total rollout GPUs. Default: 8.
   --gpus-per-engine N                  Tensor parallel size per SGLang engine. Default: 1.
@@ -55,10 +124,15 @@ Generation/eval:
   --deterministic-inference BOOL       Pass per-sample seeds to SGLang. Default: false.
   --eval-max-response-len N            Default: 38000; also the default cot per-step budget.
   --eval-max-prompt-len N              Default: 2048.
-  --eval-max-context-len N             Default: 40960 for Qwen3; prompt + response otherwise.
+  --eval-max-context-len N             Default: 40960 for Qwen3, 65536 for Qwen3.5;
+                                       prompt + response otherwise.
+  --enable-yarn BOOL                   Enable static YaRN for Qwen3. Default: auto for contexts > 40960.
+  --yarn-factor X                      Qwen3 YaRN scale factor. Default: 4.0.
+  --yarn-original-max-position-embeddings N
+                                       Qwen3 native context used by YaRN. Default: 32768.
   --limit-per-benchmark N              Generate config with first N examples per benchmark. Default: 0 (all).
   --retrieval-backend local|serper     Retrieval service to use. Default: local.
-                                       Serper requires SERPER_API_KEY unless RETRIEVAL_SERVER_URL is set.
+                                       Serper requires SERPER_PROXY_TOKEN unless RETRIEVAL_SERVER_URL is set.
   --retrieval-concurrency N            Concurrent retrieval requests. Default: 176.
   --retrieval-mode NAME                dense, lexical, or hybrid. Default: dense.
   --retrieval-cache-size N             Cross-episode retrieval LRU entries. Default: 4096.
@@ -66,7 +140,8 @@ Generation/eval:
   --eval-max-inflight-tasks N          Adaptive hard limit. Default: cot=8/engine, agent=576.
   --eval-adaptive-concurrency BOOL     Adjust inflight work from engine metrics. Default: true.
   --eval-mix-datasets BOOL            Interleave multiple benchmarks under one inflight budget. Default: true.
-  --eval-termination-retry-times N     Retry an eval trajectory when termination_reason is not env_done.
+  --eval-termination-retry-times N     Retry an eval trajectory unless termination_reason is successful
+                                       (env_done or reasoning_only).
                                        Default: 4 retries after the initial attempt; 0 disables retries.
   --eval-trajectory-sample-rate X      Full trajectory dump fraction. Default: 1.
   --eval-dump-failures BOOL            Dump failed eval trajectories. Default: true.
@@ -134,8 +209,9 @@ MODEL_DIR="${MODEL_DIR:-}"
 BENCHMARKS_ROOT="${BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 #INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-2wiki,bamboogle,gpqa_diamond,medqa}"
 #INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-browsecomp_plus}"
-INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-search_r1,medqa,gpqa_diamond}"
-#INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-bamboogle,2wiki}"
+#INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-search_r1}"
+INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-asearcher}"
+#INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-bamboogle,2wiki,gpqa_diamond}"
 EXCLUDE_BENCHMARKS="${EXCLUDE_BENCHMARKS:-}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-eval-$(date +%Y%m%d-%H%M%S)}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
@@ -148,9 +224,9 @@ RLLM_DR_USE_REFINE="${RLLM_DR_USE_REFINE:-0}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-true}"
 DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
-MAX_STEPS="${MAX_STEPS:-128}"
+MAX_STEPS="${MAX_STEPS:-64}"
 MCP_MAX_STEPS="${MCP_MAX_STEPS:-${MAX_STEPS}}"
-WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-${MAX_STEPS}}"
+WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-64}"
 CLI_MAX_STEPS="${CLI_MAX_STEPS:-${MAX_STEPS}}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-${TRAJECTORY_TIMEOUT}}"
@@ -170,8 +246,11 @@ EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-2048}"
 #EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-131072}"
 #EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-4096}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-}"
+ENABLE_YARN="${ENABLE_YARN:-auto}"
+YARN_FACTOR="${YARN_FACTOR:-4.0}"
+YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS:-32768}"
 LIMIT_PER_BENCHMARK="${LIMIT_PER_BENCHMARK:-0}"
-RETRIEVAL_BACKEND="${RETRIEVAL_BACKEND:-local}"
+RETRIEVAL_BACKEND="${RETRIEVAL_BACKEND:-serper}"
 if [ -n "${RETRIEVAL_SERVER_URL+x}" ]; then retrieval_url_explicit=true; else retrieval_url_explicit=false; fi
 SERPER_SERVER_HOST="${SERPER_SERVER_HOST:-127.0.0.1}"
 SERPER_SERVER_PORT="${SERPER_SERVER_PORT:-65433}"
@@ -218,7 +297,75 @@ RAY_JOB_WAIT="${RAY_JOB_WAIT:-0}"
 RAY_JOB_FOLLOW_LOGS="${RAY_JOB_FOLLOW_LOGS:-1}"
 CLEANUP="${CLEANUP:-false}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-false}"
+ACEBENCH_LANGUAGE="${ACEBENCH_LANGUAGE:-both}"
+ACEBENCH_CATEGORY="${ACEBENCH_CATEGORY:-test_all}"
+ACEBENCH_NUM_THREADS="${ACEBENCH_NUM_THREADS:-auto}"
+ACEBENCH_OVERWRITE="${ACEBENCH_OVERWRITE:-false}"
+ACEBENCH_MAX_DIALOG_TURNS="${ACEBENCH_MAX_DIALOG_TURNS:-40}"
+ACEBENCH_MAX_TOKENS="${ACEBENCH_MAX_TOKENS:-}"
+ACEBENCH_AGENT_BACKEND="${ACEBENCH_AGENT_BACKEND:-rllm_tool_agent}"
+ACEBENCH_PROTOCOL="${ACEBENCH_PROTOCOL:-auto}"
+ACEBENCH_USER_MODEL="${ACEBENCH_USER_MODEL:-${OPENROUTER_MODEL:-}}"
+ACEBENCH_USER_BASE_URL="${ACEBENCH_USER_BASE_URL:-${OPENROUTER_BASE_URL:-}}"
+ACEBENCH_USER_API_KEY="${ACEBENCH_USER_API_KEY:-${OPENROUTER_API_KEY:-}}"
+ACEBENCH_SGLANG_PYTHON_BIN="${ACEBENCH_SGLANG_PYTHON_BIN:-python}"
+ACEBENCH_SGLANG_LIBSTDCXX="${ACEBENCH_SGLANG_LIBSTDCXX:-}"
+BFCL_MODEL_KEY="${BFCL_MODEL_KEY:-}"
+BFCL_PYTHON_BIN="${BFCL_PYTHON_BIN:-python3}"
+BFCL_VENV_DIR="${BFCL_VENV_DIR:-}"
+BFCL_NUM_THREADS="${BFCL_NUM_THREADS:-auto}"
+BFCL_STICKY_ENGINE_ROUTING="${BFCL_STICKY_ENGINE_ROUTING:-true}"
+BFCL_AGENT_MODE="${BFCL_AGENT_MODE:-auto}"
+BFCL_USE_FC_INTERFACE="${BFCL_USE_FC_INTERFACE:-true}"
+BFCL_OVERWRITE="${BFCL_OVERWRITE:-false}"
+BFCL_MAX_TOKENS="${BFCL_MAX_TOKENS:-}"
+BFCL_SEED="${BFCL_SEED:-${ROLLOUT_SEED}}"
+BFCL_DISCARD_HISTORICAL_THINKING="${BFCL_DISCARD_HISTORICAL_THINKING:-}"
+BFCL_V3_COMMIT="${BFCL_V3_COMMIT:-cd9429ccf3d4d04156affe883c495b3b047e6b64}"
+VITABENCH_DOMAIN="${VITABENCH_DOMAIN:-delivery,instore,ota}"
+VITABENCH_LANGUAGE="${VITABENCH_LANGUAGE:-chinese}"
+VITABENCH_USER_MODEL="${VITABENCH_USER_MODEL:-}"
+VITABENCH_USER_BASE_URL="${VITABENCH_USER_BASE_URL:-${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}}"
+VITABENCH_USER_API_KEY="${VITABENCH_USER_API_KEY:-${OPENROUTER_API_KEY:-}}"
+VITABENCH_EVALUATOR_MODEL="${VITABENCH_EVALUATOR_MODEL:-}"
+VITABENCH_EVALUATOR_BASE_URL="${VITABENCH_EVALUATOR_BASE_URL:-${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}}"
+VITABENCH_EVALUATOR_API_KEY="${VITABENCH_EVALUATOR_API_KEY:-${OPENROUTER_API_KEY:-}}"
+VITABENCH_MAX_CONCURRENCY="${VITABENCH_MAX_CONCURRENCY:-auto}"
+VITABENCH_USE_SGLANG_SESSION="${VITABENCH_USE_SGLANG_SESSION:-true}"
+VITABENCH_MAX_TOKENS="${VITABENCH_MAX_TOKENS:-}"
+VITABENCH_CONTEXT_LENGTH="${VITABENCH_CONTEXT_LENGTH:-131072}"
+VITABENCH_MAX_STEPS="${VITABENCH_MAX_STEPS:-300}"
+VITABENCH_EVALUATION_TYPE="${VITABENCH_EVALUATION_TYPE:-trajectory}"
+VITABENCH_VENV_DIR="${VITABENCH_VENV_DIR:-}"
+VITABENCH_SGLANG_PYTHON_BIN="${VITABENCH_SGLANG_PYTHON_BIN:-python}"
+VITABENCH_PORT="${VITABENCH_PORT:-18080}"
+VITABENCH_OVERWRITE="${VITABENCH_OVERWRITE:-false}"
+TAU2_DOMAIN="${TAU2_DOMAIN:-all}"
+TAU2_USER_MODEL="${TAU2_USER_MODEL:-deepseek/deepseek-v4-flash}"
+TAU2_USER_BASE_URL="${TAU2_USER_BASE_URL:-${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}}"
+TAU2_USER_API_KEY="${TAU2_USER_API_KEY:-${OPENROUTER_API_KEY:-}}"
+TAU2_EVALUATOR_MODEL="${TAU2_EVALUATOR_MODEL:-}"
+TAU2_EVALUATOR_BASE_URL="${TAU2_EVALUATOR_BASE_URL:-}"
+TAU2_EVALUATOR_API_KEY="${TAU2_EVALUATOR_API_KEY:-}"
+TAU2_MAX_CONCURRENCY="${TAU2_MAX_CONCURRENCY:-auto}"
+TAU2_CONCURRENCY_SWEEP="${TAU2_CONCURRENCY_SWEEP:-}"
+TAU2_MAX_TOKENS="${TAU2_MAX_TOKENS:-8192}"
+TAU2_MAX_STEPS="${TAU2_MAX_STEPS:-}"
+TAU2_MAX_RETRIES="${TAU2_MAX_RETRIES:-3}"
+TAU2_USE_SGLANG_SESSION="${TAU2_USE_SGLANG_SESSION:-true}"
+TAU2_PYTHON_BIN="${TAU2_PYTHON_BIN:-python3.12}"
+TAU2_SGLANG_PYTHON_BIN="${TAU2_SGLANG_PYTHON_BIN:-python}"
+TAU2_SGLANG_LIBSTDCXX="${TAU2_SGLANG_LIBSTDCXX:-}"
+TAU2_VENV_DIR="${TAU2_VENV_DIR:-}"
+TAU2_PORT="${TAU2_PORT:-18081}"
+TAU2_OVERWRITE="${TAU2_OVERWRITE:-false}"
 harness_explicit=false
+acebench_agent_backend_explicit=false
+if [ -n "${BFCL_DISCARD_HISTORICAL_THINKING}" ]; then
+   bfcl_discard_historical_thinking_explicit=true
+else
+   bfcl_discard_historical_thinking_explicit=false
+fi
 EXTRA_SLIME_ARGS=()
 
 while [ "$#" -gt 0 ]; do
@@ -229,6 +376,66 @@ while [ "$#" -gt 0 ]; do
       --benchmarks-root) BENCHMARKS_ROOT="${2:?Missing value for --benchmarks-root}"; shift 2 ;;
       --include) INCLUDE_BENCHMARKS="${2:?Missing value for --include}"; shift 2 ;;
       --exclude) EXCLUDE_BENCHMARKS="${2:?Missing value for --exclude}"; shift 2 ;;
+      --tau2-domain) TAU2_DOMAIN="${2:?Missing value for --tau2-domain}"; shift 2 ;;
+      --tau2-user-model) TAU2_USER_MODEL="${2:?Missing value for --tau2-user-model}"; shift 2 ;;
+      --tau2-user-base-url) TAU2_USER_BASE_URL="${2:?Missing value for --tau2-user-base-url}"; shift 2 ;;
+      --tau2-user-api-key) TAU2_USER_API_KEY="${2:?Missing value for --tau2-user-api-key}"; shift 2 ;;
+      --tau2-evaluator-model) TAU2_EVALUATOR_MODEL="${2:?Missing value for --tau2-evaluator-model}"; shift 2 ;;
+      --tau2-evaluator-base-url) TAU2_EVALUATOR_BASE_URL="${2:?Missing value for --tau2-evaluator-base-url}"; shift 2 ;;
+      --tau2-evaluator-api-key) TAU2_EVALUATOR_API_KEY="${2:?Missing value for --tau2-evaluator-api-key}"; shift 2 ;;
+      --tau2-max-concurrency) TAU2_MAX_CONCURRENCY="${2:?Missing value for --tau2-max-concurrency}"; shift 2 ;;
+      --tau2-concurrency-sweep) TAU2_CONCURRENCY_SWEEP="${2:?Missing value for --tau2-concurrency-sweep}"; shift 2 ;;
+      --tau2-max-tokens) TAU2_MAX_TOKENS="${2:?Missing value for --tau2-max-tokens}"; shift 2 ;;
+      --tau2-max-steps) TAU2_MAX_STEPS="${2:?Missing value for --tau2-max-steps}"; shift 2 ;;
+      --tau2-max-retries) TAU2_MAX_RETRIES="${2:?Missing value for --tau2-max-retries}"; shift 2 ;;
+      --tau2-use-sglang-session) TAU2_USE_SGLANG_SESSION="${2:?Missing value for --tau2-use-sglang-session}"; shift 2 ;;
+      --tau2-python-bin) TAU2_PYTHON_BIN="${2:?Missing value for --tau2-python-bin}"; shift 2 ;;
+      --tau2-sglang-python-bin) TAU2_SGLANG_PYTHON_BIN="${2:?Missing value for --tau2-sglang-python-bin}"; shift 2 ;;
+      --tau2-sglang-libstdcxx) TAU2_SGLANG_LIBSTDCXX="${2:?Missing value for --tau2-sglang-libstdcxx}"; shift 2 ;;
+      --tau2-venv-dir) TAU2_VENV_DIR="${2:?Missing value for --tau2-venv-dir}"; shift 2 ;;
+      --tau2-port) TAU2_PORT="${2:?Missing value for --tau2-port}"; shift 2 ;;
+      --tau2-overwrite) TAU2_OVERWRITE="${2:?Missing value for --tau2-overwrite}"; shift 2 ;;
+      --vitabench-domain) VITABENCH_DOMAIN="${2:?Missing value for --vitabench-domain}"; shift 2 ;;
+      --vitabench-language) VITABENCH_LANGUAGE="${2:?Missing value for --vitabench-language}"; shift 2 ;;
+      --vitabench-user-model) VITABENCH_USER_MODEL="${2:?Missing value for --vitabench-user-model}"; shift 2 ;;
+      --vitabench-user-base-url) VITABENCH_USER_BASE_URL="${2:?Missing value for --vitabench-user-base-url}"; shift 2 ;;
+      --vitabench-user-api-key) VITABENCH_USER_API_KEY="${2:?Missing value for --vitabench-user-api-key}"; shift 2 ;;
+      --vitabench-evaluator-model) VITABENCH_EVALUATOR_MODEL="${2:?Missing value for --vitabench-evaluator-model}"; shift 2 ;;
+      --vitabench-evaluator-base-url) VITABENCH_EVALUATOR_BASE_URL="${2:?Missing value for --vitabench-evaluator-base-url}"; shift 2 ;;
+      --vitabench-evaluator-api-key) VITABENCH_EVALUATOR_API_KEY="${2:?Missing value for --vitabench-evaluator-api-key}"; shift 2 ;;
+      --vitabench-max-concurrency) VITABENCH_MAX_CONCURRENCY="${2:?Missing value for --vitabench-max-concurrency}"; shift 2 ;;
+      --vitabench-use-sglang-session) VITABENCH_USE_SGLANG_SESSION="${2:?Missing value for --vitabench-use-sglang-session}"; shift 2 ;;
+      --vitabench-max-tokens) VITABENCH_MAX_TOKENS="${2:?Missing value for --vitabench-max-tokens}"; shift 2 ;;
+      --vitabench-context-length) VITABENCH_CONTEXT_LENGTH="${2:?Missing value for --vitabench-context-length}"; shift 2 ;;
+      --vitabench-max-steps) VITABENCH_MAX_STEPS="${2:?Missing value for --vitabench-max-steps}"; shift 2 ;;
+      --vitabench-evaluation-type) VITABENCH_EVALUATION_TYPE="${2:?Missing value for --vitabench-evaluation-type}"; shift 2 ;;
+      --vitabench-venv-dir) VITABENCH_VENV_DIR="${2:?Missing value for --vitabench-venv-dir}"; shift 2 ;;
+      --vitabench-sglang-python-bin) VITABENCH_SGLANG_PYTHON_BIN="${2:?Missing value for --vitabench-sglang-python-bin}"; shift 2 ;;
+      --vitabench-port) VITABENCH_PORT="${2:?Missing value for --vitabench-port}"; shift 2 ;;
+      --vitabench-overwrite) VITABENCH_OVERWRITE="${2:?Missing value for --vitabench-overwrite}"; shift 2 ;;
+      --bfcl-model-key) BFCL_MODEL_KEY="${2:?Missing value for --bfcl-model-key}"; shift 2 ;;
+      --bfcl-python-bin) BFCL_PYTHON_BIN="${2:?Missing value for --bfcl-python-bin}"; shift 2 ;;
+      --bfcl-venv-dir) BFCL_VENV_DIR="${2:?Missing value for --bfcl-venv-dir}"; shift 2 ;;
+      --bfcl-num-threads) BFCL_NUM_THREADS="${2:?Missing value for --bfcl-num-threads}"; shift 2 ;;
+      --bfcl-sticky-engine-routing) BFCL_STICKY_ENGINE_ROUTING="${2:?Missing value for --bfcl-sticky-engine-routing}"; shift 2 ;;
+      --bfcl-agent-mode) BFCL_AGENT_MODE="${2:?Missing value for --bfcl-agent-mode}"; shift 2 ;;
+      --bfcl-use-fc-interface) BFCL_USE_FC_INTERFACE="${2:?Missing value for --bfcl-use-fc-interface}"; shift 2 ;;
+      --bfcl-overwrite) BFCL_OVERWRITE="${2:?Missing value for --bfcl-overwrite}"; shift 2 ;;
+      --bfcl-max-tokens) BFCL_MAX_TOKENS="${2:?Missing value for --bfcl-max-tokens}"; shift 2 ;;
+      --bfcl-seed) BFCL_SEED="${2:?Missing value for --bfcl-seed}"; shift 2 ;;
+      --bfcl-discard-historical-thinking) BFCL_DISCARD_HISTORICAL_THINKING="${2:?Missing value for --bfcl-discard-historical-thinking}"; bfcl_discard_historical_thinking_explicit=true; shift 2 ;;
+      --acebench-language) ACEBENCH_LANGUAGE="${2:?Missing value for --acebench-language}"; shift 2 ;;
+      --acebench-category) ACEBENCH_CATEGORY="${2:?Missing value for --acebench-category}"; shift 2 ;;
+      --acebench-num-threads) ACEBENCH_NUM_THREADS="${2:?Missing value for --acebench-num-threads}"; shift 2 ;;
+      --acebench-overwrite) ACEBENCH_OVERWRITE="${2:?Missing value for --acebench-overwrite}"; shift 2 ;;
+      --acebench-max-dialog-turns) ACEBENCH_MAX_DIALOG_TURNS="${2:?Missing value for --acebench-max-dialog-turns}"; shift 2 ;;
+      --acebench-max-tokens) ACEBENCH_MAX_TOKENS="${2:?Missing value for --acebench-max-tokens}"; shift 2 ;;
+      --acebench-agent-backend) ACEBENCH_AGENT_BACKEND="${2:?Missing value for --acebench-agent-backend}"; acebench_agent_backend_explicit=true; shift 2 ;;
+      --acebench-protocol) ACEBENCH_PROTOCOL="${2:?Missing value for --acebench-protocol}"; shift 2 ;;
+      --acebench-user-model) ACEBENCH_USER_MODEL="${2:?Missing value for --acebench-user-model}"; shift 2 ;;
+      --acebench-user-base-url) ACEBENCH_USER_BASE_URL="${2:?Missing value for --acebench-user-base-url}"; shift 2 ;;
+      --acebench-user-api-key) ACEBENCH_USER_API_KEY="${2:?Missing value for --acebench-user-api-key}"; shift 2 ;;
+      --acebench-sglang-python-bin) ACEBENCH_SGLANG_PYTHON_BIN="${2:?Missing value for --acebench-sglang-python-bin}"; shift 2 ;;
       --experiment-name) EXPERIMENT_NAME="${2:?Missing value for --experiment-name}"; shift 2 ;;
       --gpus) ROLLOUT_GPUS="${2:?Missing value for --gpus}"; shift 2 ;;
       --gpus-per-engine) ROLLOUT_NUM_GPUS_PER_ENGINE="${2:?Missing value for --gpus-per-engine}"; shift 2 ;;
@@ -256,6 +463,9 @@ while [ "$#" -gt 0 ]; do
       --eval-max-response-len) EVAL_MAX_RESPONSE_LEN="${2:?Missing value for --eval-max-response-len}"; shift 2 ;;
       --eval-max-prompt-len) EVAL_MAX_PROMPT_LEN="${2:?Missing value for --eval-max-prompt-len}"; shift 2 ;;
       --eval-max-context-len) EVAL_MAX_CONTEXT_LEN="${2:?Missing value for --eval-max-context-len}"; shift 2 ;;
+      --enable-yarn) ENABLE_YARN="${2:?Missing value for --enable-yarn}"; shift 2 ;;
+      --yarn-factor) YARN_FACTOR="${2:?Missing value for --yarn-factor}"; shift 2 ;;
+      --yarn-original-max-position-embeddings) YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${2:?Missing value for --yarn-original-max-position-embeddings}"; shift 2 ;;
       --limit-per-benchmark) LIMIT_PER_BENCHMARK="${2:?Missing value for --limit-per-benchmark}"; shift 2 ;;
       --retrieval-backend) RETRIEVAL_BACKEND="${2:?Missing value for --retrieval-backend}"; shift 2 ;;
       --retrieval-concurrency) RETRIEVAL_CONCURRENCY="${2:?Missing value for --retrieval-concurrency}"; shift 2 ;;
@@ -301,6 +511,74 @@ while [ "$#" -gt 0 ]; do
       *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
    esac
 done
+
+if [ "${bfcl_discard_historical_thinking_explicit}" = "false" ]; then
+   BFCL_DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING}"
+fi
+
+BFCL_SELECTED=false
+BFCL_BENCH_VERSION=""
+normalized_include="$(printf '%s' "${INCLUDE_BENCHMARKS}" | tr '[:upper:]_' '[:lower:]-')"
+normalized_exclude="$(printf '%s' "${EXCLUDE_BENCHMARKS}" | tr '[:upper:]_' '[:lower:]-')"
+TAU2_SELECTED=false
+case ",${normalized_include}," in *,tau2,*|*,tau2-bench,*|*,tau-2,*|*,tau\^2,*|*,tau\^2-bench,*) TAU2_SELECTED=true ;; esac
+case ",${normalized_exclude}," in *,tau2,*|*,tau2-bench,*|*,tau-2,*|*,tau\^2,*|*,tau\^2-bench,*) TAU2_SELECTED=false ;; esac
+if is_truthy "${TAU2_SELECTED}"; then
+   case "${normalized_include}" in tau2|tau2-bench|tau-2|tau\^2|tau\^2-bench) ;;
+      *) echo "tau2 uses its official simulator and cannot be mixed with slime datasets in one run." >&2; exit 2 ;;
+   esac
+fi
+VITABENCH_SELECTED=false
+case ",${normalized_include}," in *,vitabench,*|*,vita-bench,*) VITABENCH_SELECTED=true ;; esac
+case ",${normalized_exclude}," in *,vitabench,*|*,vita-bench,*) VITABENCH_SELECTED=false ;; esac
+if is_truthy "${VITABENCH_SELECTED}" && [ "${normalized_include}" != "vitabench" ] && [ "${normalized_include}" != "vita-bench" ]; then
+   echo "VitaBench uses its official simulator and evaluator and cannot be mixed with slime datasets in one run." >&2
+   echo "Run it separately with --include vitabench." >&2
+   exit 2
+fi
+case ",${normalized_include}," in
+   *,bfcl-v3,*|*,gorilla,*|*,gorilla-bfcl-v3,*) BFCL_SELECTED=true; BFCL_BENCH_VERSION=v3 ;;
+   *,bfcl-v4,*|*,gorilla-bfcl-v4,*) BFCL_SELECTED=true; BFCL_BENCH_VERSION=v4 ;;
+esac
+case ",${normalized_exclude}," in
+   *,bfcl-v3,*|*,bfcl-v4,*|*,gorilla,*|*,gorilla-bfcl-v3,*|*,gorilla-bfcl-v4,*) BFCL_SELECTED=false ;;
+esac
+if is_truthy "${BFCL_SELECTED}"; then
+   if [ -z "${BFCL_MODEL_KEY}" ]; then
+      normalized_model_config="$(printf '%s' "${MODEL_CONFIG}" | tr '[:upper:]_' '[:lower:]-')"
+      case "${normalized_model_config}" in
+         *qwen3.5-4b*) BFCL_MODEL_KEY="Qwen/Qwen3.5-4B" ;;
+         *qwen3-4b*) BFCL_MODEL_KEY="Qwen/Qwen3-4B-Thinking-2507" ;;
+         *qwen3-32b*) BFCL_MODEL_KEY="Qwen/Qwen3-32B" ;;
+         *)
+            echo "Cannot infer a BFCL handler key from --model-config ${MODEL_CONFIG@Q}." >&2
+            echo "Pass --bfcl-model-key explicitly; supported slime-gem defaults currently cover Qwen3.5 4B and Qwen3 4B/32B." >&2
+            exit 2
+            ;;
+      esac
+   fi
+   case "${normalized_include}" in
+      bfcl-v3|bfcl-v4|gorilla|gorilla-bfcl-v3|gorilla-bfcl-v4) ;;
+      *)
+         echo "BFCL uses Gorilla's generation and scoring pipeline and cannot be mixed with other datasets or BFCL versions." >&2
+         echo "Run it separately with --include bfcl-v3 or --include bfcl-v4." >&2
+         exit 2
+         ;;
+   esac
+fi
+
+ACEBENCH_SELECTED=false
+case ",${normalized_include}," in
+   *,acebench,*) ACEBENCH_SELECTED=true ;;
+esac
+case ",${normalized_exclude}," in
+   *,acebench,*) ACEBENCH_SELECTED=false ;;
+esac
+if is_truthy "${ACEBENCH_SELECTED}" && [ "${normalized_include}" != "acebench" ]; then
+   echo "ACEBench uses its official generation and scoring pipeline and cannot be mixed with slime datasets in one run." >&2
+   echo "Run it separately with --include ACEBench." >&2
+   exit 2
+fi
 
 MCP_ATLAS_SELECTED=false
 MCP_ATLAS_ONLY=false
@@ -372,6 +650,11 @@ case "${MODEL_SERIES}" in
    qwen3|qwen3.5) ;;
    *) echo "Unsupported --model-series ${MODEL_SERIES}; expected qwen3 or qwen3.5." >&2; exit 2 ;;
 esac
+if [ "${MODEL_SERIES}" = "qwen3.5" ]; then
+   TEMPERATURE=1.0
+   TOP_P=0.95
+   TOP_K=20
+fi
 case "${USER_PROMPT}" in
    long|short) ;;
    *) echo "Unsupported --user_prompt ${USER_PROMPT}; expected long or short." >&2; exit 2 ;;
@@ -390,10 +673,11 @@ if ! [[ "${SERPER_SERVER_PORT}" =~ ^[1-9][0-9]*$ ]] || [ "${SERPER_SERVER_PORT}"
 fi
 if [ "${RETRIEVAL_BACKEND}" = "serper" ] && ! is_truthy "${retrieval_url_explicit}"; then
    RETRIEVAL_SERVER_URL="http://${SERPER_SERVER_HOST}:${SERPER_SERVER_PORT}"
-   if [ -z "${SERPER_API_KEY:-}" ]; then
-      echo "SERPER_API_KEY is required for the managed Serper retrieval service" >&2
+   if [ -z "${SERPER_PROXY_TOKEN:-}" ]; then
+      echo "SERPER_PROXY_TOKEN is required for the managed Serper retrieval service" >&2
       exit 2
    fi
+   export SERPER_PROXY_TOKEN
 fi
 
 if [ -z "${MODEL_CONFIG}" ]; then
@@ -458,9 +742,49 @@ source "${MODEL_CONFIG_PATH}"
 if [ -z "${EVAL_MAX_CONTEXT_LEN}" ]; then
    if [ "${MODEL_SERIES}" = "qwen3" ]; then
       EVAL_MAX_CONTEXT_LEN=40960
+   elif [ "${MODEL_SERIES}" = "qwen3.5" ]; then
+      EVAL_MAX_CONTEXT_LEN=65536
    else
       EVAL_MAX_CONTEXT_LEN="$((EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN))"
    fi
+fi
+if [ "${ENABLE_YARN}" = "auto" ]; then
+   if [ "${MODEL_SERIES}" = "qwen3" ] && [ "${EVAL_MAX_CONTEXT_LEN}" -gt 40960 ]; then
+      ENABLE_YARN=true
+   else
+      ENABLE_YARN=false
+   fi
+fi
+if is_truthy "${ENABLE_YARN}"; then
+   if [ "${MODEL_SERIES}" != "qwen3" ]; then
+      echo "--enable-yarn is only supported with --model-series qwen3" >&2
+      exit 2
+   fi
+   python3 - "${YARN_FACTOR}" "${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}" "${EVAL_MAX_CONTEXT_LEN}" <<'PY'
+import math
+import sys
+
+factor = float(sys.argv[1])
+original_context = int(sys.argv[2])
+target_context = int(sys.argv[3])
+if not math.isfinite(factor) or factor <= 1:
+    raise SystemExit(f"YARN_FACTOR must be finite and greater than 1, got {factor}")
+if original_context <= 0:
+    raise SystemExit(
+        "YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS must be positive, "
+        f"got {original_context}"
+    )
+if target_context > int(factor * original_context):
+    raise SystemExit(
+        f"EVAL_MAX_CONTEXT_LEN={target_context} exceeds the configured YaRN capacity "
+        f"{int(factor * original_context)}"
+    )
+PY
+   MODEL_ARGS+=(
+      --use-yarn-rope
+      --yarn-rope-scaling-factor "${YARN_FACTOR}"
+      --yarn-original-max-position-embeddings "${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
+   )
 fi
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
 if [ "${ROLLOUT_GPUS}" -lt 1 ]; then
@@ -470,6 +794,595 @@ fi
 if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -lt 1 ]; then
    echo "--gpus-per-engine must be >= 1" >&2
    exit 2
+fi
+
+if is_truthy "${BFCL_SELECTED}"; then
+   BFCL_ROOT="${BENCHMARKS_ROOT}/gorilla/berkeley-function-call-leaderboard"
+   if [ ! -x "${BFCL_ROOT}/run_eval.sh" ] || [ ! -f "${BFCL_ROOT}/pyproject.toml" ]; then
+      echo "BFCL is incomplete under ${BFCL_ROOT}; expected executable run_eval.sh and pyproject.toml." >&2
+      exit 2
+   fi
+   BFCL_VENV_DIR="${BFCL_VENV_DIR:-${BFCL_ROOT}/.venv-slime-evals}"
+   if [[ "${BFCL_PYTHON_BIN}" != */* ]]; then
+      BFCL_PYTHON_BIN="$(command -v "${BFCL_PYTHON_BIN}")"
+   fi
+   if [ ! -x "${BFCL_PYTHON_BIN}" ]; then
+      echo "BFCL base Python is not executable: ${BFCL_PYTHON_BIN}" >&2
+      exit 2
+   fi
+   BFCL_SGLANG_PYTHON_BIN="$(command -v python)"
+   BFCL_SGLANG_PREFIX="$("${BFCL_SGLANG_PYTHON_BIN}" -c 'import sys; print(sys.prefix)')"
+   BFCL_SGLANG_LIBSTDCXX="${BFCL_SGLANG_PREFIX}/lib/libstdc++.so.6"
+   if [ -f "${BFCL_SGLANG_LIBSTDCXX}" ] && strings "${BFCL_SGLANG_LIBSTDCXX}" | grep -x 'GLIBCXX_3.4.32' >/dev/null; then
+      export BFCL_SGLANG_LD_PRELOAD="${BFCL_SGLANG_LIBSTDCXX}"
+   else
+      unset BFCL_SGLANG_LD_PRELOAD || true
+   fi
+   if [ "${MODEL_SERIES}" != "qwen3" ] && [ "${MODEL_SERIES}" != "qwen3.5" ]; then
+      echo "BFCL's local handler currently supports --model-series qwen3 or qwen3.5 only." >&2
+      exit 2
+   fi
+   if [ "${N_SAMPLES_PER_PROMPT}" -ne 1 ]; then
+      echo "BFCL currently supports --n-samples-per-prompt 1 only." >&2
+      exit 2
+   fi
+   if [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
+      echo "--gpus (${ROLLOUT_GPUS}) must be divisible by --gpus-per-engine (${ROLLOUT_NUM_GPUS_PER_ENGINE}) for BFCL." >&2
+      exit 2
+   fi
+   case "${BFCL_AGENT_MODE}" in
+      auto)
+         if [ "${FUSED_HARNESS}" = "gem" ]; then
+            BFCL_AGENT_MODE=slime_fused_gem
+         else
+            BFCL_AGENT_MODE=bfcl
+         fi
+         ;;
+      rllm_tool_agent) BFCL_AGENT_MODE=slime_fused_gem ;;
+      bfcl|slime_fused_gem) ;;
+      *) echo "--bfcl-agent-mode must be auto, bfcl, or slime_fused_gem" >&2; exit 2 ;;
+   esac
+   if [ "${BFCL_AGENT_MODE}" = "slime_fused_gem" ] && ! is_truthy "${BFCL_USE_FC_INTERFACE}"; then
+      echo "--bfcl-agent-mode slime_fused_gem requires --bfcl-use-fc-interface true" >&2
+      exit 2
+   fi
+   if [ "${BFCL_NUM_THREADS}" != "auto" ] && ! [[ "${BFCL_NUM_THREADS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "--bfcl-num-threads must be auto or a positive integer" >&2
+      exit 2
+   fi
+   case "${BFCL_STICKY_ENGINE_ROUTING}" in
+      true|false|1|0|yes|no|on|off) ;;
+      *) echo "--bfcl-sticky-engine-routing must be a boolean" >&2; exit 2 ;;
+   esac
+   if [ -n "${BFCL_MAX_TOKENS}" ] && ! [[ "${BFCL_MAX_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "--bfcl-max-tokens must be a positive integer" >&2
+      exit 2
+   fi
+   if [ "${BFCL_SEED}" != "none" ] && ! [[ "${BFCL_SEED}" =~ ^[0-9]+$ ]]; then
+      echo "--bfcl-seed must be a non-negative integer or none" >&2
+      exit 2
+   fi
+   case "${BFCL_DISCARD_HISTORICAL_THINKING}" in
+      true|false|1|0|yes|no|on|off) ;;
+      *) echo "--bfcl-discard-historical-thinking must be a boolean" >&2; exit 2 ;;
+   esac
+   if ! [[ "${LIMIT_PER_BENCHMARK}" =~ ^[0-9]+$ ]]; then
+      echo "--limit-per-benchmark must be a non-negative integer" >&2
+      exit 2
+   fi
+   if [ "${LIMIT_PER_BENCHMARK}" -gt 0 ] && [ "${LIMIT_PER_BENCHMARK}" -lt 99999 ]; then
+      echo "BFCL does not support --limit-per-benchmark below 99999; use 0 or 99999 for the official full set." >&2
+      exit 2
+   fi
+
+   BFCL_DP_SIZE=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
+   if is_truthy "${BFCL_STICKY_ENGINE_ROUTING}"; then
+      if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -ne 1 ]; then
+         echo "--bfcl-sticky-engine-routing true requires --gpus-per-engine 1." >&2
+         exit 2
+      fi
+      if [ "${BFCL_DP_SIZE}" -le 1 ]; then
+         echo "--bfcl-sticky-engine-routing true requires at least 2 GPUs." >&2
+         exit 2
+      fi
+   fi
+   if [ "${BFCL_NUM_THREADS}" = "auto" ]; then
+      BFCL_NUM_THREADS=$((BFCL_DP_SIZE * 8))
+   fi
+   BFCL_CUDA_DEVICES=""
+   for ((gpu_index = 0; gpu_index < ROLLOUT_GPUS; gpu_index++)); do
+      if [ -n "${BFCL_CUDA_DEVICES}" ]; then BFCL_CUDA_DEVICES+=","; fi
+      BFCL_CUDA_DEVICES+="${gpu_index}"
+   done
+   if is_truthy "${DISABLE_THINKING}"; then
+      BFCL_QWEN_PARSE_MODE=instruct
+   else
+      BFCL_QWEN_PARSE_MODE=reasoning
+   fi
+
+   BFCL_LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/evals/${EXPERIMENT_NAME}}"
+   BFCL_RESULT_DIR="${BFCL_LOG_ROOT}/bfcl_results"
+   BFCL_SCORE_DIR="${BFCL_LOG_ROOT}/bfcl_scores"
+   export BFCL_VERSION_PREFIX="BFCL_${BFCL_BENCH_VERSION}"
+   if [ "${BFCL_BENCH_VERSION}" = v4 ] && [ -z "${SERPAPI_API_KEY:-}" ]; then
+      BFCL_DOTENV="${BFCL_ROOT}/.env"
+      if [ ! -f "${BFCL_DOTENV}" ] || ! rg -q '^[[:space:]]*SERPAPI_API_KEY=..+' "${BFCL_DOTENV}"; then
+         echo "BFCL-v4 all_scoring requires SERPAPI_API_KEY for its web-search categories." >&2
+         echo "Set it in the shell or ${BFCL_DOTENV}; BFCL-v3 does not require it." >&2
+         exit 2
+      fi
+   fi
+   mkdir -p "${BFCL_RESULT_DIR}" "${BFCL_SCORE_DIR}"
+   BFCL_CMD=(
+      "${BFCL_ROOT}/run_eval.sh"
+      --no-conda
+      --sglang-python-bin "${BFCL_SGLANG_PYTHON_BIN}"
+      --server-mode local-sglang
+      --bench-version "${BFCL_BENCH_VERSION}"
+      --bfcl-model-key "${BFCL_MODEL_KEY}"
+      --agent-mode "${BFCL_AGENT_MODE}"
+      --slime-tool-parser-path "${REPO_ROOT}/slime/rollout/fused_agent/parser.py"
+      --qwen-parse-mode "${BFCL_QWEN_PARSE_MODE}"
+      --local-model-path "$(realpath "${MODEL_DIR}")"
+      --served-model-name "${EXPERIMENT_NAME}"
+      --artifact-name "${EXPERIMENT_NAME}"
+      --cuda-visible-devices "${BFCL_CUDA_DEVICES}"
+      --tp-size "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
+      --dp-size "${BFCL_DP_SIZE}"
+      --context-length "${EVAL_MAX_CONTEXT_LEN}"
+      --gpu-memory-utilization "${SGLANG_MEM_FRACTION_STATIC}"
+      --num-threads "${BFCL_NUM_THREADS}"
+      --result-dir "${BFCL_RESULT_DIR}"
+      --temperature "${TEMPERATURE}"
+      --top-p "${TOP_P}"
+      --top-k "${TOP_K}"
+   )
+   if is_truthy "${BFCL_STICKY_ENGINE_ROUTING}"; then BFCL_CMD+=(--sticky-engine-routing); fi
+   if [ "${BFCL_BENCH_VERSION}" = v3 ]; then
+      BFCL_DATA_DIR="${BFCL_DATA_DIR:-${BFCL_ROOT}/.cache/bfcl-v3-data/${BFCL_V3_COMMIT}}"
+      export BFCL_DATA_DIR
+      BFCL_CMD+=(--bfcl-v3-commit "${BFCL_V3_COMMIT}" --bfcl-data-dir "${BFCL_DATA_DIR}")
+   else
+      unset BFCL_DATA_DIR || true
+   fi
+   BFCL_SCORE_MODEL_KEY="${BFCL_MODEL_KEY%-RLLM-ToolAgent}"
+   if is_truthy "${BFCL_USE_FC_INTERFACE}"; then
+      BFCL_CMD+=(--use-fc-interface)
+      BFCL_SCORE_MODEL_KEY="${BFCL_SCORE_MODEL_KEY%-FC}-FC"
+   else
+      BFCL_CMD+=(--no-fc-interface)
+      BFCL_SCORE_MODEL_KEY="${BFCL_SCORE_MODEL_KEY%-FC}"
+   fi
+   if [ "${BFCL_AGENT_MODE}" = "slime_fused_gem" ]; then
+      BFCL_SCORE_MODEL_KEY="${BFCL_SCORE_MODEL_KEY%-RLLM-ToolAgent}-RLLM-ToolAgent"
+   fi
+   if is_truthy "${DISABLE_THINKING}"; then BFCL_CMD+=(--disable-thinking); else BFCL_CMD+=(--enable-thinking); fi
+   if [ "${BFCL_SEED}" != "none" ]; then BFCL_CMD+=(--seed "${BFCL_SEED}"); fi
+   if [ -n "${BFCL_MAX_TOKENS}" ]; then BFCL_CMD+=(--max-tokens "${BFCL_MAX_TOKENS}"); fi
+   if is_truthy "${BFCL_OVERWRITE}"; then BFCL_CMD+=(--recompute); else BFCL_CMD+=(--reuse-existing); fi
+
+   if [ "${BFCL_BENCH_VERSION}" = v4 ]; then
+      BFCL_TEST_CATEGORY=all_scoring
+   else
+      BFCL_TEST_CATEGORY=single_turn,multi_turn
+   fi
+   BFCL_EVALUATE_CMD=(
+      "${BFCL_VENV_DIR}/bin/bfcl" evaluate
+      --test-category "${BFCL_TEST_CATEGORY}"
+      --model "${BFCL_SCORE_MODEL_KEY}"
+      --artifact-name "${EXPERIMENT_NAME}"
+      --result-dir "${BFCL_RESULT_DIR}"
+      --score-dir "${BFCL_SCORE_DIR}"
+      --score-version "${BFCL_BENCH_VERSION}"
+   )
+
+   printf 'BFCL-%s generation command:' "${BFCL_BENCH_VERSION}"
+   printf ' %q' "${BFCL_CMD[@]}"
+   printf '\nBFCL-%s scoring command:' "${BFCL_BENCH_VERSION}"
+   printf ' %q' "${BFCL_EVALUATE_CMD[@]}"
+   printf '\n'
+   if is_truthy "${PREFLIGHT_ONLY}"; then
+      echo "BFCL-${BFCL_BENCH_VERSION} preflight complete. Results will be written under ${BFCL_LOG_ROOT}."
+      exit 0
+   fi
+   if [ ! -x "${BFCL_VENV_DIR}/bin/bfcl" ] || ! "${BFCL_VENV_DIR}/bin/python" -c \
+      'import bfcl_eval, boto3, cohere, datamodel_code_generator, google.genai, mistralai, openai, overrides, qwen_agent, tenacity, tree_sitter, tree_sitter_java, tree_sitter_javascript, writerai' >/dev/null 2>&1; then
+      echo "Preparing isolated BFCL environment under ${BFCL_VENV_DIR}"
+      "${BFCL_PYTHON_BIN}" -m venv --clear --system-site-packages "${BFCL_VENV_DIR}"
+      "${BFCL_VENV_DIR}/bin/python" -m pip install --no-deps -e "${BFCL_ROOT}"
+      "${BFCL_VENV_DIR}/bin/python" -m pip install \
+         'tree_sitter==0.21.3' \
+         'tree-sitter-java==0.21.0' \
+         'tree-sitter-javascript==0.21.4' \
+         'mistralai==1.7.0' \
+         'cohere==5.18.0' \
+         'datamodel-code-generator==0.25.7' \
+         'google-genai>=1.52.0' \
+         qwen-agent \
+         'tenacity>=8.5.0' \
+         'writer-sdk>=2.1.0' \
+         overrides \
+         boto3
+   fi
+   if [ "${BFCL_BENCH_VERSION}" = v4 ] && ! "${BFCL_VENV_DIR}/bin/python" -c \
+      'import faiss, sentence_transformers' >/dev/null 2>&1; then
+      echo "Preparing isolated BFCL-v4 agentic dependencies under ${BFCL_VENV_DIR}"
+      "${BFCL_VENV_DIR}/bin/python" -m pip install --no-deps \
+         'faiss-cpu==1.11.0' \
+         'sentence-transformers==3.4.1'
+   fi
+   export PATH="${BFCL_VENV_DIR}/bin:${PATH}"
+   export BFCL_PROJECT_ROOT="${BFCL_ROOT}"
+   export BFCL_DISCARD_HISTORICAL_THINKING="${BFCL_DISCARD_HISTORICAL_THINKING}"
+   export BFCL_SLIME_TOOL_PARSER_PATH="${REPO_ROOT}/slime/rollout/fused_agent/parser.py"
+   export FUSED_MODEL_SERIES="${MODEL_SERIES}"
+   export FUSED_MAX_STEPS="${MAX_STEPS}"
+   export FUSED_MCP_MAX_STEPS="${MCP_MAX_STEPS}"
+   "${BFCL_CMD[@]}"
+   if is_truthy "${BFCL_OVERWRITE}"; then
+      BFCL_SCORE_ARTIFACT_DIR="${BFCL_SCORE_DIR}/${EXPERIMENT_NAME//\//_}"
+      if [ -d "${BFCL_SCORE_ARTIFACT_DIR}" ]; then
+         rm -rf "${BFCL_SCORE_ARTIFACT_DIR:?}"
+      fi
+   fi
+   "${BFCL_EVALUATE_CMD[@]}"
+   "${BFCL_SGLANG_PYTHON_BIN}" -m slime_plugins.evals.bfcl_reliability_report \
+      --result-dir "${BFCL_RESULT_DIR}" \
+      --score-dir "${BFCL_SCORE_DIR}" \
+      --artifact-name "${EXPERIMENT_NAME}"
+   exec "${BFCL_VENV_DIR}/bin/bfcl" scores --score-dir "${BFCL_SCORE_DIR}"
+fi
+
+if is_truthy "${ACEBENCH_SELECTED}"; then
+   ACEBENCH_ROOT="${BENCHMARKS_ROOT}/ACEBench"
+   ACEBENCH_MODEL_DIR="$(realpath "${MODEL_DIR}")"
+   if [ ! -x "${ACEBENCH_ROOT}/run_eval.sh" ] || [ ! -f "${ACEBENCH_ROOT}/pyproject.toml" ]; then
+      echo "ACEBench is incomplete under ${ACEBENCH_ROOT}; expected executable run_eval.sh and pyproject.toml." >&2
+      exit 2
+   fi
+   case "${ACEBENCH_LANGUAGE}" in zh|en|both) ;; *) echo "--acebench-language must be zh, en, or both" >&2; exit 2 ;; esac
+   case "${ACEBENCH_AGENT_BACKEND}" in acebench|rllm_tool_agent) ;; *) echo "--acebench-agent-backend must be acebench or rllm_tool_agent" >&2; exit 2 ;; esac
+   case "${ACEBENCH_PROTOCOL}" in
+      auto)
+         if [ "${FUSED_HARNESS}" = "gem" ]; then
+            ACEBENCH_PROTOCOL=slime_fused_gem
+         else
+            ACEBENCH_PROTOCOL=official_acebench
+         fi
+         ;;
+      official_acebench|slime_fused_gem) ;;
+      *) echo "--acebench-protocol must be auto, official_acebench, or slime_fused_gem" >&2; exit 2 ;;
+   esac
+   if [ "${ACEBENCH_PROTOCOL}" = "slime_fused_gem" ]; then
+      if [ "${FUSED_HARNESS}" != "gem" ]; then
+         echo "slime_fused_gem currently requires --harness gem, got ${FUSED_HARNESS}" >&2
+         exit 2
+      fi
+      if is_truthy "${acebench_agent_backend_explicit}" && [ "${ACEBENCH_AGENT_BACKEND}" != "rllm_tool_agent" ]; then
+         echo "slime_fused_gem requires --acebench-agent-backend rllm_tool_agent" >&2
+         exit 2
+      fi
+      ACEBENCH_AGENT_BACKEND=rllm_tool_agent
+   elif ! is_truthy "${acebench_agent_backend_explicit}"; then
+      ACEBENCH_AGENT_BACKEND=acebench
+   fi
+   if [ "${ACEBENCH_NUM_THREADS}" != "auto" ] && ! [[ "${ACEBENCH_NUM_THREADS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "--acebench-num-threads must be auto or a positive integer" >&2
+      exit 2
+   fi
+   if ! [[ "${ACEBENCH_MAX_DIALOG_TURNS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "--acebench-max-dialog-turns must be a positive integer" >&2
+      exit 2
+   fi
+   if [ -n "${ACEBENCH_MAX_TOKENS}" ] && ! [[ "${ACEBENCH_MAX_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "--acebench-max-tokens must be a positive integer" >&2
+      exit 2
+   fi
+   if [ "${N_SAMPLES_PER_PROMPT}" -ne 1 ]; then
+      echo "ACEBench currently supports --n-samples-per-prompt 1 only." >&2
+      exit 2
+   fi
+   ACEBENCH_USE_UV=true
+   if ! command -v uv >/dev/null 2>&1; then
+      ACEBENCH_USE_UV=false
+   fi
+   if [[ "${ACEBENCH_SGLANG_PYTHON_BIN}" != */* ]]; then
+      ACEBENCH_SGLANG_PYTHON_BIN="$(command -v "${ACEBENCH_SGLANG_PYTHON_BIN}")"
+   fi
+   if [ ! -x "${ACEBENCH_SGLANG_PYTHON_BIN}" ]; then
+      echo "ACEBench SGLang Python is not executable: ${ACEBENCH_SGLANG_PYTHON_BIN}" >&2
+      exit 2
+   fi
+   if [ -z "${ACEBENCH_SGLANG_LIBSTDCXX}" ]; then
+      ACEBENCH_SGLANG_PREFIX="$("${ACEBENCH_SGLANG_PYTHON_BIN}" -c 'import sys; print(sys.prefix)')"
+      candidate_libstdcxx="${ACEBENCH_SGLANG_PREFIX}/lib/libstdc++.so.6"
+      if [ -f "${candidate_libstdcxx}" ] && strings "${candidate_libstdcxx}" | grep -x 'GLIBCXX_3.4.32' >/dev/null; then
+         ACEBENCH_SGLANG_LIBSTDCXX="${candidate_libstdcxx}"
+      fi
+   fi
+   if [ -n "${ACEBENCH_SGLANG_LIBSTDCXX}" ]; then
+      if [ ! -f "${ACEBENCH_SGLANG_LIBSTDCXX}" ]; then
+         echo "ACEBench SGLang libstdc++ does not exist: ${ACEBENCH_SGLANG_LIBSTDCXX}" >&2
+         exit 2
+      fi
+      export LD_PRELOAD="${ACEBENCH_SGLANG_LIBSTDCXX}${LD_PRELOAD:+:${LD_PRELOAD}}"
+      echo "ACEBench SGLang C++ runtime: ${ACEBENCH_SGLANG_LIBSTDCXX}"
+   fi
+
+   ACEBENCH_CUDA_DEVICES=""
+   for ((gpu_index = 0; gpu_index < ROLLOUT_GPUS; gpu_index++)); do
+      if [ -n "${ACEBENCH_CUDA_DEVICES}" ]; then ACEBENCH_CUDA_DEVICES+=","; fi
+      ACEBENCH_CUDA_DEVICES+="${gpu_index}"
+   done
+   if [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
+      echo "--gpus (${ROLLOUT_GPUS}) must be divisible by --gpus-per-engine (${ROLLOUT_NUM_GPUS_PER_ENGINE}) for ACEBench." >&2
+      exit 2
+   fi
+   ACEBENCH_DP_SIZE=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
+   if [ "${ACEBENCH_NUM_THREADS}" = "auto" ]; then
+      ACEBENCH_NUM_THREADS=$((ACEBENCH_DP_SIZE * 8))
+      echo "ACEBench generation concurrency: ${ACEBENCH_NUM_THREADS} (${ACEBENCH_DP_SIZE} DP replicas x 8)"
+   fi
+   if is_truthy "${DISABLE_THINKING}"; then
+      ACEBENCH_RESPONSE_MODE=instruct
+   else
+      ACEBENCH_RESPONSE_MODE=reasoning
+   fi
+   ACEBENCH_CMD=(
+      "${ACEBENCH_ROOT}/run_eval.sh"
+      --model-alias "${EXPERIMENT_NAME}"
+      --served-model-name "${EXPERIMENT_NAME}"
+      --sglang-model-path "${ACEBENCH_MODEL_DIR}"
+      --sglang-python-bin "${ACEBENCH_SGLANG_PYTHON_BIN}"
+      --sglang-cuda-visible-devices "${ACEBENCH_CUDA_DEVICES}"
+      --sglang-tp-size "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
+      --sglang-dp-size "${ACEBENCH_DP_SIZE}"
+      --sglang-context-length "${EVAL_MAX_CONTEXT_LEN}"
+      --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
+      --language "${ACEBENCH_LANGUAGE}"
+      --category "${ACEBENCH_CATEGORY}"
+      --num-threads "${ACEBENCH_NUM_THREADS}"
+      --max-samples-per-task "${LIMIT_PER_BENCHMARK}"
+      --max-dialog-turns "${ACEBENCH_MAX_DIALOG_TURNS}"
+      --temperature "${TEMPERATURE}"
+      --top-p "${TOP_P}"
+      --agent-backend "${ACEBENCH_AGENT_BACKEND}"
+      --protocol-mode "${ACEBENCH_PROTOCOL}"
+      --response-mode "${ACEBENCH_RESPONSE_MODE}"
+      --top-k "${TOP_K}"
+      --seed "${ROLLOUT_SEED}"
+      --slime-repo-root "${REPO_ROOT}"
+      --model-series "${MODEL_SERIES}"
+   )
+   if is_truthy "${DISABLE_THINKING}"; then
+      ACEBENCH_CMD+=(--enable-thinking false)
+   else
+      ACEBENCH_CMD+=(--enable-thinking true)
+   fi
+   if is_truthy "${DISCARD_HISTORICAL_THINKING}"; then ACEBENCH_CMD+=(--discard-historical-thinking); fi
+   if is_truthy "${DETERMINISTIC_INFERENCE}"; then ACEBENCH_CMD+=(--deterministic-inference); fi
+   if [ -n "${ACEBENCH_MAX_TOKENS}" ]; then ACEBENCH_CMD+=(--max-tokens "${ACEBENCH_MAX_TOKENS}"); fi
+   if is_truthy "${ACEBENCH_OVERWRITE}"; then ACEBENCH_CMD+=(--overwrite); else ACEBENCH_CMD+=(--no-overwrite); fi
+   if [ -n "${ACEBENCH_USER_MODEL}" ]; then ACEBENCH_CMD+=(--user-model "${ACEBENCH_USER_MODEL}"); fi
+   if [ -n "${ACEBENCH_USER_BASE_URL}" ]; then ACEBENCH_CMD+=(--user-base-url "${ACEBENCH_USER_BASE_URL}"); fi
+   if [ -n "${ACEBENCH_USER_API_KEY}" ]; then
+      export OPENROUTER_API_KEY="${ACEBENCH_USER_API_KEY}"
+   fi
+   if ! is_truthy "${ACEBENCH_USE_UV}"; then ACEBENCH_CMD+=(--no-uv); fi
+
+   printf 'ACEBench command:'
+   printf ' %q' "${ACEBENCH_CMD[@]}"
+   printf '\n'
+   if is_truthy "${PREFLIGHT_ONLY}"; then
+      echo "ACEBench preflight complete. Dependencies are isolated under ACEBench (uv=${ACEBENCH_USE_UV})."
+      exit 0
+   fi
+   if ! is_truthy "${ACEBENCH_USE_UV}"; then
+      ACEBENCH_VENV_DIR="${ACEBENCH_ROOT}/.venv-slime-evals"
+      ACEBENCH_VENV_PYTHON="${ACEBENCH_VENV_DIR}/bin/python"
+      if [ ! -x "${ACEBENCH_VENV_PYTHON}" ] || ! "${ACEBENCH_VENV_PYTHON}" -c \
+         'import openai, openpyxl, pandas, dotenv, tqdm, wcwidth' >/dev/null 2>&1; then
+         echo "Preparing isolated ACEBench environment under ${ACEBENCH_VENV_DIR}"
+         python3 -m venv "${ACEBENCH_VENV_DIR}"
+         mapfile -t ACEBENCH_REQUIREMENTS < <(python3 - "${ACEBENCH_ROOT}/pyproject.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as file:
+    print("\n".join(tomllib.load(file)["project"]["dependencies"]))
+PY
+)
+         "${ACEBENCH_VENV_PYTHON}" -m pip install "${ACEBENCH_REQUIREMENTS[@]}"
+      fi
+      export PATH="${ACEBENCH_VENV_DIR}/bin:${PATH}"
+   fi
+   export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+   export FUSED_MODEL_SERIES="${MODEL_SERIES}"
+   exec "${ACEBENCH_CMD[@]}"
+fi
+
+if is_truthy "${TAU2_SELECTED}"; then
+   TAU2_ROOT="${BENCHMARKS_ROOT}/tau^2-bench"
+   TAU2_VENV_DIR="${TAU2_VENV_DIR:-${TAU2_ROOT}/.venv-slime-evals}"
+   if [[ "${TAU2_PYTHON_BIN}" != */* ]]; then TAU2_PYTHON_BIN="$(command -v "${TAU2_PYTHON_BIN}")"; fi
+   if [[ "${TAU2_SGLANG_PYTHON_BIN}" != */* ]]; then TAU2_SGLANG_PYTHON_BIN="$(command -v "${TAU2_SGLANG_PYTHON_BIN}")"; fi
+   if [ "${FUSED_HARNESS}" != "gem" ]; then
+      echo "tau2 integration requires --harness gem, got ${FUSED_HARNESS}" >&2
+      exit 2
+   fi
+   case "${TAU2_DOMAIN}" in all|airline|retail|telecom|*,*) ;; *) echo "--tau2-domain must be all or a comma-separated subset of airline,retail,telecom" >&2; exit 2 ;; esac
+   if ! [[ "${TAU2_MAX_RETRIES}" =~ ^[0-9]+$ ]]; then
+      echo "--tau2-max-retries must be a non-negative integer" >&2
+      exit 2
+   fi
+   if [ -z "${TAU2_USER_API_KEY}" ]; then
+      echo "tau2 requires an external user-simulator credential." >&2
+      echo "Set OPENROUTER_API_KEY or pass --tau2-user-api-key." >&2
+      exit 2
+   fi
+   if [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
+      echo "--gpus must be divisible by --gpus-per-engine for tau2." >&2
+      exit 2
+   fi
+   TAU2_DP_SIZE=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
+   TAU2_EVALUATOR_MODEL="${TAU2_EVALUATOR_MODEL:-${TAU2_USER_MODEL}}"
+   TAU2_EVALUATOR_BASE_URL="${TAU2_EVALUATOR_BASE_URL:-${TAU2_USER_BASE_URL}}"
+   TAU2_EVALUATOR_API_KEY="${TAU2_EVALUATOR_API_KEY:-${TAU2_USER_API_KEY}}"
+   if [ "${TAU2_MAX_CONCURRENCY}" = "auto" ]; then TAU2_MAX_CONCURRENCY=$((TAU2_DP_SIZE * 8)); fi
+   TAU2_MAX_STEPS="${TAU2_MAX_STEPS:-${MAX_STEPS}}"
+   if is_truthy "${DISABLE_THINKING}"; then TAU2_ENABLE_THINKING=false; else TAU2_ENABLE_THINKING=true; fi
+   TAU2_NUM_TASKS="${LIMIT_PER_BENCHMARK}"
+   if [ "${TAU2_NUM_TASKS}" -ge 99999 ]; then TAU2_NUM_TASKS=0; fi
+   TAU2_CUDA_DEVICES=""
+   for ((gpu_index = 0; gpu_index < ROLLOUT_GPUS; gpu_index++)); do
+      if [ -n "${TAU2_CUDA_DEVICES}" ]; then TAU2_CUDA_DEVICES+=","; fi
+      TAU2_CUDA_DEVICES+="${gpu_index}"
+   done
+   TAU2_LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/evals/${EXPERIMENT_NAME}}"
+   TAU2_CMD=(
+      python3 -m slime_plugins.evals.tau2_launcher
+      --tau2-root "${TAU2_ROOT}"
+      --model "${MODEL_DIR}"
+      --model-series "${MODEL_SERIES}"
+      --served-model-name "${EXPERIMENT_NAME}"
+      --output-dir "${TAU2_LOG_ROOT}/tau2"
+      --venv-dir "${TAU2_VENV_DIR}"
+      --python-bin "${TAU2_PYTHON_BIN}"
+      --sglang-python-bin "${TAU2_SGLANG_PYTHON_BIN}"
+      --cuda-visible-devices "${TAU2_CUDA_DEVICES}"
+      --tp-size "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
+      --dp-size "${TAU2_DP_SIZE}"
+      --context-length "${EVAL_MAX_CONTEXT_LEN}"
+      --mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
+      --port "${TAU2_PORT}"
+      --domain "${TAU2_DOMAIN}"
+      --num-trials "${N_SAMPLES_PER_PROMPT}"
+      --num-tasks "${TAU2_NUM_TASKS}"
+      --max-steps "${TAU2_MAX_STEPS}"
+      --max-retries "${TAU2_MAX_RETRIES}"
+      --max-concurrency "${TAU2_MAX_CONCURRENCY}"
+      --seed "${ROLLOUT_SEED}"
+      --temperature "${TEMPERATURE}"
+      --top-p "${TOP_P}"
+      --top-k "${TOP_K}"
+      --max-tokens "${TAU2_MAX_TOKENS}"
+      --enable-thinking "${TAU2_ENABLE_THINKING}"
+      --discard-historical-thinking "${DISCARD_HISTORICAL_THINKING}"
+      --use-sglang-session "${TAU2_USE_SGLANG_SESSION}"
+      --deterministic-inference "${DETERMINISTIC_INFERENCE}"
+      --user-model "${TAU2_USER_MODEL}"
+      --user-base-url "${TAU2_USER_BASE_URL}"
+      --evaluator-model "${TAU2_EVALUATOR_MODEL}"
+      --evaluator-base-url "${TAU2_EVALUATOR_BASE_URL}"
+      --overwrite "${TAU2_OVERWRITE}"
+   )
+   if [ -n "${TAU2_CONCURRENCY_SWEEP}" ]; then TAU2_CMD+=(--concurrency-sweep "${TAU2_CONCURRENCY_SWEEP}"); fi
+   if [ -n "${TAU2_SGLANG_LIBSTDCXX}" ]; then TAU2_CMD+=(--sglang-libstdcxx "${TAU2_SGLANG_LIBSTDCXX}"); fi
+   export TAU2_USER_API_KEY TAU2_EVALUATOR_API_KEY
+   if is_truthy "${PREFLIGHT_ONLY}"; then TAU2_CMD+=(--preflight-only); fi
+   echo "tau2: domain=${TAU2_DOMAIN}, model=${MODEL_DIR}, user_model=${TAU2_USER_MODEL}, tasks=$([ "${TAU2_NUM_TASKS}" -eq 0 ] && echo all || echo "${TAU2_NUM_TASKS}"), trials=${N_SAMPLES_PER_PROMPT}, retries=${TAU2_MAX_RETRIES}, output=${TAU2_LOG_ROOT}/tau2"
+   if is_truthy "${CLEANUP}" && ! is_truthy "${PREFLIGHT_ONLY}"; then ray stop --force; fi
+   exec "${TAU2_CMD[@]}"
+fi
+
+if is_truthy "${VITABENCH_SELECTED}"; then
+   VITABENCH_ROOT="${BENCHMARKS_ROOT}/vitabench"
+   VITABENCH_VENV_DIR="${VITABENCH_VENV_DIR:-${VITABENCH_ROOT}/.venv-slime-evals}"
+   if [[ "${VITABENCH_SGLANG_PYTHON_BIN}" != */* ]]; then
+      VITABENCH_SGLANG_PYTHON_BIN="$(command -v "${VITABENCH_SGLANG_PYTHON_BIN}")"
+   fi
+   VITABENCH_USER_MODEL="${VITABENCH_USER_MODEL:-openai/gpt-4.1}"
+   VITABENCH_EVALUATOR_MODEL="${VITABENCH_EVALUATOR_MODEL:-openai/gpt-4.1}"
+   if [ "${FUSED_HARNESS}" != "gem" ]; then
+      echo "VitaBench's slime_fused_gem transport requires --harness gem, got ${FUSED_HARNESS}" >&2
+      exit 2
+   fi
+   case "${VITABENCH_USE_SGLANG_SESSION,,}" in true|false|1|0|yes|no|on|off) ;;
+      *) echo "--vitabench-use-sglang-session must be a boolean" >&2; exit 2 ;;
+   esac
+   case "${VITABENCH_LANGUAGE}" in chinese|english) ;; *) echo "--vitabench-language must be chinese or english" >&2; exit 2 ;; esac
+   if ! [[ "${VITABENCH_MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "--vitabench-max-steps must be a positive integer" >&2
+      exit 2
+   fi
+   if ! [[ "${VITABENCH_CONTEXT_LENGTH}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "--vitabench-context-length must be a positive integer" >&2
+      exit 2
+   fi
+   if [ -z "${VITABENCH_USER_API_KEY}" ] || [ -z "${VITABENCH_EVALUATOR_API_KEY}" ]; then
+      echo "VitaBench requires external user-simulator and rubric-evaluator credentials." >&2
+      echo "Set OPENROUTER_API_KEY or pass --vitabench-user-api-key and --vitabench-evaluator-api-key." >&2
+      exit 2
+   fi
+   if [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
+      echo "--gpus (${ROLLOUT_GPUS}) must be divisible by --gpus-per-engine (${ROLLOUT_NUM_GPUS_PER_ENGINE}) for VitaBench." >&2
+      exit 2
+   fi
+   VITABENCH_DP_SIZE=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
+   if is_truthy "${VITABENCH_USE_SGLANG_SESSION}" && [ "${VITABENCH_DP_SIZE}" -gt 1 ]; then
+      echo "VitaBench: disabling native SGLang sessions for dp=${VITABENCH_DP_SIZE}; session lifecycle requests are not DP-routable"
+      VITABENCH_USE_SGLANG_SESSION=false
+   fi
+   # Agent inference scales across DP workers, but the user and evaluator share
+   # an external OpenAI-compatible endpoint. Keep auto bounded to avoid empty or
+   # truncated judge responses under a 64-request burst.
+   if [ "${VITABENCH_MAX_CONCURRENCY}" = "auto" ]; then
+      VITABENCH_MAX_CONCURRENCY=$((VITABENCH_DP_SIZE * 2))
+      if [ "${VITABENCH_MAX_CONCURRENCY}" -gt 16 ]; then VITABENCH_MAX_CONCURRENCY=16; fi
+   fi
+   VITABENCH_MAX_TOKENS="${VITABENCH_MAX_TOKENS:-${EVAL_MAX_RESPONSE_LEN}}"
+   if is_truthy "${DISABLE_THINKING}"; then VITABENCH_ENABLE_THINKING=false; else VITABENCH_ENABLE_THINKING=true; fi
+   VITABENCH_CUDA_DEVICES=""
+   for ((gpu_index = 0; gpu_index < ROLLOUT_GPUS; gpu_index++)); do
+      if [ -n "${VITABENCH_CUDA_DEVICES}" ]; then VITABENCH_CUDA_DEVICES+=","; fi
+      VITABENCH_CUDA_DEVICES+="${gpu_index}"
+   done
+   VITABENCH_NUM_TASKS="${LIMIT_PER_BENCHMARK}"
+   if [ "${VITABENCH_NUM_TASKS}" -ge 99999 ]; then VITABENCH_NUM_TASKS=0; fi
+   VITABENCH_LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/evals/${EXPERIMENT_NAME}}"
+   VITABENCH_CMD=(
+      python3 -m slime_plugins.evals.vitabench_launcher
+      --vitabench-root "${VITABENCH_ROOT}"
+      --model "${MODEL_DIR}"
+      --served-model-name "${EXPERIMENT_NAME}"
+      --output-dir "${VITABENCH_LOG_ROOT}/vitabench"
+      --venv-dir "${VITABENCH_VENV_DIR}"
+      --sglang-python-bin "${VITABENCH_SGLANG_PYTHON_BIN}"
+      --cuda-visible-devices "${VITABENCH_CUDA_DEVICES}"
+      --tp-size "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
+      --dp-size "${VITABENCH_DP_SIZE}"
+      --context-length "${VITABENCH_CONTEXT_LENGTH}"
+      --mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
+      --port "${VITABENCH_PORT}"
+      --domain "${VITABENCH_DOMAIN}"
+      --language "${VITABENCH_LANGUAGE}"
+      --evaluation-type "${VITABENCH_EVALUATION_TYPE}"
+      --num-trials "${N_SAMPLES_PER_PROMPT}"
+      --num-tasks "${VITABENCH_NUM_TASKS}"
+      --max-steps "${VITABENCH_MAX_STEPS}"
+      --max-concurrency "${VITABENCH_MAX_CONCURRENCY}"
+      --seed "${ROLLOUT_SEED}"
+      --temperature "${TEMPERATURE}"
+      --top-p "${TOP_P}"
+      --top-k "${TOP_K}"
+      --max-tokens "${VITABENCH_MAX_TOKENS}"
+      --user-max-tokens 4096
+      --evaluator-max-tokens 8192
+      --enable-thinking "${VITABENCH_ENABLE_THINKING}"
+      --discard-historical-thinking "${DISCARD_HISTORICAL_THINKING}"
+      --deterministic-inference "${DETERMINISTIC_INFERENCE}"
+      --use-sglang-session "${VITABENCH_USE_SGLANG_SESSION}"
+      --user-model "${VITABENCH_USER_MODEL}"
+      --user-base-url "${VITABENCH_USER_BASE_URL}"
+      --evaluator-model "${VITABENCH_EVALUATOR_MODEL}"
+      --evaluator-base-url "${VITABENCH_EVALUATOR_BASE_URL}"
+      --overwrite "${VITABENCH_OVERWRITE}"
+   )
+   if is_truthy "${PREFLIGHT_ONLY}"; then VITABENCH_CMD+=(--preflight-only); fi
+   echo "VitaBench: protocol=official_vitabench, transport=slime_fused_gem, sglang_session=${VITABENCH_USE_SGLANG_SESSION}, evaluation=${VITABENCH_EVALUATION_TYPE}, model=${MODEL_DIR}, user_model=${VITABENCH_USER_MODEL}, evaluator_model=${VITABENCH_EVALUATOR_MODEL}, domain=${VITABENCH_DOMAIN}, language=${VITABENCH_LANGUAGE}, tasks=$([ "${VITABENCH_NUM_TASKS}" -eq 0 ] && echo all || echo "${VITABENCH_NUM_TASKS}"), trials=${N_SAMPLES_PER_PROMPT}, max_steps=${VITABENCH_MAX_STEPS}, dp=${VITABENCH_DP_SIZE}, tp=${ROLLOUT_NUM_GPUS_PER_ENGINE}, output=${VITABENCH_LOG_ROOT}/vitabench"
+   export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+   export VITABENCH_USER_API_KEY VITABENCH_EVALUATOR_API_KEY
+   exec "${VITABENCH_CMD[@]}"
 fi
 case "${ROUTER_POLICY}" in
    manual|consistent_hashing|cache_aware|round_robin|random|power_of_two|prefix_hash) ;;
@@ -817,9 +1730,12 @@ export RLLM_RETRIEVAL_MODE="${RETRIEVAL_MODE}"
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
 export RLLM_RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY}"
 export RLLM_RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE}"
-case "${FUSED_HARNESS}" in
-   rllm_deepresearch|rllm_dr|rllm-dr|deepresearch) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-10}" ;;
-   *) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-4}" ;;
+case "${RETRIEVAL_BACKEND}:${FUSED_HARNESS}" in
+   serper:*) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-8}" ;;
+   local:rllm_deepresearch|local:rllm_dr|local:rllm-dr|local:deepresearch)
+      export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-10}"
+      ;;
+   local:*) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-4}" ;;
 esac
 export RLLM_RETRIEVAL_SUMMARIZE="${RLLM_RETRIEVAL_SUMMARIZE:-0}"
 export RLLM_DR_REFINE_SERVER_URL

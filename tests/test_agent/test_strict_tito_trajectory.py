@@ -639,5 +639,60 @@ def test_masked_response_tokens_zero_their_rollout_logprobs():
     _assert_trainable_tokens_keep_their_logprobs(samples)
 
 
+@pytest.mark.parametrize("logprobs", [[], [float("nan")], [float("inf")]])
+def test_strict_trainable_tokens_require_complete_finite_logprobs(logprobs):
+    manager = TrajectoryManager()
+
+    with pytest.raises(ValueError, match="logprob"):
+        manager.record_turn(
+            "strict-logprobs",
+            turn=TurnRecord(
+                prompt_ids=[1],
+                context_delta_ids=[1],
+                output_ids=[2],
+                output_log_probs=logprobs,
+                finish_reason="stop",
+                require_rollout_logprobs=True,
+            ),
+            prompt_messages=[{"role": "user", "content": "u"}],
+            response_message={"role": "assistant", "content": "a"},
+        )
+
+
+def test_strict_weight_version_rejects_missing_and_mixed_turns():
+    manager = TrajectoryManager()
+    common = {
+        "prompt_ids": [1],
+        "context_delta_ids": [1],
+        "output_ids": [2],
+        "output_log_probs": [-0.1],
+        "finish_reason": "stop",
+        "require_weight_version": True,
+    }
+    messages = [{"role": "user", "content": "u"}]
+
+    with pytest.raises(ValueError, match="requires SGLang"):
+        manager.record_turn(
+            "missing-version",
+            turn=TurnRecord(**common),
+            prompt_messages=messages,
+            response_message={"role": "assistant", "content": "a"},
+        )
+
+    manager.record_turn(
+        "mixed-version",
+        turn=TurnRecord(**common, weight_version="v1"),
+        prompt_messages=messages,
+        response_message={"role": "assistant", "content": "a"},
+    )
+    with pytest.raises(ValueError, match="mixed rollout weight versions"):
+        manager.record_turn(
+            "mixed-version",
+            turn=TurnRecord(**common, weight_version="v2"),
+            prompt_messages=messages,
+            response_message={"role": "assistant", "content": "b"},
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

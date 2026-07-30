@@ -1,5 +1,6 @@
 import ast
 import logging
+import math
 
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
@@ -74,14 +75,19 @@ def validate_args(args):
 
     _megatron_validate_args(args)
 
+    if getattr(args, "use_yarn_rope", False):
+        if not math.isfinite(args.yarn_rope_scaling_factor) or args.yarn_rope_scaling_factor <= 1:
+            raise ValueError("--yarn-rope-scaling-factor must be finite and greater than 1")
+        if args.yarn_original_max_position_embeddings <= 0:
+            raise ValueError("--yarn-original-max-position-embeddings must be positive")
+
     # always use varlen
     args.variable_seq_lengths = True
     if getattr(args, "moe_token_dispatcher_type", None) == "allgather":
-        logger.info(
+        raise ValueError(
             "--moe-token-dispatcher-type allgather does not support variable sequence length, "
-            "please use alltoall dispatcher instead."
+            "use --moe-token-dispatcher-type alltoall instead."
         )
-        args.moe_token_dispatcher_type = "alltoall"
 
     if args.pipeline_model_parallel_size == 1:
         assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, (

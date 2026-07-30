@@ -425,9 +425,17 @@ def _mcp_atlas_claims(sample: Sample) -> list[str]:
 def _get_client(args) -> httpx.AsyncClient:
     global _CLIENT
     if _CLIENT is None or _CLIENT.is_closed:
+        base_url = getattr(args, "grm_base_url", None)
         api_key = getattr(args, "grm_openrouter_api_key", None) or os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
-            raise RuntimeError("OpenRouter GRM requires OPENROUTER_API_KEY or --grm-openrouter-api-key.")
+            base_url = base_url or os.environ.get("OPENAI_BASE_URL")
+            if base_url:
+                api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "OpenRouter GRM requires OPENROUTER_API_KEY or --grm-openrouter-api-key; "
+                "a custom GRM endpoint may instead use OPENAI_API_KEY with OPENAI_BASE_URL."
+            )
 
         timeout = float(getattr(args, "grm_timeout", 60.0))
         max_connections = max(1, int(getattr(args, "grm_max_connections", 128)))
@@ -443,7 +451,7 @@ def _get_client(args) -> httpx.AsyncClient:
             headers["X-Title"] = title
 
         _CLIENT = httpx.AsyncClient(
-            base_url=(getattr(args, "grm_base_url", None) or "https://openrouter.ai/api/v1").rstrip("/"),
+            base_url=(base_url or "https://openrouter.ai/api/v1").rstrip("/"),
             timeout=httpx.Timeout(timeout),
             limits=httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_connections),
             headers=headers,

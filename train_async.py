@@ -26,6 +26,9 @@ def train(args):
     actor_model.update_weights()
 
     if args.check_weight_update_equal:
+        ray.get(rollout_manager.check_weights.remote(action="snapshot"))
+        ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
+        actor_model.update_weights()
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
     if args.num_rollout == 0 and args.eval_interval is not None:

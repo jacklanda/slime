@@ -2,7 +2,12 @@ import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
-from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, suppress_known_training_warnings
+from slime.utils.logging_utils import (
+    configure_logger,
+    finish_tracking,
+    init_tracking,
+    suppress_known_training_warnings,
+)
 from slime.utils.misc import should_run_periodic_action
 
 
@@ -27,6 +32,11 @@ def train(args):
     actor_model.update_weights()
 
     if args.check_weight_update_equal:
+        ray.get(rollout_manager.check_weights.remote(action="snapshot"))
+        ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
+        if release_train:
+            actor_model.create()
+        actor_model.update_weights()
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
     if args.offload_rollout:
@@ -85,7 +95,8 @@ def train(args):
         offload_train(actor_trains)
         if args.offload_rollout and not release_train:
             ray.get(rollout_manager.onload_weights.remote())
-        actor_model.update_weights()
+        if release_train or (rollout_id + 1) % args.update_weights_interval == 0:
+            actor_model.update_weights()
 
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())

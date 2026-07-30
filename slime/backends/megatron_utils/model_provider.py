@@ -139,6 +139,14 @@ def _get_model_provider_func(
 
         # Experimental loading arguments from yaml
         config: TransformerConfig = core_transformer_config_from_args(args)
+        if args.use_yarn_rope:
+            config.yarn_rotary_scaling_factor = args.yarn_rope_scaling_factor
+            config.yarn_original_max_position_embeddings = args.yarn_original_max_position_embeddings
+            config.yarn_beta_fast = 32.0
+            config.yarn_beta_slow = 1.0
+            config.yarn_mscale = None
+            config.yarn_mscale_all_dim = None
+            config.yarn_correction_range_round_to_int = True
 
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
@@ -210,7 +218,7 @@ def _get_model_provider_func(
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
             "parallel_output": True,
             "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
-            "position_embedding_type": args.position_embedding_type,
+            "position_embedding_type": "yarn" if args.use_yarn_rope else args.position_embedding_type,
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,

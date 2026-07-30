@@ -16,8 +16,11 @@ logger = logging.getLogger(__name__)
 _MASKED_TOKEN_STYLE = "grey58 on grey11"
 _EMPTY_THINK_SHELL_STYLE = "bold grey58"
 _UNMASKED_TOKEN_STYLE = "bold bright_blue on grey15"
+_MASKED_TOOL_CALL_STYLE = "underline grey58 on grey11"
+_UNMASKED_TOOL_CALL_STYLE = "bold underline bright_blue on grey15"
 _REWARD_POS_STYLE = "bold black on bright_green"
 _REWARD_NEG_STYLE = "bold white on red3"
+_TOKEN_MASK_BORDER_STYLE = "magenta"
 _NO_CLIP_CHARS = 10**12
 _WEB_SEARCH_OBSERVATION_MAX_WORDS = 256
 
@@ -109,7 +112,13 @@ def _print_standard_sample_rich(args, sample: Sample, tokenizer, *, group_id: in
     console.print(Panel(_metadata_line(sample, group_id), title="Metadata", border_style="cyan"))
     console.print(Panel(_sample_result_text(sample), title="Result", border_style="green"))
     if token_mask_view is not None:
-        console.print(Panel(Group(_token_mask_legend(), token_mask_view), title="Token Mask View", border_style="magenta"))
+        console.print(
+            Panel(
+                Group(_token_mask_legend(), token_mask_view),
+                title="Token Mask View",
+                border_style=_TOKEN_MASK_BORDER_STYLE,
+            )
+        )
     console.print(_text_panel("Prompt", prompt_text, "blue", max_chars=max_chars))
     console.print(_text_panel("Masked Action", masked_action, "dim", max_chars=max_chars))
     console.print(_text_panel("Unmasked Action", unmasked_action, "bright_blue", max_chars=max_chars))
@@ -135,14 +144,20 @@ def _print_rllm_episode(
             tokenizer = _load_tokenizer_for_visualization(args)
             console = _trajectory_console(args)
             max_chars = _trajectory_max_chars(args)
-            token_mask_view = _token_mask_text(sample, tokenizer, related_samples=related_samples)
+            token_mask_view = _episode_token_mask_view(sample, tokenizer, related_samples=related_samples)
 
             console.print()
             console.rule("Episode Trajectory", style="cyan")
             console.print(Panel(_episode_summary_table(sample, episode, group_id), title="Overview", border_style="cyan"))
             console.print(_text_panel("Task", _task_text(episode), "orange1", max_chars=max_chars))
             if token_mask_view is not None:
-                console.print(Panel(Group(_token_mask_legend(), token_mask_view), title="Token Mask View", border_style="magenta"))
+                console.print(
+                    Panel(
+                        Group(_token_mask_legend(), token_mask_view),
+                        title="Token Mask View",
+                        border_style=_TOKEN_MASK_BORDER_STYLE,
+                    )
+                )
 
             trajectories = [traj for traj in episode.get("trajectories", []) if isinstance(traj, dict)]
             for traj_idx, trajectory in enumerate(trajectories):
@@ -259,21 +274,19 @@ def _token_mask_legend():
     legend.append(" = injected prompt prefix, ")
     legend.append(" unmasked ", style=_UNMASKED_TOKEN_STYLE)
     legend.append(" = loss_mask 1, ")
+    legend.append(" tool call ", style=_MASKED_TOOL_CALL_STYLE)
+    legend.append(" = underline, ")
     legend.append(" reward > 0 ", style=_REWARD_POS_STYLE)
     legend.append(" / ")
     legend.append(" reward <= 0 ", style=_REWARD_NEG_STYLE)
     return legend
 
 
-def _token_mask_text(sample: Sample, tokenizer, *, related_samples: list[Sample] | None = None):
+def _token_mask_text(sample: Sample, tokenizer):
     from rich.text import Text
 
     if tokenizer is None or not sample.tokens:
         return None
-
-    related_samples = [s for s in (related_samples or []) if isinstance(s, Sample) and s.tokens and s.response_length > 0]
-    if related_samples:
-        return _combined_token_mask_text(sample, tokenizer, related_samples)
 
     response_length = int(sample.response_length or 0)
     if response_length <= 0:
@@ -282,10 +295,9 @@ def _token_mask_text(sample: Sample, tokenizer, *, related_samples: list[Sample]
     tokens = list(sample.tokens)
     response_length = min(response_length, len(tokens))
     prompt_ids = tokens[:-response_length]
-    response_ids = tokens[-response_length:]
     loss_mask = _normalized_response_loss_mask(sample.loss_mask, response_length)
     full_mask = [0] * len(prompt_ids) + loss_mask
-    _promote_assistant_action_blocks(tokens, full_mask, tokenizer)
+    tool_call_positions = _assistant_action_block_token_positions(tokens, tokenizer)
     shell_positions = _empty_think_shell_token_positions(tokens, response_length, tokenizer)
 
     rendered = Text(overflow="fold", no_wrap=False)
@@ -294,6 +306,8 @@ def _token_mask_text(sample: Sample, tokenizer, *, related_samples: list[Sample]
     for idx, (token_id, mask) in enumerate(zip(tokens, full_mask, strict=False)):
         piece = _decode_token_piece(tokenizer, token_id)
         style = _UNMASKED_TOKEN_STYLE if mask else _MASKED_TOKEN_STYLE
+        if idx in tool_call_positions:
+            style = _UNMASKED_TOOL_CALL_STYLE if mask else _MASKED_TOOL_CALL_STYLE
         if idx in shell_positions:
             style = _EMPTY_THINK_SHELL_STYLE
         if reward_style is not None and idx == len(tokens) - 1:
@@ -302,48 +316,94 @@ def _token_mask_text(sample: Sample, tokenizer, *, related_samples: list[Sample]
     return rendered
 
 
-def _combined_token_mask_text(sample: Sample, tokenizer, related_samples: list[Sample]):
+def _episode_token_mask_view(sample: Sample, tokenizer, *, related_samples: list[Sample] | None):
+    from rich.console import Group
+    from rich.panel import Panel
     from rich.text import Text
 
-    base_sample = max(related_samples, key=lambda item: len(item.tokens or []), default=sample)
-    tokens = list(base_sample.tokens)
-    if not tokens:
-        return None
+    segments = list(related_samples) if related_samples is not None else [sample]
+    if not segments:
+        raise ValueError("token mask view requires at least one trajectory segment")
+    declared_segment_count = (sample.metadata or {}).get("segment_count")
+    if len(segments) == 1 and declared_segment_count in {None, 0, 1}:
+        return _token_mask_text(segments[0], tokenizer)
 
-    full_mask = [0] * len(tokens)
-    search_start = 0
-    for item in sorted(related_samples, key=lambda s: (len(s.tokens or []), int(s.response_length or 0))):
-        response_length = min(int(item.response_length or 0), len(item.tokens or []))
-        if response_length <= 0:
-            continue
-        response_ids = list(item.tokens[-response_length:])
-        loss_mask = _normalized_response_loss_mask(item.loss_mask, response_length)
-        for start, end in _unmasked_token_spans(loss_mask):
-            span_ids = response_ids[start:end]
-            if not span_ids:
-                continue
-            match = _find_subsequence(tokens, span_ids, start=search_start)
-            if match is None:
-                match = _find_subsequence(tokens, span_ids, start=0)
-            if match is None:
-                continue
-            for idx in range(match, match + len(span_ids)):
-                full_mask[idx] = 1
-            search_start = match + len(span_ids)
-    _promote_assistant_action_blocks(tokens, full_mask, tokenizer)
-    shell_positions = _empty_think_shell_token_positions(tokens, 0, tokenizer)
+    segments = _ordered_segment_samples(segments)
+    rendered_segments = []
+    for segment in segments:
+        metadata = segment.metadata or {}
+        spans = metadata["turn_spans"]
+        turn_indices = [int(span["turn_index"]) for span in spans]
+        contiguous_turns = turn_indices == list(range(turn_indices[0], turn_indices[-1] + 1))
+        if len(turn_indices) == 1:
+            turn_label = str(turn_indices[0])
+            step_label = "Step"
+        elif contiguous_turns:
+            turn_label = f"{turn_indices[0]}-{turn_indices[-1]}"
+            step_label = "Steps"
+        else:
+            turn_label = ",".join(str(index) for index in turn_indices)
+            step_label = "Steps"
+        title = Text()
+        title.append(
+            f"Segment {int(metadata['segment_index']) + 1}/{int(metadata['segment_count'])}",
+            style="bold cyan",
+        )
+        title.append(f" | {step_label} {turn_label}")
+        boundary_reason = metadata.get("tito_boundary_reason")
+        if boundary_reason:
+            title.append(f" | boundary={boundary_reason}", style="yellow")
+        rendered = _token_mask_text(segment, tokenizer)
+        if rendered is None:
+            raise ValueError(f"segment {metadata['segment_index']} has no renderable token mask")
+        rendered_segments.append(
+            Panel(
+                rendered,
+                title=title,
+                border_style=_TOKEN_MASK_BORDER_STYLE,
+                padding=(0, 1),
+            )
+        )
+    return Group(*rendered_segments)
 
-    rendered = Text(overflow="fold", no_wrap=False)
-    reward_style = _reward_style(sample.reward)
-    for idx, (token_id, mask) in enumerate(zip(tokens, full_mask, strict=False)):
-        piece = _decode_token_piece(tokenizer, token_id)
-        style = _UNMASKED_TOKEN_STYLE if mask else _MASKED_TOKEN_STYLE
-        if idx in shell_positions:
-            style = _EMPTY_THINK_SHELL_STYLE
-        if reward_style is not None and idx == len(tokens) - 1:
-            style = reward_style
-        rendered.append(piece, style=style)
-    return rendered
+
+def _ordered_segment_samples(samples: list[Sample]) -> list[Sample]:
+    parent_ids = {(sample.metadata or {}).get("parent_traj_id") for sample in samples}
+    if len(parent_ids) != 1 or None in parent_ids:
+        raise ValueError("multiple-segment token mask view requires one shared parent_traj_id")
+
+    segment_counts = {(sample.metadata or {}).get("segment_count") for sample in samples}
+    if len(segment_counts) != 1 or None in segment_counts:
+        raise ValueError("multiple-segment token mask view requires one shared segment_count")
+    segment_count = int(next(iter(segment_counts)))
+    if segment_count != len(samples):
+        raise ValueError(f"expected {segment_count} trajectory segments, got {len(samples)}")
+
+    by_index = {}
+    for sample in samples:
+        metadata = sample.metadata or {}
+        segment_index = metadata.get("segment_index")
+        spans = metadata.get("turn_spans")
+        if not isinstance(segment_index, int) or segment_index in by_index:
+            raise ValueError(f"invalid or duplicate segment_index: {segment_index!r}")
+        if not isinstance(spans, list) or not spans:
+            raise ValueError(f"segment {segment_index} is missing turn_spans provenance")
+        for span in spans:
+            if not isinstance(span, dict) or not isinstance(span.get("turn_index"), int):
+                raise ValueError(f"segment {segment_index} has invalid turn_spans provenance")
+            response_start = span.get("response_token_start")
+            response_end = span.get("response_token_end")
+            if (
+                not isinstance(response_start, int)
+                or not isinstance(response_end, int)
+                or not 0 <= response_start < response_end <= len(sample.tokens or [])
+            ):
+                raise ValueError(f"segment {segment_index} has out-of-range turn_spans provenance")
+        by_index[segment_index] = sample
+    expected_indices = set(range(segment_count))
+    if set(by_index) != expected_indices:
+        raise ValueError(f"segment indices must be contiguous: expected {expected_indices}, got {set(by_index)}")
+    return [by_index[index] for index in range(segment_count)]
 
 
 def _empty_think_shell_token_positions(tokens: list[int], response_length: int, tokenizer) -> set[int]:
@@ -373,36 +433,11 @@ def _empty_think_shell_token_positions(tokens: list[int], response_length: int, 
     return positions
 
 
-def _unmasked_token_spans(loss_mask: list[int]) -> list[tuple[int, int]]:
-    spans = []
-    start = None
-    for idx, value in enumerate(loss_mask):
-        if value and start is None:
-            start = idx
-        elif not value and start is not None:
-            spans.append((start, idx))
-            start = None
-    if start is not None:
-        spans.append((start, len(loss_mask)))
-    return spans
-
-
-def _find_subsequence(tokens: list[int], span_ids: list[int], *, start: int) -> int | None:
-    if not span_ids or len(span_ids) > len(tokens):
-        return None
-    first = span_ids[0]
-    limit = len(tokens) - len(span_ids) + 1
-    for idx in range(max(0, start), limit):
-        if tokens[idx] == first and tokens[idx : idx + len(span_ids)] == span_ids:
-            return idx
-    return None
-
-
-def _promote_assistant_action_blocks(tokens: list[int], mask: list[int], tokenizer) -> None:
+def _assistant_action_block_token_positions(tokens: list[int], tokenizer) -> set[int]:
     pieces = [_decode_token_piece(tokenizer, token_id) for token_id in tokens]
     full_text = "".join(pieces)
     if "<tool_call>" not in full_text:
-        return
+        return set()
 
     offsets = []
     cursor = 0
@@ -413,15 +448,17 @@ def _promote_assistant_action_blocks(tokens: list[int], mask: list[int], tokeniz
 
     assistant_spans = _assistant_message_spans(full_text)
     if not assistant_spans:
-        return
+        return set()
 
+    positions = set()
     for action_match in re.finditer(r"<tool_call>.*?</tool_call>", full_text, flags=re.DOTALL):
         action_start, action_end = action_match.span()
         if not any(span_start <= action_start < action_end <= span_end for span_start, span_end in assistant_spans):
             continue
         for idx, (token_start, token_end) in enumerate(offsets):
             if token_start < action_end and token_end > action_start:
-                mask[idx] = 1
+                positions.add(idx)
+    return positions
 
 
 def _assistant_message_spans(text: str) -> list[tuple[int, int]]:
@@ -609,6 +646,7 @@ def _episode_summary_rows(sample: Sample, episode: dict[str, Any], group_id: int
     rows.extend((name, str(value)) for name in ("index", "group_index", "rollout_id") if (value := getattr(sample, name, None)) is not None)
     task = _dict_or_empty(episode.get("task"))
     metrics = _dict_or_empty(episode.get("metrics"))
+    episode_metadata = _dict_or_empty(episode.get("metadata"))
     rows.extend(
         [
             ("episode_id", str(episode.get("id") or "n/a")),
@@ -618,6 +656,7 @@ def _episode_summary_rows(sample: Sample, episode: dict[str, Any], group_id: int
             ("is_correct", "yes" if episode.get("is_correct") else "no"),
             ("termination", str(episode.get("termination_reason") or "unknown")),
             ("trajectories", str(len(episode.get("trajectories") or []))),
+            ("segment_num", str(episode_metadata["segment_count"])),
         ]
     )
     for key in ("traj/steps", "turn/tool_call_turn"):

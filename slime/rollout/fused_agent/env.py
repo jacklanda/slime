@@ -1251,7 +1251,9 @@ def _format_retrieval_documents(data: Any, *, max_results: int) -> tuple[list[st
             continue
         if signature:
             seen_signatures.add(signature)
-        if len(content.split()) < _MIN_RETRIEVAL_DOC_WORDS:
+        if len(content.split()) < _MIN_RETRIEVAL_DOC_WORDS and not (
+            isinstance(row, dict) and row.get("search_snippet") is True
+        ):
             skipped_short += 1
             continue
         title = _extract_retrieval_document_title(row, content)

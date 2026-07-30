@@ -196,5 +196,6 @@ _examples_synced/
 
 experiments/**
 !experiments/*.sh
+!experiments/fused_agent_tis_wide_rs.yaml
 checkpoints/**
 submitted_result.json

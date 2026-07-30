@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
+from slime.utils.train_infer_consistency import mismatch_bucket_contributions
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -970,6 +971,7 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    local_log_prob_templates = list(log_probs)
     if not args.use_rollout_logprobs and not old_log_probs:
         old_log_probs = [log_prob.detach() for log_prob in log_probs]
     train_log_probs_for_tis = batch.get("log_probs")
@@ -1028,6 +1030,11 @@ def policy_loss_function(
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
 
+    # Keep mismatch diagnostics on the original policy-token population even
+    # when a custom TIS hook later rejects tokens from the gradient reducer.
+    mismatch_metric_reducer = pg_sum_of_sample_mean
+    modified_response_masks = pg_loss_masks
+
     # Apply off-policy correction using importance sampling if enabled
     if args.get_mismatch_metrics or args.use_tis:
         # NOTE:
@@ -1037,8 +1044,11 @@ def policy_loss_function(
         # However, mismatch/TIS/RS metrics (e.g., "truncate_fraction") are often defined over the
         # *pre-RS* valid tokens. If we aggregate metrics with `modified_response_masks`, the rejected
         # tokens are excluded from the denominator and the metric can be artificially driven to 0.
-        # Keep a copy of the original reducer (based on `batch["loss_masks"]`) for metric aggregation.
-        sum_of_sample_mean_for_mismatch_metrics = sum_of_sample_mean
+        # Keep the original policy-mask reducer for metric aggregation. This
+        # excludes credit-assignment-masked tokens while retaining tokens that
+        # the TIS/RS hook subsequently rejects.
+        sum_of_sample_mean_for_mismatch_metrics = pg_sum_of_sample_mean
+        mismatch_metric_reducer = sum_of_sample_mean_for_mismatch_metrics
 
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
@@ -1062,7 +1072,7 @@ def policy_loss_function(
         # [decouple IS and rejection] Rebuild sum_of_sample_mean with
         # modified_response_masks for numerator correction (rejected tokens
         # zeroed in pg_loss). Denominators stay the precomputed per-rollout
-        # totals from ``rollout_mask_sums`` (based on original loss_masks) —
+        # totals from ``pg_rollout_mask_sums`` (based on original policy masks) —
         # same normalizer as the outer reducer, so pg_loss and the rest of the
         # reported metrics live in the same per-rollout-mean space.
         sum_of_sample_mean = get_sum_of_sample_mean(
@@ -1117,10 +1127,20 @@ def policy_loss_function(
         loss += 0 * logits.sum()
 
     train_rollout_logprob_abs_diff = None
+    mismatch_bucket_metrics = {}
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         log_probs_to_compare = log_probs if args.use_rollout_logprobs else old_log_probs
-        train_rollout_logprob_abs_diff = pg_sum_of_sample_mean((log_probs_to_compare - rollout_log_probs).abs())
+        abs_logprob_diff = (log_probs_to_compare - rollout_log_probs).abs()
+        train_rollout_logprob_abs_diff = mismatch_metric_reducer(abs_logprob_diff)
+        bucket_ids = batch.get("mismatch_bucket_ids")
+        if bucket_ids is not None:
+            mismatch_bucket_metrics = mismatch_bucket_contributions(
+                abs_logprob_diff,
+                local_log_prob_templates,
+                bucket_ids,
+                mismatch_metric_reducer,
+            )
 
     reported_loss = {
         "loss": loss.clone().detach(),
@@ -1129,12 +1149,16 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
-    if "policy_loss_masks" in batch:
-        policy_tokens = sum(mask.sum() for mask in pg_loss_masks)
-        reported_loss["policy_loss_tokens"] = policy_tokens.float().clone().detach()
+    policy_tokens = sum(mask.sum() for mask in pg_loss_masks)
+    reported_loss["policy_loss_tokens"] = policy_tokens.float().clone().detach()
+    effective_policy_tokens = sum(mask.sum() for mask in modified_response_masks)
+    reported_loss["effective_policy_loss_tokens"] = effective_policy_tokens.float().clone().detach()
+    rejection_fraction = 1.0 - effective_policy_tokens.float() / torch.clamp_min(policy_tokens.float(), 1.0)
+    reported_loss["policy_token_rejection_fraction"] = rejection_fraction.clone().detach()
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
+        reported_loss.update(mismatch_bucket_metrics)
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()

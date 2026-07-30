@@ -3,7 +3,7 @@ from argparse import Namespace
 import pytest
 
 from slime.agent.trajectory import TrajectoryManager, TurnRecord
-from slime.ray.rollout import _collect_fused_agent_stats, convert_samples_to_train_data
+from slime.ray.rollout import _collect_fused_agent_stats, _mismatch_bucket_ids, convert_samples_to_train_data
 from slime.rollout.filter_hub.horizon_reward_shaping import post_process_rewards as post_process_horizon_rewards
 from slime.rollout.sglang_rollout import _timeout_sample
 from slime.utils.credit_assignment import CreditAssignmentConfig, build_policy_loss_mask
@@ -853,7 +853,18 @@ def test_fully_masked_tito_tail_guard_sample_survives_trainer_conversion():
     assert train_data["episode_metrics_data"]["credit_assignment_events"] == ["tail_guard_early_stop"]
 
 
-def _prompt_equal_sample(*, group_index, rollout_id, parent_traj_id, instance_id, loss_mask, policy_loss_mask=None, reward=0.0, segment_index=0, remove_sample=False):
+def _prompt_equal_sample(
+    *,
+    group_index,
+    rollout_id,
+    parent_traj_id,
+    instance_id,
+    loss_mask,
+    policy_loss_mask=None,
+    reward=0.0,
+    segment_index=0,
+    remove_sample=False,
+):
     return Sample(
         index=rollout_id,
         group_index=group_index,
@@ -877,14 +888,29 @@ def _prompt_equal_sample(*, group_index, rollout_id, parent_traj_id, instance_id
 @pytest.mark.parametrize("estimator", ["grpo", "reinforce_plus_plus_baseline"])
 def test_prompt_equal_denominator_pools_all_segments_and_rollouts_by_instance_id(estimator):
     samples = [
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="a1", instance_id="prompt-a", loss_mask=[1, 1]),
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="a1", instance_id="prompt-a", loss_mask=[1, 1, 1], segment_index=1),
-        _prompt_equal_sample(group_index=0, rollout_id=1, parent_traj_id="a2", instance_id="prompt-a", loss_mask=[1, 0, 1, 1]),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=0, parent_traj_id="a1", instance_id="prompt-a", loss_mask=[1, 1]
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="a1",
+            instance_id="prompt-a",
+            loss_mask=[1, 1, 1],
+            segment_index=1,
+        ),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=1, parent_traj_id="a2", instance_id="prompt-a", loss_mask=[1, 0, 1, 1]
+        ),
         _prompt_equal_sample(group_index=1, rollout_id=2, parent_traj_id="b1", instance_id="prompt-b", loss_mask=[1]),
-        _prompt_equal_sample(group_index=1, rollout_id=3, parent_traj_id="b2", instance_id="prompt-b", loss_mask=[1, 1, 1]),
+        _prompt_equal_sample(
+            group_index=1, rollout_id=3, parent_traj_id="b2", instance_id="prompt-b", loss_mask=[1, 1, 1]
+        ),
     ]
 
-    train_data = convert_samples_to_train_data(_args(advantage_estimator=estimator, global_batch_size=4, rewards_normalization=False), samples)
+    train_data = convert_samples_to_train_data(
+        _args(advantage_estimator=estimator, global_batch_size=4, rewards_normalization=False), samples
+    )
 
     # M_A=8, M_B=4, N_P=2, GBS=4.
     assert train_data["rollout_mask_sums"] == [4.0, 4.0, 4.0, 2.0, 2.0]
@@ -892,9 +918,30 @@ def test_prompt_equal_denominator_pools_all_segments_and_rollouts_by_instance_id
 
 def test_prompt_equal_policy_denominator_uses_live_policy_tokens_and_excludes_dead_prompts():
     samples = [
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="a1", instance_id="prompt-a", loss_mask=[1, 1, 1], policy_loss_mask=[1, 0, 1]),
-        _prompt_equal_sample(group_index=0, rollout_id=1, parent_traj_id="a2", instance_id="prompt-a", loss_mask=[1, 1], policy_loss_mask=[0, 1]),
-        _prompt_equal_sample(group_index=1, rollout_id=2, parent_traj_id="b1", instance_id="prompt-b", loss_mask=[1, 1], policy_loss_mask=[1, 1]),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="a1",
+            instance_id="prompt-a",
+            loss_mask=[1, 1, 1],
+            policy_loss_mask=[1, 0, 1],
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=1,
+            parent_traj_id="a2",
+            instance_id="prompt-a",
+            loss_mask=[1, 1],
+            policy_loss_mask=[0, 1],
+        ),
+        _prompt_equal_sample(
+            group_index=1,
+            rollout_id=2,
+            parent_traj_id="b1",
+            instance_id="prompt-b",
+            loss_mask=[1, 1],
+            policy_loss_mask=[1, 1],
+        ),
         _prompt_equal_sample(
             group_index=2,
             rollout_id=3,
@@ -914,10 +961,18 @@ def test_prompt_equal_policy_denominator_uses_live_policy_tokens_and_excludes_de
 
 def test_prompt_equal_denominators_are_computed_within_each_training_step():
     samples = [
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="a0", instance_id="prompt-a", loss_mask=[1, 1]),
-        _prompt_equal_sample(group_index=1, rollout_id=1, parent_traj_id="b0", instance_id="prompt-b", loss_mask=[1, 1]),
-        _prompt_equal_sample(group_index=0, rollout_id=2, parent_traj_id="a1", instance_id="prompt-a", loss_mask=[1, 1, 1, 1]),
-        _prompt_equal_sample(group_index=2, rollout_id=3, parent_traj_id="c0", instance_id="prompt-c", loss_mask=[1, 1, 1, 1]),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=0, parent_traj_id="a0", instance_id="prompt-a", loss_mask=[1, 1]
+        ),
+        _prompt_equal_sample(
+            group_index=1, rollout_id=1, parent_traj_id="b0", instance_id="prompt-b", loss_mask=[1, 1]
+        ),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=2, parent_traj_id="a1", instance_id="prompt-a", loss_mask=[1, 1, 1, 1]
+        ),
+        _prompt_equal_sample(
+            group_index=2, rollout_id=3, parent_traj_id="c0", instance_id="prompt-c", loss_mask=[1, 1, 1, 1]
+        ),
     ]
 
     train_data = convert_samples_to_train_data(
@@ -956,11 +1011,22 @@ def test_prompt_equal_conversion_tolerates_unmarked_group_timeout_sample():
 
 def test_prompt_equal_marker_keeps_gspo_trajectory_equal_denominators():
     samples = [
-        _prompt_equal_sample(group_index=0, rollout_id=7, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1, 1]),
-        _prompt_equal_sample(group_index=0, rollout_id=7, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1, 1, 1], segment_index=1),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=7, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1, 1]
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=7,
+            parent_traj_id="t1",
+            instance_id="prompt-a",
+            loss_mask=[1, 1, 1],
+            segment_index=1,
+        ),
     ]
 
-    train_data = convert_samples_to_train_data(_args(advantage_estimator="gspo", global_batch_size=1, rewards_normalization=False), samples)
+    train_data = convert_samples_to_train_data(
+        _args(advantage_estimator="gspo", global_batch_size=1, rewards_normalization=False), samples
+    )
 
     assert train_data["rollout_mask_sums"] == [5, 5]
 
@@ -968,13 +1034,30 @@ def test_prompt_equal_marker_keeps_gspo_trajectory_equal_denominators():
 @pytest.mark.parametrize("estimator", ["grpo", "reinforce_plus_plus_baseline"])
 def test_segment_reward_normalization_uses_anchor_then_broadcasts(estimator):
     samples = [
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0),
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=2.0, segment_index=1),
-        _prompt_equal_sample(group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=4.0),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            instance_id="prompt-a",
+            loss_mask=[1],
+            reward=2.0,
+            segment_index=1,
+        ),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=4.0
+        ),
     ]
 
     train_data = convert_samples_to_train_data(
-        _args(advantage_estimator=estimator, global_batch_size=2, rewards_normalization=True, grpo_std_normalization=False),
+        _args(
+            advantage_estimator=estimator,
+            global_batch_size=2,
+            rewards_normalization=True,
+            grpo_std_normalization=False,
+        ),
         samples,
     )
 
@@ -984,9 +1067,21 @@ def test_segment_reward_normalization_uses_anchor_then_broadcasts(estimator):
 
 def test_segment_reward_grpo_std_matches_dressage_population_standard_deviation():
     samples = [
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0),
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=2.0, segment_index=1),
-        _prompt_equal_sample(group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=4.0),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            instance_id="prompt-a",
+            loss_mask=[1],
+            reward=2.0,
+            segment_index=1,
+        ),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=4.0
+        ),
     ]
 
     train_data = convert_samples_to_train_data(
@@ -1002,8 +1097,18 @@ def test_segment_reward_std_normalization_singleton_group_yields_zero_not_nan():
     # torch sample std over one element is NaN; a lone trajectory in its group
     # (n_samples_per_prompt=1) must get a zero advantage, not a NaN one.
     samples = [
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0),
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=3.0, segment_index=1),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            instance_id="prompt-a",
+            loss_mask=[1],
+            reward=3.0,
+            segment_index=1,
+        ),
     ]
     train_data = convert_samples_to_train_data(
         _args(global_batch_size=1, rewards_normalization=True, grpo_std_normalization=True),
@@ -1036,9 +1141,33 @@ def _tito_fork_sample(*, group_index, rollout_id, parent_traj_id, loss_mask, rew
 
 def test_non_discard_tito_forks_use_prompt_equal_loss_and_anchor_reward():
     samples = [
-        _tito_fork_sample(group_index=0, rollout_id=0, parent_traj_id="t1", loss_mask=[1], reward=0.0, segment_index=0, segment_count=2),
-        _tito_fork_sample(group_index=0, rollout_id=0, parent_traj_id="t1", loss_mask=[1], reward=4.0, segment_index=1, segment_count=2),
-        _tito_fork_sample(group_index=0, rollout_id=1, parent_traj_id="t2", loss_mask=[1], reward=0.0, segment_index=0, segment_count=1),
+        _tito_fork_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            loss_mask=[1],
+            reward=0.0,
+            segment_index=0,
+            segment_count=2,
+        ),
+        _tito_fork_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            loss_mask=[1],
+            reward=4.0,
+            segment_index=1,
+            segment_count=2,
+        ),
+        _tito_fork_sample(
+            group_index=0,
+            rollout_id=1,
+            parent_traj_id="t2",
+            loss_mask=[1],
+            reward=0.0,
+            segment_index=0,
+            segment_count=1,
+        ),
     ]
 
     train_data = convert_samples_to_train_data(
@@ -1062,16 +1191,64 @@ def test_zero_std_filter_judges_non_discard_tito_forks_on_trajectory_level():
     # anyway, but a 3-segment/1-segment split with identical rewards is the
     # canonical shape this guards).
     same_terminal = [
-        _tito_fork_sample(group_index=0, rollout_id=0, parent_traj_id="t1", loss_mask=[1], reward=0.0, segment_index=0, segment_count=2),
-        _tito_fork_sample(group_index=0, rollout_id=0, parent_traj_id="t1", loss_mask=[1], reward=1.0, segment_index=1, segment_count=2),
-        _tito_fork_sample(group_index=0, rollout_id=1, parent_traj_id="t2", loss_mask=[1], reward=1.0, segment_index=0, segment_count=1),
+        _tito_fork_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            loss_mask=[1],
+            reward=0.0,
+            segment_index=0,
+            segment_count=2,
+        ),
+        _tito_fork_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            loss_mask=[1],
+            reward=1.0,
+            segment_index=1,
+            segment_count=2,
+        ),
+        _tito_fork_sample(
+            group_index=0,
+            rollout_id=1,
+            parent_traj_id="t2",
+            loss_mask=[1],
+            reward=1.0,
+            segment_index=0,
+            segment_count=1,
+        ),
     ]
     assert check_reward_nonzero_std(args, same_terminal).keep is False
 
     distinct_terminal = [
-        _tito_fork_sample(group_index=0, rollout_id=0, parent_traj_id="t1", loss_mask=[1], reward=0.0, segment_index=0, segment_count=2),
-        _tito_fork_sample(group_index=0, rollout_id=0, parent_traj_id="t1", loss_mask=[1], reward=1.0, segment_index=1, segment_count=2),
-        _tito_fork_sample(group_index=0, rollout_id=1, parent_traj_id="t2", loss_mask=[1], reward=0.0, segment_index=0, segment_count=1),
+        _tito_fork_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            loss_mask=[1],
+            reward=0.0,
+            segment_index=0,
+            segment_count=2,
+        ),
+        _tito_fork_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            loss_mask=[1],
+            reward=1.0,
+            segment_index=1,
+            segment_count=2,
+        ),
+        _tito_fork_sample(
+            group_index=0,
+            rollout_id=1,
+            parent_traj_id="t2",
+            loss_mask=[1],
+            reward=0.0,
+            segment_index=0,
+            segment_count=1,
+        ),
     ]
     assert check_reward_nonzero_std(args, distinct_terminal).keep is True
 
@@ -1084,18 +1261,56 @@ def test_zero_std_filter_judges_prompt_equal_batches_on_trajectory_level_rewards
     # Two multi-segment trajectories with identical terminal rewards: the
     # non-anchor 0.0 placeholders must not fake a nonzero std.
     same_terminal = [
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0),
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=1.0, segment_index=1),
-        _prompt_equal_sample(group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=0.0),
-        _prompt_equal_sample(group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=1.0, segment_index=1),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            instance_id="prompt-a",
+            loss_mask=[1],
+            reward=1.0,
+            segment_index=1,
+        ),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=0.0
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=1,
+            parent_traj_id="t2",
+            instance_id="prompt-a",
+            loss_mask=[1],
+            reward=1.0,
+            segment_index=1,
+        ),
     ]
     assert check_reward_nonzero_std(args, same_terminal).keep is False
 
     # Distinct terminal rewards must still pass.
     distinct_terminal = [
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0),
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=1.0, segment_index=1),
-        _prompt_equal_sample(group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=0.0, segment_index=0),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            instance_id="prompt-a",
+            loss_mask=[1],
+            reward=1.0,
+            segment_index=1,
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=1,
+            parent_traj_id="t2",
+            instance_id="prompt-a",
+            loss_mask=[1],
+            reward=0.0,
+            segment_index=0,
+        ),
     ]
     assert check_reward_nonzero_std(args, distinct_terminal).keep is True
 
@@ -1103,9 +1318,21 @@ def test_zero_std_filter_judges_prompt_equal_batches_on_trajectory_level_rewards
 def test_segment_reward_anchor_broadcast_wraps_horizon_reward_shaping(monkeypatch):
     monkeypatch.setenv("FUSED_HORIZON_REWARD_MIN_MULTIPLIER", "1")
     samples = [
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0),
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.2, segment_index=1),
-        _prompt_equal_sample(group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=0.8),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            instance_id="prompt-a",
+            loss_mask=[1],
+            reward=0.2,
+            segment_index=1,
+        ),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=0.8
+        ),
     ]
 
     train_data = convert_samples_to_train_data(
@@ -1120,8 +1347,12 @@ def test_segment_reward_anchor_broadcast_wraps_horizon_reward_shaping(monkeypatc
 
 def test_custom_reward_post_process_result_is_not_processed_twice():
     samples = [
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0),
-        _prompt_equal_sample(group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=2.0),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0
+        ),
+        _prompt_equal_sample(
+            group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=2.0
+        ),
     ]
 
     def custom_hook(_args, _samples):
@@ -1138,9 +1369,33 @@ def test_custom_reward_post_process_result_is_not_processed_twice():
 
 def test_fused_metrics_count_each_segmented_trajectory_once():
     samples = [
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=0.0, segment_index=0),
-        _prompt_equal_sample(group_index=0, rollout_id=0, parent_traj_id="t1", instance_id="prompt-a", loss_mask=[1], reward=1.0, segment_index=1),
-        _prompt_equal_sample(group_index=0, rollout_id=1, parent_traj_id="t2", instance_id="prompt-a", loss_mask=[1], reward=0.0, segment_index=0),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            instance_id="prompt-a",
+            loss_mask=[1],
+            reward=0.0,
+            segment_index=0,
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=0,
+            parent_traj_id="t1",
+            instance_id="prompt-a",
+            loss_mask=[1],
+            reward=1.0,
+            segment_index=1,
+        ),
+        _prompt_equal_sample(
+            group_index=0,
+            rollout_id=1,
+            parent_traj_id="t2",
+            instance_id="prompt-a",
+            loss_mask=[1],
+            reward=0.0,
+            segment_index=0,
+        ),
     ]
     for sample in samples:
         sample.metadata.update(
@@ -1148,6 +1403,10 @@ def test_fused_metrics_count_each_segmented_trajectory_once():
                 "fused_task_type": "webqa",
                 "fused_termination": "env_done",
                 "fused_reward_debug": {"tool_calls": 2},
+                "fused_rollout_weight_version_count": 1,
+                "fused_rollout_logprob_invalid_ratio": 0.0,
+                "fused_tito_boundary_count": 1,
+                "segment_count": 2,
             }
         )
 
@@ -1156,7 +1415,29 @@ def test_fused_metrics_count_each_segmented_trajectory_once():
     assert stats["sample_rewards_by_source"]["webqa"] == [1.0, 0.0]
     assert stats["terminations"] == ["env_done", "env_done"]
     assert stats["workflow_values"]["tool_calls"] == [2.0, 2.0]
+    assert stats["workflow_values"]["rollout_weight_version_count"] == [1.0, 1.0]
+    assert stats["workflow_values"]["rollout_logprob_invalid_ratio"] == [0.0, 0.0]
+    assert stats["workflow_values"]["tito_boundary_count"] == [1.0, 1.0]
+    assert stats["workflow_values"]["segment_count"] == [2.0, 2.0]
     assert len(stats["group_rewards"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("task", "segment_count", "response_length", "expected"),
+    [
+        ("web_search", 1, 4096, (0, 0, 0)),
+        ("mcp", 2, 4097, (1, 1, 1)),
+        ("et", 3, 16385, (2, 1, 2)),
+        ("unknown", 1, 1, (3, 0, 0)),
+    ],
+)
+def test_mismatch_bucket_ids_are_fixed_and_compact(task, segment_count, response_length, expected):
+    sample = Sample(
+        response_length=response_length,
+        metadata={"fused_task_type": task, "segment_count": segment_count},
+    )
+
+    assert _mismatch_bucket_ids(sample) == expected
 
 
 if __name__ == "__main__":

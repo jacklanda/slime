@@ -111,6 +111,63 @@ def make_allgather_cp_args(**overrides):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("factor", "original_context", "message"),
+    [
+        (1.0, 32768, "scaling-factor"),
+        (float("nan"), 32768, "scaling-factor"),
+        (4.0, 0, "original-max-position-embeddings"),
+    ],
+)
+def test_validate_args_rejects_invalid_yarn_settings(monkeypatch, factor, original_context, message):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(
+        use_yarn_rope=True,
+        yarn_rope_scaling_factor=factor,
+        yarn_original_max_position_embeddings=original_context,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        module.validate_args(args)
+
+
+@pytest.mark.unit
+def test_apply_yarn_sglang_override_merges_structured_json(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(
+        use_yarn_rope=True,
+        yarn_rope_scaling_factor=4.0,
+        yarn_original_max_position_embeddings=32768,
+        sglang_context_length=131072,
+        sglang_json_model_override_args='{"architectures":["Qwen3ForCausalLM"]}',
+    )
+
+    module._apply_yarn_sglang_override(args)
+
+    assert args.sglang_json_model_override_args == (
+        '{"architectures":["Qwen3ForCausalLM"],'
+        '"max_position_embeddings":131072,'
+        '"rope_scaling":{"rope_type":"yarn","factor":4.0,'
+        '"original_max_position_embeddings":32768}}'
+    )
+
+
+@pytest.mark.unit
+def test_apply_yarn_sglang_override_rejects_invalid_json(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(
+        use_yarn_rope=True,
+        yarn_rope_scaling_factor=4.0,
+        yarn_original_max_position_embeddings=32768,
+        sglang_context_length=131072,
+        sglang_json_model_override_args='{"broken":',
+    )
+
+    with pytest.raises(ValueError, match="must be valid JSON"):
+        module._apply_yarn_sglang_override(args)
+
+
+@pytest.mark.unit
 def test_hf_validate_all_moe_skips_dense_intermediate_size(monkeypatch):
     module = load_arguments_module(monkeypatch)
 
@@ -168,11 +225,50 @@ def test_allgather_cp_ignores_cp_size_one(monkeypatch):
 
 
 @pytest.mark.unit
+def test_variable_sequences_reject_allgather_moe_dispatcher(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(
+        moe_token_dispatcher_type="allgather",
+        pipeline_model_parallel_size=1,
+        decoder_first_pipeline_num_layers=None,
+        decoder_last_pipeline_num_layers=None,
+    )
+
+    with pytest.raises(ValueError, match="use --moe-token-dispatcher-type alltoall"):
+        module.validate_args(args)
+
+
+@pytest.mark.unit
+def test_variable_sequences_keep_explicit_alltoall_dispatcher(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(
+        moe_token_dispatcher_type="alltoall",
+        pipeline_model_parallel_size=1,
+        decoder_first_pipeline_num_layers=None,
+        decoder_last_pipeline_num_layers=None,
+    )
+
+    module.validate_args(args)
+
+    assert args.variable_seq_lengths is True
+    assert args.moe_token_dispatcher_type == "alltoall"
+
+
+@pytest.mark.unit
 def test_update_weight_disk_dir_required_for_disk_transport(monkeypatch):
     module = load_slime_arguments_module(monkeypatch)
     args = make_slime_validate_args(update_weight_transport="disk", update_weight_disk_dir=None)
 
     with pytest.raises(ValueError, match="update-weight-disk-dir"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_update_weights_interval_must_be_positive(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(update_weights_interval=0)
+
+    with pytest.raises(ValueError, match="update-weights-interval"):
         module.slime_validate_args(args)
 
 
@@ -292,6 +388,32 @@ def test_slime_validate_args_rejects_webqa_prompt_data_without_ground_truth(monk
 
     with pytest.raises(ValueError, match="sample check failed"):
         module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_slime_validate_args_allows_endless_terminal_fused_data_without_ground_truth(monkeypatch, tmp_path):
+    import pandas as pd
+
+    module = load_slime_arguments_module(monkeypatch)
+    path = tmp_path / "terminal_tasks.parquet"
+    pd.DataFrame(
+        [
+            {
+                "prompt": [{"role": "user", "content": "Fix the repository"}],
+                "reward_model": {"ground_truth": None, "style": "rule"},
+                "extra_info": {"data_source": "endless_terminals", "task_id": "task-1"},
+            }
+        ]
+    ).to_parquet(path)
+
+    args = make_slime_validate_args(
+        prompt_data=str(path),
+        label_key="reward_model",
+        metadata_key="extra_info",
+        custom_generate_function_path="slime.rollout.fused_agent.generate.generate",
+    )
+
+    module.slime_validate_args(args)
 
 
 @pytest.mark.unit

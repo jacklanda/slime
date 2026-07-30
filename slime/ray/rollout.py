@@ -34,7 +34,13 @@ from slime.utils.metric_utils import (
     dict_add_prefix,
 )
 from slime.utils.misc import Box, group_by, load_function
-from slime.utils.prompt_equal import PROMPT_EQUAL_LOSS_ESTIMATORS, has_multi_segment_trajectories, process_segment_rewards, prompt_equal_mask_sums, uses_prompt_equal_loss
+from slime.utils.prompt_equal import (
+    PROMPT_EQUAL_LOSS_ESTIMATORS,
+    has_multi_segment_trajectories,
+    process_segment_rewards,
+    prompt_equal_mask_sums,
+    uses_prompt_equal_loss,
+)
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -103,7 +109,17 @@ def _tensorize_rollout_data_for_training(rollout_data: dict[str, Any]) -> None:
                 raise TypeError(f"Failed to tensorize rollout_data[{key!r}]{detail}") from exc
 
     if "multimodal_train_inputs" in rollout_data:
-        rollout_data["multimodal_train_inputs"] = [({key: _cpu_tensor(value) if isinstance(value, (np.ndarray, torch.Tensor)) else value for key, value in mm_dict.items()} if mm_dict is not None else None) for mm_dict in rollout_data["multimodal_train_inputs"]]
+        rollout_data["multimodal_train_inputs"] = [
+            (
+                {
+                    key: _cpu_tensor(value) if isinstance(value, (np.ndarray, torch.Tensor)) else value
+                    for key, value in mm_dict.items()
+                }
+                if mm_dict is not None
+                else None
+            )
+            for mm_dict in rollout_data["multimodal_train_inputs"]
+        ]
 
     if "rollout_mask_sums" in rollout_data:
         rollout_data["rollout_mask_sums"] = _cpu_tensor(
@@ -127,7 +143,10 @@ def _post_process_rewards(args, samples: list[Sample], custom_reward_post_proces
         # the prompt-equal loss scheme and for plain TiTO forks, which must vote
         # once per trajectory in group normalization.
         return raw_rewards, process_segment_rewards(args, samples, raw_rewards, raw_rewards)
-    if args.advantage_estimator in ["grpo", "gspo", "cispo", "reinforce_plus_plus_baseline"] and args.rewards_normalization:
+    if (
+        args.advantage_estimator in ["grpo", "gspo", "cispo", "reinforce_plus_plus_baseline"]
+        and args.rewards_normalization
+    ):
         # group norm
         rewards = torch.tensor(raw_rewards, dtype=torch.float)
         if rewards.shape[-1] == args.n_samples_per_prompt * args.rollout_batch_size:
@@ -188,7 +207,9 @@ def convert_samples_to_train_data(
         if sample.loss_mask is None:
             sample.loss_mask = [1] * sample.response_length
 
-        assert len(sample.loss_mask) == sample.response_length, f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
+        assert (
+            len(sample.loss_mask) == sample.response_length
+        ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
         if sample.remove_sample:
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
@@ -200,7 +221,10 @@ def convert_samples_to_train_data(
     credit_assignment_events = []
     for sample, loss_mask in zip(samples, loss_masks, strict=True):
         if sample.policy_loss_mask is not None:
-            assert len(sample.policy_loss_mask) == sample.response_length, f"policy loss mask length {len(sample.policy_loss_mask)} " f"!= response length {sample.response_length}"
+            assert len(sample.policy_loss_mask) == sample.response_length, (
+                f"policy loss mask length {len(sample.policy_loss_mask)} "
+                f"!= response length {sample.response_length}"
+            )
             policy_mask = list(sample.policy_loss_mask)
             event = (sample.metadata or {}).get("credit_assignment_event")
             has_explicit_policy_mask = True
@@ -216,7 +240,9 @@ def convert_samples_to_train_data(
             policy_mask = list(loss_mask)
         if sample.remove_sample:
             policy_mask = [0] * sample.response_length
-        assert len(policy_mask) == sample.response_length, f"policy loss mask length {len(policy_mask)} != response length {sample.response_length}"
+        assert (
+            len(policy_mask) == sample.response_length
+        ), f"policy loss mask length {len(policy_mask)} != response length {sample.response_length}"
         policy_mask = [int(policy) & int(base) for policy, base in zip(policy_mask, loss_mask, strict=True)]
         policy_loss_masks.append(policy_mask)
         credit_assignment_events.append(event)
@@ -237,7 +263,9 @@ def convert_samples_to_train_data(
     # M_P * N_P / global_batch_size for GRPO / Reinforce++ baseline.
     rollout_id_list = train_data["rollout_ids"]
     mask_sums_per_sample = [sum(m) for m in loss_masks]
-    prompt_equal_loss = uses_prompt_equal_loss(samples) and getattr(args, "advantage_estimator", None) in PROMPT_EQUAL_LOSS_ESTIMATORS
+    prompt_equal_loss = (
+        uses_prompt_equal_loss(samples) and getattr(args, "advantage_estimator", None) in PROMPT_EQUAL_LOSS_ESTIMATORS
+    )
     if prompt_equal_loss:
         train_data["rollout_mask_sums"] = prompt_equal_mask_sums(args, samples, loss_masks, rollout_id_list)
     else:
@@ -247,7 +275,9 @@ def convert_samples_to_train_data(
         train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id_list]
     if has_explicit_policy_mask:
         if prompt_equal_loss:
-            train_data["policy_rollout_mask_sums"] = prompt_equal_mask_sums(args, samples, policy_loss_masks, rollout_id_list)
+            train_data["policy_rollout_mask_sums"] = prompt_equal_mask_sums(
+                args, samples, policy_loss_masks, rollout_id_list
+            )
         else:
             policy_mask_sums_per_sample = [sum(m) for m in policy_loss_masks]
             policy_rollout_total_mask: dict[int, int] = {}
@@ -262,14 +292,30 @@ def convert_samples_to_train_data(
         "metadata": [sample.metadata or {} for sample in samples],
         "remove_sample": [sample.remove_sample for sample in samples],
         "loss_mask_sums": mask_sums_per_sample,
-        "policy_loss_mask_sums": ([sum(m) for m in policy_loss_masks] if has_explicit_policy_mask else mask_sums_per_sample),
+        "policy_loss_mask_sums": (
+            [sum(m) for m in policy_loss_masks] if has_explicit_policy_mask else mask_sums_per_sample
+        ),
         "credit_assignment_events": credit_assignment_events,
         "prompt_lengths": [len(sample.tokens) - sample.response_length for sample in samples],
         "response_lengths": [sample.response_length for sample in samples],
         "statuses": [sample.status.value for sample in samples],
     }
+    train_data["mismatch_bucket_ids"] = [_mismatch_bucket_ids(sample) for sample in samples]
 
     return train_data
+
+
+def _mismatch_bucket_ids(sample: Sample) -> tuple[int, int, int]:
+    """Return compact task/segment/length buckets for trainer mismatch metrics."""
+    metadata = sample.metadata or {}
+    task = _metric_task_suffix(
+        str(metadata.get("fused_task_type") or metadata.get("task_type") or metadata.get("data_source") or "")
+    )
+    task_id = {"webqa": 0, "mcp": 1, "cli": 2}.get(task, 3)
+    segment_id = int(int(metadata.get("segment_count", 1) or 1) > 1)
+    response_length = int(sample.response_length or 0)
+    length_id = 0 if response_length <= 4096 else 1 if response_length <= 16384 else 2
+    return task_id, segment_id, length_id
 
 
 @dataclasses.dataclass
@@ -399,7 +445,9 @@ class ServerGroup:
 
         # Compute base_port from the maximum cursor across all nodes that
         # this group's engines may land on (conservative: just use global max).
-        base_port = max(port_cursors.values()) if port_cursors else int(os.environ.get("SLIME_SGLANG_BASE_PORT", "15000"))
+        base_port = (
+            max(port_cursors.values()) if port_cursors else int(os.environ.get("SLIME_SGLANG_BASE_PORT", "15000"))
+        )
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
             args=self.args,
             rollout_engines=rollout_engines,
@@ -421,7 +469,9 @@ class ServerGroup:
             local_idx = rank - self.rank_offset
             node_rank = local_idx % self.nodes_per_engine
             if self.worker_type != "encoder" and node_rank == 0:
-                self.engine_urls[local_idx] = f"http://{_wrap_ipv6(addr_and_ports[rank]['host'])}:{addr_and_ports[rank]['port']}"
+                self.engine_urls[local_idx] = (
+                    f"http://{_wrap_ipv6(addr_and_ports[rank]['host'])}:{addr_and_ports[rank]['port']}"
+                )
         return init_handles, port_cursors
 
     def mark_unhealthy_engines(self, timeout: float) -> None:
@@ -505,7 +555,9 @@ class ServerGroup:
         """
         if not self.needs_offload or not self.model_path:
             return []
-        return [engine.update_weights_from_disk.remote(self.model_path) for engine in self.engines if engine is not None]
+        return [
+            engine.update_weights_from_disk.remote(self.model_path) for engine in self.engines if engine is not None
+        ]
 
 
 @dataclasses.dataclass
@@ -609,7 +661,12 @@ class RolloutServer:
             for _model_path, engines in non_updatable_groups_engines:
                 all_resume_engines.extend(engines)
             if all_resume_engines:
-                ray.get([engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]) for engine in all_resume_engines])
+                ray.get(
+                    [
+                        engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+                        for engine in all_resume_engines
+                    ]
+                )
 
     def offload(self):
         """Release memory occupation across all groups (concurrent).
@@ -627,9 +684,17 @@ class RolloutServer:
             if g.needs_offload:
                 g.generation_health_check_enabled = False
 
-        pause_handles = [engine.pause_generation.remote() for g in self.server_groups if g.needs_offload for engine in g.engines if engine is not None]
+        pause_handles = [
+            engine.pause_generation.remote()
+            for g in self.server_groups
+            if g.needs_offload
+            for engine in g.engines
+            if engine is not None
+        ]
         if pause_handles:
-            logger.info("Pausing generation on %d offloaded SGLang engines before releasing memory.", len(pause_handles))
+            logger.info(
+                "Pausing generation on %d offloaded SGLang engines before releasing memory.", len(pause_handles)
+            )
             ray.get(pause_handles)
 
         handles = []
@@ -638,7 +703,13 @@ class RolloutServer:
         return ray.get(handles) if handles else []
 
     def _continue_generation_for_offloaded_groups(self):
-        handles = [engine.continue_generation.remote() for g in self.server_groups if g.needs_offload for engine in g.engines if engine is not None]
+        handles = [
+            engine.continue_generation.remote()
+            for g in self.server_groups
+            if g.needs_offload
+            for engine in g.engines
+            if engine is not None
+        ]
         if handles:
             logger.info("Continuing generation on %d offloaded SGLang engines after memory resume.", len(handles))
             return ray.get(handles)
@@ -718,7 +789,9 @@ class RolloutManager:
             self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
         self.custom_convert_samples_to_train_data_func = None
         if self.args.custom_convert_samples_to_train_data_path is not None:
-            self.custom_convert_samples_to_train_data_func = load_function(self.args.custom_convert_samples_to_train_data_path)
+            self.custom_convert_samples_to_train_data_func = load_function(
+                self.args.custom_convert_samples_to_train_data_path
+            )
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
         logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
 
@@ -751,7 +824,12 @@ class RolloutManager:
         # Only inject fault once
         self._ci_fault_injection_pending = False
 
-        if self.server and self.server.server_groups and self.server.server_groups[0].all_engines and self.server.server_groups[0].all_engines[0]:
+        if (
+            self.server
+            and self.server.server_groups
+            and self.server.server_groups[0].all_engines
+            and self.server.server_groups[0].all_engines[0]
+        ):
             logger.info("CI Fault Injection: Simulating crash on engine 0 during generate")
             try:
                 # This will cause the ray actor to exit
@@ -914,7 +992,9 @@ class RolloutManager:
                 original_num_rows = len(data)
                 rough_subsample_num_rows = int(original_num_rows * ratio)
                 data = data[: rough_subsample_num_rows // 2] + data[-rough_subsample_num_rows // 2 :]
-                logger.info(f"Subsample loaded debug rollout data using {ratio=} and change num rows {original_num_rows} -> {len(data)}")
+                logger.info(
+                    f"Subsample loaded debug rollout data using {ratio=} and change num rows {original_num_rows} -> {len(data)}"
+                )
             metrics = None
         else:
             data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
@@ -950,7 +1030,9 @@ class RolloutManager:
 
             # TODO may improve the format
             if evaluation:
-                dump_data = dict(samples=[sample.to_dict() for dataset_name, info in data.items() for sample in info["samples"]])
+                dump_data = dict(
+                    samples=[sample.to_dict() for dataset_name, info in data.items() for sample in info["samples"]]
+                )
             else:
                 dump_data = dict(
                     samples=[sample.to_dict() for sample in data],
@@ -977,7 +1059,14 @@ class RolloutManager:
         # Overwrite raw_reward when available. Mixed-source batches may only
         # populate this field for a subset of samples (e.g. SWE but not code).
         if any(sample.metadata and "raw_reward" in sample.metadata for sample in samples):
-            train_data["raw_reward"] = [sample.metadata["raw_reward"] if sample.metadata and sample.metadata.get("raw_reward") is not None else sample.reward for sample in samples]
+            train_data["raw_reward"] = [
+                (
+                    sample.metadata["raw_reward"]
+                    if sample.metadata and sample.metadata.get("raw_reward") is not None
+                    else sample.reward
+                )
+                for sample in samples
+            ]
             train_data["episode_metrics_data"]["raw_rewards"] = train_data["raw_reward"]
 
         # For rollout buffer
@@ -992,7 +1081,11 @@ class RolloutManager:
             rollout_log_probs := _collect_optional_sample_attr(
                 samples,
                 "rollout_log_probs",
-                required=(getattr(self.args, "use_rollout_logprobs", False) or getattr(self.args, "use_tis", False) or getattr(self.args, "get_mismatch_metrics", False)),
+                required=(
+                    getattr(self.args, "use_rollout_logprobs", False)
+                    or getattr(self.args, "use_tis", False)
+                    or getattr(self.args, "get_mismatch_metrics", False)
+                ),
             )
         ) is not None:
             train_data["rollout_log_probs"] = rollout_log_probs
@@ -1010,8 +1103,14 @@ class RolloutManager:
         )
         if rollout_top_p_token_ids is not None and rollout_top_p_token_offsets is not None:
             for sample in samples:
-                assert len(sample.rollout_top_p_token_offsets) == sample.response_length + 1, f"top-p token offsets length {len(sample.rollout_top_p_token_offsets)} " f"!= response length + 1 {sample.response_length + 1}"
-                assert sample.rollout_top_p_token_offsets[-1] == len(sample.rollout_top_p_token_ids), f"top-p token offsets[-1] {sample.rollout_top_p_token_offsets[-1]} " f"!= token ids length {len(sample.rollout_top_p_token_ids)}"
+                assert len(sample.rollout_top_p_token_offsets) == sample.response_length + 1, (
+                    f"top-p token offsets length {len(sample.rollout_top_p_token_offsets)} "
+                    f"!= response length + 1 {sample.response_length + 1}"
+                )
+                assert sample.rollout_top_p_token_offsets[-1] == len(sample.rollout_top_p_token_ids), (
+                    f"top-p token offsets[-1] {sample.rollout_top_p_token_offsets[-1]} "
+                    f"!= token ids length {len(sample.rollout_top_p_token_ids)}"
+                )
             train_data["rollout_top_p_token_ids"] = rollout_top_p_token_ids
             train_data["rollout_top_p_token_offsets"] = rollout_top_p_token_offsets
 
@@ -1094,6 +1193,7 @@ class RolloutManager:
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
                 "source_names",
+                "mismatch_bucket_ids",
                 "prompt",
                 "teacher_log_probs",
             ]:
@@ -1144,7 +1244,11 @@ def _validate_rollout_id_annotated(node, depth=0):
         if depth >= 2 and len(node) > 1:
             rids = [s.rollout_id for s in node]
             missing = [i for i, r in enumerate(rids) if r is None]
-            assert not missing, f"Compact rollout returned {len(node)} samples but rollout_id is unset on " f"positions {missing}. Set Sample.rollout_id on every sibling so the loss " "reducer can aggregate them as one rollout instead of N."
+            assert not missing, (
+                f"Compact rollout returned {len(node)} samples but rollout_id is unset on "
+                f"positions {missing}. Set Sample.rollout_id on every sibling so the loss "
+                "reducer can aggregate them as one rollout instead of N."
+            )
             assert len(set(rids)) == 1, f"Sibling samples from one compact rollout must share rollout_id; got {rids}."
         return
     for item in node:
@@ -1386,7 +1490,10 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
                     overrides.setdefault(k, v)
             if args.offload_rollout and not needs_offload:
                 overrides.setdefault("enable_memory_saver", False)
-            logger.info(f"Engine group '{group_cfg.worker_type}' gpu_offset={gpu_offset} " f"(abs={group_abs_start}): needs_offload={needs_offload}")
+            logger.info(
+                f"Engine group '{group_cfg.worker_type}' gpu_offset={gpu_offset} "
+                f"(abs={group_abs_start}): needs_offload={needs_offload}"
+            )
 
             group = ServerGroup(
                 args=args,
@@ -1463,9 +1570,20 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
 
     # Expose per-model router info for custom rollout functions.
     args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
-    args.sglang_model_engine_urls = {name: [url for group in srv.server_groups if group.worker_type == "regular" for url in group.engine_urls if url is not None] for name, srv in servers.items()}
+    args.sglang_model_engine_urls = {
+        name: [
+            url
+            for group in srv.server_groups
+            if group.worker_type == "regular"
+            for url in group.engine_urls
+            if url is not None
+        ]
+        for name, srv in servers.items()
+    }
     default_model_name = next(iter(servers), None)
-    args.sglang_engine_urls = args.sglang_model_engine_urls.get(default_model_name, []) if default_model_name is not None else []
+    args.sglang_engine_urls = (
+        args.sglang_model_engine_urls.get(default_model_name, []) if default_model_name is not None else []
+    )
 
     return servers, pending_init_handles
 
@@ -1576,7 +1694,10 @@ def _compute_mcp_atlas_coverage_metrics(rewards: list[float], samples: list[Samp
 
 
 def _format_eval_log_dict_for_display(log_dict: dict[str, Any]) -> dict[str, Any]:
-    return {key: round(float(value) * 100, 1) if _is_eval_percentage_metric(key, value) else value for key, value in log_dict.items()}
+    return {
+        key: round(float(value) * 100, 1) if _is_eval_percentage_metric(key, value) else value
+        for key, value in log_dict.items()
+    }
 
 
 def _is_eval_percentage_metric(key: str, value: Any) -> bool:
@@ -1648,7 +1769,11 @@ def _compute_eval_source_metrics(samples: list[Sample], rewards: list[float], gr
 
 def _eval_sample_steps(sample: Sample) -> float | None:
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-    return _coerce_finite_float(metadata.get("fused_traj_steps") if metadata.get("fused_traj_steps") is not None else metadata.get("traj_steps"))
+    return _coerce_finite_float(
+        metadata.get("fused_traj_steps")
+        if metadata.get("fused_traj_steps") is not None
+        else metadata.get("traj_steps")
+    )
 
 
 def _eval_sample_tool_calls(sample: Sample) -> float | None:
@@ -1717,16 +1842,24 @@ def compute_metrics_from_samples(args, samples):
     for sample in samples:
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
         compact_prompt_length = metadata.get("fused_prompt_length_tokens")
-        prompt_lengths.append(int(compact_prompt_length) if compact_prompt_length is not None else len(sample.tokens) - sample.response_length)
+        prompt_lengths.append(
+            int(compact_prompt_length)
+            if compact_prompt_length is not None
+            else len(sample.tokens) - sample.response_length
+        )
 
     log_dict = {}
     response_length_stats = compute_statistics(response_lengths)
     log_dict |= dict_add_prefix(response_length_stats, "response_length/")
     if response_lengths:
-        log_dict["response_length/clip_ratio"] = float(np.mean([length >= args.rollout_max_response_len for length in response_lengths]))
+        log_dict["response_length/clip_ratio"] = float(
+            np.mean([length >= args.rollout_max_response_len for length in response_lengths])
+        )
     log_dict |= dict_add_prefix(compute_statistics(prompt_lengths), "prompt_length/")
     if prompt_lengths and args.rollout_max_prompt_len:
-        log_dict["prompt_length/clip_ratio"] = float(np.mean([length >= args.rollout_max_prompt_len for length in prompt_lengths]))
+        log_dict["prompt_length/clip_ratio"] = float(
+            np.mean([length >= args.rollout_max_prompt_len for length in prompt_lengths])
+        )
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
@@ -1805,7 +1938,10 @@ def _collect_fused_agent_stats(args, all_samples: list[Sample]):
             continue
         trajectory_id = str(parent_traj_id)
         segment_index = int(metadata.get("segment_index", 0) or 0)
-        if trajectory_id not in representative_positions or segment_index >= representative_segment_indices[trajectory_id]:
+        if (
+            trajectory_id not in representative_positions
+            or segment_index >= representative_segment_indices[trajectory_id]
+        ):
             representative_positions[trajectory_id] = pos
             representative_segment_indices[trajectory_id] = segment_index
 
@@ -1829,7 +1965,9 @@ def _collect_fused_agent_stats(args, all_samples: list[Sample]):
             group_id = sample.index if sample.index is not None else pos
         group_rewards.setdefault(group_id, []).append(reward)
 
-        task_type = str(metadata.get("fused_task_type") or metadata.get("task_type") or metadata.get("data_source") or "unknown")
+        task_type = str(
+            metadata.get("fused_task_type") or metadata.get("task_type") or metadata.get("data_source") or "unknown"
+        )
         group_task_types.setdefault(group_id, task_type)
         sample_rewards_by_source.setdefault(task_type, []).append(reward)
         if group_id not in group_steps:
@@ -1837,7 +1975,11 @@ def _collect_fused_agent_stats(args, all_samples: list[Sample]):
             if steps is not None:
                 group_steps[group_id] = steps
         if group_id not in group_tool_call_turns:
-            tool_call_turns = _coerce_finite_float(metadata.get("fused_tool_call_turns") or metadata.get("tool_call_turns") or metadata.get("tool_call_turn"))
+            tool_call_turns = _coerce_finite_float(
+                metadata.get("fused_tool_call_turns")
+                or metadata.get("tool_call_turns")
+                or metadata.get("tool_call_turn")
+            )
             if tool_call_turns is not None:
                 group_tool_call_turns[group_id] = tool_call_turns
 
@@ -1852,6 +1994,18 @@ def _collect_fused_agent_stats(args, all_samples: list[Sample]):
                     value = int(value)
                 if isinstance(value, (int, float)) and np.isfinite(value):
                     workflow_values.setdefault(key, []).append(float(value))
+
+        for key in (
+            "fused_rollout_weight_version_count",
+            "fused_rollout_logprob_invalid_ratio",
+            "fused_tito_boundary_count",
+            "fused_tito_exact_prefix_turns",
+            "fused_tito_prompt_prefix_mismatch_turns",
+            "segment_count",
+        ):
+            value = _coerce_finite_float(metadata.get(key))
+            if value is not None:
+                workflow_values.setdefault(key.removeprefix("fused_"), []).append(value)
 
     episode_rewards_by_source: dict[str, list[float]] = {}
     episode_turn_values: dict[str, list[float]] = {}
@@ -1916,6 +2070,7 @@ def _normalize_termination_reason(reason: str) -> str:
         "unknown",
         "timeout",
         "max_turns_exceeded",
+        "repeated_query_early_stop",
         "max_response_len_exceeded",
         "max_context_len_exceeded",
         "abnormal_parse_error",
@@ -1967,11 +2122,15 @@ def compute_perf_metrics_from_samples(args, samples, rollout_time):
         if max(non_generation_time) == 0:
             return
 
-        non_generation_time = [t for t, length in zip(non_generation_time, response_lengths, strict=True) if length == max_response_length]
+        non_generation_time = [
+            t for t, length in zip(non_generation_time, response_lengths, strict=True) if length == max_response_length
+        ]
         mean_non_generation_time = sum(non_generation_time) / len(non_generation_time)
 
         log_dict[f"longest_{key}sample_non_generation_time"] = mean_non_generation_time
-        log_dict[f"longest_{key}sample_tokens_per_sec_without_non_generation"] = max_response_length / (rollout_time - mean_non_generation_time)
+        log_dict[f"longest_{key}sample_tokens_per_sec_without_non_generation"] = max_response_length / (
+            rollout_time - mean_non_generation_time
+        )
 
     token_perf([sample.response_length for sample in samples], non_generation_time, key="")
     token_perf([sample.effective_response_length for sample in samples], non_generation_time, key="effective_")
@@ -2059,7 +2218,9 @@ def _compute_top_p_kept_vocab_metrics(args, all_samples: list[Sample]):
         offsets = torch.as_tensor(offsets, dtype=torch.int64)
         if offsets.numel() == 0:
             continue
-        assert offsets.numel() == sample.response_length + 1, f"top-p token offsets length {offsets.numel()} != response length + 1 {sample.response_length + 1}"
+        assert (
+            offsets.numel() == sample.response_length + 1
+        ), f"top-p token offsets length {offsets.numel()} != response length + 1 {sample.response_length + 1}"
         if sample.remove_sample:
             continue
         if sample.loss_mask is None:
@@ -2067,7 +2228,9 @@ def _compute_top_p_kept_vocab_metrics(args, all_samples: list[Sample]):
             total_tokens += sample.response_length
             continue
         loss_mask = torch.as_tensor(sample.loss_mask, dtype=torch.bool, device=offsets.device)
-        assert loss_mask.numel() == sample.response_length, f"loss mask length {loss_mask.numel()} != response length {sample.response_length}"
+        assert (
+            loss_mask.numel() == sample.response_length
+        ), f"loss mask length {loss_mask.numel()} != response length {sample.response_length}"
         total_kept += int(torch.diff(offsets)[loss_mask].sum())
         total_tokens += int(loss_mask.sum())
     if total_tokens == 0:

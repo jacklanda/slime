@@ -20,7 +20,11 @@ logger = logging.getLogger(__name__)
 _BENCHMARK_COLUMN = ("Benchmark", 21, "<")
 _METRIC_COLUMN_WIDTH = 15
 _COUNT_COLUMNS = (("# steps", "steps", 10, ">"), ("# tool calls", "tool_calls", 12, ">"))
-_ABNORMAL_COLUMN = ("# abnormal / all", "abnormal", 16, ">")
+_TERMINATION_COLUMNS = (
+    ("# abnormal / all", "abnormal", 16, ">"),
+    ("# max turns / all", "max_turns", 17, ">"),
+    ("# repeat query / all", "repeated_query", 20, ">"),
+)
 
 
 def log_eval_results_table(rollout_id: int, args: Any, data: dict[str, Any], extra_metrics: dict[str, Any] | None) -> bool:
@@ -39,8 +43,8 @@ def format_eval_results_table(args: Any, data: dict[str, Any]) -> str:
         source_metrics: dict[str, float | str] = {}
         if (samples := dataset_data.get("samples")) is not None:
             source_metrics = _compute_eval_source_metrics(samples, rewards, group_size)
-            dataset_metrics["abnormal"] = _format_abnormal_count(samples, group_size)
-            source_metrics.update(_source_abnormal_counts(samples, group_size))
+            dataset_metrics.update(_format_termination_counts(samples, group_size))
+            source_metrics.update(_source_termination_counts(samples, group_size))
             steps = [value for sample in samples if (value := _eval_sample_steps(sample)) is not None]
             if steps:
                 dataset_metrics["steps"] = float(np.mean(steps))
@@ -73,7 +77,9 @@ def _result_row(
     prefix: str = "",
 ) -> tuple[str, dict[str, float | str]] | None:
     row_metrics = {
-        key.removeprefix(prefix): value if key.removeprefix(prefix) == "abnormal" else float(value)
+        key.removeprefix(prefix): value
+        if key.removeprefix(prefix) in {column[1] for column in _TERMINATION_COLUMNS}
+        else float(value)
         for key, value in metrics.items()
         if key.startswith(prefix) and _is_table_metric_key(key.removeprefix(prefix))
     }
@@ -88,7 +94,7 @@ def _render_table(rows: list[tuple[str, dict[str, float | str]]]) -> str:
         _BENCHMARK_COLUMN,
         *[(f"{key.replace('/', ' ')} (%)", _METRIC_COLUMN_WIDTH, ">") for key in metric_keys],
         *[(header, width, align) for header, _, width, align in _COUNT_COLUMNS],
-        (_ABNORMAL_COLUMN[0], _ABNORMAL_COLUMN[2], _ABNORMAL_COLUMN[3]),
+        *[(header, width, align) for header, _, width, align in _TERMINATION_COLUMNS],
     )
     header = _render_cells(tuple(column[0] for column in columns), columns)
     heavy_rule = "  ".join("━" * width for _, width, _ in columns)
@@ -98,8 +104,8 @@ def _render_table(rows: list[tuple[str, dict[str, float | str]]]) -> str:
         name, metrics = row
         values = tuple(_format_metric(metrics[key]) if key in metrics else "" for key in metric_keys)
         counts = tuple(_format_count(metrics[key]) if key in metrics else "" for _, key, _, _ in _COUNT_COLUMNS)
-        abnormal = str(metrics.get(_ABNORMAL_COLUMN[1], ""))
-        lines.append(_render_cells((name, *values, *counts, abnormal), columns))
+        terminations = tuple(str(metrics.get(key, "")) for _, key, _, _ in _TERMINATION_COLUMNS)
+        lines.append(_render_cells((name, *values, *counts, *terminations), columns))
         if index != len(rows) - 1:
             lines.append(light_rule)
     return "\n".join(lines)
@@ -125,11 +131,14 @@ def _is_table_metric_key(key: str) -> bool:
         "steps",
         "tool_calls",
         "abnormal",
+        "max_turns",
+        "repeated_query",
     }
 
 
 def _table_metric_keys(rows: list[tuple[str, dict[str, float | str]]]) -> list[str]:
-    keys = {key for _, metrics in rows for key in metrics if key not in {"steps", "tool_calls", "abnormal"}}
+    non_metric_keys = {"steps", "tool_calls", *(column[1] for column in _TERMINATION_COLUMNS)}
+    keys = {key for _, metrics in rows for key in metrics if key not in non_metric_keys}
     return sorted(keys, key=_metric_key_sort_key)
 
 
@@ -143,25 +152,35 @@ def _metric_key_sort_key(key: str) -> tuple[int, int, int]:
     return (symbol_order, int(k), stat_order)
 
 
-def _format_abnormal_count(samples: list[Any], group_size: int) -> str:
+def _format_termination_counts(samples: list[Any], group_size: int) -> dict[str, str]:
     group_size = max(1, group_size)
     groups = [samples[start : start + group_size] for start in range(0, len(samples), group_size)]
-    abnormal = sum(any(_eval_sample_is_abnormal(sample) for sample in group) for group in groups)
-    return f"{abnormal} / {len(groups)}"
+    abnormal = sum(any(_eval_sample_termination(sample).startswith("abnormal_") for sample in group) for group in groups)
+    max_turns = sum(any(_eval_sample_termination(sample) == "max_turns_exceeded" for sample in group) for group in groups)
+    repeated_query = sum(
+        any(_eval_sample_termination(sample) == "repeated_query_early_stop" for sample in group) for group in groups
+    )
+    return {
+        "abnormal": f"{abnormal} / {len(groups)}",
+        "max_turns": f"{max_turns} / {len(groups)}",
+        "repeated_query": f"{repeated_query} / {len(groups)}",
+    }
 
 
-def _source_abnormal_counts(samples: list[Any], group_size: int) -> dict[str, str]:
+def _source_termination_counts(samples: list[Any], group_size: int) -> dict[str, str]:
     samples_by_source: dict[str, list[Any]] = {}
     for sample in samples:
         if source := _eval_source_from_sample(sample):
             samples_by_source.setdefault(source, []).append(sample)
-    return {
-        f"{source}/abnormal": _format_abnormal_count(source_samples, group_size)
-        for source, source_samples in samples_by_source.items()
-    }
+    counts = {}
+    for source, source_samples in samples_by_source.items():
+        counts.update(
+            {f"{source}/{key}": value for key, value in _format_termination_counts(source_samples, group_size).items()}
+        )
+    return counts
 
 
-def _eval_sample_is_abnormal(sample: Any) -> bool:
+def _eval_sample_termination(sample: Any) -> str:
     metadata = sample.metadata if isinstance(getattr(sample, "metadata", None), dict) else {}
     reason = metadata.get("fused_termination") or metadata.get("termination_reason")
-    return reason is not None and str(reason).strip().lower() != "env_done"
+    return str(reason).strip().lower() if reason is not None else ""

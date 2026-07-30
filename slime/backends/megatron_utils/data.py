@@ -156,6 +156,16 @@ def get_batch(
             strict=True,
         )
     ]
+    if batch.get("policy_loss_masks") is not None:
+        batch["policy_loss_masks"] = [
+            _normalize_response_loss_mask(loss_mask, total_length, response_length)
+            for loss_mask, total_length, response_length in zip(
+                batch["policy_loss_masks"],
+                batch["total_lengths"],
+                batch["response_lengths"],
+                strict=True,
+            )
+        ]
 
     loss_masks = []
     for loss_mask, total_length, response_length in zip(
@@ -334,6 +344,7 @@ def log_rollout_data(
                 "episode_metrics_data",
                 "rollout_metrics",
                 "source_names",
+                "mismatch_bucket_ids",
             ]:
                 continue
             # Emit (sum, count) so gather_log_data can do a weighted average across

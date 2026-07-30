@@ -51,20 +51,20 @@ def test_format_eval_results_table_includes_overall_and_sources():
                     "searchR1_triviaqa",
                     steps=8,
                     tool_calls=7,
-                    termination_reason="max_context_len_exceeded",
+                    termination_reason="ABNORMAL_EVAL_RESPONSE",
                 ),
             ],
         }
     }
 
     assert format_eval_results_table(args, data) == (
-        "Benchmark              pass@1 mean (%)   pass@1 std (%)  pass^1 mean (%)   pass^1 std (%)     # steps  # tool calls  # abnormal / all\n"
-        "━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━  ━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━\n"
-        "overall / search_r1               50.0              0.0             50.0              0.0         5.0           4.0             1 / 4\n"
-        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────  ──────────  ────────────  ────────────────\n"
-        "nq                                50.0              0.0             50.0              0.0         3.0           2.0             0 / 2\n"
-        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────  ──────────  ────────────  ────────────────\n"
-        "triviaqa                          50.0              0.0             50.0              0.0         7.0           6.0             1 / 2"
+        "Benchmark              pass@1 mean (%)   pass@1 std (%)  pass^1 mean (%)   pass^1 std (%)     # steps  # tool calls  # abnormal / all  # max turns / all  # repeat query / all\n"
+        "━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━  ━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━\n"
+        "overall / search_r1               50.0              0.0             50.0              0.0         5.0           4.0             1 / 4              0 / 4                 0 / 4\n"
+        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────  ──────────  ────────────  ────────────────  ─────────────────  ────────────────────\n"
+        "nq                                50.0              0.0             50.0              0.0         3.0           2.0             0 / 2              0 / 2                 0 / 2\n"
+        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────  ──────────  ────────────  ────────────────  ─────────────────  ────────────────────\n"
+        "triviaqa                          50.0              0.0             50.0              0.0         7.0           6.0             1 / 2              0 / 2                 0 / 2"
     )
 
 
@@ -87,7 +87,7 @@ def test_format_eval_results_table_includes_power_of_two_pass_at_k_columns():
     assert "search_r1" in table
 
 
-def test_abnormal_column_counts_prompts_instead_of_sampled_trajectories():
+def test_termination_columns_count_prompts_and_separate_max_turns_from_abnormal():
     args = SimpleNamespace(
         eval_datasets=[SimpleNamespace(name="search_r1", n_samples_per_eval_prompt=2)],
         n_samples_per_eval_prompt=1,
@@ -97,16 +97,19 @@ def test_abnormal_column_counts_prompts_instead_of_sampled_trajectories():
             "rewards": [0.0, 0.0, 1.0, 0.0],
             "samples": [
                 _sample(0, "searchR1_nq", steps=2, tool_calls=1),
-                _sample(1, "searchR1_nq", steps=2, tool_calls=1, termination_reason="timeout"),
-                _sample(2, "searchR1_nq", steps=2, tool_calls=1),
-                _sample(3, "searchR1_nq", steps=2, tool_calls=1),
+                _sample(1, "searchR1_nq", steps=2, tool_calls=1, termination_reason="max_turns_exceeded"),
+                _sample(2, "searchR1_nq", steps=2, tool_calls=1, termination_reason="abnormal_parse_error"),
+                _sample(3, "searchR1_nq", steps=2, tool_calls=1, termination_reason="repeated_query_early_stop"),
             ],
         }
     }
 
     table = format_eval_results_table(args, data)
 
-    assert table.count("1 / 2") == 2
+    assert "# abnormal / all" in table
+    assert "# max turns / all" in table
+    assert "# repeat query / all" in table
+    assert table.count("1 / 2") == 6
 
 
 def test_log_eval_results_table_keeps_default_logging_enabled(caplog):

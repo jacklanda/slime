@@ -17,6 +17,10 @@ Usage:
 Options:
   --harness NAME                         Fused prompt harness: bare, cot, react, gem, unified_gem.
   --model PATH                           HF model path.
+  --enable-yarn BOOL                     Enable static YaRN for long contexts. Default: false.
+  --yarn-factor X                        YaRN scale factor. Default: 2.0.
+  --yarn-original-max-position-embeddings N
+                                         Qwen3 native context used by YaRN. Default: 32768.
   --disable-thinking BOOL                Stored in env for compatible fused code.
   --discard-historical-thinking BOOL     Remove prior assistant <think> blocks before each new rollout step.
                                          Effective only when --disable-thinking is false. Default: true.
@@ -24,13 +28,13 @@ Options:
   --unified-system-prompt                Select unified_gem harness unless --harness is set later.
   --no-unified-system-prompt             Select gem harness unless --harness is set later.
   --partial-rollout / --no-partial-rollout
-                                         Recycle partial rollouts during abort/sync.
+                                         Partial rollout is rejected for fused agents until resumable state is implemented.
   --terminal-log-style STYLE             progress, rollouts, or both. Stored in env for compatible fused code.
   --show-rollout-progress-logs BOOL      Show periodic fused rollout request/progress logs. Default: false.
   --temperature X                       Training rollout sampling temperature. Default: 1.0.
   --micro-batch-size N                   Training micro-batch size.
   --update-weights-interval N            Rollout weight update interval. Default: 1.
-  --rollout-num-gpus-per-engine N        Tensor-parallel GPUs per rollout engine. Default: 4.
+  --rollout-num-gpus-per-engine N        Tensor-parallel GPUs per rollout engine. Default: 2.
   --retrieval-mode MODE                  Retrieval mode env.
   --retrieval-max-words N                Retrieval max words env.
   --retrieval-retry-budget N             Retrieval retry env.
@@ -72,10 +76,11 @@ Options:
   --horizon-reward-target-tool-calls X   Target tool calls for no horizon penalty. Default: target_steps - 1.
   --enable-dynamic-sampling-filter BOOL  Enable DAPO-style non-zero reward variance dynamic filtering. Default: true.
   --normalize-advantages / --no-normalize-advantages
-                                         Whiten advantages across the data-parallel batch. Default: disabled.
+                                         Whiten advantages across the data-parallel batch. Default: enabled.
   --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
   --grm-model NAME                       OpenRouter judge model. Default: google/gemini-3-flash-preview.
   --grm-base-url URL                     OpenRouter-compatible judge endpoint.
+  --grm-openrouter-api-key KEY           GRM API key. Prefer the OPENROUTER_API_KEY environment variable.
   --grm-mode score|equivalence           GRM protocol. Default: score.
   --grm-concurrency N                    Max concurrent GRM requests. Default: 128.
   --grm-timeout SECONDS                  GRM request timeout. Default: 60.
@@ -97,7 +102,7 @@ Options:
   --eval-temperature X                   Eval-only sampling temperature. Default: 0.6.
   --eval-top-p X                         Eval-only nucleus sampling threshold. Default: 0.95.
   --eval-top-k N                         Eval-only top-k sampling. Default: -1 (disabled).
-  --per-step-max-tokens N                Per fused-agent turn. Default: 38000.
+  --per-step-max-tokens N                Per fused-agent turn. Default: 8192.
   --eval-max-response-len N              Eval-only max generated tokens. Default: 38000.
   --eval-max-prompt-len N                Eval-only max prompt tokens. Default: 2048.
   --eval-max-context-len N               Eval-only context length. Default: 40960.
@@ -111,11 +116,12 @@ Options:
   --native-sglang-session BOOL           Use incremental SGLang sessions during eval. Default: true.
   --val_before_train BOOL                Run one eval before training starts. Default: true.
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
-  --offload-train BOOL                   Offload trainer model between rollout/train phases. Default: matches --colocate.
+  --offload-train BOOL                   Offload trainer model between phases. Disabled by --release-train.
+  --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: true.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 1024.
-  --sglang-max-running-requests N        SGLang max running requests. Default: 512.
-  --colocate / --no-colocate             Share trainer and rollout GPUs with offload. Default: disabled.
+  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 128.
+  --sglang-max-running-requests N        SGLang max running requests. Default: 64.
+  --colocate / --no-colocate             Share trainer and rollout GPUs with offload. Default: enabled.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
 EOF
@@ -129,14 +135,18 @@ is_truthy() {
 }
 
 PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
+ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
-# Keep trainer and rollout on separate GPUs by default. Repeated
-# torch_memory_saver.pause() calls in colocated runs can fail natively with
-# cudaErrorInvalidValue and kill the Ray actor without a Python exception.
-COLOCATE="${COLOCATE:-false}"
+# Alternate training and rollout across all eight GPUs. The pinned
+# torch_memory_saver revision includes the CUDA VMM granularity fix required by
+# repeated pause/resume cycles in long-running colocated jobs.
+COLOCATE="${COLOCATE:-true}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-false}"
+ENABLE_YARN="${ENABLE_YARN:-false}"
+YARN_FACTOR="${YARN_FACTOR:-2.0}"
+YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS:-32768}"
 DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-true}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-8}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
@@ -159,26 +169,29 @@ CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_
 CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER:-True}"
 CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP:-False}"
 HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
-NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
+NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"
+LR="${LR:-1e-6}"
+KL_COEF="${KL_COEF:-0.0}"
+USE_WANDB="${USE_WANDB:-1}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
 FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT="${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT:-0.3}"
 FUSED_HORIZON_REWARD_TARGET_STEPS="${FUSED_HORIZON_REWARD_TARGET_STEPS:-32}"
 FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS="${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-}"
-MAX_STEPS="${MAX_STEPS:-128}"
-MCP_MAX_STEPS="${MCP_MAX_STEPS:-128}"
-WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-128}"
-CLI_MAX_STEPS="${CLI_MAX_STEPS:-128}"
+MAX_STEPS="${MAX_STEPS:-64}"
+MCP_MAX_STEPS="${MCP_MAX_STEPS:-64}"
+WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-64}"
+CLI_MAX_STEPS="${CLI_MAX_STEPS:-64}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-7200}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-1024}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-512}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-128}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-20}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-}"
 EVAL_INCLUDE_BENCHMARKS="${EVAL_INCLUDE_BENCHMARKS:-search_r1}"
@@ -201,13 +214,11 @@ NATIVE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION:-true}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
-# Offload only makes sense under colocate (train/rollout share GPUs and take
-# turns via torch_memory_saver). Under non-colocate they own separate GPUs, so
-# default offload off — this is the whole point of the split: skip the crashing
-# torch_memory_saver.pause() path entirely.
-# Resolve the default after CLI parsing so --colocate/--no-colocate also changes
-# the offload default. An explicit environment or CLI value still wins.
+# Resolve the offload default after CLI parsing so --colocate/--no-colocate also
+# changes it. Release-train overrides this below because it replaces the trainer
+# actor instead of pausing it.
 OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-}}"
+RELEASE_TRAIN="${RELEASE_TRAIN:-true}"
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
 GRM_MODEL="${GRM_MODEL:-google/gemini-3-flash-preview}"
@@ -228,6 +239,9 @@ while [ "$#" -gt 0 ]; do
    case "$1" in
       --harness) FUSED_HARNESS="${2:?Missing value for --harness}"; harness_explicit=true; shift 2 ;;
       --model) MODEL_DIR="${2:?Missing value for --model}"; shift 2 ;;
+      --enable-yarn) ENABLE_YARN="${2:?Missing value for --enable-yarn}"; shift 2 ;;
+      --yarn-factor) YARN_FACTOR="${2:?Missing value for --yarn-factor}"; shift 2 ;;
+      --yarn-original-max-position-embeddings) YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${2:?Missing value for --yarn-original-max-position-embeddings}"; shift 2 ;;
       --disable-thinking) DISABLE_THINKING="${2:?Missing value for --disable-thinking}"; shift 2 ;;
       --discard-historical-thinking) DISCARD_HISTORICAL_THINKING="${2:?Missing value for --discard-historical-thinking}"; shift 2 ;;
       --mcp-disable-step-penalty) RLLM_MCP_DISABLE_STEP_PENALTY="${2:?Missing value for --mcp-disable-step-penalty}"; shift 2 ;;
@@ -282,6 +296,12 @@ while [ "$#" -gt 0 ]; do
       --enable_use_grm_evals|--enable-use-grm-evals) ENABLE_USE_GRM_EVALS="${2:?Missing value for --enable_use_grm_evals}"; shift 2 ;;
       --grm-model) GRM_MODEL="${2:?Missing value for --grm-model}"; shift 2 ;;
       --grm-base-url) GRM_BASE_URL="${2:?Missing value for --grm-base-url}"; shift 2 ;;
+      --grm-openrouter-api-key)
+         set +x
+         export OPENROUTER_API_KEY="${2:?Missing value for --grm-openrouter-api-key}"
+         set -x
+         shift 2
+         ;;
       --grm-mode) GRM_MODE="${2:?Missing value for --grm-mode}"; shift 2 ;;
       --grm-concurrency) GRM_CONCURRENCY="${2:?Missing value for --grm-concurrency}"; shift 2 ;;
       --grm-max-connections) GRM_MAX_CONNECTIONS="${2:?Missing value for --grm-max-connections}"; shift 2 ;;
@@ -331,6 +351,7 @@ while [ "$#" -gt 0 ]; do
          ;;
       --n-samples-per-eval-prompt) N_SAMPLES_PER_EVAL_PROMPT="${2:?Missing value for --n-samples-per-eval-prompt}"; shift 2 ;;
       --offload-train) OFFLOAD_TRAIN="${2:?Missing value for --offload-train}"; shift 2 ;;
+      --release-train) RELEASE_TRAIN="${2:?Missing value for --release-train}"; shift 2 ;;
       --max-tool-output-length) MAX_TOOL_OUTPUT_LENGTH="${2:?Missing value for --max-tool-output-length}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
@@ -344,6 +365,34 @@ done
 
 OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${COLOCATE}}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-40960}"
+
+# Colocated trainer pause/resume uses a pinned CPU copy for every tracked CUDA
+# allocation. Long runs can exhaust/fragment CUDA host registrations and make
+# cudaMallocHost fail natively inside torch_memory_saver.pause(). Release-train
+# preserves model, optimizer, and RNG through a checkpoint while avoiding that
+# native path entirely.
+if is_truthy "${RELEASE_TRAIN}"; then
+   if ! is_truthy "${COLOCATE}"; then
+      echo "RELEASE_TRAIN=true requires COLOCATE=true in this launcher." >&2
+      exit 2
+   fi
+   OFFLOAD_TRAIN=false
+fi
+
+if is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTOM_RM_PATH}" ]; then
+   if [ -z "${OPENROUTER_API_KEY:-}" ] \
+      && [ -n "${OPENAI_API_KEY:-}" ] \
+      && [ -n "${GRM_BASE_URL:-${OPENAI_BASE_URL:-}}" ]; then
+      set +x
+      export OPENROUTER_API_KEY="${OPENAI_API_KEY}"
+      set -x
+      GRM_BASE_URL="${GRM_BASE_URL:-${OPENAI_BASE_URL}}"
+   fi
+   if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+      echo "GRM evals require OPENROUTER_API_KEY (or OPENAI_API_KEY with GRM_BASE_URL/OPENAI_BASE_URL)." >&2
+      exit 2
+   fi
+fi
 
 case "${TERMINAL_LOG_STYLE}" in
    progress|rollouts|both) ;;
@@ -361,7 +410,10 @@ BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 
 default_experiment_name() {
-   local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
+   #local prefix="fused-dapo-q3-8b-think-gem-sync-dev"
+   local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
+   #local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
+   #local prefix="fused-dapo-q3-4b-dht-gem-sync-dev"  # w/o rft warmup
    #local prefix="fused-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="fused-dapo-q3-4b-pet-gem-sync-dev"
    #local prefix="webqa-dapo-q3-4b-think-pet-gem-sync-dev"
@@ -400,43 +452,65 @@ elif [ "${SLIME_CLEANUP:-0}" = "1" ]; then
    echo "SLIME_CLEANUP=1 ignored because SLIME_CLEANUP_CONFIRM=1 is not set; preserving existing processes and artifacts."
 fi
 
-MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
-#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
-#MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
+#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
+MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
 
-# Default tensor-parallel size depends on the model. Gated attention
-# (--attention-output-gate, qwen3.5) is broken in Megatron when
-# num_query_groups < TP: the per-rank query head re-slice (attention.py step 4)
-# is not mirrored on the gate tensor, so gate.view() fails with a size mismatch
-# (factor = TP // num_query_groups). qwen3.5-4B has num_query_groups=4, so its TP
-# must be <= 4. Non-gated models (qwen3-4B, num_query_groups=8) keep TP=8.
-# NOTE: this is only the model-level cap; it is further clamped to ACTOR_GPUS
-# below (a non-colocate 4-GPU actor cannot run TP=8).
-if printf '%s\n' "${MODEL_ARGS[@]}" | grep -q -- "--attention-output-gate"; then
-   DEFAULT_TP_SIZE=8
-else
-   DEFAULT_TP_SIZE=8
+# Match the trainer tensor-parallel topology to the default TP2 rollout engines
+# for the train/infer consistency baseline.
+DEFAULT_TP_SIZE=2
+
+# In colocate mode both phases use all eight GPUs in alternation. Defined here
+# before PERF_ARGS is built because bash arrays expand values at definition time.
+ACTOR_GPUS="${ACTOR_GPUS:-8}"
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+CP_SIZE="${CP_SIZE:-1}"
+PP_SIZE="${PP_SIZE:-1}"
+
+if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -lt 1 ] \
+   || [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
+   echo "ROLLOUT_GPUS=${ROLLOUT_GPUS} must be divisible by ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE}" >&2
+   exit 2
+fi
+ROLLOUT_ENGINE_COUNT=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
+
+# Keep context parallelism disabled for the train/infer consistency baseline.
+# Explicit CP overrides still clamp TP to the remaining actor-GPU dimension.
+if [ "${CP_SIZE}" -lt 1 ] || [ "${PP_SIZE}" -lt 1 ]; then
+   echo "CP_SIZE and PP_SIZE must be positive; got CP_SIZE=${CP_SIZE}, PP_SIZE=${PP_SIZE}" >&2
+   exit 2
+fi
+TP_CAPACITY=$((ACTOR_GPUS / CP_SIZE / PP_SIZE))
+if [ "${TP_CAPACITY}" -lt 1 ]; then
+   echo "ACTOR_GPUS=${ACTOR_GPUS} is insufficient for CP_SIZE=${CP_SIZE}, PP_SIZE=${PP_SIZE}" >&2
+   exit 2
+fi
+if [ "${DEFAULT_TP_SIZE}" -gt "${TP_CAPACITY}" ]; then
+   DEFAULT_TP_SIZE="${TP_CAPACITY}"
+fi
+TP_SIZE="${TP_SIZE:-${DEFAULT_TP_SIZE}}"
+MODEL_PARALLEL_SIZE=$((TP_SIZE * CP_SIZE * PP_SIZE))
+if [ $((ACTOR_GPUS % MODEL_PARALLEL_SIZE)) -ne 0 ]; then
+   echo "ACTOR_GPUS=${ACTOR_GPUS} must be divisible by TP_SIZE*CP_SIZE*PP_SIZE=${MODEL_PARALLEL_SIZE}" >&2
+   exit 2
 fi
 
-# Split the default 8-GPU node evenly between training and rollout. Defined here
-# before PERF_ARGS is built because bash arrays expand values at definition time.
-ACTOR_GPUS="${ACTOR_GPUS:-4}"
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
-ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}"
-
-# TP cannot exceed the number of actor GPUs. Clamp the model-level default so a
-# 4-GPU non-colocate actor uses TP=4 instead of the colocate-era TP=8 default.
-if [ "${DEFAULT_TP_SIZE}" -gt "${ACTOR_GPUS}" ]; then
-   DEFAULT_TP_SIZE="${ACTOR_GPUS}"
+if [ "${UPDATE_WEIGHTS_INTERVAL}" -lt 1 ]; then
+   echo "UPDATE_WEIGHTS_INTERVAL must be at least 1; got ${UPDATE_WEIGHTS_INTERVAL}" >&2
+   exit 2
+fi
+if is_truthy "${PARTIAL_ROLLOUT}"; then
+   echo "Fused-agent partial rollout is unsupported: multi-turn environment and TiTO state cannot yet be resumed atomically." >&2
+   exit 2
 fi
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/GEM/Qwen3-4B-RFT-Warmup-v0}"  # init RL training with a self-distil wamrup ckpt
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/GEM/Qwen3-4B-RFT-Warmup-v0}"  # init RL training with a self-distil wamrup ckpt
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/checkpoints/FusedRL/${EXPERIMENT_NAME}}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
@@ -497,7 +571,6 @@ else
       "${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
       "${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
       #"${SCRIPT_DIR}/artifacts/asearcher.parquet"
-      #"${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet"
    )
 fi
 SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
@@ -664,11 +737,13 @@ fi
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-15472}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-24576}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$(((MAX_CONTEXT_LEN + CP_SIZE - 1) / CP_SIZE))}"
+LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-1024}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
-# Keep a deep request queue for the default single TP4 rollout engine so
-# retrieval/tool I/O waits do not leave the engine idle.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-64}"
+# Keep enough candidate groups queued to feed the default four TP2 rollout
+# engines without generating the much larger surplus created by a batch of 64.
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-16}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
@@ -688,13 +763,40 @@ if [ "${MAX_MODEL_LEN}" -ne "${MAX_CONTEXT_LEN}" ]; then
    echo "MAX_MODEL_LEN=${MAX_MODEL_LEN} must equal MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN} for this slime launcher." >&2
    exit 2
 fi
-if [ "${MAX_TOKENS_PER_GPU}" -lt "${MAX_CONTEXT_LEN}" ]; then
-   echo "MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU} is smaller than MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH (${MAX_CONTEXT_LEN})." >&2
+if [ $((MAX_TOKENS_PER_GPU * CP_SIZE)) -lt "${MAX_CONTEXT_LEN}" ]; then
+   echo "MAX_TOKENS_PER_GPU*CP_SIZE=$((MAX_TOKENS_PER_GPU * CP_SIZE)) is smaller than MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN}." >&2
    exit 2
 fi
-if [ "${LOG_PROBS_MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}" -lt "${MAX_CONTEXT_LEN}" ]; then
-   echo "LOG_PROBS_MAX_TOKENS_PER_GPU=${LOG_PROBS_MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}} is smaller than MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH (${MAX_CONTEXT_LEN})." >&2
+if [ $((LOG_PROBS_MAX_TOKENS_PER_GPU * CP_SIZE)) -lt "${MAX_CONTEXT_LEN}" ]; then
+   echo "LOG_PROBS_MAX_TOKENS_PER_GPU*CP_SIZE=$((LOG_PROBS_MAX_TOKENS_PER_GPU * CP_SIZE)) is smaller than MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN}." >&2
    exit 2
+fi
+if is_truthy "${ENABLE_YARN}"; then
+   python3 - "${YARN_FACTOR}" "${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}" "${MAX_CONTEXT_LEN}" <<'PY'
+import math
+import sys
+
+factor = float(sys.argv[1])
+original_context = int(sys.argv[2])
+target_context = int(sys.argv[3])
+if not math.isfinite(factor) or factor <= 1:
+    raise SystemExit(f"YARN_FACTOR must be finite and greater than 1, got {factor}")
+if original_context <= 0:
+    raise SystemExit(
+        "YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS must be positive, "
+        f"got {original_context}"
+    )
+if target_context > int(factor * original_context):
+    raise SystemExit(
+        f"MAX_CONTEXT_LEN={target_context} exceeds the configured YaRN capacity "
+        f"{int(factor * original_context)}"
+    )
+PY
+   MODEL_ARGS+=(
+      --use-yarn-rope
+      --yarn-rope-scaling-factor "${YARN_FACTOR}"
+      --yarn-original-max-position-embeddings "${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
+   )
 fi
 
 TRAIN_NUM_ROWS=$(python3 - "${PROMPT_DATA_FOR_SLIME}" <<'PY'
@@ -712,7 +814,7 @@ CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}"
    --ref-load "${REF_LOAD}"
    --save "${SAVE_DIR}"
-   --save-interval "${SAVE_INTERVAL:-10}"
+   --save-interval "${SAVE_INTERVAL:-20}"
 )
 # Resume training state (model/optimizer/rng/step + rollout data state) from an
 # existing Megatron checkpoint dir. Defaults to SAVE_DIR so a re-launch with the
@@ -723,14 +825,54 @@ if [ -n "${LOAD}" ]; then
    CKPT_ARGS+=(--load "${LOAD}")
 fi
 
-# When resuming a checkpoint saved under a different TP (e.g. migrating a TP=8
-# colocate run to a TP=4 non-colocate layout), the DistributedOptimizer state
-# uses sharding type dp_reshardable which cannot be resharded across TP. Set
-# NO_LOAD_OPTIM=1 for that one migration launch to load only the (TP-reshardable)
-# model weights and reinit the optimizer/RNG. New checkpoints this run saves are
-# TP=4-native, so later resumes do NOT need this flag.
+# A distributed checkpoint can reshard model tensors, but exact training-state
+# resume requires the same parallel topology. Refuse a partial resume instead of
+# silently dropping RNG or rerun state.
+if [ -n "${LOAD}" ] && [ -f "${LOAD}/latest_checkpointed_iteration.txt" ]; then
+   EXPECTED_DP_SIZE=$((ACTOR_GPUS / MODEL_PARALLEL_SIZE))
+   python3 - "${LOAD}" "${TP_SIZE}" "${PP_SIZE}" "${CP_SIZE}" "${ACTOR_GPUS}" "${EXPECTED_DP_SIZE}" <<'PY'
+import pathlib
+import sys
+
+import torch
+
+load_dir = pathlib.Path(sys.argv[1])
+iteration = int((load_dir / "latest_checkpointed_iteration.txt").read_text().strip())
+common_path = load_dir / f"iter_{iteration:07d}" / "common.pt"
+if not common_path.is_file():
+    raise SystemExit(f"Resume checkpoint metadata is missing: {common_path}")
+
+state = torch.load(common_path, map_location="cpu", weights_only=False)
+checkpoint_args = state.get("args")
+if checkpoint_args is None:
+    raise SystemExit(f"Resume checkpoint has no saved training arguments: {common_path}")
+
+expected = {
+    "tensor_model_parallel_size": int(sys.argv[2]),
+    "pipeline_model_parallel_size": int(sys.argv[3]),
+    "context_parallel_size": int(sys.argv[4]),
+    "world_size": int(sys.argv[5]),
+    "data_parallel_size": int(sys.argv[6]),
+}
+mismatches = {
+    name: (getattr(checkpoint_args, name, None), value)
+    for name, value in expected.items()
+    if getattr(checkpoint_args, name, None) != value
+}
+if mismatches:
+    details = ", ".join(
+        f"{name}: checkpoint={actual}, requested={requested}"
+        for name, (actual, requested) in mismatches.items()
+    )
+    raise SystemExit(f"Refusing inexact resume from iteration {iteration}: {details}")
+
+print(f"Validated exact resume topology for iteration {iteration}: {expected}")
+PY
+fi
+
 if is_truthy "${NO_LOAD_OPTIM:-false}"; then
-   CKPT_ARGS+=(--no-load-optim --no-load-rng)
+   echo "NO_LOAD_OPTIM is not supported by this launcher because it discards optimizer and RNG resume state. Unset NO_LOAD_OPTIM." >&2
+   exit 2
 fi
 
 ROLLOUT_ARGS=(
@@ -776,9 +918,6 @@ if [ "${ENABLE_QUOTA_BUCKET_SAMPLING:-1}" = "1" ]; then
 fi
 if [ -n "${BUFFER_FILTER_PATH:-}" ]; then
    ROLLOUT_ARGS+=(--buffer-filter-path "${BUFFER_FILTER_PATH}")
-fi
-if [ "${PARTIAL_ROLLOUT,,}" = "true" ] || [ "${PARTIAL_ROLLOUT}" = "1" ]; then
-   ROLLOUT_ARGS+=(--partial-rollout --mask-offpolicy-in-partial-rollout)
 fi
 if [ -n "${CUSTOM_GENERATE_FUNCTION_PATH}" ]; then
    ROLLOUT_ARGS+=(--custom-generate-function-path "${CUSTOM_GENERATE_FUNCTION_PATH}")
@@ -873,11 +1012,11 @@ if [ -n "${DUMP_DETAILS}" ]; then
 fi
 
 PERF_ARGS=(
-   # See DEFAULT_TP_SIZE above: qwen3.5 gated attention requires TP <= 4.
-   --tensor-model-parallel-size "${TP_SIZE:-${DEFAULT_TP_SIZE}}"
+   # TP2 matches the default rollout engines; explicit overrides are validated above.
+   --tensor-model-parallel-size "${TP_SIZE}"
    --sequence-parallel
-   --pipeline-model-parallel-size "${PP_SIZE:-1}"
-   --context-parallel-size "${CP_SIZE:-1}"
+   --pipeline-model-parallel-size "${PP_SIZE}"
+   --context-parallel-size "${CP_SIZE}"
    --expert-model-parallel-size "${EP_SIZE:-1}"
    --expert-tensor-parallel-size "${ETP_SIZE:-1}"
 
@@ -887,8 +1026,8 @@ PERF_ARGS=(
 
    --micro-batch-size "${MICRO_BATCH_SIZE}"
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
-   --log-probs-max-tokens-per-gpu "${LOG_PROBS_MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
-   --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE:-512}"
+   --log-probs-max-tokens-per-gpu "${LOG_PROBS_MAX_TOKENS_PER_GPU}"
+   --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE}"
 )
 
 if [ "${USE_DYNAMIC_BATCH_SIZE:-1}" = "1" ]; then
@@ -897,13 +1036,16 @@ fi
 
 GRPO_ARGS=(
    --advantage-estimator "${ADVANTAGE_ESTIMATOR:-grpo}"
-   --kl-coef "${KL_COEF:-0.03}"
-   --kl-loss-coef "${KL_LOSS_COEF:-0.00}"
+   --kl-coef "${KL_COEF}"
+   --kl-loss-coef "${KL_LOSS_COEF:-0.001}"
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF:-0.00}"
    --eps-clip "${EPS_CLIP:-0.2}"
    --eps-clip-high "${EPS_CLIP_HIGH:-0.28}"
 )
+if is_truthy "${USE_KL_LOSS:-1}"; then
+   GRPO_ARGS+=(--use-kl-loss)
+fi
 if is_truthy "${NORMALIZE_ADVANTAGES}"; then
    GRPO_ARGS+=(--normalize-advantages)
 fi
@@ -914,23 +1056,22 @@ fi
 # - MIS (Masked Importance Sampling): hard correction through tis_mode=mask.
 #   It masks out tokens/sequences whose importance ratio leaves the trust range.
 # - RS (Rejection Sampling): an additional hard rejection mask, independent of
-#   the TIS weighting mode. The recommended default here is TIS + RS: keep the
-#   stable soft reweighting from TIS while rejecting severe rollout/trainer
-#   mismatches with RS. To try pure MIS, point ROLLOUT_CORRECTION_CONFIG at a
-#   config with tis_mode=mask and usually use_rs=false.
-# Disable all rollout correction with USE_TIS=0. Override the YAML path or hook
-# with ROLLOUT_CORRECTION_CONFIG / ROLLOUT_CORRECTION_FUNCTION.
+#   the TIS weighting mode. The stable default uses Slime's vanilla token TIS
+#   [0, 2], avoiding abrupt effective-batch changes. Custom MIS/RS remains
+#   opt-in via ROLLOUT_CORRECTION_CONFIG.
 if is_truthy "${USE_TIS:-1}"; then
-   GRPO_ARGS+=(
-      --use-tis
-      --custom-config-path "${ROLLOUT_CORRECTION_CONFIG:-${REPO_ROOT}/experiments/fused_agent_tis_rs.yaml}"
-      --custom-tis-function-path "${ROLLOUT_CORRECTION_FUNCTION:-examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp}"
-   )
+   GRPO_ARGS+=(--use-tis)
+   if [ -n "${ROLLOUT_CORRECTION_CONFIG:-}" ]; then
+      GRPO_ARGS+=(
+         --custom-config-path "${ROLLOUT_CORRECTION_CONFIG}"
+         --custom-tis-function-path "${ROLLOUT_CORRECTION_FUNCTION:-examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp}"
+      )
+   fi
 fi
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr "${LR:-2e-6}"
+   --lr "${LR}"
    --lr-decay-style constant
    --weight-decay "${WEIGHT_DECAY:-0.05}"
    --adam-beta1 0.9
@@ -954,11 +1095,14 @@ SGLANG_ARGS=(
    --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}"
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
    --sglang-context-length "${MAX_CONTEXT_LEN}"
+   --sglang-enable-deterministic-inference
+   --sglang-attention-backend flashinfer
    --sglang-disable-custom-all-reduce
+   --sglang-disable-piecewise-cuda-graph
+   --router-policy "${ROUTER_POLICY}"
 )
-
 WANDB_ARGS=()
-if [ "${USE_WANDB:-1}" = "1" ]; then
+if [ "${USE_WANDB}" = "1" ]; then
    WANDB_ARGS=(
       --use-wandb
       --wandb-mode "${WANDB_MODE:-online}"
@@ -981,8 +1125,15 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
-   --train-env-vars '{"TMS_INIT_ENABLE_CPU_BACKUP":"0"}'
+   --deterministic-mode
+   --moe-token-dispatcher-type alltoall
+   --train-env-vars '{"TMS_INIT_ENABLE_CPU_BACKUP":"1"}'
 )
+if is_truthy "${CHECK_WEIGHT_UPDATE_EQUAL:-1}"; then
+   # One tensor-level equality check validates the transport at startup;
+   # lightweight weight-version checks cover every subsequent update.
+   MISC_ARGS+=(--check-weight-update-equal)
+fi
 
 if [ "${PRINT_ROLLOUT_TRAJECTORY:-1}" = "1" ]; then
    MISC_ARGS+=(--print-rollout-trajectory)
@@ -1015,6 +1166,7 @@ export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-10000
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
 export OPENROUTER_APP_NAME="${OPENROUTER_APP_NAME:-GRM}"
+export SLIME_FUSED_REQUIRE_WEIGHT_VERSION="${SLIME_FUSED_REQUIRE_WEIGHT_VERSION:-1}"
 
 # Fused-agent service knobs inherited from the rllm launcher. They are runtime
 # env only; current slime code consumes the subset used by selected generators.
@@ -1058,7 +1210,7 @@ export FUSED_WEB_SEARCH_MAX_STEPS="${FUSED_WEB_SEARCH_MAX_STEPS:-${WEB_SEARCH_MA
 export FUSED_CLI_MAX_STEPS="${CLI_MAX_STEPS}"
 export FUSED_TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT}"
 export FUSED_EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT}"
-export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-${MAX_RESPONSE_LENGTH}}"
+export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-8192}"
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE}"
 export SLIME_FUSED_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS}"
@@ -1092,6 +1244,8 @@ if [ -n "${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS}" ]; then
 fi
 export SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER="${SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER:-4}"
 
+# RUNTIME_ENV_JSON contains service credentials and is passed verbatim to Ray.
+set +x
 RUNTIME_ENV_JSON=$(python3 - <<PY
 import json, os
 keys = (
@@ -1099,6 +1253,7 @@ keys = (
     "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL", "OPENROUTER_APP_NAME",
     "SLIME_EPISODE_LOG_DIR", "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE",
     "SLIME_FUSED_EVAL_DUMP_FAILURES", "SLIME_FUSED_EVAL_USE_SGLANG_SESSION",
+    "SLIME_FUSED_REQUIRE_WEIGHT_VERSION",
     "RAY_WARN_BLOCKING_GET_INSIDE_ASYNC", "TOKENIZERS_PARALLELISM",
     "VLLM_ALLOW_LONG_MAX_MODEL_LEN", "VLLM_ENGINE_ITERATION_TIMEOUT_S",
     "VLLM_WORKER_MULTIPROC_METHOD", "PYTORCH_CUDA_ALLOC_CONF",
@@ -1138,7 +1293,10 @@ keys = (
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["PYTHONPATH"] = f"{os.environ['MEGATRON_LM_PATH']}:{os.environ['REPO_ROOT']}:{os.environ['SCRIPT_DIR']}"
 env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+env["NCCL_ALGO"] = "Ring"
 env["NCCL_NVLS_ENABLE"] = os.environ["HAS_NVLINK"]
+env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 env["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"
 print(json.dumps({"env_vars": env}))
 PY
@@ -1153,11 +1311,13 @@ echo "Save dir: ${SAVE_DIR}"
 echo "Log root: ${LOG_ROOT}"
 echo "Episode dump root: ${EPISODE_LOG_DIR} (train/ and evals/)"
 echo "Dump details dir: ${DUMP_DETAILS:-<disabled>}"
-echo "W&B enabled: ${USE_WANDB:-0}"
+echo "W&B enabled: ${USE_WANDB}"
 echo "Custom generate: ${CUSTOM_GENERATE_FUNCTION_PATH:-<stock slime rollout>}"
 echo "Custom reward post-process: ${CUSTOM_REWARD_POST_PROCESS_PATH:-<vanilla>}"
 echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
-echo "Actor GPUs: ${ACTOR_GPUS}, actor TP=${TP_SIZE:-${DEFAULT_TP_SIZE}}, rollout GPUs: ${ROLLOUT_GPUS}, rollout TP=${ROLLOUT_NUM_GPUS_PER_ENGINE}, colocate=${COLOCATE}, offload_train=${OFFLOAD_TRAIN}, ray GPUs=${NUM_GPUS}"
+echo "Actor GPUs: ${ACTOR_GPUS}, actor TP=${TP_SIZE}, CP=${CP_SIZE}, PP=${PP_SIZE}, rollout GPUs: ${ROLLOUT_GPUS}, rollout TP=${ROLLOUT_NUM_GPUS_PER_ENGINE}, rollout engines=${ROLLOUT_ENGINE_COUNT}, colocate=${COLOCATE}, offload_train=${OFFLOAD_TRAIN}, ray GPUs=${NUM_GPUS}"
+echo "Training token budgets: max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}, log_probs_max_tokens_per_gpu=${LOG_PROBS_MAX_TOKENS_PER_GPU}, log_probs_chunk_size=${LOG_PROBS_CHUNK_SIZE}, max_context_len=${MAX_CONTEXT_LEN}"
+echo "YaRN: enable=${ENABLE_YARN}, factor=${YARN_FACTOR}, original_max_position_embeddings=${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
 echo "SGLang: mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}, server_concurrency=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}"
 echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
 echo "Training batches: micro_batch=${MICRO_BATCH_SIZE}, num_steps_per_rollout=${NUM_STEPS_PER_ROLLOUT}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}, rollout_temperature=${TEMPERATURE}"
@@ -1166,7 +1326,7 @@ echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_S
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, benchmarks=${EVAL_INCLUDE_BENCHMARKS}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, temperature=${EVAL_TEMPERATURE}, top_p=${EVAL_TOP_P}, top_k=${EVAL_TOP_K}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}"
 echo "Eval scheduling: inflight=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS}, adaptive=${EVAL_ADAPTIVE_CONCURRENCY}, mix_datasets=${EVAL_MIX_DATASETS}, termination_retries=${EVAL_TERMINATION_RETRY_TIMES}, trajectory_sample_rate=${EVAL_TRAJECTORY_SAMPLE_RATE}, dump_failures=${EVAL_DUMP_FAILURES}, native_session=${NATIVE_SGLANG_SESSION}"
 echo "OpenRouter GRM evals: enable=${ENABLE_USE_GRM_EVALS}, model=${GRM_MODEL}, mode=${GRM_MODE}, concurrency=${GRM_CONCURRENCY}, max_connections=${GRM_MAX_CONNECTIONS}, timeout=${GRM_TIMEOUT}, retries=${GRM_MAX_RETRIES}, max_input_tokens=${GRM_MAX_INPUT_TOKENS}, max_new_tokens=${GRM_MAX_NEW_TOKENS}, custom_rm=${GRM_CUSTOM_RM_PATH}"
-echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, normalize_advantages=${NORMALIZE_ADVANTAGES}, kl_coef=${KL_COEF:-0.03}, lr=${LR:-2e-6}, eps_clip=${EPS_CLIP:-0.2}, eps_clip_high=${EPS_CLIP_HIGH:-0.28}"
+echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, normalize_advantages=${NORMALIZE_ADVANTAGES}, kl_coef=${KL_COEF}, lr=${LR}, eps_clip=${EPS_CLIP:-0.2}, eps_clip_high=${EPS_CLIP_HIGH:-0.28}"
 echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING:-0}, path=${BUFFER_FILTER_PATH:-${ENABLE_QUOTA_BUCKET_SAMPLING:+slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps}}"
 echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}"
 echo "Horizon reward shaping: enable=${HORIZON_REWARD_SHAPING}, min_multiplier=${FUSED_HORIZON_REWARD_MIN_MULTIPLIER}, gamma=${FUSED_HORIZON_REWARD_GAMMA}, step_weight=${FUSED_HORIZON_REWARD_STEP_WEIGHT}, tool_call_weight=${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT}, target_steps=${FUSED_HORIZON_REWARD_TARGET_STEPS}, target_tool_calls=${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-target_steps-1}"
@@ -1221,9 +1381,19 @@ CLUSTER_ARGS=(
    --actor-num-gpus-per-node "${ACTOR_GPUS}"
    --rollout-num-gpus "${ROLLOUT_GPUS}"
    --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL}"
+   --verify-rollout-weight-versions
 )
 if is_truthy "${COLOCATE}"; then
    CLUSTER_ARGS+=(--colocate)
+fi
+if is_truthy "${RELEASE_TRAIN}"; then
+   UPDATE_WEIGHT_DISK_DIR="${UPDATE_WEIGHT_DISK_DIR:-${SAVE_DIR}/rollout_weights}"
+   CLUSTER_ARGS+=(
+      --release-train
+      --update-weight-mode full
+      --update-weight-transport disk
+      --update-weight-disk-dir "${UPDATE_WEIGHT_DISK_DIR}"
+   )
 fi
 if is_truthy "${OFFLOAD_TRAIN}"; then
    CLUSTER_ARGS+=(--offload-train)
@@ -1248,6 +1418,7 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    "${CREDIT_ASSIGNMENT_ARGS[@]}" \
    "${MISC_ARGS[@]}" \
    "${WANDB_ARGS[@]}"
+set -x
 
 if [ "${RAY_JOB_WAIT:-0}" != "1" ] && [ "${RAY_JOB_FOLLOW_LOGS:-1}" = "1" ]; then
    echo "Following Ray job logs for ${RAY_SUBMISSION_ID}"

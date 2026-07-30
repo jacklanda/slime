@@ -67,7 +67,7 @@ tensorboard
 tiktoken==0.13.0
 tilelang==0.1.11
 torch==2.11.0+cu129
-torch_memory_saver==0.0.9.post1
+torch_memory_saver @ git+https://github.com/fzyzcjy/torch_memory_saver.git@f05a8754daf68238d54e4cf31cb3ba866684bbaf
 tqdm==4.68.3
 transformer_engine==2.16.0
 transformer_engine_cu12==2.16.0

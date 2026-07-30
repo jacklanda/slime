@@ -9,6 +9,7 @@ from urllib.parse import quote
 import requests
 import sglang_router
 from packaging.version import parse
+from sglang.srt.constants import GPU_MEMORY_ALL_TYPES
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
@@ -148,6 +149,7 @@ class SGLangEngine(RayActor):
         self.base_gpu_id = base_gpu_id
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
+        self._offloaded_memory_tags = set()
 
     def init(
         self,
@@ -360,23 +362,40 @@ class SGLangEngine(RayActor):
     def get_weight_version(self):
         if self.node_rank != 0:
             return
-        url = f"http://{self.server_host}:{self.server_port}/get_weight_version"
-        response = requests.get(url)
+        url = f"http://{self.server_host}:{self.server_port}/model_info"
+        response = requests.get(url, timeout=self.args.rollout_health_check_timeout)
         response.raise_for_status()
         return response.json()["weight_version"]
 
-    def release_memory_occupation(self):
-        self.flush_cache()
-        return self._make_request("release_memory_occupation")
+    def release_memory_occupation(self, tags: list[str] | None = None):
+        requested_tags = set(tags or GPU_MEMORY_ALL_TYPES)
+        offloaded_tags = getattr(self, "_offloaded_memory_tags", set())
+        tags_to_release = requested_tags - offloaded_tags
+        if not tags_to_release:
+            logger.info("Skipping release_memory_occupation; tags are already offloaded: %s", sorted(requested_tags))
+            return None
 
-    def resume_memory_occupation(self, tags: list[str] = None):
+        self.flush_cache()
+        result = self._make_request("release_memory_occupation", {"tags": sorted(tags_to_release)})
+        offloaded_tags.update(tags_to_release)
+        self._offloaded_memory_tags = offloaded_tags
+        return result
+
+    def resume_memory_occupation(self, tags: list[str] | None = None):
         """
         Available tags for multi-stage resume: weights, kv_cache
         """
-        return self._make_request(
-            "resume_memory_occupation",
-            {"tags": tags},
-        )
+        requested_tags = set(tags or GPU_MEMORY_ALL_TYPES)
+        offloaded_tags = getattr(self, "_offloaded_memory_tags", set())
+        tags_to_resume = requested_tags & offloaded_tags
+        if not tags_to_resume:
+            logger.info("Skipping resume_memory_occupation; tags are already active: %s", sorted(requested_tags))
+            return None
+
+        result = self._make_request("resume_memory_occupation", {"tags": sorted(tags_to_resume)})
+        offloaded_tags.difference_update(tags_to_resume)
+        self._offloaded_memory_tags = offloaded_tags
+        return result
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})

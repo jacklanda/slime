@@ -9,7 +9,13 @@ import numpy as np
 import pytest
 
 import slime.rollout.fused_agent.env as fused_env
-from slime.rollout.fused_agent.env import FusedEnvironment, _exact_match_reward, _format_retrieval, normalize_task, resolve_task_mode
+from slime.rollout.fused_agent.env import (
+    FusedEnvironment,
+    _exact_match_reward,
+    _format_retrieval,
+    normalize_task,
+    resolve_task_mode,
+)
 import slime.rollout.fused_agent.generate as fused_generate
 from slime.rollout.fused_agent.generate import (
     _format_tool_observation,
@@ -96,11 +102,18 @@ class FakeGemma4Tokenizer:
                     body += f"<|tool>{Gemma4ToolParser._format_function_declaration(schema)}<tool|>"
             for tool_call in message.get("tool_calls") or []:
                 function = tool_call.get("function", tool_call)
-                body += f"<|tool_call>call:{function['name']}" f"{Gemma4ToolParser._format_argument(function.get('arguments') or {}, escape_keys=False)}" "<tool_call|>"
+                body += (
+                    f"<|tool_call>call:{function['name']}"
+                    f"{Gemma4ToolParser._format_argument(function.get('arguments') or {}, escape_keys=False)}"
+                    "<tool_call|>"
+                )
             if message.get("tool_responses"):
                 body += "<|tool_response>"
                 for response in message["tool_responses"]:
-                    body += f"response:{response['name']}" f"{Gemma4ToolParser._format_argument(response.get('response') or {}, escape_keys=False)}"
+                    body += (
+                        f"response:{response['name']}"
+                        f"{Gemma4ToolParser._format_argument(response.get('response') or {}, escape_keys=False)}"
+                    )
                 body += "<tool_response|>"
             body += content
             chunks.append(f"<|turn>{role}\n{body}<turn|>\n")
@@ -130,6 +143,7 @@ def _run_generate_with_fake_sglang(
     evaluation: bool = False,
     tokenizer=None,
     prompt_ids_seen: list[list[int]] | None = None,
+    sampling_params_seen: list[dict] | None = None,
 ):
     async def fake_call_sglang(
         args,
@@ -142,9 +156,13 @@ def _run_generate_with_fake_sglang(
         session_params=None,
         context_token_count=None,
         server_url=None,
+        expected_weight_version=None,
+        require_weight_version=False,
     ):
         if prompt_ids_seen is not None:
             prompt_ids_seen.append(list(prompt_ids))
+        if sampling_params_seen is not None:
+            sampling_params_seen.append(dict(sampling_params))
         item = calls.pop(0)
         text = item["text"]
         return {
@@ -193,21 +211,31 @@ def _response_text(sample: Sample) -> str:
 
 
 def _masked_text(sample: Sample) -> str:
-    return "".join(chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], sample.loss_mask, strict=False) if mask)
+    return "".join(
+        chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], sample.loss_mask, strict=False) if mask
+    )
 
 
 def _unmasked_text(sample: Sample) -> str:
-    return "".join(chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], sample.loss_mask, strict=False) if not mask)
+    return "".join(
+        chr(tok)
+        for tok, mask in zip(sample.tokens[-sample.response_length :], sample.loss_mask, strict=False)
+        if not mask
+    )
 
 
 def _policy_masked_text(sample: Sample) -> str:
     policy_mask = sample.policy_loss_mask if sample.policy_loss_mask is not None else sample.loss_mask
-    return "".join(chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], policy_mask, strict=False) if mask)
+    return "".join(
+        chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], policy_mask, strict=False) if mask
+    )
 
 
 def _policy_unmasked_text(sample: Sample) -> str:
     policy_mask = sample.policy_loss_mask if sample.policy_loss_mask is not None else sample.loss_mask
-    return "".join(chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], policy_mask, strict=False) if not mask)
+    return "".join(
+        chr(tok) for tok, mask in zip(sample.tokens[-sample.response_length :], policy_mask, strict=False) if not mask
+    )
 
 
 def _visualized_text_by_style(sample: Sample, tokenizer, style: str) -> str:
@@ -358,7 +386,9 @@ def test_qwen_tool_parser_finish_and_answer_fallback():
     calls = parser.parse('<tool_call>{"name":"submit","arguments":{}}</tool_call>')
     assert calls[0].name == "finish"
 
-    calls = parser.parse('<tool_call>{"name":"finish","arguments":{"command":"submit","result":"The answer is \\\\boxed{Fixed Answer}.}}</tool_call>')
+    calls = parser.parse(
+        '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"The answer is \\\\boxed{Fixed Answer}.}}</tool_call>'
+    )
     assert calls[0].name == "finish"
     assert calls[0].arguments["result"] == "The answer is \\\\boxed{Fixed Answer}."
 
@@ -431,7 +461,12 @@ def test_qwen3_coder_parser_parses_xml_calls_with_schema_coercion():
     # get_tool_prompt loads the parameter config used for type coercion.
     parser.get_tool_prompt("\n".join(json.dumps(t, indent=0, ensure_ascii=False) for t in tools))
 
-    raw = "<tool_call>\n<function=web_search>\n" "<parameter=query>\nsenior comic artist\n</parameter>\n" "<parameter=max_results>\n4\n</parameter>\n" "</function>\n</tool_call>"
+    raw = (
+        "<tool_call>\n<function=web_search>\n"
+        "<parameter=query>\nsenior comic artist\n</parameter>\n"
+        "<parameter=max_results>\n4\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
     calls = parser.parse(raw)
     assert len(calls) == 1
     assert calls[0].name == "web_search"
@@ -441,7 +476,12 @@ def test_qwen3_coder_parser_parses_xml_calls_with_schema_coercion():
     assert raw[calls[0].start : calls[0].end].startswith("<tool_call>")
 
     action_text = parser.format_action(calls[0])
-    assert action_text == ("<tool_call>\n<function=web_search>\n" "<parameter=query>\nsenior comic artist\n</parameter>\n" "<parameter=max_results>\n4\n</parameter>\n" "</function>\n</tool_call>")
+    assert action_text == (
+        "<tool_call>\n<function=web_search>\n"
+        "<parameter=query>\nsenior comic artist\n</parameter>\n"
+        "<parameter=max_results>\n4\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
     assert parser.parse(action_text)[0].arguments == {"query": "senior comic artist", "max_results": 4}
 
 
@@ -450,7 +490,12 @@ def test_initial_messages_configure_runtime_qwen35_parser_schema():
     parser = make_tool_parser("Qwen3.5-4B", valid_tools={"web_search", "finish", "submit"})
 
     _initial_messages("gem", "webqa", "question", tools, "Qwen3.5-4B", tool_parser=parser)
-    call = parser.parse("<tool_call>\n<function=web_search>\n" "<parameter=query>\nquery\n</parameter>\n" "<parameter=max_results>\n10\n</parameter>\n" "</function>\n</tool_call>")[0]
+    call = parser.parse(
+        "<tool_call>\n<function=web_search>\n"
+        "<parameter=query>\nquery\n</parameter>\n"
+        "<parameter=max_results>\n10\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )[0]
 
     assert call.arguments == {"query": "query", "max_results": 10}
 
@@ -460,7 +505,12 @@ def test_qwen3_coder_parser_accepts_colon_before_integer_value():
     parser = make_tool_parser("Qwen3.5-4B", valid_tools={"web_search"})
     parser.get_tool_prompt("\n".join(json.dumps(t, indent=0, ensure_ascii=False) for t in tools))
 
-    call = parser.parse("<tool_call>\n<function=web_search>\n" "<parameter=query>\n: 10\n</parameter>\n" "<parameter=max_results>\n: 10\n</parameter>\n" "</function>\n</tool_call>")[0]
+    call = parser.parse(
+        "<tool_call>\n<function=web_search>\n"
+        "<parameter=query>\n: 10\n</parameter>\n"
+        "<parameter=max_results>\n: 10\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )[0]
 
     assert call.arguments == {"query": ": 10", "max_results": 10}
 
@@ -468,7 +518,12 @@ def test_qwen3_coder_parser_accepts_colon_before_integer_value():
 def test_qwen3_coder_parser_normalizes_submit_and_keeps_boxed_fallback():
     parser = make_tool_parser("qwen3-coder", valid_tools={"web_search", "finish", "submit"})
 
-    submit = parser.parse("<tool_call>\n<function=submit>\n" "<parameter=command>submit</parameter>\n" "<parameter=result>Milton Caniff</parameter>\n" "</function>\n</tool_call>")
+    submit = parser.parse(
+        "<tool_call>\n<function=submit>\n"
+        "<parameter=command>submit</parameter>\n"
+        "<parameter=result>Milton Caniff</parameter>\n"
+        "</function>\n</tool_call>"
+    )
     assert submit[0].name == "finish"
     assert submit[0].arguments["result"] == "Milton Caniff"
 
@@ -539,14 +594,26 @@ def test_gemma4_tool_prompt_formats_complex_json_schema_without_python_repr():
 
     assert '<|"|>display name<|"|>:{description:<|"|>Human readable name<|"|>,type:<|"|>STRING<|"|>}' in declaration
     assert 'maybe:{description:<|"|>Optional text<|"|>,type:[<|"|>STRING<|"|>,<|"|>NULL<|"|>]}' in declaration
-    assert ('nums:{description:<|"|>Numbers<|"|>,default:[1,2],items:{minimum:1,type:<|"|>INTEGER<|"|>},' 'minItems:1,maxItems:4,type:<|"|>ARRAY<|"|>}') in declaration
+    assert (
+        'nums:{description:<|"|>Numbers<|"|>,default:[1,2],items:{minimum:1,type:<|"|>INTEGER<|"|>},'
+        'minItems:1,maxItems:4,type:<|"|>ARRAY<|"|>}'
+    ) in declaration
     assert 'pair:{items:[{type:<|"|>STRING<|"|>},{type:<|"|>INTEGER<|"|>}],type:<|"|>ARRAY<|"|>}' in declaration
-    assert 'mode:{anyOf:[{enum:[<|"|>fast<|"|>,<|"|>safe<|"|>],type:<|"|>STRING<|"|>},{type:<|"|>NULL<|"|>}]}' in declaration
+    assert (
+        'mode:{anyOf:[{enum:[<|"|>fast<|"|>,<|"|>safe<|"|>],type:<|"|>STRING<|"|>},{type:<|"|>NULL<|"|>}]}'
+        in declaration
+    )
     assert 'payload:{additionalProperties:{type:<|"|>STRING<|"|>},type:<|"|>OBJECT<|"|>}' in declaration
     assert 'profile:{$ref:<|"|>#/$defs/Profile<|"|>}' in declaration
     assert 'sealed:{additionalProperties:false,type:<|"|>OBJECT<|"|>}' in declaration
-    assert ('token:{const:<|"|>ok<|"|>,$defs:{Alias:{description:<|"|>Short name<|"|>,type:<|"|>STRING<|"|>}},' 'pattern:<|"|>^[a-z]+$<|"|>,minLength:2,maxLength:8,type:<|"|>STRING<|"|>}') in declaration
-    assert ('$defs:{Profile:{properties:{age:{type:<|"|>INTEGER<|"|>},name:{type:<|"|>STRING<|"|>}},' 'required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}') in declaration
+    assert (
+        'token:{const:<|"|>ok<|"|>,$defs:{Alias:{description:<|"|>Short name<|"|>,type:<|"|>STRING<|"|>}},'
+        'pattern:<|"|>^[a-z]+$<|"|>,minLength:2,maxLength:8,type:<|"|>STRING<|"|>}'
+    ) in declaration
+    assert (
+        '$defs:{Profile:{properties:{age:{type:<|"|>INTEGER<|"|>},name:{type:<|"|>STRING<|"|>}},'
+        'required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}'
+    ) in declaration
     assert 'definitions:{<|"|>legacy type<|"|>:{enum:[<|"|>old<|"|>],type:<|"|>STRING<|"|>}}' in declaration
     assert "['STRING', 'NULL']" not in declaration
 
@@ -554,7 +621,9 @@ def test_gemma4_tool_prompt_formats_complex_json_schema_without_python_repr():
 def test_gemma4_tool_parser_parses_native_calls_and_formats_observation():
     parser = make_tool_parser("gemma4", valid_tools={"web_search", "finish", "submit"})
 
-    calls = parser.parse('<|tool_call>call:web_search{query:<|"|>Tokyo weather<|"|>,max_results:3}<tool_call|><|tool_response>')
+    calls = parser.parse(
+        '<|tool_call>call:web_search{query:<|"|>Tokyo weather<|"|>,max_results:3}<tool_call|><|tool_response>'
+    )
 
     assert len(calls) == 1
     assert calls[0].name == "web_search"
@@ -638,7 +707,9 @@ def test_gemma4_tool_parser_formats_multiple_tool_responses():
 def test_gemma4_tool_parser_handles_nested_arguments_and_finish_alias():
     parser = make_tool_parser("gemma_4", valid_tools={"finish", "submit"})
 
-    calls = parser.parse('<|tool_call>call:submit{command:<|"|>submit<|"|>,result:{answer:<|"|>42<|"|>,sources:[<|"|>a<|"|>,<|"|>b<|"|>]}}<tool_call|>')
+    calls = parser.parse(
+        '<|tool_call>call:submit{command:<|"|>submit<|"|>,result:{answer:<|"|>42<|"|>,sources:[<|"|>a<|"|>,<|"|>b<|"|>]}}<tool_call|>'
+    )
 
     assert calls[0].name == "finish"
     assert calls[0].arguments == {"command": "submit", "result": {"answer": "42", "sources": ["a", "b"]}}
@@ -647,7 +718,9 @@ def test_gemma4_tool_parser_handles_nested_arguments_and_finish_alias():
 def test_gemma4_tool_parser_accepts_python_style_bare_literals():
     parser = make_tool_parser("gemma4", valid_tools={"set_flags"})
 
-    calls = parser.parse('<|tool_call>call:set_flags{enabled:True,disabled:False,missing:None,quoted:"True"}<tool_call|>')
+    calls = parser.parse(
+        '<|tool_call>call:set_flags{enabled:True,disabled:False,missing:None,quoted:"True"}<tool_call|>'
+    )
 
     assert len(calls) == 1
     assert calls[0].name == "set_flags"
@@ -662,7 +735,9 @@ def test_gemma4_tool_parser_accepts_python_style_bare_literals():
 def test_gemma4_tool_parser_does_not_truncate_braces_inside_strings():
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
-    calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>The answer is \\boxed{Chacruna}. {"ok": true}<|"|>}<tool_call|><|tool_response>')
+    calls = parser.parse(
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>The answer is \\boxed{Chacruna}. {"ok": true}<|"|>}<tool_call|><|tool_response>'
+    )
 
     assert len(calls) == 1
     assert calls[0].name == "finish"
@@ -670,13 +745,17 @@ def test_gemma4_tool_parser_does_not_truncate_braces_inside_strings():
         "command": "submit",
         "result": 'The answer is \\boxed{Chacruna}. {"ok": true}',
     }
-    assert calls[0].end == calls[0].start + len('<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>The answer is \\boxed{Chacruna}. {"ok": true}<|"|>}<tool_call|>')
+    assert calls[0].end == calls[0].start + len(
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>The answer is \\boxed{Chacruna}. {"ok": true}<|"|>}<tool_call|>'
+    )
 
 
 def test_gemma4_tool_parser_parses_logged_finish_call():
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
-    calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>Chacruna<|"|>}<tool_call|><|tool_response>')
+    calls = parser.parse(
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>Chacruna<|"|>}<tool_call|><|tool_response>'
+    )
 
     assert len(calls) == 1
     assert calls[0].name == "finish"
@@ -687,7 +766,9 @@ def test_gemma4_tool_parser_repairs_finish_command_missing_native_quote_before_r
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit,result:<|"|>answer<|"|>}<tool_call|><|tool_response>')
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>submit,result:<|"|>answer<|"|>}<tool_call|><|tool_response>'
+        )
 
     assert len(calls) == 1
     assert calls[0].name == "finish"
@@ -699,7 +780,9 @@ def test_gemma4_tool_parser_repairs_finish_command_value_before_result(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:finish{command:<|"|>finish,result:<|"|>answer<|"|>}<tool_call|><|tool_response>')
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>finish,result:<|"|>answer<|"|>}<tool_call|><|tool_response>'
+        )
 
     assert len(calls) == 1
     assert calls[0].name == "finish"
@@ -711,7 +794,10 @@ def test_gemma4_tool_parser_repairs_finish_result_with_extra_native_marker(caplo
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit<|"|>,' 'result:<|"|>The literal marker <|"|> appeared in prose.<|"|>}<tool_call|>')
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+            'result:<|"|>The literal marker <|"|> appeared in prose.<|"|>}<tool_call|>'
+        )
 
     assert len(calls) == 1
     assert calls[0].arguments == {
@@ -725,7 +811,9 @@ def test_gemma4_tool_parser_repairs_missing_command_quote_with_json_quoted_resul
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit,result:"Could not identify \\"Creek E\\"."}<tool_call|>')
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>submit,result:"Could not identify \\"Creek E\\"."}<tool_call|>'
+        )
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "submit", "result": 'Could not identify \\"Creek E\\".'}
@@ -736,7 +824,9 @@ def test_gemma4_tool_parser_repairs_finish_function_like_command_payload(caplog)
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:finish{command:<|"|>finish(result="I am unable to identify it.")"}<tool_call|>')
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>finish(result="I am unable to identify it.")"}<tool_call|>'
+        )
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "finish", "result": "I am unable to identify it."}
@@ -758,7 +848,9 @@ def test_gemma4_tool_parser_repairs_finish_braced_result_payload(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:finish{command:<|"|>finish{result:<|"|>Wordian formation<|"|>}}<tool_call|>')
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>finish{result:<|"|>Wordian formation<|"|>}}<tool_call|>'
+        )
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "finish", "result": "Wordian formation"}
@@ -769,7 +861,9 @@ def test_gemma4_tool_parser_repairs_finish_json_answer_payload(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit,{"answer":"High Performance Fortran"}}<tool_call|>')
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>submit,{"answer":"High Performance Fortran"}}<tool_call|>'
+        )
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "submit", "result": "High Performance Fortran"}
@@ -780,7 +874,9 @@ def test_gemma4_tool_parser_repairs_incomplete_finish_json_answer_payload(caplog
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:finish{command:<|"|>submit,{"answer":"High Performance Fortran}<tool_call|>')
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>submit,{"answer":"High Performance Fortran}<tool_call|>'
+        )
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "submit", "result": "High Performance Fortran"}
@@ -791,7 +887,10 @@ def test_gemma4_tool_parser_repairs_instruction_like_finish_command(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:finish{command:<|"|>Finish the task and submit the final result with the synthesized answer.<|"|>,' 'result:<|"|>Journal of Hand Surgery<|"|>}<tool_call|>')
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>Finish the task and submit the final result with the synthesized answer.<|"|>,'
+            'result:<|"|>Journal of Hand Surgery<|"|>}<tool_call|>'
+        )
 
     assert len(calls) == 1
     assert calls[0].arguments == {"command": "submit", "result": "Journal of Hand Surgery"}
@@ -802,7 +901,10 @@ def test_gemma4_tool_parser_repairs_function_like_command_argument(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:finish{command:<|"|>finish(command="Which theory was used with Classical Laminate Theory?")<|"|>,' 'result="The provided search results do not name it}<tool_call|>')
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>finish(command="Which theory was used with Classical Laminate Theory?")<|"|>,'
+            'result="The provided search results do not name it}<tool_call|>'
+        )
 
     assert len(calls) == 1
     assert calls[0].arguments == {
@@ -816,7 +918,11 @@ def test_gemma4_tool_parser_repairs_unclosed_finish_result(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:finish{command:<|"|>Please synthesize the search results to answer the question.<|"|>,' 'result:<|"|>Based on the search results, the relevant journal is Journal of Hand Surgery' "<tool_call|>")
+        calls = parser.parse(
+            '<|tool_call>call:finish{command:<|"|>Please synthesize the search results to answer the question.<|"|>,'
+            'result:<|"|>Based on the search results, the relevant journal is Journal of Hand Surgery'
+            "<tool_call|>"
+        )
 
     assert len(calls) == 1
     assert calls[0].arguments == {
@@ -830,7 +936,9 @@ def test_gemma4_tool_parser_repairs_web_search_query_equals(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"web_search"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:web_search{query="Greek phrase primary manuscript authority"}<tool_call|>')
+        calls = parser.parse(
+            '<|tool_call>call:web_search{query="Greek phrase primary manuscript authority"}<tool_call|>'
+        )
 
     assert len(calls) == 1
     assert calls[0].arguments == {"query": "Greek phrase primary manuscript authority"}
@@ -841,7 +949,9 @@ def test_gemma4_tool_parser_repairs_web_search_query_with_extra_quotes(caplog):
     parser = make_tool_parser("gemma4", valid_tools={"web_search"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:web_search{query:<|"|>EEG system adaptive gain control neuronal populations daily imaging"""}<tool_call|>')
+        calls = parser.parse(
+            '<|tool_call>call:web_search{query:<|"|>EEG system adaptive gain control neuronal populations daily imaging"""}<tool_call|>'
+        )
 
     assert len(calls) == 1
     assert calls[0].arguments == {"query": "EEG system adaptive gain control neuronal populations daily imaging"}
@@ -876,7 +986,9 @@ def test_gemma4_tool_parser_decodes_json_like_unicode_escapes():
 def test_gemma4_tool_parser_tolerates_unescaped_quotes_inside_json_like_strings():
     parser = make_tool_parser("gemma4", valid_tools={"web_search"})
 
-    calls = parser.parse('<|tool_call>call:web_search{query:"who wrote "In Context Music" with Angus Tarnawsky?",max_results:3}<tool_call|>')
+    calls = parser.parse(
+        '<|tool_call>call:web_search{query:"who wrote "In Context Music" with Angus Tarnawsky?",max_results:3}<tool_call|>'
+    )
 
     assert len(calls) == 1
     assert calls[0].name == "web_search"
@@ -933,7 +1045,9 @@ def test_gemma4_parser_error_credit_assignment_masks_only_bad_native_action():
     bad = '<|tool_call>call:web_search{query:<|"|>bad<|"|>'
 
     result = _run_generate_with_fake_sglang(
-        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Use web_search before submit"}),
+        Sample(
+            prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Use web_search before submit"}
+        ),
         [{"text": bad}],
         {
             "CREDIT_ASSIGNMENT_ENABLE": "True",
@@ -955,7 +1069,9 @@ def test_gemma4_malformed_closed_tool_call_terminates_as_parser_error():
     bad = '<|tool_call>call:web_search{query:"unterminated}<tool_call|>'
 
     result = _run_generate_with_fake_sglang(
-        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Use web_search before submit"}),
+        Sample(
+            prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Use web_search before submit"}
+        ),
         [{"text": bad}],
         {
             "CREDIT_ASSIGNMENT_ENABLE": "True",
@@ -1055,13 +1171,66 @@ def test_explicit_model_series_overrides_noncanonical_checkpoint_path(monkeypatc
 
     monkeypatch.setenv("FUSED_MODEL_SERIES", "qwen3")
     assert type(make_tool_parser(checkpoint)) is QwenToolParser
-    assert '{"name": <function-name>, "arguments": <args-json-object>}' in build_system_prompt(FUSED_SEARCH_SYSTEM_PROMPT, tools, checkpoint)
+    assert '{"name": <function-name>, "arguments": <args-json-object>}' in build_system_prompt(
+        FUSED_SEARCH_SYSTEM_PROMPT, tools, checkpoint
+    )
 
 
 def test_invalid_explicit_model_series_fails_closed(monkeypatch):
     monkeypatch.setenv("FUSED_MODEL_SERIES", "qwen-next")
     with pytest.raises(ValueError, match="Unsupported FUSED_MODEL_SERIES"):
         make_tool_parser("/models/Qwen3-4B")
+
+
+def test_qwen35_fused_sampling_uses_model_specific_parameters():
+    sampling_params_seen = []
+
+    _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label="answer", metadata={"question": "Answer directly"}),
+        [{"text": "answer"}],
+        {"FUSED_HARNESS": "cot", "FUSED_MODEL_SERIES": "qwen3.5"},
+        evaluation=True,
+        sampling_params_seen=sampling_params_seen,
+    )
+
+    assert sampling_params_seen == [
+        {
+            "max_new_tokens": 1024,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "repetition_penalty": 1.0,
+        }
+    ]
+
+
+def test_qwen3_fused_sampling_keeps_existing_parameters():
+    sampling_params_seen = []
+
+    _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label="answer", metadata={"question": "Answer directly"}),
+        [{"text": "answer"}],
+        {"FUSED_HARNESS": "cot", "FUSED_MODEL_SERIES": "qwen3"},
+        evaluation=True,
+        sampling_params_seen=sampling_params_seen,
+    )
+
+    assert sampling_params_seen == [{"max_new_tokens": 1024, "temperature": 1.0, "top_p": 1.0}]
+
+
+def test_qwen35_training_sampling_keeps_training_parameters():
+    sampling_params_seen = []
+
+    _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label="answer", metadata={"question": "Answer directly"}),
+        [{"text": "answer"}],
+        {"FUSED_HARNESS": "cot", "FUSED_MODEL_SERIES": "qwen3.5"},
+        sampling_params_seen=sampling_params_seen,
+    )
+
+    assert sampling_params_seen == [{"max_new_tokens": 1024, "temperature": 1.0, "top_p": 1.0}]
 
 
 def test_resolve_cli_and_et_modes_without_docker_reset():
@@ -1362,7 +1531,7 @@ def test_mcp_atlas_bypasses_sandbox_cache_after_mutating_a_server(monkeypatch):
                 "name": "slack_channels_list",
                 "description": "List channels",
                 "inputSchema": {"type": "object", "properties": {}},
-            }
+            },
         ],
     )
 
@@ -1693,7 +1862,11 @@ def test_enabled_thinking_discards_prior_thoughts_and_emits_prompt_equal_segment
     samples = _run_generate_with_fake_sglang(
         _local_mcp_sample(tmp_path, question="Think independently on each turn"),
         [{"text": first_thought + first_action}, {"text": second_thought + final_action}],
-        {"FUSED_DISABLE_THINKING": "False", "FUSED_DISCARD_HISTORICAL_THINKING": "True", "CREDIT_ASSIGNMENT_ENABLE": "False"},
+        {
+            "FUSED_DISABLE_THINKING": "False",
+            "FUSED_DISCARD_HISTORICAL_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
         tokenizer=FakeChatTemplateTokenizer(),
     )
 
@@ -1713,6 +1886,7 @@ def test_enabled_thinking_discards_prior_thoughts_and_emits_prompt_equal_segment
     episode = samples[0].metadata["rllm_episode"]
     assert episode["metadata"]["prompt_equal_loss"] is True
     assert episode["metadata"]["segment_count"] == 2
+    assert ("segment_num", "2") in rollout_visualization._episode_summary_rows(samples[0], episode, None)
     assert episode["metadata"]["parent_traj_id"] == samples[0].metadata["parent_traj_id"]
     assert episode["metadata"]["historical_thinking_discard_steps"] == 1
     steps = episode["trajectories"][0]["steps"]
@@ -1843,7 +2017,11 @@ def test_prompt_equal_is_independent_of_historical_thinking_discard(tmp_path: Pa
     samples = _run_generate_with_fake_sglang(
         _local_mcp_sample(tmp_path, question="Keep existing disable-thinking behavior"),
         [{"text": thought + _echo_call("alpha")}, {"text": _finish_call()}],
-        {"FUSED_DISABLE_THINKING": "True", "FUSED_DISCARD_HISTORICAL_THINKING": "True", "CREDIT_ASSIGNMENT_ENABLE": "False"},
+        {
+            "FUSED_DISABLE_THINKING": "True",
+            "FUSED_DISCARD_HISTORICAL_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
         tokenizer=FakeChatTemplateTokenizer(),
     )
 
@@ -1877,6 +2055,9 @@ def test_eval_rollout_discards_prior_thinking_before_next_assistant_step(tmp_pat
     assert first_thought not in second_prompt
     assert first_action in second_prompt
     episode = result[0].metadata["rllm_episode"]
+    assert result[0].metadata["segment_count"] == 1
+    assert episode["metadata"]["segment_count"] == 1
+    assert ("segment_num", "1") in rollout_visualization._episode_summary_rows(result[0], episode, None)
     assert episode["metadata"]["discard_historical_thinking_enabled"] is True
     assert episode["metadata"]["historical_thinking_discard_steps"] == 1
     steps = episode["trajectories"][0]["steps"]
@@ -1910,7 +2091,9 @@ def test_gemma4_render_prompt_ids_falls_back_to_inline_native_tools_when_tools_k
         def __init__(self):
             self.rendered_messages = None
 
-        def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, enable_thinking=True, **kwargs):
+        def apply_chat_template(
+            self, messages, tokenize=True, add_generation_prompt=True, enable_thinking=True, **kwargs
+        ):
             if "tools" in kwargs:
                 raise TypeError("apply_chat_template() got an unexpected keyword argument 'tools'")
             self.rendered_messages = messages
@@ -2065,7 +2248,9 @@ def test_disable_thinking_loss_mask_token_domain_masks_through_close_think(close
     # We only need the </think> id present; use distinct filler ids for the rest.
     tokenizer = _ThinkTokenizer(close_id)
     output_ids = [900, 901, 902, close_id, 271, 800, 801]  # </think> at index 3
-    mask = _default_response_loss_mask(tokenizer, "irrelevant", output_len=len(output_ids), disable_thinking=True, output_ids=output_ids)
+    mask = _default_response_loss_mask(
+        tokenizer, "irrelevant", output_len=len(output_ids), disable_thinking=True, output_ids=output_ids
+    )
     # masked through </think> (index 3), answer (incl. trailing \n\n) trainable
     assert mask == [0, 0, 0, 0, 1, 1, 1]
 
@@ -2076,7 +2261,9 @@ def test_disable_thinking_loss_mask_token_domain_qwen35_shape(close_id):
     # injected into the prompt, not generated), </think> still inside output.
     tokenizer = _ThinkTokenizer(close_id)
     output_ids = [700, 701, close_id, 271, 800]  # </think> at index 2
-    mask = _default_response_loss_mask(tokenizer, "irrelevant", output_len=len(output_ids), disable_thinking=True, output_ids=output_ids)
+    mask = _default_response_loss_mask(
+        tokenizer, "irrelevant", output_len=len(output_ids), disable_thinking=True, output_ids=output_ids
+    )
     assert mask == [0, 0, 0, 1, 1]
 
 
@@ -2086,7 +2273,9 @@ def test_disable_thinking_loss_mask_no_misfired_think_trains_full(close_id):
     # output_ids carry no </think> -> nothing to mask, full response trains.
     tokenizer = _ThinkTokenizer(close_id)
     output_ids = [800, 801, 802, 803]
-    mask = _default_response_loss_mask(tokenizer, "answer only", output_len=len(output_ids), disable_thinking=True, output_ids=output_ids)
+    mask = _default_response_loss_mask(
+        tokenizer, "answer only", output_len=len(output_ids), disable_thinking=True, output_ids=output_ids
+    )
     assert mask == [1, 1, 1, 1]
 
 
@@ -2097,7 +2286,9 @@ def test_disable_thinking_loss_mask_stray_closer_after_tool_call_trains_full(clo
     tokenizer = _ThinkTokenizer(close_id)
     response = '<tool_call>{"name":"echo","arguments":{"value":"x"}}</tool_call> stray </think> tail'
     output_ids = [800, 801, 802, close_id, 803]
-    mask = _default_response_loss_mask(tokenizer, response, output_len=len(output_ids), disable_thinking=True, output_ids=output_ids)
+    mask = _default_response_loss_mask(
+        tokenizer, response, output_len=len(output_ids), disable_thinking=True, output_ids=output_ids
+    )
     assert mask == [1, 1, 1, 1, 1]
 
 
@@ -2108,7 +2299,9 @@ def test_enable_thinking_loss_mask_trains_reasoning_and_answer(close_id):
     # in the builder.
     tokenizer = _ThinkTokenizer(close_id)
     output_ids = [900, 901, close_id, 271, 800]
-    mask = _default_response_loss_mask(tokenizer, "reason </think> answer", output_len=len(output_ids), disable_thinking=False, output_ids=output_ids)
+    mask = _default_response_loss_mask(
+        tokenizer, "reason </think> answer", output_len=len(output_ids), disable_thinking=False, output_ids=output_ids
+    )
     assert mask is None
 
 
@@ -2126,7 +2319,9 @@ def test_disable_thinking_loss_mask_falls_back_to_char_level_without_close_id():
 
     response = "<think>\nplan\n</think>\n<tool_call>x</tool_call>"
     output_ids = [ord(ch) for ch in response]
-    mask = _default_response_loss_mask(NoThinkTokenizer(), response, output_len=len(output_ids), disable_thinking=True, output_ids=output_ids)
+    mask = _default_response_loss_mask(
+        NoThinkTokenizer(), response, output_len=len(output_ids), disable_thinking=True, output_ids=output_ids
+    )
     split = response.index("<tool_call>")
     assert mask == [0] * split + [1] * (len(response) - split)
 
@@ -2292,7 +2487,12 @@ def test_cot_generate_ignores_tool_calls_and_scores_as_reasoning_only(monkeypatc
 def test_tool_observation_has_execution_output_header():
     observation = _format_tool_observation("web_search", "AHPL is a hardware description language.")
 
-    assert observation == ("<tool_response>\n" "Execution output of [web_search]:\n" "AHPL is a hardware description language.\n" "</tool_response>")
+    assert observation == (
+        "<tool_response>\n"
+        "Execution output of [web_search]:\n"
+        "AHPL is a hardware description language.\n"
+        "</tool_response>"
+    )
 
 
 def test_web_search_retrieval_formats_plain_text_without_json_or_urls():
@@ -2332,7 +2532,12 @@ def test_web_search_tool_observation_normalizes_structured_payload():
         ],
     )
 
-    assert observation == ("<tool_response>\n" "Execution output of [web_search]:\n" "[1] XMLSpy: XMLSpy is an XML editor. Development started in 1999.\n" "</tool_response>")
+    assert observation == (
+        "<tool_response>\n"
+        "Execution output of [web_search]:\n"
+        "[1] XMLSpy: XMLSpy is an XML editor. Development started in 1999.\n"
+        "</tool_response>"
+    )
 
 
 def test_web_search_tool_observation_normalizes_json_string_payload():
@@ -2424,7 +2629,9 @@ def test_web_search_falls_back_to_one_for_malformed_max_results(monkeypatch):
     monkeypatch.setattr("slime.rollout.fused_agent.env.aiohttp.ClientSession", FakeSession)
     env = FusedEnvironment({"question": "Find evidence"})
 
-    observation, reward, done, info = asyncio.run(env.step(fused_generate.ToolCall("web_search", {"query": "q", "max_results": "10\n</<|im_start|>user>"})))
+    observation, reward, done, info = asyncio.run(
+        env.step(fused_generate.ToolCall("web_search", {"query": "q", "max_results": "10\n</<|im_start|>user>"}))
+    )
 
     assert observation.startswith("[Result 1] Title: Doc\nSnippet: fallback0 fallback1")
     assert reward == 0.0
@@ -2821,7 +3028,9 @@ def test_web_search_summary_splits_oversized_requests(monkeypatch):
                 if total_words > 700:
                     return FakeResponse(
                         500,
-                        {"detail": "Summarization Error: ValueError('The decoder prompt (length 9000) is longer than the maximum model length of 8192. Make sure that `max_model_len` is no smaller than the number of text tokens.')"},
+                        {
+                            "detail": "Summarization Error: ValueError('The decoder prompt (length 9000) is longer than the maximum model length of 8192. Make sure that `max_model_len` is no smaller than the number of text tokens.')"
+                        },
                     )
                 return FakeResponse(200, {"summary": f"# Summary: summarized {total_words}"})
             raise AssertionError(url)
@@ -2843,7 +3052,13 @@ def test_web_search_summary_splits_oversized_requests(monkeypatch):
     summarize_calls = [payload for url, payload in FakeSession.calls if url.endswith("/summarize")]
     assert len(summarize_calls) == 5
     assert sum(len(str(item.get("content", "")).split()) for item in summarize_calls[0]["documents"]) > 700
-    assert max(sum(len(str(item.get("content", "")).split()) for item in payload["documents"]) for payload in summarize_calls[1:]) <= 700
+    assert (
+        max(
+            sum(len(str(item.get("content", "")).split()) for item in payload["documents"])
+            for payload in summarize_calls[1:]
+        )
+        <= 700
+    )
 
 
 def test_web_search_skips_summary_when_disabled(monkeypatch):
@@ -3093,6 +3308,99 @@ def test_call_sglang_eval_uses_text_without_logprobs(monkeypatch):
         "output_ids": [],
         "rid": requests[0][1]["rid"],
     }
+
+
+def test_call_sglang_strict_weight_version_is_returned_and_pinned(monkeypatch):
+    async def fake_post(url, payload, headers=None):
+        return {
+            "text": "x",
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "output_token_logprobs": [[-0.25, 7, "x"]],
+                "weight_version": "v7",
+            },
+        }
+
+    monkeypatch.setattr(fused_generate.http_utils, "post", fake_post)
+    args = SimpleNamespace(
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        router_policy="consistent_hashing",
+    )
+
+    result = asyncio.run(
+        fused_generate._call_sglang(
+            args,
+            [1, 2],
+            {"max_new_tokens": 1},
+            session_id="sid",
+            expected_weight_version="v7",
+            require_weight_version=True,
+        )
+    )
+    assert result["weight_version"] == "v7"
+
+    with pytest.raises(fused_generate.SGLangWeightVersionError, match="changed within"):
+        asyncio.run(
+            fused_generate._call_sglang(
+                args,
+                [1, 2],
+                {"max_new_tokens": 1},
+                session_id="sid",
+                expected_weight_version="v8",
+                require_weight_version=True,
+            )
+        )
+
+
+def test_call_sglang_strict_weight_version_rejects_missing(monkeypatch):
+    async def fake_post(url, payload, headers=None):
+        return {
+            "text": "x",
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "output_token_logprobs": [[-0.25, 7, "x"]],
+            },
+        }
+
+    monkeypatch.setattr(fused_generate.http_utils, "post", fake_post)
+    args = SimpleNamespace(sglang_router_ip="127.0.0.1", sglang_router_port=30000, router_policy="manual")
+
+    with pytest.raises(fused_generate.SGLangWeightVersionError, match="omitted weight_version"):
+        asyncio.run(
+            fused_generate._call_sglang(
+                args,
+                [1, 2],
+                {"max_new_tokens": 1},
+                session_id="sid",
+                require_weight_version=True,
+            )
+        )
+
+
+def test_call_sglang_training_rejects_text_without_token_logprobs(monkeypatch):
+    async def fake_post(url, payload, headers=None):
+        return {
+            "text": "generated without evidence",
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "weight_version": "v1",
+            },
+        }
+
+    monkeypatch.setattr(fused_generate.http_utils, "post", fake_post)
+    args = SimpleNamespace(sglang_router_ip="127.0.0.1", sglang_router_port=30000, router_policy="manual")
+
+    with pytest.raises(ValueError, match="without output token/logprob evidence"):
+        asyncio.run(
+            fused_generate._call_sglang(
+                args,
+                [1, 2],
+                {"max_new_tokens": 4},
+                session_id="sid",
+                require_weight_version=True,
+            )
+        )
 
 
 def test_manual_router_policy_sends_sticky_routing_header():
@@ -3375,7 +3683,9 @@ def verify(tools, answer):
 
     calls = [
         {"text": '<tool_call>{"name":"get_value","arguments":{}}</tool_call>'},
-        {"text": '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"{\\"answer\\":3}"}}</tool_call>'},
+        {
+            "text": '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"{\\"answer\\":3}"}}</tool_call>'
+        },
     ]
 
     result = _run_generate_with_fake_sglang(sample, calls)
@@ -3565,6 +3875,35 @@ def test_repeated_search_warns_once_before_credit_assignment():
     assert _policy_masked_text(sample) == repeated_twice
 
 
+def test_new_search_query_resets_repeated_search_strikes():
+    same = _search_call("same query")
+    different = _search_call("different query")
+
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Search before answer"}),
+        [
+            {"text": same},
+            {"text": same},
+            {"text": different},
+            {"text": same},
+            {"text": same},
+            {"text": same},
+        ],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY": "True",
+            "FUSED_REPEATED_SEARCH_MAX_STRIKES": "2",
+        },
+        evaluation=True,
+    )
+
+    sample = result[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["fused_termination"] == "repeated_query_early_stop"
+    assert sample.metadata["credit_assignment_event"] is None
+    assert sample.metadata["duplicate_query_count"] == 2
+
+
 def test_multiturn_agentic_mask_keeps_prompts_and_observations_masked(tmp_path: Path):
     turns = [_echo_call("alpha"), _echo_call("beta"), _finish_call()]
 
@@ -3640,9 +3979,13 @@ def test_long_horizon_web_search_mask_and_visualization_unmask_all_assistant_gen
     assert "<tool_response>" in masked_context
 
     visual_unmasked = _visualized_text_by_styles(
-        sample,
-        tokenizer,
-        {rollout_visualization._UNMASKED_TOKEN_STYLE, rollout_visualization._REWARD_POS_STYLE},
+                sample,
+                tokenizer,
+                {
+                    rollout_visualization._UNMASKED_TOKEN_STYLE,
+                    rollout_visualization._UNMASKED_TOOL_CALL_STYLE,
+                    rollout_visualization._REWARD_POS_STYLE,
+                },
     )
     visual_masked = _visualized_text_by_style(sample, tokenizer, rollout_visualization._MASKED_TOKEN_STYLE)
     assert visual_unmasked == expected_unmasked
@@ -3760,34 +4103,63 @@ def test_long_horizon_visualization_keeps_actions_unmasked_under_assistant_repla
         tokenizer=tokenizer,
     )
 
-    assert len(result) == 1
-    sample = result[0]
-    unmasked_text = _masked_text(sample)
-    assert "<tool_response>" not in _masked_text(sample)
-    assert "<tool_response>" in _policy_unmasked_text(sample)
+    assert len(result) == 21
+    assert all(sample.metadata["segment_count"] == 21 for sample in result)
+    assert all(sample.metadata["fused_tito_boundary_count"] == 20 for sample in result)
+    assert all(sample.metadata["fused_tito_prompt_prefix_mismatch_turns"] == 20 for sample in result)
+    assert [sample.metadata["turn_spans"][0]["turn_index"] for sample in result] == list(range(1, 22))
+    assert all(len(sample.metadata["turn_spans"]) == 1 for sample in result)
+    episode = result[0].metadata["rllm_episode"]
+    assert episode["metadata"]["segment_count"] == 21
+    assert ("segment_num", "21") in rollout_visualization._episode_summary_rows(result[0], episode, None)
+    unmasked_text = "".join(_masked_text(sample) for sample in result)
+    assert "<tool_response>" not in unmasked_text
+    # A forced boundary strips the new segment's leading prompt. Historical
+    # tool responses therefore remain context-only and are absent from the
+    # response-aligned policy masks.
+    assert "<tool_response>" not in "".join(_policy_unmasked_text(sample) for sample in result)
     for idx in range(len(tool_turns)):
         assert f"drift evidence query {idx:02d}" in unmasked_text
     assert '"name":"finish"' in unmasked_text
     assert "\\\\boxed{answer}" in unmasked_text
 
-    visual_unmasked = _visualized_text_by_styles(
-        sample,
-        tokenizer,
-        {rollout_visualization._UNMASKED_TOKEN_STYLE, rollout_visualization._REWARD_POS_STYLE},
+    visual_unmasked = "".join(
+        _visualized_text_by_styles(
+            sample,
+            tokenizer,
+            {
+                rollout_visualization._UNMASKED_TOKEN_STYLE,
+                rollout_visualization._UNMASKED_TOOL_CALL_STYLE,
+                rollout_visualization._REWARD_POS_STYLE,
+            },
+        )
+        for sample in result
     )
-    visual_masked = _visualized_text_by_style(sample, tokenizer, rollout_visualization._MASKED_TOKEN_STYLE)
     for idx in range(len(tool_turns)):
         query = f"drift evidence query {idx:02d}"
         assert query in visual_unmasked
-        assert query not in visual_masked
     assert '"name":"finish"' in visual_unmasked
     assert "\\\\boxed{answer}" in visual_unmasked
 
+    segment_view = rollout_visualization._episode_token_mask_view(
+        result[0],
+        tokenizer,
+        related_samples=list(reversed(result)),
+    )
+    assert len(segment_view.renderables) == 21
+    assert segment_view.renderables[0].title.plain == "Segment 1/21 | Step 1"
+    assert segment_view.renderables[-1].title.plain.startswith("Segment 21/21 | Step 21")
+    for index, panel in enumerate(segment_view.renderables[:-1]):
+        assert f"drift evidence query {index:02d}" in panel.renderable.plain
+    assert '"name":"finish"' in segment_view.renderables[-1].renderable.plain
 
-def test_group_visualization_combines_sibling_samples_into_full_episode_mask():
+
+def test_group_visualization_orders_and_renders_every_segment_without_fuzzy_matching():
     tokenizer = FakeChatTemplateTokenizer()
     first_action = _search_call("first evidence")
-    second_action = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"\\\\boxed{answer}"}}</tool_call>'
+    second_action = (
+        '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"\\\\boxed{answer}"}}</tool_call>'
+    )
 
     prompt = tokenizer.apply_chat_template(
         [{"role": "user", "content": "Find evidence"}],
@@ -3795,13 +4167,28 @@ def test_group_visualization_combines_sibling_samples_into_full_episode_mask():
         add_generation_prompt=True,
     )
     first_tokens = prompt + [ord(c) for c in first_action]
+    shared_episode = {"trajectories": [{"steps": [{}, {}]}]}
     first = Sample(
         rollout_id=7,
         tokens=first_tokens,
         response_length=len(first_action),
         loss_mask=[1] * len(first_action),
         reward=1.0,
-        metadata={"rllm_episode": {"trajectories": [{"steps": [{}, {}]}]}},
+        metadata={
+            "rllm_episode": shared_episode,
+            "parent_traj_id": "episode-7",
+            "segment_index": 0,
+            "segment_count": 2,
+            "turn_spans": [
+                {
+                    "turn_index": 1,
+                    "response_token_start": len(prompt),
+                    "response_token_end": len(first_tokens),
+                    "trained": True,
+                    "truncated": False,
+                }
+            ],
+        },
     )
 
     replay_prompt = tokenizer.apply_chat_template(
@@ -3820,32 +4207,123 @@ def test_group_visualization_combines_sibling_samples_into_full_episode_mask():
         response_length=len(second_action),
         loss_mask=[1] * len(second_action),
         reward=1.0,
-        metadata=first.metadata,
+        metadata={
+            "rllm_episode": shared_episode,
+            "parent_traj_id": "episode-7",
+            "segment_index": 1,
+            "segment_count": 2,
+            "turn_spans": [
+                {
+                    "turn_index": 2,
+                    "response_token_start": len(replay_prompt),
+                    "response_token_end": len(second_tokens),
+                    "trained": True,
+                    "truncated": False,
+                }
+            ],
+        },
     )
 
     single_rendered = rollout_visualization._token_mask_text(second, tokenizer)
     assert single_rendered is not None
     single_unmasked = _visualized_text_by_styles_from_rendered(
         single_rendered,
-        {rollout_visualization._UNMASKED_TOKEN_STYLE, rollout_visualization._REWARD_POS_STYLE},
+        {
+            rollout_visualization._UNMASKED_TOKEN_STYLE,
+            rollout_visualization._UNMASKED_TOOL_CALL_STYLE,
+            rollout_visualization._REWARD_POS_STYLE,
+        },
     )
-    single_masked = _visualized_text_by_style(second, tokenizer, rollout_visualization._MASKED_TOKEN_STYLE)
-    assert "first evidence" in single_unmasked
-    assert "first evidence" not in single_masked
+    single_masked_tool = _visualized_text_by_style(
+        second, tokenizer, rollout_visualization._MASKED_TOOL_CALL_STYLE
+    )
+    assert "first evidence" not in single_unmasked
+    assert "first evidence" in single_masked_tool
 
-    combined_rendered = rollout_visualization._token_mask_text(first, tokenizer, related_samples=[first, second])
-    assert combined_rendered is not None
-    combined_unmasked = _visualized_text_by_styles_from_rendered(
-        combined_rendered,
-        {rollout_visualization._UNMASKED_TOKEN_STYLE, rollout_visualization._REWARD_POS_STYLE},
+    ordered = rollout_visualization._ordered_segment_samples([second, first])
+    assert ordered == [first, second]
+    segment_view = rollout_visualization._episode_token_mask_view(
+        first,
+        tokenizer,
+        related_samples=[second, first],
     )
-    combined_masked = _visualized_text_by_styles_from_rendered(
-        combined_rendered,
-        {rollout_visualization._MASKED_TOKEN_STYLE},
+    from rich.panel import Panel
+
+    assert len(segment_view.renderables) == 2
+    assert all(isinstance(renderable, Panel) for renderable in segment_view.renderables)
+    assert [renderable.border_style for renderable in segment_view.renderables] == [
+        rollout_visualization._TOKEN_MASK_BORDER_STYLE,
+        rollout_visualization._TOKEN_MASK_BORDER_STYLE,
+    ]
+    assert [renderable.title.plain for renderable in segment_view.renderables] == [
+        "Segment 1/2 | Step 1",
+        "Segment 2/2 | Step 2",
+    ]
+    combined_unmasked = "".join(
+        _visualized_text_by_styles_from_rendered(
+            rollout_visualization._token_mask_text(segment, tokenizer),
+            {
+                rollout_visualization._UNMASKED_TOKEN_STYLE,
+                rollout_visualization._UNMASKED_TOOL_CALL_STYLE,
+                rollout_visualization._REWARD_POS_STYLE,
+            },
+        )
+        for segment in ordered
     )
     assert "first evidence" in combined_unmasked
     assert '"name":"finish"' in combined_unmasked
-    assert "first evidence" not in combined_masked
+
+    with pytest.raises(ValueError, match="expected 2 trajectory segments, got 1"):
+        rollout_visualization._ordered_segment_samples([first])
+    with pytest.raises(ValueError, match="expected 2 trajectory segments, got 1"):
+        rollout_visualization._episode_token_mask_view(first, tokenizer, related_samples=[first])
+
+    second.metadata.pop("turn_spans")
+    with pytest.raises(ValueError, match="segment 1 is missing turn_spans provenance"):
+        rollout_visualization._episode_token_mask_view(
+            first,
+            tokenizer,
+            related_samples=[first, second],
+        )
+
+
+def test_token_mask_view_keeps_whitespace_between_historical_tool_calls_masked():
+    tokenizer = FakeChatTemplateTokenizer()
+    first = _search_call("first")
+    second = _search_call("second")
+    finish = _finish_call()
+    prompt = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": "Find evidence"},
+            {"role": "assistant", "content": first + "\n" + second},
+            {"role": "user", "content": "<tool_response>ok</tool_response>"},
+        ],
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+    sample = Sample(
+        tokens=prompt + [ord(char) for char in finish],
+        response_length=len(finish),
+        loss_mask=[1] * len(finish),
+    )
+
+    rendered = rollout_visualization._token_mask_text(sample, tokenizer)
+    assert rendered is not None
+    masked_tool_calls = _visualized_text_by_styles_from_rendered(
+        rendered, {rollout_visualization._MASKED_TOOL_CALL_STYLE}
+    )
+    unmasked_tool_calls = _visualized_text_by_styles_from_rendered(
+        rendered, {rollout_visualization._UNMASKED_TOOL_CALL_STYLE}
+    )
+    assert "first" in masked_tool_calls
+    assert "second" in masked_tool_calls
+    assert '"name":"finish"' in unmasked_tool_calls
+
+    separator_start = rendered.plain.index("</tool_call>\\n<tool_call>") + len("</tool_call>")
+    separator_style = next(
+        str(span.style) for span in rendered.spans if span.start <= separator_start < span.end
+    )
+    assert separator_style == rollout_visualization._MASKED_TOKEN_STYLE
 
 
 def test_trailing_im_end_is_not_replayed_twice_in_next_prompt():
@@ -3939,7 +4417,9 @@ def test_direct_finish_without_tool_is_penalized_and_masked():
     direct = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"\\\\boxed{answer}"}}</tool_call>'
 
     result = _run_generate_with_fake_sglang(
-        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Use web_search before submit"}),
+        Sample(
+            prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Use web_search before submit"}
+        ),
         [{"text": direct}],
         {
             "CREDIT_ASSIGNMENT_ENABLE": "True",
@@ -3960,7 +4440,11 @@ def test_direct_finish_without_tool_is_penalized_and_masked():
 
 
 def test_mcp_nested_finish_payload_is_rejected_and_masked(tmp_path: Path):
-    nested = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"' '\\u003ctool_call\\u003e{\\"name\\": \\"finish\\", \\"arguments\\": {}}\\u003c/tool_call\\u003e' '"}}</tool_call>'
+    nested = (
+        '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"'
+        '\\u003ctool_call\\u003e{\\"name\\": \\"finish\\", \\"arguments\\": {}}\\u003c/tool_call\\u003e'
+        '"}}</tool_call>'
+    )
 
     result = _run_generate_with_fake_sglang(
         _local_mcp_sample(tmp_path, question="Use tools before finish"),
@@ -4079,7 +4563,9 @@ def test_finish_after_non_finish_tool_is_not_direct_submit_credit_event():
 def test_mixed_tool_and_boxed_answer_breaks_loop_and_masks_only_error_turn():
     first = _search_call("first evidence")
     mixed = _search_call("second evidence") + "\n\\boxed{answer}"
-    unused_finish = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"\\\\boxed{answer}"}}</tool_call>'
+    unused_finish = (
+        '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"\\\\boxed{answer}"}}</tool_call>'
+    )
 
     result = _run_generate_with_fake_sglang(
         Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Search before answer"}),
@@ -4181,7 +4667,7 @@ def test_eval_disables_direct_submit_abnormal_detection():
     assert sample.metadata["reward_debug"]["insufficient_searches"] is True
 
 
-def test_eval_disables_repeated_search_abnormal_detection():
+def test_eval_stops_repeated_search_with_distinct_termination_reason():
     first = _search_call("same query")
     repeated = _search_call("same query")
     finish = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"answer"}}</tool_call>'
@@ -4200,8 +4686,10 @@ def test_eval_disables_repeated_search_abnormal_detection():
     assert len(result) == 1
     sample = result[0]
     assert sample.metadata["credit_assignment_event"] is None
-    assert sample.metadata["fused_termination"] == "env_done"
-    assert "duplicate_search_detected" not in sample.metadata
+    assert sample.metadata["fused_termination"] == "repeated_query_early_stop"
+    assert sample.metadata["duplicate_search_detected"] is True
+    assert sample.metadata["duplicate_query_count"] == 1
+    assert sample.metadata["fused_traj_steps"] == 2
     assert sample.tokens == []
 
 
@@ -4303,12 +4791,47 @@ def test_eval_rejects_unbalanced_response_tags(tmp_path: Path):
     assert sample.reward == 0.0
     assert sample.metadata["fused_termination"] == "ABNORMAL_EVAL_RESPONSE"
     assert sample.metadata["eval_response_anomalies"] == ["unbalanced_tags"]
-    assert sample.metadata["unbalanced_response_tags"] == {
-        "tool_call": {"open": 1, "close": 0, "misordered": False}
-    }
+    assert sample.metadata["unbalanced_response_tags"] == {"tool_call": {"open": 1, "close": 0, "misordered": False}}
     assert fused_generate._response_tag_imbalances("</answer><answer>") == {
         "answer": {"open": 1, "close": 1, "misordered": True}
     }
+
+
+def test_eval_accepts_think_close_for_generation_prompt_prefix(tmp_path: Path):
+    reasoning = "Reason before using the tool.\n</think>\n"
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Use the prefetched think tag"),
+        [
+            {"text": reasoning + _echo_call("evidence")},
+            {"text": reasoning + _finish_call()},
+        ],
+        {
+            "FUSED_DISABLE_THINKING": "False",
+            "CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD": "1.0",
+        },
+        evaluation=True,
+    )
+
+    sample = result[0]
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert "eval_response_anomalies" not in sample.metadata
+    assert fused_generate._response_tag_imbalances(
+        "reasoning</think>",
+        allow_leading_think_close=True,
+    ) == {}
+    assert fused_generate._response_tag_imbalances(
+        "<think>reasoning</think>",
+        allow_leading_think_close=True,
+    ) == {}
+    assert fused_generate._response_tag_imbalances(
+        _echo_call("no reasoning tags"),
+        allow_leading_think_close=True,
+    ) == {}
+    assert fused_generate._response_tag_imbalances(
+        "reasoning</think></think>",
+        allow_leading_think_close=True,
+    ) == {"think": {"open": 0, "close": 2, "misordered": True}}
 
 
 def test_eval_disables_length_abnormal_detection(tmp_path: Path):
@@ -4722,15 +5245,18 @@ def test_tool_burst_credit_assignment_masks_only_burst_turn_after_history(tmp_pa
     assert "<tool_response>" in _policy_unmasked_text(sample)
 
 
-def test_repeated_search_credit_assignment_after_many_prior_turns_masks_only_repeated_turn():
+def test_nonconsecutive_repeated_search_does_not_trigger_credit_assignment():
     prior_queries = [f"q{i:02d}" for i in range(12)]
-    prior_turns = [f'<tool_call>{{"name":"web_search","arguments":{{"query":"{query}"}}}}</tool_call>' for query in prior_queries]
+    prior_turns = [
+        f'<tool_call>{{"name":"web_search","arguments":{{"query":"{query}"}}}}</tool_call>' for query in prior_queries
+    ]
     reasoning = "<think>Try the same query again.</think>\n"
     repeated = '<tool_call>{"name":"web_search","arguments":{"query":"q07"}}</tool_call>'
+    finish = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"x"}}</tool_call>'
 
     result = _run_generate_with_fake_sglang(
         Sample(prompt="placeholder", label={"answer": "x"}, metadata={"question": "Search many times"}),
-        [{"text": text} for text in [*prior_turns, reasoning + repeated]],
+        [{"text": text} for text in [*prior_turns, reasoning + repeated, finish]],
         {
             "CREDIT_ASSIGNMENT_ENABLE": "True",
             "CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY": "True",
@@ -4741,14 +5267,9 @@ def test_repeated_search_credit_assignment_after_many_prior_turns_masks_only_rep
 
     assert len(result) == 1
     sample = result[0]
-    assert sample.reward == 0.0
-    assert sample.metadata["credit_assignment_event"] == "repeated_search_query"
-    assert repeated in _masked_text(sample)
-    assert _policy_masked_text(sample) == repeated
-    assert reasoning in _policy_unmasked_text(sample)
-    for prior in prior_turns:
-        assert prior in _policy_unmasked_text(sample)
-    assert "<tool_response>" in _policy_unmasked_text(sample)
+    assert sample.reward == 1.0
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["credit_assignment_event"] is None
 
 
 def test_ngram_repetition_credit_assignment_masks_only_repeated_turn_action(tmp_path: Path):

@@ -267,7 +267,7 @@ export TMS_CUDA_MAJOR
 # PEP 517 build venv hides them, so the wheel comes out python-only (~46KB)
 # and sglang trips `Only hook_mode=preload supports pauseable CUDA Graph`
 # because the preload .so was never compiled in.
-pip install -v git+https://github.com/fzyzcjy/torch_memory_saver.git@a193d9dd1b877d33c64a41cfb3db9f867df2d926 \
+pip install -v git+https://github.com/fzyzcjy/torch_memory_saver.git@f05a8754daf68238d54e4cf31cb3ba866684bbaf \
   --no-cache-dir --force-reinstall --no-build-isolation
 # matches Dockerfile (different fork/branch from older build_conda.sh)
 pip install git+https://github.com/radixark/Megatron-Bridge.git@bridge --no-deps --no-build-isolation

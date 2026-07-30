@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -21,6 +22,8 @@ from slime.utils.prompt_equal import PROMPT_EQUAL_LOSS_ESTIMATORS
 from slime.utils.types import Sample
 
 from .env import FusedEnvironment, _format_retrieval, normalize_task, resolve_task_mode
+from .history import messages_without_historical_thinking as _messages_without_historical_thinking
+from .history import strip_trailing_chat_template_stop as _strip_trailing_chat_template_stop
 from .parser import Gemma4ToolParser, ToolCall, make_tool_parser
 from .prompts import (
     COT_SYSTEM_PROMPT,
@@ -47,17 +50,16 @@ from .search_gym import SEARCH_GYM_SYSTEM_PROMPT, SEARCH_GYM_USER_PROMPT, Search
 
 logger = logging.getLogger(__name__)
 DEFAULT_SGLANG_CONTEXT_LENGTH_MARGIN = 256
-_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL)
-_THOUGHT_CHANNEL_BLOCK_RE = re.compile(r"<\|channel>thought\n.*?<channel\|>", re.DOTALL)
-_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>")
-_THOUGHT_CHANNEL_OPEN_RE = re.compile(r"<\|channel>thought\n")
-_THINK_CLOSE_RE = re.compile(r"</think\s*>")
 _LAST_SGLANG_REQUEST_LOG_TS = 0.0
 _EVAL_ENGINE_POOL_LOOP: asyncio.AbstractEventLoop | None = None
 _EVAL_ENGINE_POOL: EvalSessionEnginePool | None = None
 
 
 class SGLangContextLengthExceededError(ValueError):
+    pass
+
+
+class SGLangWeightVersionError(RuntimeError):
     pass
 
 
@@ -119,7 +121,12 @@ class EvalSessionEnginePool:
         if not self._active:
             return None
         now = time.monotonic()
-        eligible = [url for url, count in self._active.items() if self._blocked_until[url] <= now and (self._max_sessions_per_engine is None or count < self._max_sessions_per_engine)]
+        eligible = [
+            url
+            for url, count in self._active.items()
+            if self._blocked_until[url] <= now
+            and (self._max_sessions_per_engine is None or count < self._max_sessions_per_engine)
+        ]
         if not eligible:
             return None
         minimum = min(self._active[url] for url in eligible)
@@ -151,7 +158,11 @@ def _get_eval_engine_pool(args) -> EvalSessionEnginePool | None:
         return None
     loop = asyncio.get_running_loop()
     normalized_urls = {url.rstrip("/") for url in urls}
-    if _EVAL_ENGINE_POOL_LOOP is not loop or _EVAL_ENGINE_POOL is None or set(_EVAL_ENGINE_POOL._active) != normalized_urls:
+    if (
+        _EVAL_ENGINE_POOL_LOOP is not loop
+        or _EVAL_ENGINE_POOL is None
+        or set(_EVAL_ENGINE_POOL._active) != normalized_urls
+    ):
         _EVAL_ENGINE_POOL_LOOP = loop
         max_sessions_per_engine = max(
             1,
@@ -400,19 +411,39 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     discard_historical_thinking = not disable_thinking and _env_bool("FUSED_DISCARD_HISTORICAL_THINKING", False)
     prompt_equal_loss = not evaluation and getattr(args, "advantage_estimator", "grpo") in PROMPT_EQUAL_LOSS_ESTIMATORS
     max_context_tokens = _effective_sglang_context_limit(args)
-    max_tool_calls_per_turn = int(os.environ.get("FUSED_MAX_TOOL_CALLS_PER_TURN", os.environ.get("MAX_TOOL_CALLS_PER_TURN", "4")))
+    max_tool_calls_per_turn = int(
+        os.environ.get("FUSED_MAX_TOOL_CALLS_PER_TURN", os.environ.get("MAX_TOOL_CALLS_PER_TURN", "4"))
+    )
     credit_assignment_enable = _env_bool("CREDIT_ASSIGNMENT_ENABLE", True)
-    credit_assignment_tool_parser_error = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR", True)
-    credit_assignment_repeated_search_query = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY", True)
-    credit_assignment_too_many_tool_calls = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS", True)
+    credit_assignment_tool_parser_error = credit_assignment_enable and _env_bool(
+        "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR", True
+    )
+    credit_assignment_repeated_search_query = credit_assignment_enable and _env_bool(
+        "CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY", True
+    )
+    credit_assignment_too_many_tool_calls = credit_assignment_enable and _env_bool(
+        "CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS", True
+    )
     credit_assignment_search_bypass = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_SEARCH_BYPASS", True)
-    credit_assignment_direct_submit_without_tool = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL", True)
-    credit_assignment_mixed_tool_and_answer = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER", True)
-    credit_assignment_tail_guard_early_stop = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP", True)
-    credit_assignment_ngram_repetition = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_NGRAM_REPETITION", True)
+    credit_assignment_direct_submit_without_tool = credit_assignment_enable and _env_bool(
+        "CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL", True
+    )
+    credit_assignment_mixed_tool_and_answer = credit_assignment_enable and _env_bool(
+        "CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER", True
+    )
+    credit_assignment_tail_guard_early_stop = credit_assignment_enable and _env_bool(
+        "CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP", True
+    )
+    credit_assignment_ngram_repetition = credit_assignment_enable and _env_bool(
+        "CREDIT_ASSIGNMENT_NGRAM_REPETITION", True
+    )
     credit_assignment_max_turns = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_MAX_TURNS", True)
-    credit_assignment_max_response_len = credit_assignment_enable and _env_bool("CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN", True)
-    credit_assignment_parser_error_token_window = int(os.environ.get("CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR_TOKEN_WINDOW", "256"))
+    credit_assignment_max_response_len = credit_assignment_enable and _env_bool(
+        "CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN", True
+    )
+    credit_assignment_parser_error_token_window = int(
+        os.environ.get("CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR_TOKEN_WINDOW", "256")
+    )
     ngram_repetition_n = int(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_N", "8"))
     ngram_repetition_threshold = float(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD", "0.35"))
     ngram_repetition_min_tokens = int(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS", "128"))
@@ -422,10 +453,20 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
 
     tools = [local_search_schema(), finish_schema()] if rllm_deepresearch else env.tools()
     model_name = getattr(state.tokenizer, "name_or_path", None) or getattr(args, "hf_checkpoint", None)
-    parser = SearchGymToolParser(valid_tools=_valid_tool_names(tools)) if search_gym else make_tool_parser(model_name, valid_tools=_valid_tool_names(tools))
-    messages = _initial_messages(harness, info.get("task_type", ""), observation, tools, model_name, tool_parser=parser)
+    parser = (
+        SearchGymToolParser(valid_tools=_valid_tool_names(tools))
+        if search_gym
+        else make_tool_parser(model_name, valid_tools=_valid_tool_names(tools))
+    )
+    messages = _initial_messages(
+        harness, info.get("task_type", ""), observation, tools, model_name, tool_parser=parser
+    )
     max_steps = base_max_steps if rllm_deepresearch else _max_steps_for_mode(env.mode, base_max_steps)
-    manager = None if evaluation else TrajectoryManager(fork_threshold_tokens=int(os.environ.get("SLIME_FUSED_FORK_THRESHOLD_TOKENS", "1024")))
+    manager = (
+        None
+        if evaluation
+        else TrajectoryManager(fork_threshold_tokens=int(os.environ.get("SLIME_FUSED_FORK_THRESHOLD_TOKENS", "1024")))
+    )
     session_id = base_sample.session_id or uuid.uuid4().hex
     base_sample.session_id = session_id
     eval_sglang_session = (
@@ -451,7 +492,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     env_time = 0.0
     pending_turns: list[dict[str, Any]] = []
     tito_prefix_ids: list[int] = []
-    seen_search_queries: set[str] = set()
+    trajectory_weight_version: str | None = None
+    require_weight_version = not evaluation and _env_bool("SLIME_FUSED_REQUIRE_WEIGHT_VERSION", False)
+    last_search_query: str | None = None
     seen_rllm_calls: set[tuple[str, str]] = set()
     repeated_search_strikes = 0
     used_non_finish_tool = False
@@ -505,22 +548,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     context_delta_ids = list(prompt_ids)
                     tito_context_reason = "historical_thinking_discard"
             else:
-                prompt_context_start_idx = await asyncio.to_thread(
-                    _last_assistant_context_start_idx,
-                    state.tokenizer,
-                    rollout_messages,
-                    tools=tools,
-                    disable_thinking=disable_thinking,
-                )
+                prompt_context_start_idx = None
                 tito_boundary_before = bool(tito_prefix_ids) and not _has_token_prefix(prompt_ids, tito_prefix_ids)
                 if tito_boundary_before:
-                    if prompt_context_start_idx is not None and 0 <= prompt_context_start_idx <= len(prompt_ids):
-                        context_delta_ids = list(prompt_ids[prompt_context_start_idx:])
-                        tito_boundary_before = False
-                        tito_context_reason = "assistant_replay_tail_delta"
-                    else:
-                        context_delta_ids = list(prompt_ids)
-                        tito_context_reason = "prompt_prefix_mismatch"
+                    context_delta_ids = list(prompt_ids)
+                    tito_context_reason = "prompt_prefix_mismatch"
                 else:
                     context_delta_ids = list(prompt_ids[len(tito_prefix_ids) :])
                     tito_context_reason = "initial" if not tito_prefix_ids else "append_delta"
@@ -547,9 +579,24 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     }
                 )
             else:
-                step_sampling["max_new_tokens"] = max(0, min(int(step_sampling.get("max_new_tokens", per_step_max_tokens)), per_step_max_tokens))
+                if evaluation and os.environ.get("FUSED_MODEL_SERIES", "").strip().lower() == "qwen3.5":
+                    step_sampling.update(
+                        {
+                            "temperature": 1.0,
+                            "top_p": 0.95,
+                            "top_k": 20,
+                            "min_p": 0.0,
+                            "presence_penalty": 1.5,
+                            "repetition_penalty": 1.0,
+                        }
+                    )
+                step_sampling["max_new_tokens"] = max(
+                    0, min(int(step_sampling.get("max_new_tokens", per_step_max_tokens)), per_step_max_tokens)
+                )
             if max_context_tokens:
-                step_sampling["max_new_tokens"] = min(step_sampling["max_new_tokens"], max_context_tokens - len(prompt_ids))
+                step_sampling["max_new_tokens"] = min(
+                    step_sampling["max_new_tokens"], max_context_tokens - len(prompt_ids)
+                )
             if step_sampling["max_new_tokens"] <= 0:
                 final_done = True
                 last_info = {
@@ -576,6 +623,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         session_params=session_params,
                         context_token_count=len(prompt_ids),
                         server_url=eval_sglang_session.server_url if session_params is not None else None,
+                        expected_weight_version=trajectory_weight_version,
+                        require_weight_version=require_weight_version,
                     )
                 except (asyncio.CancelledError, SGLangContextLengthExceededError):
                     raise
@@ -583,8 +632,14 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     if eval_sglang_session is None or session_params is None:
                         raise
                     log_warning = True
-                    if isinstance(exc, httpx.TransportError) and eval_sglang_session.engine_pool is not None and eval_sglang_session.server_url is not None:
-                        log_warning = eval_sglang_session.engine_pool.record_transport_failure(eval_sglang_session.server_url)
+                    if (
+                        isinstance(exc, httpx.TransportError)
+                        and eval_sglang_session.engine_pool is not None
+                        and eval_sglang_session.server_url is not None
+                    ):
+                        log_warning = eval_sglang_session.engine_pool.record_transport_failure(
+                            eval_sglang_session.server_url
+                        )
                     await eval_sglang_session.disable(
                         f"session generation failed with {type(exc).__name__}: {exc!r}",
                         log_warning=log_warning,
@@ -597,6 +652,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         evaluation=evaluation,
                         request_semaphore=state.semaphore if evaluation else None,
                         context_token_count=len(prompt_ids),
+                        expected_weight_version=trajectory_weight_version,
+                        require_weight_version=require_weight_version,
                     )
             except SGLangContextLengthExceededError as exc:
                 final_done = True
@@ -626,6 +683,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             else:
                 output_ids = output["output_ids"]
                 output_logprobs = output["output_logprobs"]
+                observed_weight_version = output.get("weight_version")
+                if trajectory_weight_version is None and observed_weight_version is not None:
+                    trajectory_weight_version = str(observed_weight_version)
                 # Decode, tool-call parsing, and the default loss mask are pure-Python
                 # CPU work; bundle them into a single worker-thread hop so a wave of
                 # trajectories finishing an LLM turn together cannot monopolize the
@@ -658,8 +718,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
 
             assistant_content = response
             if rllm_deepresearch and parsed_actions:
-                assistant_content = re.sub(r"<tool_call>.*?</tool_call>", "", assistant_content, flags=re.DOTALL).strip()
-                assistant_content = re.sub(r"<function=[^>]+>.*?(?:</function>|$)", "", assistant_content, flags=re.DOTALL).strip()
+                assistant_content = re.sub(
+                    r"<tool_call>.*?</tool_call>", "", assistant_content, flags=re.DOTALL
+                ).strip()
+                assistant_content = re.sub(
+                    r"<function=[^>]+>.*?(?:</function>|$)", "", assistant_content, flags=re.DOTALL
+                ).strip()
             assistant_msg = {"role": "assistant", "content": assistant_content}
             if rllm_deepresearch and parsed_actions:
                 assistant_msg["tool_calls"] = [
@@ -681,9 +745,15 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             output_ids=output_ids,
                             finish_reason="tool_calls" if parsed_actions else finish_reason,
                             output_log_probs=output_logprobs,
+                            weight_version=(
+                                str(observed_weight_version) if observed_weight_version is not None else None
+                            ),
+                            require_rollout_logprobs=True,
+                            require_weight_version=require_weight_version,
                             context_delta_ids=context_delta_ids,
                             tito_boundary_before=tito_boundary_before,
                             tito_model_type=_tito_model_type(model_name),
+                            tito_context_reason=tito_context_reason,
                             disable_thinking=disable_thinking,
                             loss_mask=response_loss_mask,
                             rollout_top_p_token_ids=output.get("rollout_top_p_token_ids"),
@@ -700,6 +770,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             "tito_context_delta_tokens": len(context_delta_ids),
                             "tito_boundary_before": tito_boundary_before,
                             "disable_thinking": disable_thinking,
+                            "weight_version": observed_weight_version,
                         },
                     }
                 )
@@ -761,6 +832,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     response,
                     actions,
                     state.tokenizer,
+                    allow_leading_think_close=not disable_thinking,
                     ngram_n=ngram_repetition_n,
                     ngram_threshold=ngram_repetition_threshold,
                     ngram_min_tokens=ngram_repetition_min_tokens,
@@ -824,9 +896,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 call_keys = [
                     (
                         action.name,
-                        response[action.start : action.end]
-                        if action.start is not None and action.end is not None
-                        else json.dumps(action.arguments or {}, ensure_ascii=False),
+                        (
+                            response[action.start : action.end]
+                            if action.start is not None and action.end is not None
+                            else json.dumps(action.arguments or {}, ensure_ascii=False)
+                        ),
                     )
                     for action in actions
                 ]
@@ -868,9 +942,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     "termination_reason": (
                         "rllm_dr_tool_error"
                         if tool_failed
-                        else "rllm_dr_refine_error"
-                        if refine_failed
-                        else "rllm_dr_tools_complete"
+                        else "rllm_dr_refine_error" if refine_failed else "rllm_dr_tools_complete"
                     ),
                 }
                 trajectory_steps.append(
@@ -896,7 +968,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             "name": action.name,
                             "content": str(raw_observation),
                         }
-                        for action_idx, (action, raw_observation) in enumerate(zip(actions, raw_observations, strict=True))
+                        for action_idx, (action, raw_observation) in enumerate(
+                            zip(actions, raw_observations, strict=True)
+                        )
                     )
                 else:
                     _append_tool_observation_messages(
@@ -950,7 +1024,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     )
                     break
                 actions = [ToolCall("finish", {"command": "submit", "result": response})]
-            elif isinstance(parser, Gemma4ToolParser) and detect_abnormal_trajectories and credit_assignment_tool_parser_error and _response_has_malformed_tool_call(response):
+            elif (
+                isinstance(parser, Gemma4ToolParser)
+                and detect_abnormal_trajectories
+                and credit_assignment_tool_parser_error
+                and _response_has_malformed_tool_call(response)
+            ):
                 final_reward = 0.0
                 final_done = True
                 credit_event = "tool_parser_error"
@@ -1019,7 +1098,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     )
                 )
                 break
-            if detect_abnormal_trajectories and credit_assignment_mixed_tool_and_answer and _has_mixed_tool_and_answer(response, actions):
+            if (
+                detect_abnormal_trajectories
+                and credit_assignment_mixed_tool_and_answer
+                and _has_mixed_tool_and_answer(response, actions)
+            ):
                 final_reward = 0.0
                 final_done = True
                 credit_event = "mixed_tool_and_answer"
@@ -1053,8 +1136,16 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     )
                 )
                 break
-            direct_submit_without_tool = not used_non_finish_tool and _requires_non_finish_tool(tools) and all(action.name == "finish" for action in actions)
-            if detect_abnormal_trajectories and direct_submit_without_tool and (step_idx == 0 or credit_assignment_direct_submit_without_tool):
+            direct_submit_without_tool = (
+                not used_non_finish_tool
+                and _requires_non_finish_tool(tools)
+                and all(action.name == "finish" for action in actions)
+            )
+            if (
+                detect_abnormal_trajectories
+                and direct_submit_without_tool
+                and (step_idx == 0 or credit_assignment_direct_submit_without_tool)
+            ):
                 final_reward = 0.0
                 final_done = True
                 credit_event = "direct_submit_without_tool"
@@ -1081,17 +1172,32 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     )
                 )
                 break
-            repeated_action_span = _repeated_search_action_span(actions, seen_search_queries)
-            repeated_query = _has_repeated_search_query(actions, seen_search_queries)
-            if detect_abnormal_trajectories and repeated_query:
-                repeated_search_strikes += 1
+            repeated_action_span = None
+            for action in actions:
+                if not _is_web_search_tool(action.name):
+                    continue
+                query = _normalize_search_query((action.arguments or {}).get("query") or "")
+                if not query:
+                    continue
+                if query == last_search_query:
+                    repeated_search_strikes += 1
+                    repeated_action_span = _actions_span([action])
+                else:
+                    repeated_search_strikes = 0
+                    repeated_action_span = None
+                last_search_query = query
+            repeated_query = repeated_search_strikes > 0
+            if repeated_query and (detect_abnormal_trajectories or evaluation):
                 duplicate_search_info = {
                     "duplicate_search_detected": True,
                     "duplicate_query_count": repeated_search_strikes,
                     "duplicate_query_max_strikes": repeated_search_max_strikes,
                 }
                 if repeated_search_strikes < repeated_search_max_strikes:
-                    obs = "Repeated search query detected. Use different keywords, split the question into a new " "sub-query, or submit only if the existing evidence is sufficient."
+                    obs = (
+                        "Repeated search query detected. Use different keywords, split the question into a new "
+                        "sub-query, or submit only if the existing evidence is sufficient."
+                    )
                     formatted_obs = _format_tool_observation(parser, actions[0].name, obs)
                     last_info = duplicate_search_info
                     trajectory_steps.append(
@@ -1114,7 +1220,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     continue
                 final_reward = 0.0
                 final_done = True
-                if credit_assignment_repeated_search_query:
+                if detect_abnormal_trajectories and credit_assignment_repeated_search_query:
                     credit_event = "repeated_search_query"
                     credit_step_index = len(pending_turns) - 1
                     await _mark_pending_turn_error_span(
@@ -1125,7 +1231,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         output_len=len(output_ids),
                     )
                 last_info = {
-                    "termination_reason": "ABNORMAL_REPEATED_QUERY",
+                    "termination_reason": (
+                        "ABNORMAL_REPEATED_QUERY" if detect_abnormal_trajectories else "repeated_query_early_stop"
+                    ),
                     "credit_assignment_event": credit_event,
                     "credit_assignment_error_step_index": credit_step_index,
                     **duplicate_search_info,
@@ -1157,7 +1265,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 else {"score": 0.0, "n": ngram_repetition_n, "total": 0, "unique": 0}
             )
             repeated_action_span = _actions_span(actions)
-            if detect_abnormal_trajectories and repeated_output["score"] > ngram_repetition_threshold and repeated_action_span is not None:
+            if (
+                detect_abnormal_trajectories
+                and repeated_output["score"] > ngram_repetition_threshold
+                and repeated_action_span is not None
+            ):
                 final_reward = 0.0
                 final_done = True
                 if credit_assignment_ngram_repetition:
@@ -1237,7 +1349,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         disable_thinking=disable_thinking,
                     )
                 )
-                _append_tool_observation_messages(messages, parser, executed_actions, formatted_observations, raw_observations)
+                _append_tool_observation_messages(
+                    messages, parser, executed_actions, formatted_observations, raw_observations
+                )
                 observation = formatted_obs
                 if batch_done:
                     break
@@ -1262,14 +1376,27 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 else:
                     credit_event = "reasoning_step_only"
                     credit_step_index = len(pending_turns) - 1
-            elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_SEARCH_BYPASS" and credit_assignment_search_bypass:
+            elif (
+                detect_abnormal_trajectories
+                and last_info.get("termination_reason") == "ABNORMAL_SEARCH_BYPASS"
+                and credit_assignment_search_bypass
+            ):
                 final_reward = 0.0
                 credit_event = "search_bypass"
                 credit_step_index = len(pending_turns) - 1
-            elif detect_abnormal_trajectories and last_info.get("termination_reason") in {"ABNORMAL_PARSE_ERROR", "INVALID_REACT_STRUCTURE", "INVALID_FINAL_STEP"} and credit_assignment_tool_parser_error:
+            elif (
+                detect_abnormal_trajectories
+                and last_info.get("termination_reason")
+                in {"ABNORMAL_PARSE_ERROR", "INVALID_REACT_STRUCTURE", "INVALID_FINAL_STEP"}
+                and credit_assignment_tool_parser_error
+            ):
                 credit_event = "tool_parser_error"
                 credit_step_index = len(pending_turns) - 1
-            elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_NESTED_FINISH_PAYLOAD" and credit_assignment_tool_parser_error:
+            elif (
+                detect_abnormal_trajectories
+                and last_info.get("termination_reason") == "ABNORMAL_NESTED_FINISH_PAYLOAD"
+                and credit_assignment_tool_parser_error
+            ):
                 credit_event = "tool_parser_error"
                 credit_step_index = len(pending_turns) - 1
                 await _mark_pending_turn_error_span(
@@ -1279,16 +1406,32 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     _actions_span(actions),
                     output_len=len(output_ids),
                 )
-            elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_TOOL_BURST" and credit_assignment_too_many_tool_calls:
+            elif (
+                detect_abnormal_trajectories
+                and last_info.get("termination_reason") == "ABNORMAL_TOOL_BURST"
+                and credit_assignment_too_many_tool_calls
+            ):
                 credit_event = "too_many_tool_calls"
                 credit_step_index = len(pending_turns) - 1
-            elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_REPEATED_QUERY" and credit_assignment_repeated_search_query:
+            elif (
+                detect_abnormal_trajectories
+                and last_info.get("termination_reason") == "ABNORMAL_REPEATED_QUERY"
+                and credit_assignment_repeated_search_query
+            ):
                 credit_event = "repeated_search_query"
                 credit_step_index = len(pending_turns) - 1
-            elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_NGRAM_REPETITION" and credit_assignment_ngram_repetition:
+            elif (
+                detect_abnormal_trajectories
+                and last_info.get("termination_reason") == "ABNORMAL_NGRAM_REPETITION"
+                and credit_assignment_ngram_repetition
+            ):
                 credit_event = "ngram_repetition"
                 credit_step_index = len(pending_turns) - 1
-            elif detect_abnormal_trajectories and last_info.get("termination_reason") == "ABNORMAL_MIXED_TOOL_AND_ANSWER" and credit_assignment_mixed_tool_and_answer:
+            elif (
+                detect_abnormal_trajectories
+                and last_info.get("termination_reason") == "ABNORMAL_MIXED_TOOL_AND_ANSWER"
+                and credit_assignment_mixed_tool_and_answer
+            ):
                 credit_event = "mixed_tool_and_answer"
                 credit_step_index = len(pending_turns) - 1
             trajectory_steps.append(
@@ -1335,9 +1478,18 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         env.close()
 
     termination_reason = last_info.get("termination_reason", "env_done" if final_done else "unknown")
-    if detect_abnormal_trajectories and termination_reason == "TAIL_GUARD_EARLY_STOP" and credit_assignment_tail_guard_early_stop:
+    if (
+        detect_abnormal_trajectories
+        and termination_reason == "TAIL_GUARD_EARLY_STOP"
+        and credit_assignment_tail_guard_early_stop
+    ):
         credit_event = "tail_guard_early_stop"
-    elif detect_abnormal_trajectories and termination_reason == "max_response_len_exceeded" and credit_assignment_max_response_len and pending_turns:
+    elif (
+        detect_abnormal_trajectories
+        and termination_reason == "max_response_len_exceeded"
+        and credit_assignment_max_response_len
+        and pending_turns
+    ):
         credit_event = "max_response_len_exceeded"
         credit_step_index = len(pending_turns) - 1
     if credit_event is not None and credit_step_index is not None:
@@ -1354,6 +1506,14 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         "total_time": episode_end_time - episode_start_time,
     }
     reward_debug = env.reward_debug or last_info.get("reward_debug", {})
+    tito_reasons = [
+        str(item["metadata"].get("tito_context_reason"))
+        for item in pending_turns
+        if item.get("metadata", {}).get("tito_context_reason") is not None
+    ]
+    rollout_versions = sorted(
+        {str(item["turn"].weight_version) for item in pending_turns if item["turn"].weight_version is not None}
+    )
     common_metadata = {
         **dict(base_sample.metadata or {}),
         **last_info,
@@ -1366,12 +1526,21 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         "fused_tool_call_turns": total_tool_call_turns,
         "fused_prompt_length_tokens": compact_prompt_length,
         "fused_completion_length_tokens": total_completion_tokens,
+        "rollout_weight_version": trajectory_weight_version,
+        "fused_rollout_weight_versions": rollout_versions,
+        "fused_rollout_weight_version_count": len(rollout_versions),
+        "fused_rollout_logprob_invalid_ratio": 0.0,
+        "fused_tito_boundary_count": sum(bool(item["turn"].tito_boundary_before) for item in pending_turns),
+        "fused_tito_exact_prefix_turns": sum(reason in {"initial", "append_delta"} for reason in tito_reasons),
+        "fused_tito_prompt_prefix_mismatch_turns": tito_reasons.count("prompt_prefix_mismatch"),
     }
     if prompt_equal_loss:
         instance_id = (base_sample.metadata or {}).get("instance_id")
         if instance_id is None:
             instance_id = base_sample.group_index if base_sample.group_index is not None else base_sample.index
-        common_metadata.update({"prompt_equal_loss": True, "parent_traj_id": session_id, "instance_id": str(instance_id)})
+        common_metadata.update(
+            {"prompt_equal_loss": True, "parent_traj_id": session_id, "instance_id": str(instance_id)}
+        )
     if eval_sglang_session is not None:
         common_metadata.update(
             {
@@ -1383,6 +1552,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         )
 
     if evaluation:
+        common_metadata["segment_count"] = 1
         should_dump_episode = capture_eval_details or _is_failed_eval_termination(termination_reason)
         if should_dump_episode:
             common_metadata["rllm_episode"] = _rllm_episode_dict(
@@ -1402,6 +1572,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 task_type=env.mode,
                 discard_historical_thinking_enabled=discard_historical_thinking,
             )
+            common_metadata["rllm_episode"]["metadata"]["segment_count"] = 1
         return [
             Sample(
                 index=base_sample.index,
@@ -1458,8 +1629,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         extra_metadata={**common_metadata, "rllm_episode": episode_dict},
     )
     if not samples:
+        episode_dict["metadata"]["segment_count"] = 0
         if prompt_equal_loss:
-            episode_dict["metadata"].update({"prompt_equal_loss": True, "parent_traj_id": session_id, "segment_count": 0})
+            episode_dict["metadata"].update(
+                {"prompt_equal_loss": True, "parent_traj_id": session_id, "segment_count": 0}
+            )
         failed = Sample(
             index=base_sample.index,
             group_index=base_sample.group_index,
@@ -1481,7 +1655,6 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         "parent_traj_id": session_id,
                         "instance_id": common_metadata["instance_id"],
                         "segment_index": 0,
-                        "segment_count": 1,
                     }
                     if prompt_equal_loss
                     else {}
@@ -1493,12 +1666,14 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 "credit_assignment_error_step_index": credit_step_index,
                 "fused_traj_steps": total_steps,
                 "fused_tool_call_turns": total_tool_call_turns,
+                "segment_count": 0,
                 "rllm_episode": episode_dict,
                 **last_info,
             },
         )
         return failed
     segment_count = len(samples)
+    episode_dict["metadata"]["segment_count"] = segment_count
     if prompt_equal_loss:
         # All sibling segments share this one episode dict (and the offline dump
         # dedupes by episode id), so mark the segment breakdown once, in place.
@@ -1532,7 +1707,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         sample.reward = final_reward if segment_index == segment_count - 1 else 0.0
         sample.status = Sample.Status.COMPLETED
         if sample.rollout_log_probs is None:
-            sample.rollout_log_probs = [0.0] * sample.response_length
+            raise ValueError("fused training sample omitted rollout_log_probs")
     return samples
 
 
@@ -1604,7 +1779,10 @@ def _initial_messages(
     if harness == "search_gym":
         schemas_str = "\n".join(json.dumps(schema, ensure_ascii=False) for schema in tools)
         system = SEARCH_GYM_SYSTEM_PROMPT + "\n" + SearchGymToolParser().get_tool_prompt(schemas_str)
-        return [{"role": "system", "content": system}, {"role": "user", "content": SEARCH_GYM_USER_PROMPT.format(question=observation)}]
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": SEARCH_GYM_USER_PROMPT.format(question=observation)},
+        ]
     if harness == "bare":
         return [{"role": "user", "content": observation}]
     if harness == "cot":
@@ -1667,7 +1845,10 @@ def _append_tool_observation_messages(
     formatted_observations: list[str],
     raw_observations: list[Any],
 ) -> None:
-    payloads = [_tool_response_payload(action.name, raw_observation) for action, raw_observation in zip(actions, raw_observations, strict=True)]
+    payloads = [
+        _tool_response_payload(action.name, raw_observation)
+        for action, raw_observation in zip(actions, raw_observations, strict=True)
+    ]
     assistant_message = parser.assistant_tool_results_message(actions, payloads)
     if assistant_message is not None:
         messages[-1] = assistant_message
@@ -1742,90 +1923,10 @@ def _declared_tool_names(tools: list[dict]) -> set[str]:
     return names
 
 
-def _strip_trailing_chat_template_stop(text: str) -> str:
-    stripped = text
-    while True:
-        without_ws = stripped.rstrip()
-        if not without_ws.endswith("<|im_end|>"):
-            return stripped
-        stripped = without_ws[: -len("<|im_end|>")]
-
-
-def _strip_historical_thinking(content: str) -> tuple[str, bool]:
-    starts_with_thinking = _THINK_BLOCK_RE.match(content) is not None or _THOUGHT_CHANNEL_BLOCK_RE.match(content) is not None
-    stripped = _THINK_BLOCK_RE.sub("", content)
-    stripped = _THOUGHT_CHANNEL_BLOCK_RE.sub("", stripped)
-    # Qwen3.5-style chat templates pre-open ``<think>\n`` inside the generation
-    # prompt, so the recorded assistant content is ``thought</think>\n\nanswer``
-    # with no opening tag and the closed-block regex never matches. Mirror the
-    # template's own ``content.split('</think>')[-1]`` split: everything up to
-    # the last bare closer is reasoning.
-    closers = list(_THINK_CLOSE_RE.finditer(stripped))
-    if closers:
-        stripped = stripped[closers[-1].end() :].lstrip("\n")
-    elif starts_with_thinking:
-        stripped = stripped.lstrip("\r\n")
-
-    openers = [match for regex in (_THINK_OPEN_RE, _THOUGHT_CHANNEL_OPEN_RE) if (match := regex.search(stripped))]
-    if not openers:
-        return stripped, False
-    return stripped[: min(match.start() for match in openers)].rstrip(), True
-
-
-def _content_without_historical_thinking(content: str) -> str:
-    return _strip_historical_thinking(content)[0]
-
-
-def _messages_without_historical_thinking(messages: list[dict[str, Any]], *, parser=None) -> list[dict[str, Any]]:
-    prepared = []
-    for message in messages:
-        if message.get("role") != "assistant" or not isinstance(message.get("content"), str):
-            prepared.append(message)
-            continue
-        original_content = message["content"]
-        content, had_unclosed_thinking = _strip_historical_thinking(original_content)
-        if had_unclosed_thinking and parser is not None and not message.get("tool_calls"):
-            content = "".join(parser.format_action(action) for action in parser.parse(original_content))
-        prepared.append(message if content == message["content"] else {**message, "content": content})
-    return prepared
-
-
-def _has_repeated_search_query(actions: list[ToolCall], seen_queries: set[str]) -> bool:
-    repeated = False
-    for action in actions:
-        if not _is_web_search_tool(action.name):
-            continue
-        query = _normalize_search_query((action.arguments or {}).get("query") or "")
-        if not query:
-            continue
-        if query in seen_queries:
-            repeated = True
-        else:
-            seen_queries.add(query)
-    return repeated
-
-
 def _actions_span(actions: list[ToolCall]) -> tuple[int, int] | None:
     spans = [(action.start, action.end) for action in actions if action.start is not None and action.end is not None]
     if not spans:
         return None
-    return min(start for start, _ in spans), max(end for _, end in spans)
-
-
-def _repeated_search_action_span(actions: list[ToolCall], prior_seen_queries: set[str]) -> tuple[int, int] | None:
-    spans = []
-    seen = set(prior_seen_queries)
-    for action in actions:
-        if not _is_web_search_tool(action.name):
-            continue
-        query = _normalize_search_query((action.arguments or {}).get("query") or "")
-        if not query:
-            continue
-        if query in seen and action.start is not None and action.end is not None:
-            spans.append((action.start, action.end))
-        seen.add(query)
-    if not spans:
-        return _actions_span([action for action in actions if _is_web_search_tool(action.name)])
     return min(start for start, _ in spans), max(end for _, end in spans)
 
 
@@ -1834,16 +1935,27 @@ def _normalize_search_query(query: Any) -> str:
 
 
 def _has_mixed_tool_and_answer(response: str, actions: list[ToolCall]) -> bool:
-    return any(action.name != "finish" for action in actions) and (any(action.name == "finish" for action in actions) or _answer_span(response, excluded_spans=_actions_spans(actions)) is not None)
+    return any(action.name != "finish" for action in actions) and (
+        any(action.name == "finish" for action in actions)
+        or _answer_span(response, excluded_spans=_actions_spans(actions)) is not None
+    )
 
 
 def _mixed_tool_and_answer_span(response: str, actions: list[ToolCall]) -> tuple[int, int] | None:
-    spans = [(action.start, action.end) for action in actions if action.start is not None and action.end is not None and action.name != "finish"]
+    spans = [
+        (action.start, action.end)
+        for action in actions
+        if action.start is not None and action.end is not None and action.name != "finish"
+    ]
     answer_span = _answer_span(response, excluded_spans=_actions_spans(actions))
     if answer_span is not None:
         spans.append(answer_span)
     else:
-        spans.extend((action.start, action.end) for action in actions if action.start is not None and action.end is not None and action.name == "finish")
+        spans.extend(
+            (action.start, action.end)
+            for action in actions
+            if action.start is not None and action.end is not None and action.name == "finish"
+        )
     if not spans:
         return _actions_span(actions)
     return min(start for start, _ in spans), max(end for _, end in spans)
@@ -1861,7 +1973,11 @@ def _answer_span(response: str, *, excluded_spans: list[tuple[int, int]] | None 
             continue
         return match.start(), match.end()
     boxed_start, boxed_end = _boxed_answer_span(response or "")
-    if boxed_start is not None and boxed_end is not None and not _span_overlaps_any((boxed_start, boxed_end), excluded_spans):
+    if (
+        boxed_start is not None
+        and boxed_end is not None
+        and not _span_overlaps_any((boxed_start, boxed_end), excluded_spans)
+    ):
         return boxed_start, boxed_end
     return None
 
@@ -1903,6 +2019,7 @@ def _eval_response_anomaly_info(
     actions: list[ToolCall],
     tokenizer,
     *,
+    allow_leading_think_close: bool,
     ngram_n: int,
     ngram_threshold: float,
     ngram_min_tokens: int,
@@ -1911,11 +2028,17 @@ def _eval_response_anomaly_info(
     info: dict[str, Any] = {}
 
     normalized_response = response.lower()
-    if any(marker in normalized_response for marker in ("<tool_response>", "</tool_response>", "<|tool_response>", "<tool_response|>")):
+    if any(
+        marker in normalized_response
+        for marker in ("<tool_response>", "</tool_response>", "<|tool_response>", "<tool_response|>")
+    ):
         anomalies.append("forged_tool_response")
         info["forged_tool_response_detected"] = True
 
-    tag_imbalances = _response_tag_imbalances(response)
+    tag_imbalances = _response_tag_imbalances(
+        response,
+        allow_leading_think_close=allow_leading_think_close,
+    )
     if tag_imbalances:
         anomalies.append("unbalanced_tags")
         info["unbalanced_response_tags"] = tag_imbalances
@@ -1943,7 +2066,11 @@ def _eval_response_anomaly_info(
     return {"eval_response_anomalies": anomalies, **info}
 
 
-def _response_tag_imbalances(response: str) -> dict[str, dict[str, int | bool]]:
+def _response_tag_imbalances(
+    response: str,
+    *,
+    allow_leading_think_close: bool = False,
+) -> dict[str, dict[str, int | bool]]:
     imbalances = {}
     for name, begin, end in (
         ("think", "<think>", "</think>"),
@@ -1956,12 +2083,18 @@ def _response_tag_imbalances(response: str) -> dict[str, dict[str, int | bool]]:
         markers = list(re.finditer(f"({re.escape(begin)}|{re.escape(end)})", response, flags=re.IGNORECASE))
         opens = sum(match.group(0).lower() == begin.lower() for match in markers)
         closes = len(markers) - opens
-        balance = 0
+        implicit_opens = int(
+            name == "think"
+            and allow_leading_think_close
+            and bool(markers)
+            and markers[0].group(0).lower() == end.lower()
+        )
+        balance = implicit_opens
         misordered = False
         for match in markers:
             balance += 1 if match.group(0).lower() == begin.lower() else -1
             misordered = misordered or balance < 0
-        if opens != closes or misordered:
+        if opens + implicit_opens != closes or misordered:
             imbalances[name] = {"open": opens, "close": closes, "misordered": misordered}
     return imbalances
 
@@ -1991,7 +2124,9 @@ def _parser_error_action_span(response: str) -> tuple[int, int] | None:
 
 
 def _response_has_malformed_tool_call(response: str) -> bool:
-    return _first_unclosed_tool_call_span(response) is not None or _first_malformed_tool_call_span(response) is not None
+    return (
+        _first_unclosed_tool_call_span(response) is not None or _first_malformed_tool_call_span(response) is not None
+    )
 
 
 def _first_unclosed_tool_call_span(response: str) -> tuple[int, int] | None:
@@ -2154,7 +2289,9 @@ def _credit_assignment_loss_mask(
     def apply_base(mask: list[int]) -> list[int]:
         if base_loss_mask is None:
             return mask
-        assert len(base_loss_mask) == output_len, f"base_loss_mask length {len(base_loss_mask)} != output length {output_len}"
+        assert (
+            len(base_loss_mask) == output_len
+        ), f"base_loss_mask length {len(base_loss_mask)} != output length {output_len}"
         return [int(policy) & int(base) for policy, base in zip(mask, base_loss_mask, strict=True)]
 
     if credit_event is None:
@@ -2418,7 +2555,11 @@ def _apply_chat_template(
         if "enable_thinking" not in str(exc):
             raise
         kwargs.pop("enable_thinking", None)
-        fallback_messages = messages if native_tools else _prepare_messages_for_fallback_chat_template(messages, disable_thinking=disable_thinking)
+        fallback_messages = (
+            messages
+            if native_tools
+            else _prepare_messages_for_fallback_chat_template(messages, disable_thinking=disable_thinking)
+        )
         try:
             rendered = tokenizer.apply_chat_template(fallback_messages, **kwargs)
         except TypeError as fallback_exc:
@@ -2810,6 +2951,8 @@ async def _call_sglang(
     session_params: dict[str, Any] | None = None,
     context_token_count: int | None = None,
     server_url: str | None = None,
+    expected_weight_version: str | None = None,
+    require_weight_version: bool = False,
 ) -> dict[str, Any]:
     global _LAST_SGLANG_REQUEST_LOG_TS
     max_new_tokens = int(sampling_params.get("max_new_tokens", 0) or 0)
@@ -2817,8 +2960,15 @@ async def _call_sglang(
     effective_prompt_tokens = context_token_count if context_token_count is not None else len(prompt_ids)
     requested_tokens = effective_prompt_tokens + max_new_tokens
     if max_context_tokens and requested_tokens > max_context_tokens:
-        raise SGLangContextLengthExceededError(f"SGLang request would use {requested_tokens} tokens " f"({effective_prompt_tokens} prompt + {max_new_tokens} new), exceeding local limit {max_context_tokens}.")
-    url = f"{server_url.rstrip('/')}/generate" if server_url else f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+        raise SGLangContextLengthExceededError(
+            f"SGLang request would use {requested_tokens} tokens "
+            f"({effective_prompt_tokens} prompt + {max_new_tokens} new), exceeding local limit {max_context_tokens}."
+        )
+    url = (
+        f"{server_url.rstrip('/')}/generate"
+        if server_url
+        else f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    )
     rid = uuid.uuid4().hex
     payload = {
         "rid": rid,
@@ -2842,7 +2992,9 @@ async def _call_sglang(
         headers = {**(headers or {}), "Connection": "close"}
     started = time.time()
     now = started
-    should_log = _env_bool("SLIME_FUSED_PROGRESS_LOGS", False) and now - _LAST_SGLANG_REQUEST_LOG_TS >= float(os.environ.get("SLIME_FUSED_SGLANG_LOG_INTERVAL", "10"))
+    should_log = _env_bool("SLIME_FUSED_PROGRESS_LOGS", False) and now - _LAST_SGLANG_REQUEST_LOG_TS >= float(
+        os.environ.get("SLIME_FUSED_SGLANG_LOG_INTERVAL", "10")
+    )
     if should_log:
         _LAST_SGLANG_REQUEST_LOG_TS = now
         logger.info(
@@ -2865,6 +3017,18 @@ async def _call_sglang(
         await _abort_sglang_request(args, rid, server_url=server_url)
         raise
     meta = output.get("meta_info") or {}
+    observed_weight_version = meta.get("weight_version")
+    if observed_weight_version is not None:
+        observed_weight_version = str(observed_weight_version)
+    if require_weight_version and observed_weight_version is None:
+        raise SGLangWeightVersionError(
+            "SGLang response omitted weight_version while strict fused rollout versioning is enabled"
+        )
+    if expected_weight_version is not None and observed_weight_version != str(expected_weight_version):
+        raise SGLangWeightVersionError(
+            "SGLang weight version changed within one fused trajectory: "
+            f"expected {expected_weight_version!r}, observed {observed_weight_version!r}"
+        )
     finish_reason = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
     if evaluation:
         completion_tokens = meta.get("completion_tokens")
@@ -2883,11 +3047,17 @@ async def _call_sglang(
         output_ids, output_logprobs, top_p_data = await asyncio.to_thread(_unpack_generate_meta, meta, token_logprobs)
     else:
         output_ids, output_logprobs, top_p_data = _unpack_generate_meta(meta, token_logprobs)
+    if output.get("text") and not output_ids:
+        raise ValueError("SGLang returned generated text without output token/logprob evidence")
+    invalid_logprobs = [index for index, value in enumerate(output_logprobs) if not math.isfinite(value)]
+    if invalid_logprobs:
+        raise ValueError(f"SGLang returned non-finite output logprobs at indices {invalid_logprobs[:8]}")
     result = {
         "text": output.get("text") or "",
         "output_ids": output_ids,
         "output_logprobs": output_logprobs,
         "finish_reason": finish_reason,
+        "weight_version": observed_weight_version,
     }
     if top_p_data is not None:
         result["rollout_top_p_token_ids"], result["rollout_top_p_token_offsets"] = top_p_data
@@ -2919,7 +3089,9 @@ def _is_failed_eval_termination(termination_reason: str) -> bool:
     return termination_reason not in {"env_done", "reasoning_only"}
 
 
-def _unpack_generate_meta(meta: dict[str, Any], token_logprobs: list) -> tuple[list[int], list[float], tuple[list[int], list[int]] | None]:
+def _unpack_generate_meta(
+    meta: dict[str, Any], token_logprobs: list
+) -> tuple[list[int], list[float], tuple[list[int], list[int]] | None]:
     output_ids = [x[1] for x in token_logprobs]
     output_logprobs = [float(x[0]) for x in token_logprobs]
     top_p_data = _extract_rollout_top_p_token_data(meta, expected_num_tokens=len(output_ids))
@@ -2932,7 +3104,11 @@ async def _abort_sglang_request(args, rid: str, *, server_url: str | None = None
         return
     try:
         await client.post(
-            f"{server_url.rstrip('/')}/abort_request" if server_url else f"http://{args.sglang_router_ip}:{args.sglang_router_port}/abort_request",
+            (
+                f"{server_url.rstrip('/')}/abort_request"
+                if server_url
+                else f"http://{args.sglang_router_ip}:{args.sglang_router_port}/abort_request"
+            ),
             json={"rid": rid},
             timeout=5.0,
         )

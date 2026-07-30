@@ -44,7 +44,7 @@ IMPORTANT: Do NOT use file editing tools (file_editor, execute_bash, search) for
 FUSED_MCP_SYSTEM_PROMPT = """You are a tool agent. You are given a task to complete using the provided tools.
 
 CRITICAL RULES:
-1. You MUST use available non-finish tools to gather data before submitting.
+1. Use available non-finish tools when they are relevant to the task. If none apply, do not call an unrelated tool.
 2. Plan your approach, then call tools step by step to collect evidence.
 3. Be precise in tool arguments and respect parameter types.
 4. Emit tool calls exactly in the format shown in the Tools section below.
@@ -58,7 +58,7 @@ FUSED_MCP_USER_PROMPT = """Solve the following task using the available tools.
 {problem_statement}
 </task>
 
-First call tools to retrieve the data you need. Submit using finish when complete."""
+Use relevant tools to retrieve any data you need. Submit using finish when complete."""
 
 FUSED_CLI_SYSTEM_PROMPT = """You are a CLI agent tasked with resolving a repository issue in a Linux environment. You have access to tools that operate inside the task container.
 

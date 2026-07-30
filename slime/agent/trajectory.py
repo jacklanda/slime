@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import logging
+import math
 from collections.abc import Iterator
 from typing import Any
 
@@ -36,11 +37,15 @@ class TurnRecord:
     output_ids: list[int]
     finish_reason: str
     output_log_probs: list[float] = dataclasses.field(default_factory=list)
+    weight_version: str | None = None
+    require_rollout_logprobs: bool = False
+    require_weight_version: bool = False
     loss_mask: list[int] | None = None
     policy_loss_mask: list[int] | None = None
     context_delta_ids: list[int] | None = None
     tito_boundary_before: bool = False
     tito_model_type: str | None = None
+    tito_context_reason: str | None = None
     disable_thinking: bool | None = None
     prompt_context_start_idx: int | None = None
     rollout_top_p_token_ids: list[int] | None = None
@@ -167,7 +172,7 @@ class _SampleBuilder:
     Each surviving builder yields one Sample.
     """
 
-    def __init__(self, fork_threshold: int) -> None:
+    def __init__(self, fork_threshold: int, *, boundary_reason: str | None = None) -> None:
         self._fork_threshold = fork_threshold
         self.tokens: list[int] = []
         self.loss_mask: list[int] = []
@@ -177,6 +182,11 @@ class _SampleBuilder:
         self.top_p_token_offsets: list[int] | None = None
         self.last_response_start_idx: int | None = None
         self.leading_prompt_len: int = 0
+        self.weight_versions: set[str] = set()
+        self.boundary_reason = boundary_reason
+        self.tito_context_reasons: list[str] = []
+        self.tito_model_types: set[str] = set()
+        self.turn_spans: list[dict[str, Any]] = []
 
     def classify_token_drift(self, turn: TurnRecord) -> DriftKind:
         """Decide how this builder should absorb ``turn``'s prompt.
@@ -200,11 +210,24 @@ class _SampleBuilder:
 
         return DriftKind.FORK
 
-    def append_turn(self, turn: TurnRecord, kind: DriftKind, *, trained: bool = True) -> None:
+    def append_turn(
+        self,
+        turn: TurnRecord,
+        kind: DriftKind,
+        *,
+        turn_index: int,
+        trained: bool = True,
+    ) -> None:
         """Append one turn into this SampleBuilder."""
         assert kind is not DriftKind.FORK, "append_turn called on a builder that would fork"
 
         is_first_turn = self.last_response_start_idx is None
+        if turn.weight_version is not None:
+            self.weight_versions.add(str(turn.weight_version))
+        if turn.tito_context_reason is not None:
+            self.tito_context_reasons.append(turn.tito_context_reason)
+        if turn.tito_model_type is not None:
+            self.tito_model_types.add(turn.tito_model_type)
 
         # --- append this turn's prompt tail (loss_mask=0) ---
         if turn.context_delta_ids is not None:
@@ -214,6 +237,7 @@ class _SampleBuilder:
 
         # --- append this turn's generated response (loss_mask=1 unless re-emitted as context) ---
         self.last_response_start_idx = len(self.tokens)
+        response_start = self.last_response_start_idx
         if trained:
             response_mask = turn.loss_mask if turn.loss_mask is not None else 1
             policy_response_mask = turn.policy_loss_mask if turn.policy_loss_mask is not None else response_mask
@@ -228,6 +252,15 @@ class _SampleBuilder:
             )
         else:
             self._append_tokens(turn.output_ids, loss_mask=0)
+        response_end = len(self.tokens)
+        self.turn_spans.append(
+            {
+                "turn_index": turn_index,
+                "response_token_start": response_start,
+                "response_token_end": response_end,
+                "trained": bool(trained),
+            }
+        )
 
         if is_first_turn:
             self.leading_prompt_len = self.last_response_start_idx
@@ -251,7 +284,9 @@ class _SampleBuilder:
         if policy_loss_mask is None:
             policy_loss_mask = loss_mask
         if isinstance(policy_loss_mask, list):
-            assert len(policy_loss_mask) == len(ids), f"policy_loss_mask length {len(policy_loss_mask)} != ids length {len(ids)}"
+            assert len(policy_loss_mask) == len(
+                ids
+            ), f"policy_loss_mask length {len(policy_loss_mask)} != ids length {len(ids)}"
             self.policy_loss_mask.extend(policy_loss_mask)
         else:
             self.policy_loss_mask.extend([policy_loss_mask] * len(ids))
@@ -288,9 +323,13 @@ class _SampleBuilder:
         *,
         expected_num_tokens: int,
     ) -> None:
-        assert len(offsets) == expected_num_tokens + 1, f"top-p token offsets length {len(offsets)} != generated token count + 1 {expected_num_tokens + 1}"
+        assert (
+            len(offsets) == expected_num_tokens + 1
+        ), f"top-p token offsets length {len(offsets)} != generated token count + 1 {expected_num_tokens + 1}"
         assert offsets and offsets[0] == 0, f"top-p token offsets must start with 0, got {offsets[:1]}"
-        assert offsets[-1] == len(token_ids), f"top-p token offsets[-1] {offsets[-1]} != token ids length {len(token_ids)}"
+        assert offsets[-1] == len(
+            token_ids
+        ), f"top-p token offsets[-1] {offsets[-1]} != token ids length {len(token_ids)}"
         if self.top_p_token_ids is None:
             self.top_p_token_ids = []
             prefix_len = len(self.tokens) - expected_num_tokens
@@ -315,7 +354,9 @@ class _SampleBuilder:
             return
         target_len = len(self.tokens) + 1
         if len(self.top_p_token_offsets) < target_len:
-            self.top_p_token_offsets.extend([self.top_p_token_offsets[-1]] * (target_len - len(self.top_p_token_offsets)))
+            self.top_p_token_offsets.extend(
+                [self.top_p_token_offsets[-1]] * (target_len - len(self.top_p_token_offsets))
+            )
 
     def _truncate_top_p_tokens(self, length: int) -> None:
         if self.top_p_token_ids is None or self.top_p_token_offsets is None:
@@ -327,7 +368,9 @@ class _SampleBuilder:
     def has_trained_response(self) -> bool:
         return any(self.loss_mask[self.leading_prompt_len :])
 
-    def to_sample(self, base_sample: Sample, extra_metadata: dict[str, Any] | None, max_sample_tokens: int = 0) -> Sample:
+    def to_sample(
+        self, base_sample: Sample, extra_metadata: dict[str, Any] | None, max_sample_tokens: int = 0
+    ) -> Sample:
         """Emit the accumulated tokens as one ``Sample``, stripping the first-turn
         prompt so loss_mask / logprobs cover only the response region."""
         start = self.leading_prompt_len  # first-turn prompt stripped; response region starts here
@@ -342,6 +385,37 @@ class _SampleBuilder:
             logprobs = logprobs[:max_sample_tokens]
             self._truncate_top_p_tokens(max_sample_tokens)
         md = dict(extra_metadata or {})
+        turn_spans = []
+        for span in self.turn_spans:
+            response_start = int(span["response_token_start"])
+            if response_start >= len(tokens):
+                continue
+            response_end = min(int(span["response_token_end"]), len(tokens))
+            turn_spans.append(
+                {
+                    **span,
+                    "response_token_end": response_end,
+                    "truncated": response_end < int(span["response_token_end"]),
+                }
+            )
+        versions = sorted(self.weight_versions)
+        md.update(
+            {
+                "rollout_weight_versions": versions,
+                "rollout_weight_version_count": len(versions),
+                "rollout_trainable_tokens": int(sum(loss_mask[start:])),
+                "rollout_logprob_invalid_tokens": 0,
+                "tito_context_reasons": list(self.tito_context_reasons),
+                "tito_exact_prefix_turns": sum(
+                    reason in {"initial", "append_delta"} for reason in self.tito_context_reasons
+                ),
+                "tito_boundary_reason": self.boundary_reason,
+                "tito_model_types": sorted(self.tito_model_types),
+                "turn_spans": turn_spans,
+            }
+        )
+        if len(versions) == 1:
+            md["rollout_weight_version"] = versions[0]
         sample = Sample(
             index=base_sample.index,
             group_index=base_sample.group_index,
@@ -375,6 +449,7 @@ class TrajectoryManager:
         self._fork_threshold: int = 1024 if fork_threshold_tokens is None else fork_threshold_tokens
         self._trees: dict[str, MessageNode] = {}
         self._turn_count: dict[str, int] = {}
+        self._weight_versions: dict[str, str] = {}
 
     # -------------------- public ------------------------------------------
 
@@ -396,14 +471,61 @@ class TrajectoryManager:
         if not prompt_messages:
             logger.warning("record_turn(sid=%s): empty prompt_messages; skipping", sid)
             return
-        assert not turn.output_log_probs or len(turn.output_log_probs) == len(turn.output_ids), f"turn.output_log_probs length {len(turn.output_log_probs)} != " f"turn.output_ids length {len(turn.output_ids)}"
-        assert turn.loss_mask is None or len(turn.loss_mask) == len(turn.output_ids), f"turn.loss_mask length {len(turn.loss_mask)} != " f"turn.output_ids length {len(turn.output_ids)}"
-        assert turn.policy_loss_mask is None or len(turn.policy_loss_mask) == len(turn.output_ids), f"turn.policy_loss_mask length {len(turn.policy_loss_mask)} != " f"turn.output_ids length {len(turn.output_ids)}"
+        assert not turn.output_log_probs or len(turn.output_log_probs) == len(turn.output_ids), (
+            f"turn.output_log_probs length {len(turn.output_log_probs)} != "
+            f"turn.output_ids length {len(turn.output_ids)}"
+        )
+        assert turn.loss_mask is None or len(turn.loss_mask) == len(turn.output_ids), (
+            f"turn.loss_mask length {len(turn.loss_mask)} != " f"turn.output_ids length {len(turn.output_ids)}"
+        )
+        assert turn.policy_loss_mask is None or len(turn.policy_loss_mask) == len(turn.output_ids), (
+            f"turn.policy_loss_mask length {len(turn.policy_loss_mask)} != "
+            f"turn.output_ids length {len(turn.output_ids)}"
+        )
         if turn.context_delta_ids is not None:
-            assert len(turn.context_delta_ids) <= len(turn.prompt_ids), f"turn.context_delta_ids length {len(turn.context_delta_ids)} exceeds " f"turn.prompt_ids length {len(turn.prompt_ids)}"
-        assert (turn.rollout_top_p_token_ids is None) == (turn.rollout_top_p_token_offsets is None), "turn.rollout_top_p_token_ids and turn.rollout_top_p_token_offsets must be set together"
+            assert len(turn.context_delta_ids) <= len(turn.prompt_ids), (
+                f"turn.context_delta_ids length {len(turn.context_delta_ids)} exceeds "
+                f"turn.prompt_ids length {len(turn.prompt_ids)}"
+            )
+        assert (turn.rollout_top_p_token_ids is None) == (
+            turn.rollout_top_p_token_offsets is None
+        ), "turn.rollout_top_p_token_ids and turn.rollout_top_p_token_offsets must be set together"
         if turn.rollout_top_p_token_offsets is not None:
-            assert len(turn.rollout_top_p_token_offsets) == len(turn.output_ids) + 1, f"turn.rollout_top_p_token_offsets length {len(turn.rollout_top_p_token_offsets)} != " f"turn.output_ids length + 1 {len(turn.output_ids) + 1}"
+            assert len(turn.rollout_top_p_token_offsets) == len(turn.output_ids) + 1, (
+                f"turn.rollout_top_p_token_offsets length {len(turn.rollout_top_p_token_offsets)} != "
+                f"turn.output_ids length + 1 {len(turn.output_ids) + 1}"
+            )
+
+        train_mask = turn.loss_mask if turn.loss_mask is not None else [1] * len(turn.output_ids)
+        has_trainable_tokens = (
+            any(train_mask) if isinstance(train_mask, list) else bool(train_mask and turn.output_ids)
+        )
+        if turn.require_rollout_logprobs and has_trainable_tokens:
+            if len(turn.output_log_probs) != len(turn.output_ids):
+                raise ValueError(
+                    "trainable rollout tokens require one finite logprob per output token: "
+                    f"got {len(turn.output_log_probs)} logprobs for {len(turn.output_ids)} tokens"
+                )
+            invalid_indices = [
+                index
+                for index, (value, mask) in enumerate(zip(turn.output_log_probs, train_mask, strict=True))
+                if mask and not math.isfinite(float(value))
+            ]
+            if invalid_indices:
+                raise ValueError(
+                    "trainable rollout tokens contain non-finite logprobs at indices " f"{invalid_indices[:8]}"
+                )
+
+        if turn.require_weight_version and turn.weight_version is None:
+            raise ValueError("strict rollout versioning requires SGLang to return weight_version")
+        if turn.weight_version is not None:
+            observed_version = str(turn.weight_version)
+            expected_version = self._weight_versions.setdefault(sid, observed_version)
+            if observed_version != expected_version:
+                raise ValueError(
+                    f"mixed rollout weight versions for session {sid!r}: "
+                    f"expected {expected_version!r}, observed {observed_version!r}"
+                )
 
         root = self._trees.setdefault(sid, MessageNode())
 
@@ -454,11 +576,13 @@ class TrajectoryManager:
 
         self._trees.pop(sid, None)
         self._turn_count.pop(sid, None)
+        self._weight_versions.pop(sid, None)
         return samples
 
     def drop_session(self, sid: str) -> None:
         self._trees.pop(sid, None)
         self._turn_count.pop(sid, None)
+        self._weight_versions.pop(sid, None)
 
     # -------------------- internals ----------------------------------------
 
@@ -525,7 +649,8 @@ class TrajectoryManager:
         if len(asst_children) != 1:
             if len(asst_children) > 1:
                 logger.warning(
-                    "record_turn(sid=%s turn=%s): %d assistant children at mount " "point; can't tell which the rewrite targets, so forking.",
+                    "record_turn(sid=%s turn=%s): %d assistant children at mount "
+                    "point; can't tell which the rewrite targets, so forking.",
                     sid,
                     self._turn_count.get(sid, 0) + 1,
                     len(asst_children),
@@ -533,7 +658,11 @@ class TrajectoryManager:
             return node, depth
 
         rewritten_node = asst_children[0]
-        if rewritten_node.children or rewritten_node.turn is None or len(rewritten_node.turn.output_ids) >= self._fork_threshold:
+        if (
+            rewritten_node.children
+            or rewritten_node.turn is None
+            or len(rewritten_node.turn.output_ids) >= self._fork_threshold
+        ):
             return node, depth
 
         retains_training = incoming_turn is not None and incoming_turn.context_delta_ids is not None
@@ -595,10 +724,23 @@ class TrajectoryManager:
             asst_node.response_trained = True
 
             if not builders or (kind := builders[-1].classify_token_drift(asst_node.turn)) is DriftKind.FORK:
-                builders.append(_SampleBuilder(self._fork_threshold))
-                builders[-1].append_turn(asst_node.turn, DriftKind.CLEAN, trained=trained)
+                boundary_reason = asst_node.turn.tito_context_reason if builders else None
+                builders.append(_SampleBuilder(self._fork_threshold, boundary_reason=boundary_reason))
+                assert asst_node.turn_index is not None
+                builders[-1].append_turn(
+                    asst_node.turn,
+                    DriftKind.CLEAN,
+                    turn_index=asst_node.turn_index,
+                    trained=trained,
+                )
             else:
-                builders[-1].append_turn(asst_node.turn, kind, trained=trained)
+                assert asst_node.turn_index is not None
+                builders[-1].append_turn(
+                    asst_node.turn,
+                    kind,
+                    turn_index=asst_node.turn_index,
+                    trained=trained,
+                )
         return builders
 
     def _chain_to_samples(
@@ -620,7 +762,11 @@ class TrajectoryManager:
             "use_tool": use_tool,
             "ill_formed": ill_formed,
         }
-        return [builder.to_sample(base_sample, md, max_sample_tokens) for builder in self._split_chain_into_builders(chain) if allow_fully_masked or builder.has_trained_response()]
+        return [
+            builder.to_sample(base_sample, md, max_sample_tokens)
+            for builder in self._split_chain_into_builders(chain)
+            if allow_fully_masked or builder.has_trained_response()
+        ]
 
 
 __all__ = [

@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import time
@@ -8,6 +9,9 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, add_default_ray_env_vars
+from slime.utils.train_infer_consistency import validate_rollout_weight_versions
+
+logger = logging.getLogger(__name__)
 
 
 class RayTrainGroup:
@@ -92,7 +96,7 @@ class RayTrainGroup:
 
             env_vars["LD_PRELOAD"] = dynlib_path
             env_vars["TMS_INIT_ENABLE"] = "1"
-            env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+            env_vars.setdefault("TMS_INIT_ENABLE_CPU_BACKUP", "1")
 
         # We cannot do routing replay for critic.
         if self.args.use_routing_replay and self.role == "actor":
@@ -158,12 +162,26 @@ class RayTrainGroup:
             self.args.finetune = False
             self.args.no_load_optim = self.args.no_save_optim
             self.args.no_load_rng = False
+            self._remove_previous_temporary_checkpoint(rollout_id)
         return ret
+
+    def _remove_previous_temporary_checkpoint(self, rollout_id):
+        previous_rollout_id = rollout_id - 1
+        if previous_rollout_id < 0 or (previous_rollout_id + 1) % self.args.save_interval == 0:
+            return
+
+        checkpoint_dir = Path(self.args.save) / f"iter_{previous_rollout_id:07d}"
+        if checkpoint_dir.is_dir():
+            shutil.rmtree(checkpoint_dir)
+            logger.info("Removed temporary release-train checkpoint %s", checkpoint_dir)
 
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
         if not self._full_disk_weight_update_enabled():
             return ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+
+        if not self._actor_handlers:
+            raise RuntimeError("Cannot publish full disk weights without active training actors; call create() first")
 
         weight_version = self._disk_weight_version + 1
         disk_weight_dir = Path(self.args.update_weight_disk_dir) / f"weight_v{weight_version:06d}"
@@ -253,18 +271,10 @@ class RayTrainGroup:
                 for engine in engines
             ]
         )
-        if self.args.ci_test:
+        verify_versions = self.args.ci_test or getattr(self.args, "verify_rollout_weight_versions", False)
+        if verify_versions:
             engine_versions = ray.get([engine.get_weight_version.remote() for engine in engines])
-            mismatches = [
-                f"engine {idx}: {engine_version}"
-                for idx, engine_version in enumerate(engine_versions)
-                if str(engine_version) != str(weight_version)
-            ]
-            if mismatches:
-                raise RuntimeError(
-                    "Weight version mismatch after disk reload! "
-                    f"Expected: {weight_version}; " + ", ".join(mismatches)
-                )
+            validate_rollout_weight_versions(weight_version, engine_versions)
         if not self.args.update_weight_disk_keep_files:
             shutil.rmtree(disk_weight_dir, ignore_errors=True)
         ray.get([engine.continue_generation.remote() for engine in engines])

@@ -106,6 +106,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_train_arguments(parser):
+            parser.add_argument(
+                "--use-yarn-rope",
+                action="store_true",
+                help="Use static YaRN RoPE in the Megatron actor model.",
+            )
+            parser.add_argument(
+                "--yarn-rope-scaling-factor",
+                type=float,
+                default=1.0,
+                help="Static YaRN scaling factor used by the Megatron actor model.",
+            )
+            parser.add_argument(
+                "--yarn-original-max-position-embeddings",
+                type=int,
+                default=32768,
+                help="Native context length used to train the model before YaRN scaling.",
+            )
             # --train-backend is parsed early in _pre_parse_mode() and merged later.
             parser.add_argument(
                 "--qwen-gdn-backend",
@@ -556,7 +573,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--update-weights-interval",
                 type=int,
                 default=1,
-                help="Interval for updating the weights",
+                help="Push actor weights to rollout every N completed training rounds",
+            )
+            parser.add_argument(
+                "--verify-rollout-weight-versions",
+                action="store_true",
+                default=False,
+                help="After each weight update, require every SGLang engine to report the new version",
             )
             parser.add_argument(
                 "--keep-old-actor",
@@ -891,8 +914,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=0,
                 help=(
-                    "Number of retries for an eval trajectory whose termination_reason is present and not env_done. "
-                    "The initial attempt is not included."
+                    "Number of retries for an eval trajectory whose termination_reason is not a successful "
+                    "termination (env_done or reasoning_only). The initial attempt is not included."
                 ),
             )
             parser.add_argument(
@@ -1763,6 +1786,28 @@ def _pre_parse_mode():
     return temp_args
 
 
+def _apply_yarn_sglang_override(args):
+    if not getattr(args, "use_yarn_rope", False):
+        return
+
+    try:
+        model_overrides = json.loads(args.sglang_json_model_override_args)
+    except json.JSONDecodeError as exc:
+        raise ValueError("--sglang-json-model-override-args must be valid JSON") from exc
+    if not isinstance(model_overrides, dict):
+        raise ValueError("--sglang-json-model-override-args must contain a JSON object")
+    context_length = int(args.sglang_context_length)
+    if context_length <= 0:
+        raise ValueError("--sglang-context-length must be positive when YaRN is enabled")
+    model_overrides["max_position_embeddings"] = context_length
+    model_overrides["rope_scaling"] = {
+        "rope_type": "yarn",
+        "factor": args.yarn_rope_scaling_factor,
+        "original_max_position_embeddings": args.yarn_original_max_position_embeddings,
+    }
+    args.sglang_json_model_override_args = json.dumps(model_overrides, separators=(",", ":"))
+
+
 def parse_args(add_custom_arguments=None):
     # Users may call `parse_args` very early, thus we ensure logger is configured here
     configure_logger()
@@ -1797,6 +1842,7 @@ def parse_args(add_custom_arguments=None):
     if sglang_ns is not None:
         for key, value in vars(sglang_ns).items():
             setattr(args, key, value)
+        _apply_yarn_sglang_override(args)
 
     slime_validate_args(args)
 
@@ -1933,12 +1979,13 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
+    if getattr(args, "update_weights_interval", 1) < 1:
+        raise ValueError("--update-weights-interval must be at least 1")
+
     if getattr(args, "eval_termination_retry_times", 0) < 0:
         raise ValueError("--eval-termination-retry-times must be a non-negative integer.")
 
-    if getattr(args, "wandb_skip_resume_first_step", False) and (
-        not args.use_wandb or args.wandb_run_id is None
-    ):
+    if getattr(args, "wandb_skip_resume_first_step", False) and (not args.use_wandb or args.wandb_run_id is None):
         raise ValueError("--wandb-skip-resume-first-step requires --use-wandb and --wandb-run-id.")
 
     if args.kl_coef != 0 or args.use_kl_loss:
@@ -2020,9 +2067,9 @@ def slime_validate_args(args):
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
         assert args.eval_max_inflight_tasks > 0, "eval_max_inflight_tasks must be positive."
         if args.eval_initial_inflight_tasks is not None:
-            assert 0 < args.eval_initial_inflight_tasks <= args.eval_max_inflight_tasks, (
-                "eval_initial_inflight_tasks must be positive and no larger than eval_max_inflight_tasks."
-            )
+            assert (
+                0 < args.eval_initial_inflight_tasks <= args.eval_max_inflight_tasks
+            ), "eval_initial_inflight_tasks must be positive and no larger than eval_max_inflight_tasks."
         assert args.eval_concurrency_step > 0, "eval_concurrency_step must be positive."
         assert args.eval_concurrency_poll_interval > 0, "eval_concurrency_poll_interval must be positive."
 
@@ -2267,16 +2314,36 @@ def _validate_webqa_ground_truths(args):
         return
     rollout_path = str(getattr(args, "rollout_function_path", "") or "")
     custom_generate = str(getattr(args, "custom_generate_function_path", "") or "")
-    if "webqa" not in prompt_data.lower() and "webqa" not in rollout_path.lower() and "fused_agent" not in custom_generate.lower():
+    explicit_webqa = "webqa" in prompt_data.lower() or "webqa" in rollout_path.lower()
+    if not explicit_webqa and "fused_agent" not in custom_generate.lower():
         return
 
     label_key = getattr(args, "label_key", None)
     metadata_key = getattr(args, "metadata_key", "metadata")
 
+    inspected = 0
     sampled = 0
     missing = 0
     sample_limit = int(os.environ.get("FUSED_WEBQA_GROUND_TRUTH_SAMPLE_LIMIT", "64"))
     for row in read_file(prompt_data):
+        inspected += 1
+        metadata = row.get(metadata_key) or {}
+        if not explicit_webqa:
+            sources = [row.get("data_source"), row.get("task_type"), row.get("benchmark"), row.get("dataset")]
+            if isinstance(metadata, dict):
+                sources.extend(
+                    metadata.get(key) for key in ("data_source", "task_type", "benchmark", "dataset")
+                )
+            normalized_sources = {
+                str(source).strip().lower().replace("-", "_").replace(" ", "_")
+                for source in sources
+                if source
+            }
+            if not normalized_sources.intersection({"webqa", "web_search", "search"}):
+                if inspected >= sample_limit:
+                    break
+                continue
+
         sampled += 1
         label = row.get(label_key) if label_key is not None else row.get("reward_model")
         if isinstance(label, dict):
@@ -2284,12 +2351,16 @@ def _validate_webqa_ground_truths(args):
         else:
             gt = label
         if gt is None or (isinstance(gt, str) and not gt.strip()):
-            extra = row.get(metadata_key) or {}
-            if isinstance(extra, dict):
-                gt = extra.get("ground_truth") or extra.get("target") or extra.get("answer") or extra.get("answers")
+            if isinstance(metadata, dict):
+                gt = (
+                    metadata.get("ground_truth")
+                    or metadata.get("target")
+                    or metadata.get("answer")
+                    or metadata.get("answers")
+                )
         if gt is None or (isinstance(gt, str) and not gt.strip()):
             missing += 1
-        if sampled >= sample_limit:
+        if inspected >= sample_limit:
             break
 
     if sampled > 0 and missing == sampled:

@@ -490,6 +490,54 @@ def test_eval_retries_non_env_done_termination_before_reward(monkeypatch):
     ]
 
 
+def test_eval_does_not_retry_reasoning_only_termination(monkeypatch):
+    attempts = 0
+    scored_responses = []
+
+    async def custom_generate(_args, sample, _sampling_params, evaluation=False):
+        nonlocal attempts
+        assert evaluation is True
+        attempts += 1
+        sample.response = "reasoning"
+        sample.status = Sample.Status.COMPLETED
+        sample.metadata["fused_termination"] = "reasoning_only"
+        return sample
+
+    async def fake_rm(_args, sample, evaluation=False):
+        assert evaluation is True
+        scored_responses.append(sample.response)
+        return 1.0
+
+    class UnblockedState:
+        aborted = False
+        semaphore = asyncio.Semaphore(1)
+
+        def __init__(self, _args):
+            pass
+
+        def dp_rank_context(self):
+            return nullcontext()
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", UnblockedState)
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda _path: custom_generate)
+    monkeypatch.setattr(sglang_rollout, "async_rm", fake_rm)
+    args = Namespace(
+        custom_generate_function_path="custom",
+        eval_termination_retry_times=4,
+        group_rm=False,
+        rm_type="",
+        partial_rollout=False,
+        mask_offpolicy_in_partial_rollout=False,
+    )
+
+    sample = asyncio.run(sglang_rollout.generate_and_rm(args, Sample(index=7, prompt="q"), {}, evaluation=True))
+
+    assert attempts == 1
+    assert scored_responses == ["reasoning"]
+    assert sample.metadata["eval_retry_count"] == 0
+    assert sample.metadata["eval_retry_termination_reasons"] == []
+
+
 def test_eval_stops_after_configured_termination_retries(monkeypatch):
     attempts = 0
 

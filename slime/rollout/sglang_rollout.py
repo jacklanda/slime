@@ -527,7 +527,7 @@ async def generate_and_rm(
 
         generated_samples = sample if isinstance(sample, list) else [sample]
         termination_reason = _eval_termination_reason(generated_samples)
-        if termination_reason is None or termination_reason == "env_done" or attempt >= retry_times:
+        if termination_reason in {None, "env_done", "reasoning_only"} or attempt >= retry_times:
             if evaluation:
                 for generated_sample in generated_samples:
                     generated_sample.metadata = {
@@ -772,7 +772,7 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
     dropped_groups = 0
     started = time.time()
     last_log = started
-    pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Group collection")
+    pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Trace collection")
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.

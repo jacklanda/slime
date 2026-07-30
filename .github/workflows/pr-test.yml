@@ -643,6 +643,14 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_acebench_eval_launcher.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_bfcl_eval_launcher.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_openrouter_grm.py"
             },
             {
@@ -656,10 +664,6 @@ jobs:
             {
               "num_gpus": 0,
               "test_file": "test_logging_noise_suppression.py"
-            },
-            {
-              "num_gpus": 0,
-              "test_file": "test_wandb_metric_definitions.py"
             },
             {
               "num_gpus": 0,

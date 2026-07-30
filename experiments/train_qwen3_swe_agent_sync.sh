@@ -5,14 +5,17 @@
 # this slime checkout. The fused-agent workload knobs mirror the rllm fused
 # launcher where current slime exposes equivalent CLI arguments.
 
-set -ex
+set -e
+if [ "${SLIME_SHELL_TRACE:-0}" = "1" ]; then
+   set -x
+fi
 
 export PYTHONUNBUFFERED=1
 
 usage() {
    cat <<'EOF'
 Usage:
-  bash experiments/train_qwen3.5_fused_agent_sync.sh [options]
+  bash experiments/train_qwen3_swe_agent_sync.sh [options]
 
 Options:
   --harness NAME                         Fused prompt harness: bare, cot, react, gem, unified_gem.
@@ -162,7 +165,7 @@ HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"
 LR="${LR:-1e-6}"
 KL_COEF="${KL_COEF:-0.0}"
-USE_WANDB="${USE_WANDB:-1}"
+USE_WANDB="${USE_WANDB:-0}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
@@ -201,7 +204,7 @@ EVAL_TERMINATION_RETRY_TIMES="${EVAL_TERMINATION_RETRY_TIMES:-4}"
 EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-1}"
 EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES:-true}"
 NATIVE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION:-true}"
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-false}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
 # Offload only makes sense under colocate (train/rollout share GPUs and take
@@ -364,7 +367,8 @@ BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 
 default_experiment_name() {
-   local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
+   #local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
+   local prefix="et-dapo-q3-4b-dht-gem-sync-dev"  # w/ rft warmup
    #local prefix="fused-dapo-q3-4b-think-gem-sync-dev"
    #local prefix="fused-dapo-q3-4b-pet-gem-sync-dev"
    #local prefix="webqa-dapo-q3-4b-think-pet-gem-sync-dev"
@@ -394,18 +398,13 @@ default_experiment_name() {
    echo "${prefix}$((max_dev + 1))"
 }
 
-if [ "${SLIME_CLEANUP:-0}" = "1" ] && [ "${SLIME_CLEANUP_CONFIRM:-0}" = "1" ]; then
-   ray stop --force 2>/dev/null || true
-   pkill -9 -f 'ray::' 2>/dev/null || true
-   pkill -9 -f 'sglang.*fused_agent' 2>/dev/null || true
-   sleep 3
-elif [ "${SLIME_CLEANUP:-0}" = "1" ]; then
-   echo "SLIME_CLEANUP=1 ignored because SLIME_CLEANUP_CONFIRM=1 is not set; preserving existing processes and artifacts."
+if [ "${SLIME_CLEANUP:-0}" = "1" ]; then
+   echo "SLIME_CLEANUP=1 is unsupported by this launcher because global cleanup can terminate unrelated training jobs." >&2
+   exit 2
 fi
 
-MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
+MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
-#MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
 
@@ -471,8 +470,8 @@ fi
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/GEM/Qwen3-4B-RFT-Warmup-v0}"  # init RL training with a self-distil wamrup ckpt
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/checkpoints/FusedRL/${EXPERIMENT_NAME}}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
@@ -530,8 +529,9 @@ else
    # TRAIN_FILES as the source of truth; only build a prepared parquet when
    # multiple source files need to be merged.
    TRAIN_FILES=(
-      "${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
-      "${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
+      #"${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
+      #"${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
+      "${SCRIPT_DIR}/artifacts/endless_terminals/train.parquet"
       #"${SCRIPT_DIR}/artifacts/asearcher.parquet"
       #"${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet"
    )
@@ -974,12 +974,12 @@ OPTIMIZER_ARGS=(
    --adam-beta2 0.98
 )
 
-# Colocated SGLang shares each GPU with residual trainer allocations during
-# weight synchronization. A 0.9 static pool needs about 71 GiB on an 80 GiB
-# GPU and cannot resume when the trainer is still using roughly 18 GiB.
+# Colocated SGLang shares each GPU with the trainer and may also coexist with
+# unrelated GPU processes. The 0.65 default is validated on 80 GiB GPUs with
+# pre-existing per-GPU allocations; callers can still override it explicitly.
 if [ -z "${SGLANG_MEM_FRACTION_STATIC:-}" ]; then
    if is_truthy "${COLOCATE}"; then
-      SGLANG_MEM_FRACTION_STATIC=0.8
+      SGLANG_MEM_FRACTION_STATIC=0.65
    else
       SGLANG_MEM_FRACTION_STATIC="${GPU_MEMORY_UTILIZATION:-0.9}"
    fi
@@ -1244,6 +1244,9 @@ if is_truthy "${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER}"; then
 fi
 
 RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
+# Waiting keeps a newly started local Ray head attached to a durable launcher
+# process and makes the script exit status reflect the submitted training job.
+RAY_JOB_WAIT="${RAY_JOB_WAIT:-1}"
 
 if ray job list --address="${RAY_DASHBOARD_ADDRESS}" >/dev/null 2>&1; then
    echo "Reusing existing Ray head at ${RAY_DASHBOARD_ADDRESS}"
@@ -1254,7 +1257,7 @@ fi
 cd "${REPO_ROOT}"
 
 RAY_JOB_SUBMIT_ARGS=()
-if [ "${RAY_JOB_WAIT:-0}" != "1" ]; then
+if [ "${RAY_JOB_WAIT}" != "1" ]; then
    RAY_JOB_SUBMIT_ARGS+=(--no-wait)
 fi
 
@@ -1296,7 +1299,7 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    "${MISC_ARGS[@]}" \
    "${WANDB_ARGS[@]}"
 
-if [ "${RAY_JOB_WAIT:-0}" != "1" ] && [ "${RAY_JOB_FOLLOW_LOGS:-1}" = "1" ]; then
+if [ "${RAY_JOB_WAIT}" != "1" ] && [ "${RAY_JOB_FOLLOW_LOGS:-1}" = "1" ]; then
    echo "Following Ray job logs for ${RAY_SUBMISSION_ID}"
    ray job logs --address="${RAY_DASHBOARD_ADDRESS}" --follow "${RAY_SUBMISSION_ID}"
 fi

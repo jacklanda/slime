@@ -460,6 +460,50 @@ def test_openrouter_grm_failure_falls_back_to_rule_based(monkeypatch):
     assert reward == 1.0
 
 
+def test_openrouter_grm_uses_openai_credentials_for_custom_endpoint(monkeypatch):
+    args = Args()
+    args.grm_base_url = None
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "custom-endpoint-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://judge.example/v1/")
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", None)
+
+    client = openrouter_grm._get_client(args)
+
+    assert str(client.base_url) == "https://judge.example/v1/"
+    assert client.headers["Authorization"] == "Bearer custom-endpoint-key"
+    asyncio.run(client.aclose())
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", None)
+
+
+def test_openrouter_grm_does_not_send_openai_key_to_openrouter(monkeypatch):
+    args = Args()
+    args.grm_base_url = None
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-only-key")
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", None)
+
+    with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+        openrouter_grm._get_client(args)
+
+
+def test_openrouter_credentials_ignore_unrelated_openai_endpoint(monkeypatch):
+    args = Args()
+    args.grm_base_url = None
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://judge.example/v1")
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", None)
+
+    client = openrouter_grm._get_client(args)
+
+    assert str(client.base_url) == "https://openrouter.ai/api/v1/"
+    assert client.headers["Authorization"] == "Bearer openrouter-key"
+    asyncio.run(client.aclose())
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", None)
+
+
 def test_openrouter_grm_parse_failure_falls_back_to_rule_based(monkeypatch):
     args = Args()
     client = FakeClient({"choices": [{"message": {"content": "not-json-no-score"}}]})
