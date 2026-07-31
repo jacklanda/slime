@@ -145,9 +145,9 @@ COLOCATE="${COLOCATE:-true}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-false}"
 ENABLE_YARN="${ENABLE_YARN:-false}"
-YARN_FACTOR="${YARN_FACTOR:-2.0}"
+YARN_FACTOR="${YARN_FACTOR:-1.0}"
 YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS:-32768}"
-DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-true}"
+DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-8}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
@@ -407,11 +407,12 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
+RUNS_ROOT="${RUNS_ROOT:-/share/nlp/share/gem/runs}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 
 default_experiment_name() {
-   #local prefix="fused-dapo-q3-8b-think-gem-sync-dev"
-   local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
+   local prefix="odyssey-q3-8b-think-dev"
+   #local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
    #local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
    #local prefix="fused-dapo-q3-4b-dht-gem-sync-dev"  # w/o rft warmup
    #local prefix="fused-dapo-q3-4b-think-gem-sync-dev"
@@ -431,7 +432,7 @@ default_experiment_name() {
    #local prefix="webqa-dapo-q3-4b-no_think-gem-async-dev0"
    local max_dev=-1
    local root base suffix
-   for root in "${REPO_ROOT}/checkpoints/FusedRL" "${REPO_ROOT}/experiments/logs/FusedRL"; do
+   for root in "${RUNS_ROOT}" "${REPO_ROOT}/checkpoints/FusedRL" "${REPO_ROOT}/experiments/logs/FusedRL"; do
       [ -d "${root}" ] || continue
       while IFS= read -r base; do
          suffix="${base#${prefix}}"
@@ -510,18 +511,41 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
 MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/GEM/Qwen3-4B-RFT-Warmup-v0}"  # init RL training with a self-distil wamrup ckpt
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/gem/Qwen3-4B-RFT-Warmup-v0}"  # init RL training with a self-distil wamrup ckpt
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
-SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/checkpoints/FusedRL/${EXPERIMENT_NAME}}"
+RUN_ROOT="${RUN_ROOT:-${RUNS_ROOT}/${EXPERIMENT_NAME}}"
+SAVE_DIR="${SAVE_DIR:-${RUN_ROOT}/checkpoints}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
-LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/FusedRL/${EXPERIMENT_NAME}}"
-EPISODE_LOG_DIR="${EPISODE_LOG_DIR:-${LOG_ROOT}}"
+LOG_ROOT="${LOG_ROOT:-${RUN_ROOT}/logs}"
+EPISODE_LOG_DIR="${EPISODE_LOG_DIR:-${LOG_ROOT}/episodes}"
 DUMP_DETAILS="${DUMP_DETAILS:-${LOG_ROOT}/debug}"
+EVAL_CACHE_DIR="${EVAL_CACHE_DIR:-${LOG_ROOT}/eval_cache}"
+PREPARED_PROMPT_DATA="${PREPARED_PROMPT_DATA:-${RUN_ROOT}/data/prepared_train.parquet}"
+UPDATE_WEIGHT_DISK_DIR="${UPDATE_WEIGHT_DISK_DIR:-/tmp/slime-rollout-weights/${EXPERIMENT_NAME}}"
+WANDB_DIR="${WANDB_DIR:-${LOG_ROOT}/wandb}"
+WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${RUN_ROOT}/cache/wandb}"
+HF_HOME="${HF_HOME:-${RUN_ROOT}/cache/huggingface}"
+TORCH_HOME="${TORCH_HOME:-${RUN_ROOT}/cache/torch}"
+TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${RUN_ROOT}/cache/triton}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-${RUN_ROOT}/cache/xdg}"
+
+mkdir -p \
+   "${SAVE_DIR}" \
+   "${LOG_ROOT}" \
+   "${EPISODE_LOG_DIR}" \
+   "${DUMP_DETAILS}" \
+   "${EVAL_CACHE_DIR}" \
+   "$(dirname "${PREPARED_PROMPT_DATA}")" \
+   "${UPDATE_WEIGHT_DISK_DIR}" \
+   "${WANDB_DIR}" \
+   "${WANDB_CACHE_DIR}" \
+   "${HF_HOME}" \
+   "${TORCH_HOME}" \
+   "${TRITON_CACHE_DIR}" \
+   "${XDG_CACHE_HOME}"
 
 if [ -n "${EVAL_INTERVAL}" ] && [ -z "${EVAL_CONFIG}" ] && [ "${#EVAL_PROMPT_DATA[@]}" -eq 0 ]; then
    EVAL_CONFIG="${LOG_ROOT}/eval_config.yaml"
-   EVAL_CACHE_DIR="${EVAL_CACHE_DIR:-${LOG_ROOT}/normalized_eval_benchmarks}"
-   mkdir -p "${EVAL_CACHE_DIR}"
    PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" python3 -m slime_plugins.evals.fused_benchmark_config \
       --benchmarks-root "${EVAL_BENCHMARKS_ROOT}" \
       --output-config "${EVAL_CONFIG}" \
@@ -1143,6 +1167,8 @@ if [ "${PRINT_TRAIN_METRICS_TABLE:-1}" = "1" ]; then
 fi
 
 export SCRIPT_DIR REPO_ROOT MEGATRON_LM_PATH HAS_NVLINK
+export RUNS_ROOT RUN_ROOT SAVE_DIR LOG_ROOT EPISODE_LOG_DIR DUMP_DETAILS EVAL_CACHE_DIR PREPARED_PROMPT_DATA
+export UPDATE_WEIGHT_DISK_DIR WANDB_DIR WANDB_CACHE_DIR HF_HOME TORCH_HOME TRITON_CACHE_DIR XDG_CACHE_HOME
 export SLIME_EPISODE_LOG_DIR="${EPISODE_LOG_DIR}"
 export SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE}"
 export SLIME_FUSED_EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES}"
@@ -1265,6 +1291,7 @@ keys = (
     "RLLM_RETRIEVAL_LEXRANK_MAX_SENTENCES", "RLLM_RETRIEVAL_LEXRANK_MAX_INPUT_SENTENCES",
     "RLLM_RETRIEVAL_LEXRANK_MULTIPROCESSING", "RLLM_RETRIEVAL_LEXRANK_WORKERS",
     "DOCKER_HOST", "DOCKER_API_VERSION", "WANDB_API_KEY",
+    "WANDB_DIR", "WANDB_CACHE_DIR", "HF_HOME", "TORCH_HOME", "TRITON_CACHE_DIR", "XDG_CACHE_HOME",
     "RLLM_MCP_MIN_NOFILE", "RLLM_MCP_FD_THROTTLE_THRESHOLD", "RLLM_MCP_INIT_TIMEOUT",
     "RLLM_MCP_START_RETRIES", "RLLM_MCP_START_WAIT_TIMEOUT", "RLLM_MCP_TOOL_TIMEOUT",
     "RLLM_MCP_MAX_ACTIVE_SERVERS", "RLLM_MCP_PREFILTER_WORKERS", "RLLM_MCP_DISABLE_STEP_PENALTY",
@@ -1303,6 +1330,7 @@ PY
 )
 
 echo "Experiment: ${EXPERIMENT_NAME}"
+echo "Run root: ${RUN_ROOT}"
 echo "Model: ${MODEL_DIR}"
 echo "Ref: ${REF_LOAD}"
 echo "Prompt data: ${PROMPT_DATA_FOR_SLIME}"
@@ -1387,7 +1415,6 @@ if is_truthy "${COLOCATE}"; then
    CLUSTER_ARGS+=(--colocate)
 fi
 if is_truthy "${RELEASE_TRAIN}"; then
-   UPDATE_WEIGHT_DISK_DIR="${UPDATE_WEIGHT_DISK_DIR:-${SAVE_DIR}/rollout_weights}"
    CLUSTER_ARGS+=(
       --release-train
       --update-weight-mode full

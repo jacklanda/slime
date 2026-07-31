@@ -14,6 +14,7 @@ from slime.ray.rollout import (
     _eval_sample_tool_calls,
 )
 from slime.utils.metric_utils import compute_pass_at_k_and_pass_all
+from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ _COUNT_COLUMNS = (("# steps", "steps", 10, ">"), ("# tool calls", "tool_calls", 
 _TERMINATION_COLUMNS = (
     ("# abnormal / all", "abnormal", 16, ">"),
     ("# max turns / all", "max_turns", 17, ">"),
-    ("# repeat query / all", "repeated_query", 20, ">"),
+    ("# clip / all", "clip", 12, ">"),
 )
 
 
@@ -132,7 +133,7 @@ def _is_table_metric_key(key: str) -> bool:
         "tool_calls",
         "abnormal",
         "max_turns",
-        "repeated_query",
+        "clip",
     }
 
 
@@ -157,13 +158,11 @@ def _format_termination_counts(samples: list[Any], group_size: int) -> dict[str,
     groups = [samples[start : start + group_size] for start in range(0, len(samples), group_size)]
     abnormal = sum(any(_eval_sample_termination(sample).startswith("abnormal_") for sample in group) for group in groups)
     max_turns = sum(any(_eval_sample_termination(sample) == "max_turns_exceeded" for sample in group) for group in groups)
-    repeated_query = sum(
-        any(_eval_sample_termination(sample) == "repeated_query_early_stop" for sample in group) for group in groups
-    )
+    clipped = sum(sample.status == Sample.Status.TRUNCATED for sample in samples)
     return {
         "abnormal": f"{abnormal} / {len(groups)}",
         "max_turns": f"{max_turns} / {len(groups)}",
-        "repeated_query": f"{repeated_query} / {len(groups)}",
+        "clip": f"{clipped} / {len(samples)}",
     }
 
 

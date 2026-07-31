@@ -12,6 +12,7 @@ def _sample(
     steps: int,
     tool_calls: int,
     termination_reason: str = "env_done",
+    status: Sample.Status = Sample.Status.COMPLETED,
 ) -> Sample:
     return Sample(
         index=index,
@@ -19,6 +20,7 @@ def _sample(
         response_length=1,
         reward=0.0,
         response="ok",
+        status=status,
         metadata={
             "fused_traj_steps": steps,
             "fused_termination": termination_reason,
@@ -58,13 +60,13 @@ def test_format_eval_results_table_includes_overall_and_sources():
     }
 
     assert format_eval_results_table(args, data) == (
-        "Benchmark              pass@1 mean (%)   pass@1 std (%)  pass^1 mean (%)   pass^1 std (%)     # steps  # tool calls  # abnormal / all  # max turns / all  # repeat query / all\n"
-        "━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━  ━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━\n"
-        "overall / search_r1               50.0              0.0             50.0              0.0         5.0           4.0             1 / 4              0 / 4                 0 / 4\n"
-        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────  ──────────  ────────────  ────────────────  ─────────────────  ────────────────────\n"
-        "nq                                50.0              0.0             50.0              0.0         3.0           2.0             0 / 2              0 / 2                 0 / 2\n"
-        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────  ──────────  ────────────  ────────────────  ─────────────────  ────────────────────\n"
-        "triviaqa                          50.0              0.0             50.0              0.0         7.0           6.0             1 / 2              0 / 2                 0 / 2"
+        "Benchmark              pass@1 mean (%)   pass@1 std (%)  pass^1 mean (%)   pass^1 std (%)     # steps  # tool calls  # abnormal / all  # max turns / all  # clip / all\n"
+        "━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━  ━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━\n"
+        "overall / search_r1               50.0              0.0             50.0              0.0         5.0           4.0             1 / 4              0 / 4         0 / 4\n"
+        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────  ──────────  ────────────  ────────────────  ─────────────────  ────────────\n"
+        "nq                                50.0              0.0             50.0              0.0         3.0           2.0             0 / 2              0 / 2         0 / 2\n"
+        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────  ──────────  ────────────  ────────────────  ─────────────────  ────────────\n"
+        "triviaqa                          50.0              0.0             50.0              0.0         7.0           6.0             1 / 2              0 / 2         0 / 2"
     )
 
 
@@ -87,7 +89,7 @@ def test_format_eval_results_table_includes_power_of_two_pass_at_k_columns():
     assert "search_r1" in table
 
 
-def test_termination_columns_count_prompts_and_separate_max_turns_from_abnormal():
+def test_termination_columns_count_clipped_trajectories_and_grouped_terminations():
     args = SimpleNamespace(
         eval_datasets=[SimpleNamespace(name="search_r1", n_samples_per_eval_prompt=2)],
         n_samples_per_eval_prompt=1,
@@ -99,7 +101,7 @@ def test_termination_columns_count_prompts_and_separate_max_turns_from_abnormal(
                 _sample(0, "searchR1_nq", steps=2, tool_calls=1),
                 _sample(1, "searchR1_nq", steps=2, tool_calls=1, termination_reason="max_turns_exceeded"),
                 _sample(2, "searchR1_nq", steps=2, tool_calls=1, termination_reason="abnormal_parse_error"),
-                _sample(3, "searchR1_nq", steps=2, tool_calls=1, termination_reason="repeated_query_early_stop"),
+                _sample(3, "searchR1_nq", steps=2, tool_calls=1, status=Sample.Status.TRUNCATED),
             ],
         }
     }
@@ -108,8 +110,9 @@ def test_termination_columns_count_prompts_and_separate_max_turns_from_abnormal(
 
     assert "# abnormal / all" in table
     assert "# max turns / all" in table
-    assert "# repeat query / all" in table
-    assert table.count("1 / 2") == 6
+    assert "# clip / all" in table
+    assert "1 / 4" in table
+    assert "1 / 2" in table
 
 
 def test_log_eval_results_table_keeps_default_logging_enabled(caplog):
