@@ -667,6 +667,10 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_train_step_metrics.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_sglang_rollout_group_timeout.py"
             },
             {

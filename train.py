@@ -1,5 +1,9 @@
+import logging
+from time import perf_counter
+
 import ray
 
+from slime.utils import logging_utils
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import (
@@ -9,6 +13,11 @@ from slime.utils.logging_utils import (
     suppress_known_training_warnings,
 )
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.metric_utils import compute_rollout_step
+from slime.utils.train_step_metrics import build_step_timing_metrics
+
+
+logger = logging.getLogger(__name__)
 
 
 def train(args):
@@ -57,18 +66,30 @@ def train(args):
 
     # train loop.
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
-            ray.get(rollout_manager.eval.remote(rollout_id))
+        step_start = perf_counter()
+        phase_times = {}
 
+        if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
+            phase_start = perf_counter()
+            ray.get(rollout_manager.eval.remote(rollout_id))
+            phase_times["pre_train_eval"] = perf_counter() - phase_start
+
+        phase_start = perf_counter()
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+        phase_times["rollout_phase"] = perf_counter() - phase_start
 
         if args.offload_rollout:
+            phase_start = perf_counter()
             ray.get(rollout_manager.offload.remote())
+            phase_times["rollout_offload"] = perf_counter() - phase_start
 
         if release_train:
+            phase_start = perf_counter()
             actor_model.create()
+            phase_times["trainer_create"] = perf_counter() - phase_start
 
         actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
+        phase_start = perf_counter()
         if args.use_critic:
             value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
             if actor_trains:
@@ -77,13 +98,18 @@ def train(args):
                 ray.get(value_refs)
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+        train_time = perf_counter() - phase_start
 
         if actor_trains:
+            phase_start = perf_counter()
             ray.get(rollout_manager.save_rllm_episodes.remote(rollout_id))
+            phase_times["episode_save"] = perf_counter() - phase_start
 
-        if release_train or should_run_periodic_action(
+        should_save = release_train or should_run_periodic_action(
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
-        ):
+        )
+        if should_save:
+            phase_start = perf_counter()
             force_sync = release_train or rollout_id == args.num_rollout - 1
             if actor_trains:
                 actor_model.save_model(rollout_id, force_sync=force_sync)
@@ -91,18 +117,41 @@ def train(args):
                 critic_model.save_model(rollout_id, force_sync=force_sync)
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.save.remote(rollout_id))
+            phase_times["checkpoint"] = perf_counter() - phase_start
 
+        phase_start = perf_counter()
         offload_train(actor_trains)
+        phase_times["train_cleanup"] = perf_counter() - phase_start
         if args.offload_rollout and not release_train:
+            phase_start = perf_counter()
             ray.get(rollout_manager.onload_weights.remote())
-        if release_train or (rollout_id + 1) % args.update_weights_interval == 0:
+            phase_times["rollout_weights_onload"] = perf_counter() - phase_start
+        should_update_weights = release_train or (rollout_id + 1) % args.update_weights_interval == 0
+        if should_update_weights:
+            phase_start = perf_counter()
             actor_model.update_weights()
+            phase_times["update_weights"] = perf_counter() - phase_start
 
         if args.offload_rollout:
+            phase_start = perf_counter()
             ray.get(rollout_manager.onload_kv.remote())
+            phase_times["rollout_kv_onload"] = perf_counter() - phase_start
 
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+        should_eval = should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch)
+        if should_eval:
+            phase_start = perf_counter()
             ray.get(rollout_manager.eval.remote(rollout_id))
+            phase_times["eval"] = perf_counter() - phase_start
+
+        step_time = perf_counter() - step_start
+        timing_metrics = build_step_timing_metrics(
+            step_time=step_time,
+            train_time=train_time,
+            phase_times=phase_times,
+        )
+        logger.info("step perf %s: %s", rollout_id, timing_metrics)
+        timing_metrics["rollout/step"] = compute_rollout_step(args, rollout_id)
+        logging_utils.log(args, timing_metrics, step_key="rollout/step", rollout_id=rollout_id)
 
     ray.get(rollout_manager.dispose.remote())
     finish_tracking(args)

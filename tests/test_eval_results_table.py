@@ -60,13 +60,13 @@ def test_format_eval_results_table_includes_overall_and_sources():
     }
 
     assert format_eval_results_table(args, data) == (
-        "Benchmark              pass@1 mean (%)   pass@1 std (%)  pass^1 mean (%)   pass^1 std (%)     # steps  # tool calls  # abnormal / all  # max turns / all  # clip / all\n"
-        "━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━  ━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━\n"
-        "overall / search_r1               50.0              0.0             50.0              0.0         5.0           4.0             1 / 4              0 / 4         0 / 4\n"
-        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────  ──────────  ────────────  ────────────────  ─────────────────  ────────────\n"
-        "nq                                50.0              0.0             50.0              0.0         3.0           2.0             0 / 2              0 / 2         0 / 2\n"
-        "─────────────────────  ───────────────  ───────────────  ───────────────  ───────────────  ──────────  ────────────  ────────────────  ─────────────────  ────────────\n"
-        "triviaqa                          50.0              0.0             50.0              0.0         7.0           6.0             1 / 2              0 / 2         0 / 2"
+        "Benchmark                 % pass@1 (±)     % pass^1 (±)     # steps  # tool calls  # abnormal / all  # max turns / all  # clip / all\n"
+        "━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━  ━━━━━━━━━━  ━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━\n"
+        "overall / search_r1        50.0 (±0.0)      50.0 (±0.0)         5.0           4.0             1 / 4              0 / 4         0 / 4\n"
+        "─────────────────────  ───────────────  ───────────────  ──────────  ────────────  ────────────────  ─────────────────  ────────────\n"
+        "nq                         50.0 (±0.0)      50.0 (±0.0)         3.0           2.0             0 / 2              0 / 2         0 / 2\n"
+        "─────────────────────  ───────────────  ───────────────  ──────────  ────────────  ────────────────  ─────────────────  ────────────\n"
+        "triviaqa                   50.0 (±0.0)      50.0 (±0.0)         7.0           6.0             1 / 2              0 / 2         0 / 2"
     )
 
 
@@ -83,9 +83,12 @@ def test_format_eval_results_table_includes_power_of_two_pass_at_k_columns():
 
     table = format_eval_results_table(args, data)
 
-    assert "pass@1 mean (%)" in table
-    assert "pass@2 mean (%)" in table
-    assert "pass@4 mean (%)" in table
+    assert "% pass@1 (±)" in table
+    assert "% pass@2 (±)" in table
+    assert "% pass@4 (±)" in table
+    assert "% pass^4 (±)" in table
+    assert "mean (%)" not in table
+    assert "std (%)" not in table
     assert "search_r1" in table
 
 

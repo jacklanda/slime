@@ -77,9 +77,12 @@ class QwenToolParser:
                 try:
                     args = json.loads(args)
                 except json.JSONDecodeError:
-                    args = {"result": args} if name == "finish" else {}
+                    # Do not silently turn malformed arguments into an empty
+                    # call.  That hides protocol failures and can execute a
+                    # different tool request than the model emitted.
+                    continue
             if not isinstance(args, dict):
-                args = {}
+                continue
             calls.append(ToolCall(name=name, arguments=args, start=start, end=end))
         if not calls:
             calls.extend(self._extract_answer_fallback(model_response or ""))
@@ -89,10 +92,27 @@ class QwenToolParser:
         idx = text.rfind("</think>")
         offset = idx + len("</think>") if idx >= 0 else 0
         search_text = text[offset:]
-        payloads = [
-            (match.group(1), offset + match.start(), offset + match.end())
-            for match in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", search_text, flags=re.DOTALL)
-        ]
+        payloads = []
+        cursor = 0
+        begin = "<tool_call>"
+        end_marker = "</tool_call>"
+        while True:
+            start = search_text.find(begin, cursor)
+            if start < 0:
+                break
+            end = search_text.find(end_marker, start + len(begin))
+            if end < 0:
+                # An incomplete call is not a valid call. Do not parse JSON
+                # from it or accidentally consume a later response fragment.
+                break
+            payloads.append(
+                (
+                    search_text[start + len(begin) : end].strip(),
+                    offset + start,
+                    offset + end + len(end_marker),
+                )
+            )
+            cursor = end + len(end_marker)
         if payloads:
             return payloads
         # Accept a bare JSON tool call after reasoning.
@@ -186,7 +206,11 @@ class QwenToolParser:
                     try:
                         return json.loads(text[start : i + 1])
                     except json.JSONDecodeError:
-                        return None
+                        candidate = re.sub(r",\s*([}\]])", r"\1", text[start : i + 1])
+                        try:
+                            return json.loads(candidate)
+                        except json.JSONDecodeError:
+                            return None
         return None
 
     def _normalize_name(self, name: str) -> str:

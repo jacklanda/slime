@@ -7,16 +7,17 @@ NUM_GPUS = 0
 
 
 @pytest.mark.unit
-def test_qwen3_sync_launcher_defaults_to_colocated_release_train():
+def test_qwen3_sync_launcher_defaults_to_colocated_trainer_offload():
     repo_root = Path(__file__).resolve().parents[1]
     launcher = (repo_root / "experiments/train_qwen3_fused_agent_sync.sh").read_text(encoding="utf-8")
 
     assert 'COLOCATE="${COLOCATE:-true}"' in launcher
-    assert 'RELEASE_TRAIN="${RELEASE_TRAIN:-true}"' in launcher
+    assert 'RELEASE_TRAIN="${RELEASE_TRAIN:-false}"' in launcher
     assert 'OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${COLOCATE}}"' in launcher
     assert 'CLUSTER_ARGS+=(--colocate)' in launcher
     assert '--release-train' in launcher
     assert '--update-weight-transport disk' in launcher
+    assert '--save-interval "${SAVE_INTERVAL:-20}"' in launcher
 
 
 @pytest.mark.unit

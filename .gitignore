@@ -195,7 +195,10 @@ _examples_synced/
 .DS_Store
 
 experiments/**
+!experiments/
 !experiments/*.sh
+!experiments/lib/
+!experiments/lib/retrieval_backend.sh
 !experiments/fused_agent_tis_wide_rs.yaml
 checkpoints/**
 submitted_result.json

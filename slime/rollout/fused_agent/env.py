@@ -1257,7 +1257,7 @@ def _format_retrieval_documents(data: Any, *, max_results: int) -> tuple[list[st
             skipped_short += 1
             continue
         title = _extract_retrieval_document_title(row, content)
-        documents.append(f"[Result {len(documents) + 1}] Title: {title}\nSnippet: {content.strip()}")
+        documents.append(f"[Result {len(documents) + 1}] Title: {title}\nContent: {content.strip()}")
         if len(documents) >= max_results:
             break
 

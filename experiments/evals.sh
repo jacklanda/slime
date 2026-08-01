@@ -131,8 +131,9 @@ Generation/eval:
   --yarn-original-max-position-embeddings N
                                        Qwen3 native context used by YaRN. Default: 32768.
   --limit-per-benchmark N              Generate config with first N examples per benchmark. Default: 0 (all).
-  --retrieval-backend local|serper     Retrieval service to use. Default: local.
+  --retrieval-backend local|serper     Retrieval service to use. Default: serper.
                                        Serper requires SERPER_PROXY_TOKEN unless RETRIEVAL_SERVER_URL is set.
+                                       Upstream proxy defaults to http://10.2.152.50:9999/search.
   --retrieval-concurrency N            Concurrent retrieval requests. Default: 176.
   --retrieval-mode NAME                dense, lexical, or hybrid. Default: dense.
   --retrieval-cache-size N             Cross-episode retrieval LRU entries. Default: 4096.
@@ -254,6 +255,7 @@ RETRIEVAL_BACKEND="${RETRIEVAL_BACKEND:-serper}"
 if [ -n "${RETRIEVAL_SERVER_URL+x}" ]; then retrieval_url_explicit=true; else retrieval_url_explicit=false; fi
 SERPER_SERVER_HOST="${SERPER_SERVER_HOST:-127.0.0.1}"
 SERPER_SERVER_PORT="${SERPER_SERVER_PORT:-65433}"
+SERPER_SEARCH_URL="${SERPER_SEARCH_URL:-http://10.2.152.50:9999/search}"
 SERPER_SERVICE_PID=""
 RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-176}"
 RETRIEVAL_MODE="${RETRIEVAL_MODE:-dense}"
@@ -678,6 +680,7 @@ if [ "${RETRIEVAL_BACKEND}" = "serper" ] && ! is_truthy "${retrieval_url_explici
       exit 2
    fi
    export SERPER_PROXY_TOKEN
+   export SERPER_SEARCH_URL
 fi
 
 if [ -z "${MODEL_CONFIG}" ]; then
@@ -1731,7 +1734,7 @@ export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
 export RLLM_RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY}"
 export RLLM_RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE}"
 case "${RETRIEVAL_BACKEND}:${FUSED_HARNESS}" in
-   serper:*) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-8}" ;;
+   serper:*) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-10}" ;;
    local:rllm_deepresearch|local:rllm_dr|local:rllm-dr|local:deepresearch)
       export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-10}"
       ;;

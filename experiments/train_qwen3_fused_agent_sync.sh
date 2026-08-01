@@ -35,7 +35,12 @@ Options:
   --micro-batch-size N                   Training micro-batch size.
   --update-weights-interval N            Rollout weight update interval. Default: 1.
   --rollout-num-gpus-per-engine N        Tensor-parallel GPUs per rollout engine. Default: 2.
+  --retrieval-backend local|serper       Set both train and eval backends (compatibility alias).
+  --train-retrieval-backend local|serper Training retrieval backend. Default: local.
+  --eval-retrieval-backend local|serper  Evaluation retrieval backend. Default: serper.
+  --retrieval-concurrency N              Concurrent retrieval requests. Default: 176.
   --retrieval-mode MODE                  Retrieval mode env.
+  --retrieval-cache-size N               Cross-episode retrieval LRU entries. Default: 4096.
   --retrieval-max-words N                Retrieval max words env.
   --retrieval-retry-budget N             Retrieval retry env.
   --retrieval-summary-retry-budget N     Retrieval summary retry env.
@@ -88,6 +93,7 @@ Options:
   --grm-max-input-tokens N               Maximum GRM input content tokens. Default: 131072.
   --max-steps N                          Fused agent max steps. Default: 96.
   --mcp-max-steps N                      Fused MCP max steps. Default: 96.
+  --mcp-max-tool-calls-per-turn N        Maximum MCP calls emitted in one assistant turn. Default: 8.
   --web-search-max-steps N               Fused web-search max steps. Default: 96.
   --cli-max-steps N                      CLI fused agent max steps env.
   --trajectory-timeout N                 Fused trajectory timeout env.
@@ -96,7 +102,7 @@ Options:
   --eval-config PATH                     Structured slime eval dataset config. Overrides generated benchmarks.
   --eval-prompt-data NAME PATH [...]     Legacy eval dataset name/path pairs.
   --eval-benchmarks-root PATH             Benchmark root used to generate the default eval config.
-  --eval-include LIST                    Comma-separated default eval benchmarks. Default: search_r1,medqa,gpqa_diamond.
+  --eval-include LIST                    Comma-separated default eval benchmarks. Default: asearcher.
   --eval-exclude LIST                    Comma-separated eval benchmarks to exclude.
   --eval-limit-per-benchmark N           Use the first N examples per benchmark. Default: 0 (all).
   --eval-temperature X                   Eval-only sampling temperature. Default: 0.6.
@@ -106,8 +112,8 @@ Options:
   --eval-max-response-len N              Eval-only max generated tokens. Default: 38000.
   --eval-max-prompt-len N                Eval-only max prompt tokens. Default: 2048.
   --eval-max-context-len N               Eval-only context length. Default: 40960.
-  --eval-initial-inflight-tasks N        Initial scheduled eval trajectories. Default: 384.
-  --eval-max-inflight-tasks N            Adaptive eval hard limit. Default: 576.
+  --eval-initial-inflight-tasks N        Initial scheduled eval trajectories. Default: 128.
+  --eval-max-inflight-tasks N            Adaptive eval hard limit. Default: 256.
   --eval-adaptive-concurrency BOOL       Adjust eval concurrency from engine metrics. Default: true.
   --eval-mix-datasets BOOL               Interleave eval benchmarks under one inflight budget. Default: true.
   --eval-termination-retry-times N       Retry non-env_done eval trajectories. Default: 4.
@@ -117,9 +123,10 @@ Options:
   --val_before_train BOOL                Run one eval before training starts. Default: true.
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
   --offload-train BOOL                   Offload trainer model between phases. Disabled by --release-train.
-  --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: true.
+  --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: false.
   --max-tool-output-length N             Fused max tool output length env.
   --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 128.
+  --sglang-router-request-timeout-secs N Router request timeout. Default: 21600.
   --sglang-max-running-requests N        SGLang max running requests. Default: 64.
   --colocate / --no-colocate             Share trainer and rollout GPUs with offload. Default: enabled.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
@@ -151,6 +158,15 @@ DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-8}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
+TRAIN_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND:-${RETRIEVAL_BACKEND:-local}}"
+EVAL_RETRIEVAL_BACKEND="${EVAL_RETRIEVAL_BACKEND:-serper}"
+RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-256}"
+RETRIEVAL_MODE="${RETRIEVAL_MODE:-${RLLM_RETRIEVAL_MODE:-hybrid}}"
+RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE:-4096}"
+SERPER_SERVER_HOST="${SERPER_SERVER_HOST:-127.0.0.1}"
+SERPER_SERVER_PORT="${SERPER_SERVER_PORT:-65433}"
+SERPER_SEARCH_URL="${SERPER_SEARCH_URL:-http://10.2.152.50:9999/search}"
+EVAL_SERPER_SERVICE_PID=""
 TAIL_GUARD="${TAIL_GUARD:-False}"
 TAIL_GUARD_TIME_GUARD="${TAIL_GUARD_TIME_GUARD:-True}"
 TAIL_GUARD_TIME_MULTIPLIER="${TAIL_GUARD_TIME_MULTIPLIER:-1.05}"
@@ -158,6 +174,7 @@ TAIL_GUARD_TIME_SLACK_SECONDS="${TAIL_GUARD_TIME_SLACK_SECONDS:-16}"
 TAIL_GUARD_MIN_COMPLETION_RATIO="${TAIL_GUARD_MIN_COMPLETION_RATIO:-0.60}"
 CREDIT_ASSIGNMENT_ENABLE="${CREDIT_ASSIGNMENT_ENABLE:-True}"
 CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR="${CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR:-True}"
+CREDIT_ASSIGNMENT_THINK_PARSER_ERROR="${CREDIT_ASSIGNMENT_THINK_PARSER_ERROR:-True}"
 CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY="${CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY:-True}"
 CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS="${CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS:-True}"
 CREDIT_ASSIGNMENT_NGRAM_REPETITION="${CREDIT_ASSIGNMENT_NGRAM_REPETITION:-True}"
@@ -168,6 +185,8 @@ CREDIT_ASSIGNMENT_SEARCH_BYPASS="${CREDIT_ASSIGNMENT_SEARCH_BYPASS:-True}"
 CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL:-True}"
 CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER:-True}"
 CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP:-False}"
+CREDIT_ASSIGNMENT_MAX_TURNS="${CREDIT_ASSIGNMENT_MAX_TURNS:-True}"
+CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN:-True}"
 HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"
 LR="${LR:-1e-6}"
@@ -181,6 +200,7 @@ FUSED_HORIZON_REWARD_TARGET_STEPS="${FUSED_HORIZON_REWARD_TARGET_STEPS:-32}"
 FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS="${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-}"
 MAX_STEPS="${MAX_STEPS:-64}"
 MCP_MAX_STEPS="${MCP_MAX_STEPS:-64}"
+MCP_MAX_TOOL_CALLS_PER_TURN="${MCP_MAX_TOOL_CALLS_PER_TURN:-8}"
 WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-64}"
 CLI_MAX_STEPS="${CLI_MAX_STEPS:-64}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
@@ -191,10 +211,11 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Queued HTTP requests do not consume the running batch's KV allocation.
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-128}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
+SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-20}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-}"
-EVAL_INCLUDE_BENCHMARKS="${EVAL_INCLUDE_BENCHMARKS:-search_r1}"
+EVAL_INCLUDE_BENCHMARKS="${EVAL_INCLUDE_BENCHMARKS:-asearcher}"
 EVAL_EXCLUDE_BENCHMARKS="${EVAL_EXCLUDE_BENCHMARKS:-}"
 EVAL_LIMIT_PER_BENCHMARK="${EVAL_LIMIT_PER_BENCHMARK:-0}"
 EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-0.6}"
@@ -203,22 +224,22 @@ EVAL_TOP_K="${EVAL_TOP_K:--1}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-2048}"
 EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-38000}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-40960}"
-EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-384}"
-EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-576}"
+EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-128}"
+EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-256}"
 EVAL_ADAPTIVE_CONCURRENCY="${EVAL_ADAPTIVE_CONCURRENCY:-true}"
 EVAL_MIX_DATASETS="${EVAL_MIX_DATASETS:-true}"
 EVAL_TERMINATION_RETRY_TIMES="${EVAL_TERMINATION_RETRY_TIMES:-4}"
 EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-1}"
 EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES:-true}"
 NATIVE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION:-true}"
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-false}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
 # Resolve the offload default after CLI parsing so --colocate/--no-colocate also
 # changes it. Release-train overrides this below because it replaces the trainer
 # actor instead of pausing it.
 OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-}}"
-RELEASE_TRAIN="${RELEASE_TRAIN:-true}"
+RELEASE_TRAIN="${RELEASE_TRAIN:-false}"
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
 GRM_MODEL="${GRM_MODEL:-google/gemini-3-flash-preview}"
@@ -255,7 +276,12 @@ while [ "$#" -gt 0 ]; do
       --micro-batch-size) MICRO_BATCH_SIZE="${2:?Missing value for --micro-batch-size}"; shift 2 ;;
       --update-weights-interval) UPDATE_WEIGHTS_INTERVAL="${2:?Missing value for --update-weights-interval}"; shift 2 ;;
       --rollout-num-gpus-per-engine) ROLLOUT_NUM_GPUS_PER_ENGINE="${2:?Missing value for --rollout-num-gpus-per-engine}"; shift 2 ;;
+      --retrieval-backend) TRAIN_RETRIEVAL_BACKEND="${2:?Missing value for --retrieval-backend}"; EVAL_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND}"; shift 2 ;;
+      --train-retrieval-backend) TRAIN_RETRIEVAL_BACKEND="${2:?Missing value for --train-retrieval-backend}"; shift 2 ;;
+      --eval-retrieval-backend) EVAL_RETRIEVAL_BACKEND="${2:?Missing value for --eval-retrieval-backend}"; shift 2 ;;
+      --retrieval-concurrency) RETRIEVAL_CONCURRENCY="${2:?Missing value for --retrieval-concurrency}"; shift 2 ;;
       --retrieval-mode) RLLM_RETRIEVAL_MODE="${2:?Missing value for --retrieval-mode}"; shift 2 ;;
+      --retrieval-cache-size) RETRIEVAL_CACHE_SIZE="${2:?Missing value for --retrieval-cache-size}"; shift 2 ;;
       --retrieval-max-words) RLLM_RETRIEVAL_MAX_WORDS="${2:?Missing value for --retrieval-max-words}"; shift 2 ;;
       --retrieval-retry-budget) RLLM_RETRIEVAL_RETRY_BUDGET="${2:?Missing value for --retrieval-retry-budget}"; shift 2 ;;
       --retrieval-summary-retry-budget) RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET="${2:?Missing value for --retrieval-summary-retry-budget}"; shift 2 ;;
@@ -283,6 +309,8 @@ while [ "$#" -gt 0 ]; do
       --credit-assignment-direct-submit-without-tool) CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${2:?Missing value for --credit-assignment-direct-submit-without-tool}"; shift 2 ;;
       --credit-assignment-mixed-tool-and-answer) CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${2:?Missing value for --credit-assignment-mixed-tool-and-answer}"; shift 2 ;;
       --credit-assignment-tail-guard-early-stop) CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${2:?Missing value for --credit-assignment-tail-guard-early-stop}"; shift 2 ;;
+      --credit-assignment-max-turns) CREDIT_ASSIGNMENT_MAX_TURNS="${2:?Missing value for --credit-assignment-max-turns}"; shift 2 ;;
+      --credit-assignment-max-response-len) CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${2:?Missing value for --credit-assignment-max-response-len}"; shift 2 ;;
       --horizon-reward-shaping) HORIZON_REWARD_SHAPING="${2:?Missing value for --horizon-reward-shaping}"; shift 2 ;;
       --horizon-reward-min-multiplier) FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${2:?Missing value for --horizon-reward-min-multiplier}"; shift 2 ;;
       --horizon-reward-gamma) FUSED_HORIZON_REWARD_GAMMA="${2:?Missing value for --horizon-reward-gamma}"; shift 2 ;;
@@ -315,6 +343,7 @@ while [ "$#" -gt 0 ]; do
       --grm-failure-reward) GRM_FAILURE_REWARD="${2:?Missing value for --grm-failure-reward}"; shift 2 ;;
       --max-steps) MAX_STEPS="${2:?Missing value for --max-steps}"; shift 2 ;;
       --mcp-max-steps) MCP_MAX_STEPS="${2:?Missing value for --mcp-max-steps}"; shift 2 ;;
+      --mcp-max-tool-calls-per-turn) MCP_MAX_TOOL_CALLS_PER_TURN="${2:?Missing value for --mcp-max-tool-calls-per-turn}"; shift 2 ;;
       --web-search-max-steps) WEB_SEARCH_MAX_STEPS="${2:?Missing value for --web-search-max-steps}"; shift 2 ;;
       --cli-max-steps) CLI_MAX_STEPS="${2:?Missing value for --cli-max-steps}"; shift 2 ;;
       --trajectory-timeout) TRAJECTORY_TIMEOUT="${2:?Missing value for --trajectory-timeout}"; shift 2 ;;
@@ -355,6 +384,7 @@ while [ "$#" -gt 0 ]; do
       --max-tool-output-length) MAX_TOOL_OUTPUT_LENGTH="${2:?Missing value for --max-tool-output-length}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
+      --sglang-router-request-timeout-secs) SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${2:?Missing value for --sglang-router-request-timeout-secs}"; shift 2 ;;
       --colocate) COLOCATE=true; shift ;;
       --no-colocate) COLOCATE=false; shift ;;
       --experiment-name) EXPERIMENT_NAME="${2:?Missing value for --experiment-name}"; shift 2 ;;
@@ -406,6 +436,25 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
+source "${SCRIPT_DIR}/lib/retrieval_backend.sh"
+RETRIEVAL_MODE="${RLLM_RETRIEVAL_MODE:-${RETRIEVAL_MODE}}"
+RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND}"
+configure_retrieval_backend
+TRAIN_RETRIEVAL_SERVER_URL="${RETRIEVAL_SERVER_URL}"
+if [ -n "${EVAL_RETRIEVAL_SERVER_URL+x}" ]; then EVAL_RETRIEVAL_SERVER_URL_EXPLICIT=true; else EVAL_RETRIEVAL_SERVER_URL_EXPLICIT=false; fi
+case "${EVAL_RETRIEVAL_BACKEND}" in
+   local) EVAL_RETRIEVAL_SERVER_URL="${EVAL_RETRIEVAL_SERVER_URL:-http://10.2.152.50:65432}" ;;
+   serper) EVAL_RETRIEVAL_SERVER_URL="${EVAL_RETRIEVAL_SERVER_URL:-http://${SERPER_SERVER_HOST}:${SERPER_SERVER_PORT}}" ;;
+   *) echo "Unsupported --eval-retrieval-backend ${EVAL_RETRIEVAL_BACKEND}; expected local or serper." >&2; exit 2 ;;
+esac
+export TRAIN_RETRIEVAL_SERVER_URL EVAL_RETRIEVAL_SERVER_URL
+if [ "${EVAL_RETRIEVAL_BACKEND}" = "serper" ] && [ -z "${SERPER_PROXY_TOKEN:-}" ]; then
+   echo "SERPER_PROXY_TOKEN is required for Serper interval evals" >&2
+   exit 2
+fi
+if [ "${EVAL_RETRIEVAL_BACKEND}" = "serper" ]; then
+   export SERPER_PROXY_TOKEN SERPER_SEARCH_URL
+fi
 BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 RUNS_ROOT="${RUNS_ROOT:-/share/nlp/share/gem/runs}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
@@ -763,7 +812,7 @@ MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-24576}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$(((MAX_CONTEXT_LEN + CP_SIZE - 1) / CP_SIZE))}"
 LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
-LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-1024}"
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-4096}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 # Keep enough candidate groups queued to feed the default four TP2 rollout
 # engines without generating the much larger surplus created by a batch of 64.
@@ -771,7 +820,7 @@ OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-16}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
-NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-200}"
 EFFECTIVE_GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT / NUM_STEPS_PER_ROLLOUT))}"
 ENABLE_DYNAMIC_SAMPLING_FILTER="${ENABLE_DYNAMIC_SAMPLING_FILTER:-true}"
 DYNAMIC_SAMPLING_FILTER_PATH="${DYNAMIC_SAMPLING_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
@@ -1061,11 +1110,11 @@ fi
 GRPO_ARGS=(
    --advantage-estimator "${ADVANTAGE_ESTIMATOR:-grpo}"
    --kl-coef "${KL_COEF}"
-   --kl-loss-coef "${KL_LOSS_COEF:-0.001}"
+   --kl-loss-coef "${KL_LOSS_COEF:-0.00}"
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF:-0.00}"
    --eps-clip "${EPS_CLIP:-0.2}"
-   --eps-clip-high "${EPS_CLIP_HIGH:-0.28}"
+   --eps-clip-high "${EPS_CLIP_HIGH:-0.6}"
 )
 if is_truthy "${USE_KL_LOSS:-1}"; then
    GRPO_ARGS+=(--use-kl-loss)
@@ -1103,11 +1152,11 @@ OPTIMIZER_ARGS=(
 )
 
 # Colocated SGLang shares each GPU with residual trainer allocations during
-# weight synchronization. A 0.9 static pool needs about 71 GiB on an 80 GiB
-# GPU and cannot resume when the trainer is still using roughly 18 GiB.
+# weight synchronization. Keep the static pool at 0.6 so KV/CUDA graph resume
+# has enough headroom while trainer CUDA allocations are still being released.
 if [ -z "${SGLANG_MEM_FRACTION_STATIC:-}" ]; then
    if is_truthy "${COLOCATE}"; then
-      SGLANG_MEM_FRACTION_STATIC=0.8
+      SGLANG_MEM_FRACTION_STATIC=0.6
    else
       SGLANG_MEM_FRACTION_STATIC="${GPU_MEMORY_UTILIZATION:-0.9}"
    fi
@@ -1117,10 +1166,11 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
    --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
    --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}"
+   --sglang-router-request-timeout-secs "${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS}"
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
    --sglang-context-length "${MAX_CONTEXT_LEN}"
    --sglang-enable-deterministic-inference
-   --sglang-attention-backend flashinfer
+   --sglang-attention-backend triton
    --sglang-disable-custom-all-reduce
    --sglang-disable-piecewise-cuda-graph
    --router-policy "${ROUTER_POLICY}"
@@ -1196,10 +1246,7 @@ export SLIME_FUSED_REQUIRE_WEIGHT_VERSION="${SLIME_FUSED_REQUIRE_WEIGHT_VERSION:
 
 # Fused-agent service knobs inherited from the rllm launcher. They are runtime
 # env only; current slime code consumes the subset used by selected generators.
-export RETRIEVAL_SERVER_URL="${RETRIEVAL_SERVER_URL:-http://10.2.152.50:65432}"
-export RLLM_RETRIEVAL_MODE="${RLLM_RETRIEVAL_MODE:-hybrid}"
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
-export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-${RLLM_RETRIEVAL_MAX_RESULTS:-4}}"
 export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-3}"
 # Summarize is a ~2s LLM call per search with a large retry budget; on slow
 # trajectories it stacks up and blows the 180s rollout collection timeout,
@@ -1232,6 +1279,7 @@ export FUSED_DISABLE_THINKING="${DISABLE_THINKING}"
 export FUSED_DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING}"
 export FUSED_MAX_STEPS="${FUSED_MAX_STEPS:-${MAX_STEPS}}"
 export FUSED_MCP_MAX_STEPS="${FUSED_MCP_MAX_STEPS:-${MCP_MAX_STEPS}}"
+export FUSED_MCP_MAX_TOOL_CALLS_PER_TURN="${MCP_MAX_TOOL_CALLS_PER_TURN}"
 export FUSED_WEB_SEARCH_MAX_STEPS="${FUSED_WEB_SEARCH_MAX_STEPS:-${WEB_SEARCH_MAX_STEPS}}"
 export FUSED_CLI_MAX_STEPS="${CLI_MAX_STEPS}"
 export FUSED_TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT}"
@@ -1247,6 +1295,7 @@ export SLIME_FUSED_TAIL_GUARD_TIME_SLACK_SECONDS="${TAIL_GUARD_TIME_SLACK_SECOND
 export SLIME_FUSED_TAIL_GUARD_MIN_COMPLETION_RATIO="${TAIL_GUARD_MIN_COMPLETION_RATIO}"
 export CREDIT_ASSIGNMENT_ENABLE="${CREDIT_ASSIGNMENT_ENABLE}"
 export CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR="${CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR}"
+export CREDIT_ASSIGNMENT_THINK_PARSER_ERROR="${CREDIT_ASSIGNMENT_THINK_PARSER_ERROR}"
 export CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY="${CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY}"
 export CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS="${CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS}"
 export CREDIT_ASSIGNMENT_NGRAM_REPETITION="${CREDIT_ASSIGNMENT_NGRAM_REPETITION}"
@@ -1257,6 +1306,8 @@ export CREDIT_ASSIGNMENT_SEARCH_BYPASS="${CREDIT_ASSIGNMENT_SEARCH_BYPASS}"
 export CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL}"
 export CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER}"
 export CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP}"
+export CREDIT_ASSIGNMENT_MAX_TURNS="${CREDIT_ASSIGNMENT_MAX_TURNS}"
+export CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN}"
 export FUSED_FILTER_MIN_MEAN_STEPS="${FUSED_FILTER_MIN_MEAN_STEPS:-0}"
 export FUSED_FILTER_MIN_MCP_MEAN_STEPS="${FUSED_FILTER_MIN_MCP_MEAN_STEPS:-0}"
 export FUSED_FILTER_MAX_ABNORMAL_RATIO="${FUSED_FILTER_MAX_ABNORMAL_RATIO:-0}"
@@ -1283,7 +1334,8 @@ keys = (
     "RAY_WARN_BLOCKING_GET_INSIDE_ASYNC", "TOKENIZERS_PARALLELISM",
     "VLLM_ALLOW_LONG_MAX_MODEL_LEN", "VLLM_ENGINE_ITERATION_TIMEOUT_S",
     "VLLM_WORKER_MULTIPROC_METHOD", "PYTORCH_CUDA_ALLOC_CONF",
-    "RETRIEVAL_SERVER_URL", "RLLM_RETRIEVAL_MODE", "RLLM_RETRIEVAL_MAX_WORDS",
+    "RETRIEVAL_SERVER_URL", "TRAIN_RETRIEVAL_SERVER_URL", "EVAL_RETRIEVAL_SERVER_URL", "SERPER_PROXY_TOKEN", "SERPER_SEARCH_URL", "RLLM_RETRIEVAL_MODE", "RLLM_RETRIEVAL_MAX_WORDS",
+    "RLLM_RETRIEVAL_CONCURRENCY", "RLLM_RETRIEVAL_CACHE_SIZE",
     "RETRIEVAL_MAX_RESULTS", "RLLM_RETRIEVAL_SUMMARIZE",
     "FUSED_WEBQA_MIN_UNIQUE_SEARCHES",
     "RLLM_RETRIEVAL_RETRY_BUDGET", "RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET",
@@ -1297,19 +1349,21 @@ keys = (
     "RLLM_MCP_MAX_ACTIVE_SERVERS", "RLLM_MCP_PREFILTER_WORKERS", "RLLM_MCP_DISABLE_STEP_PENALTY",
     "FUSED_HARNESS", "FUSED_UNIFIED_SYSTEM_PROMPT", "FUSED_DISABLE_THINKING",
     "FUSED_DISCARD_HISTORICAL_THINKING",
-    "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS", "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
+    "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS", "FUSED_MCP_MAX_TOOL_CALLS_PER_TURN",
+    "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "SLIME_ROLLOUT_GROUP_TIMEOUT", "SLIME_EVAL_ROLLOUT_GROUP_TIMEOUT",
     "PER_STEP_MAX_TOKENS", "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH",
     "SLIME_FUSED_TERMINAL_LOG_STYLE", "SLIME_FUSED_PROGRESS_LOGS",
     "SLIME_FUSED_TAIL_GUARD", "SLIME_FUSED_TAIL_GUARD_TIME_GUARD",
     "SLIME_FUSED_TAIL_GUARD_TIME_MULTIPLIER", "SLIME_FUSED_TAIL_GUARD_TIME_SLACK_SECONDS",
     "SLIME_FUSED_TAIL_GUARD_MIN_COMPLETION_RATIO",
-    "CREDIT_ASSIGNMENT_ENABLE", "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR",
+    "CREDIT_ASSIGNMENT_ENABLE", "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR", "CREDIT_ASSIGNMENT_THINK_PARSER_ERROR",
     "CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY", "CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS",
     "CREDIT_ASSIGNMENT_NGRAM_REPETITION", "CREDIT_ASSIGNMENT_NGRAM_REPETITION_N",
     "CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD", "CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS",
     "CREDIT_ASSIGNMENT_SEARCH_BYPASS", "CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL",
     "CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER", "CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP",
+    "CREDIT_ASSIGNMENT_MAX_TURNS", "CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN",
     "FUSED_FILTER_MIN_MEAN_STEPS", "FUSED_FILTER_MIN_MCP_MEAN_STEPS",
     "FUSED_FILTER_MAX_ABNORMAL_RATIO",
     "FUSED_HORIZON_REWARD_MIN_MULTIPLIER", "FUSED_HORIZON_REWARD_GAMMA",
@@ -1347,9 +1401,9 @@ echo "Actor GPUs: ${ACTOR_GPUS}, actor TP=${TP_SIZE}, CP=${CP_SIZE}, PP=${PP_SIZ
 echo "Training token budgets: max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}, log_probs_max_tokens_per_gpu=${LOG_PROBS_MAX_TOKENS_PER_GPU}, log_probs_chunk_size=${LOG_PROBS_CHUNK_SIZE}, max_context_len=${MAX_CONTEXT_LEN}"
 echo "YaRN: enable=${ENABLE_YARN}, factor=${YARN_FACTOR}, original_max_position_embeddings=${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
 echo "SGLang: mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}, server_concurrency=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}"
-echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
+echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, mcp_max_tool_calls_per_turn=${FUSED_MCP_MAX_TOOL_CALLS_PER_TURN}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
 echo "Training batches: micro_batch=${MICRO_BATCH_SIZE}, num_steps_per_rollout=${NUM_STEPS_PER_ROLLOUT}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}, rollout_temperature=${TEMPERATURE}"
-echo "Retrieval: mode=${RLLM_RETRIEVAL_MODE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RLLM_RETRIEVAL_RETRY_BUDGET}, summary_retry=${RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RLLM_RETRIEVAL_LEXRANK_FALLBACK}"
+echo "Retrieval: train_backend=${TRAIN_RETRIEVAL_BACKEND}, train_url=${TRAIN_RETRIEVAL_SERVER_URL}, eval_backend=${EVAL_RETRIEVAL_BACKEND}, eval_url=${EVAL_RETRIEVAL_SERVER_URL}, mode=${RLLM_RETRIEVAL_MODE}, concurrency=${RLLM_RETRIEVAL_CONCURRENCY}, cache_size=${RLLM_RETRIEVAL_CACHE_SIZE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RETRIEVAL_RETRY_BUDGET}, summary_retry=${RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RETRIEVAL_LEXRANK_FALLBACK}"
 echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, relax_after_groups=${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}"
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, benchmarks=${EVAL_INCLUDE_BENCHMARKS}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, temperature=${EVAL_TEMPERATURE}, top_p=${EVAL_TOP_P}, top_k=${EVAL_TOP_K}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}"
 echo "Eval scheduling: inflight=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS}, adaptive=${EVAL_ADAPTIVE_CONCURRENCY}, mix_datasets=${EVAL_MIX_DATASETS}, termination_retries=${EVAL_TERMINATION_RETRY_TIMES}, trajectory_sample_rate=${EVAL_TRAJECTORY_SAMPLE_RATE}, dump_failures=${EVAL_DUMP_FAILURES}, native_session=${NATIVE_SGLANG_SESSION}"
@@ -1428,6 +1482,33 @@ else
    CLUSTER_ARGS+=(--no-offload-train)
 fi
 
+start_managed_retrieval_backend
+start_managed_eval_serper() {
+   if [ "${EVAL_RETRIEVAL_BACKEND}" != "serper" ] || [ "${EVAL_RETRIEVAL_SERVER_URL_EXPLICIT}" = "true" ]; then
+      return
+   fi
+   python3 "${REPO_ROOT}/examples/search-r1/serper_search_server.py" \
+      --host "${SERPER_SERVER_HOST}" --port "${SERPER_SERVER_PORT}" \
+      >"${LOG_ROOT}/eval_serper_search_server.log" 2>&1 &
+   EVAL_SERPER_SERVICE_PID=$!
+   trap 'if [ -n "${EVAL_SERPER_SERVICE_PID}" ]; then kill "${EVAL_SERPER_SERVICE_PID}" 2>/dev/null || true; fi' EXIT
+   python3 - "${EVAL_RETRIEVAL_SERVER_URL}" "${EVAL_SERPER_SERVICE_PID}" <<'PY'
+import json, os, sys, time, urllib.request
+url = sys.argv[1].rstrip('/') + '/health'
+pid = int(sys.argv[2])
+for _ in range(100):
+    if not os.path.exists(f'/proc/{pid}'):
+        break
+    try:
+        with urllib.request.urlopen(url, timeout=1) as response:
+            if json.load(response).get('status') == 'ok':
+                raise SystemExit(0)
+    except Exception:
+        time.sleep(0.1)
+raise SystemExit(f'Managed eval Serper service failed to start at {url}')
+PY
+}
+start_managed_eval_serper
 ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    --submission-id="${RAY_SUBMISSION_ID}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -391,7 +392,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     retrieval_max_results = int(os.environ.get("RETRIEVAL_MAX_RESULTS", "10" if rllm_deepresearch else "5"))
     env = FusedEnvironment(
         task,
-        retrieval_url=os.environ.get("RETRIEVAL_SERVER_URL"),
+        # Training and evaluation may intentionally use different retrieval services.
+        retrieval_url=os.environ.get(
+            "EVAL_RETRIEVAL_SERVER_URL" if evaluation else "TRAIN_RETRIEVAL_SERVER_URL",
+            os.environ.get("RETRIEVAL_SERVER_URL"),
+        ),
         retrieval_max_results=retrieval_max_results,
         enable_tools=not reasoning_only,
         search_gym=search_gym,
@@ -411,12 +416,21 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     discard_historical_thinking = not disable_thinking and _env_bool("FUSED_DISCARD_HISTORICAL_THINKING", False)
     prompt_equal_loss = not evaluation and getattr(args, "advantage_estimator", "grpo") in PROMPT_EQUAL_LOSS_ESTIMATORS
     max_context_tokens = _effective_sglang_context_limit(args)
-    max_tool_calls_per_turn = int(
-        os.environ.get("FUSED_MAX_TOOL_CALLS_PER_TURN", os.environ.get("MAX_TOOL_CALLS_PER_TURN", "4"))
+    global_max_tool_calls_per_turn = os.environ.get(
+        "FUSED_MAX_TOOL_CALLS_PER_TURN", os.environ.get("MAX_TOOL_CALLS_PER_TURN")
     )
+    if env.mode == "mcp":
+        max_tool_calls_per_turn = int(
+            os.environ.get("FUSED_MCP_MAX_TOOL_CALLS_PER_TURN", global_max_tool_calls_per_turn or "8")
+        )
+    else:
+        max_tool_calls_per_turn = int(global_max_tool_calls_per_turn or "4")
     credit_assignment_enable = _env_bool("CREDIT_ASSIGNMENT_ENABLE", True)
     credit_assignment_tool_parser_error = credit_assignment_enable and _env_bool(
         "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR", True
+    )
+    credit_assignment_think_parser_error = credit_assignment_enable and _env_bool(
+        "CREDIT_ASSIGNMENT_THINK_PARSER_ERROR", True
     )
     credit_assignment_repeated_search_query = credit_assignment_enable and _env_bool(
         "CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY", True
@@ -492,6 +506,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     env_time = 0.0
     pending_turns: list[dict[str, Any]] = []
     tito_prefix_ids: list[int] = []
+    tito_messages_snapshot: list[dict[str, Any]] | None = None
     trajectory_weight_version: str | None = None
     require_weight_version = not evaluation and _env_bool("SLIME_FUSED_REQUIRE_WEIGHT_VERSION", False)
     last_search_query: str | None = None
@@ -518,19 +533,26 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             # many concurrent trajectory coroutines actually overlap instead of
             # serializing on the single rollout event-loop thread (which
             # otherwise saturates one core and starves the SGLang engines).
-            prompt_ids = await asyncio.to_thread(
-                _render_prompt_ids,
-                state.tokenizer,
-                rollout_messages,
-                tools=tools,
-                disable_thinking=disable_thinking,
-            )
             if evaluation:
+                prompt_ids = await asyncio.to_thread(
+                    _render_prompt_ids,
+                    state.tokenizer,
+                    rollout_messages,
+                    tools=tools,
+                    disable_thinking=disable_thinking,
+                )
                 prompt_context_start_idx = None
                 tito_boundary_before = False
                 context_delta_ids = []
                 tito_context_reason = "evaluation"
             elif discard_historical_thinking and step_idx > 0:
+                prompt_ids = await asyncio.to_thread(
+                    _render_prompt_ids,
+                    state.tokenizer,
+                    rollout_messages,
+                    tools=tools,
+                    disable_thinking=disable_thinking,
+                )
                 prompt_context_start_idx = None
                 if _has_token_prefix(prompt_ids, tito_prefix_ids):
                     # Nothing was discarded from the served prefix this step
@@ -547,7 +569,41 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     tito_boundary_before = True
                     context_delta_ids = list(prompt_ids)
                     tito_context_reason = "historical_thinking_discard"
+            elif tito_prefix_ids and tito_messages_snapshot is not None and _tito_model_type(model_name) == "qwen3":
+                prompt_context_start_idx = None
+                try:
+                    context_delta_ids = await asyncio.to_thread(
+                        _render_qwen3_tito_delta_ids,
+                        state.tokenizer,
+                        tito_messages_snapshot,
+                        rollout_messages,
+                        tito_prefix_ids,
+                        disable_thinking=disable_thinking,
+                    )
+                except Exception:
+                    logger.exception("Qwen3 incremental TITO prompt construction failed; starting a new segment.")
+                    prompt_ids = await asyncio.to_thread(
+                        _render_prompt_ids,
+                        state.tokenizer,
+                        rollout_messages,
+                        tools=tools,
+                        disable_thinking=disable_thinking,
+                    )
+                    tito_boundary_before = True
+                    context_delta_ids = list(prompt_ids)
+                    tito_context_reason = "tito_incremental_tokenization_failed"
+                else:
+                    prompt_ids = list(tito_prefix_ids) + context_delta_ids
+                    tito_boundary_before = False
+                    tito_context_reason = "append_delta"
             else:
+                prompt_ids = await asyncio.to_thread(
+                    _render_prompt_ids,
+                    state.tokenizer,
+                    rollout_messages,
+                    tools=tools,
+                    disable_thinking=disable_thinking,
+                )
                 prompt_context_start_idx = None
                 tito_boundary_before = bool(tito_prefix_ids) and not _has_token_prefix(prompt_ids, tito_prefix_ids)
                 if tito_boundary_before:
@@ -782,6 +838,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     tito_prefix_ids.extend(context_delta_ids)
                     tito_prefix_ids.extend(output_ids)
             messages.append(assistant_msg)
+            if not evaluation:
+                # The exact generated output ids already live in tito_prefix_ids.
+                # Keep only the semantic message snapshot needed to prove that the
+                # next request is append-only; never re-tokenize this assistant turn.
+                tito_messages_snapshot = copy.deepcopy(messages)
 
             if detect_abnormal_trajectories and finish_reason == "length":
                 final_done = True
@@ -859,12 +920,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     )
                     break
             if rllm_deepresearch:
-                if not actions or all(action.name == "finish" for action in actions):
-                    env.answer = (
-                        str(actions[-1].arguments.get("result") or actions[-1].arguments.get("answer") or "")
-                        if actions
-                        else response
-                    )
+                if not actions:
+                    env.answer = response
                     final_reward = env.compute_final_reward(require_tool_evidence=False)
                     final_done = True
                     last_info = {"termination_reason": "rllm_dr_no_tool_call", "reward_debug": env.reward_debug}
@@ -873,6 +930,30 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             observation=observation,
                             response=response,
                             action="",
+                            reward=final_reward,
+                            done=True,
+                            messages=rollout_messages if capture_eval_details else [],
+                            tito_context_reason=tito_context_reason,
+                            historical_thinking_discarded=historical_thinking_discarded,
+                            llm_time=step_llm_time,
+                            env_time=0.0,
+                            disable_thinking=disable_thinking,
+                        )
+                    )
+                    break
+
+                if all(action.name == "finish" for action in actions):
+                    env.answer = str(
+                        actions[-1].arguments.get("result") or actions[-1].arguments.get("answer") or ""
+                    )
+                    final_reward = env.compute_final_reward(require_tool_evidence=False)
+                    final_done = True
+                    last_info = {"termination_reason": "env_done", "reward_debug": env.reward_debug}
+                    trajectory_steps.append(
+                        _episode_step(
+                            observation=observation,
+                            response=response,
+                            action="".join(parser.format_action(action) for action in actions),
                             reward=final_reward,
                             done=True,
                             messages=rollout_messages if capture_eval_details else [],
@@ -987,6 +1068,39 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 if final_done:
                     break
                 continue
+
+            if (
+                detect_abnormal_trajectories
+                and credit_assignment_think_parser_error
+                and _has_unclosed_think(response)
+                and not _response_has_malformed_tool_call(response)
+            ):
+                final_reward = 0.0
+                final_done = True
+                credit_event = "think_parser_error"
+                credit_step_index = len(pending_turns) - 1
+                last_info = {
+                    "termination_reason": "ABNORMAL_THINK_PARSE_ERROR",
+                    "credit_assignment_event": credit_event,
+                    "credit_assignment_error_step_index": credit_step_index,
+                    "think_parser_error_count": 1,
+                }
+                trajectory_steps.append(
+                    _episode_step(
+                        observation=observation,
+                        response=response,
+                        action="",
+                        reward=0.0,
+                        done=True,
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
+                        llm_time=step_llm_time,
+                        env_time=0.0,
+                        disable_thinking=disable_thinking,
+                    )
+                )
+                break
 
             if not actions:
                 if detect_abnormal_trajectories and credit_assignment_tool_parser_error:
@@ -1532,7 +1646,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         "fused_rollout_logprob_invalid_ratio": 0.0,
         "fused_tito_boundary_count": sum(bool(item["turn"].tito_boundary_before) for item in pending_turns),
         "fused_tito_exact_prefix_turns": sum(reason in {"initial", "append_delta"} for reason in tito_reasons),
+        "fused_tito_incremental_turns": tito_reasons.count("append_delta"),
         "fused_tito_prompt_prefix_mismatch_turns": tito_reasons.count("prompt_prefix_mismatch"),
+        "fused_tito_incremental_tokenization_failed_turns": tito_reasons.count("tito_incremental_tokenization_failed"),
     }
     if prompt_equal_loss:
         instance_id = (base_sample.metadata or {}).get("instance_id")
@@ -2099,6 +2215,18 @@ def _response_tag_imbalances(
     return imbalances
 
 
+def _has_unclosed_think(response: str) -> bool:
+    """Return whether a response opens more ``<think>`` blocks than it closes."""
+    markers = re.findall(r"<think>|</think>", response, flags=re.IGNORECASE)
+    depth = 0
+    for marker in markers:
+        if marker.lower() == "<think>":
+            depth += 1
+        elif depth > 0:
+            depth -= 1
+    return depth > 0
+
+
 def _parser_error_action_span(response: str) -> tuple[int, int] | None:
     span = _first_unclosed_tool_call_span(response)
     if span is not None:
@@ -2310,7 +2438,7 @@ def _credit_assignment_loss_mask(
         start, end = action_span
         if 0 <= start < end <= output_len:
             return apply_base([0] * start + [1] * (end - start) + [0] * (output_len - end))
-    if credit_event == "tool_parser_error" and turn_index == credit_step_index:
+    if credit_event in {"tool_parser_error", "think_parser_error"} and turn_index == credit_step_index:
         trained_len = max(0, min(output_len, parser_error_token_window))
         return apply_base([0] * (output_len - trained_len) + [1] * trained_len)
     if credit_event == "max_response_len_exceeded" and turn_index == credit_step_index:
@@ -2473,6 +2601,76 @@ def _render_prompt_ids(
     elif isinstance(rendered, dict):
         rendered = rendered["input_ids"]
     return list(rendered)
+
+
+def _render_qwen3_tito_delta_ids(
+    tokenizer,
+    old_messages: list[dict[str, Any]],
+    new_messages: list[dict[str, Any]],
+    prefix_ids: list[int],
+    *,
+    disable_thinking: bool,
+) -> list[int]:
+    """Encode only the Qwen3 chat-template suffix added since the last turn.
+
+    The caller prepends these ids to the exact prompt/output ids served on the
+    previous turn. This avoids decoding and re-tokenizing generated assistant
+    tokens, whose thinking whitespace can be canonicalized by Qwen3's template.
+    """
+    if len(new_messages) < len(old_messages) or new_messages[: len(old_messages)] != old_messages:
+        raise ValueError("Qwen3 TITO requires append-only message history")
+
+    appended_messages = new_messages[len(old_messages) :]
+    if not appended_messages:
+        raise ValueError("Qwen3 TITO continuation has no appended messages")
+    unsupported_roles = [message.get("role") for message in appended_messages if message.get("role") not in {"tool", "user"}]
+    if unsupported_roles:
+        raise ValueError(f"Qwen3 TITO cannot append message roles {unsupported_roles!r}")
+
+    dummy_system = {"role": "system", "content": "slime tito anchor"}
+    rendered_base = _apply_chat_template(
+        tokenizer,
+        [dummy_system],
+        tokenize=False,
+        add_generation_prompt=False,
+        disable_thinking=disable_thinking,
+    )
+    rendered_with_delta = _apply_chat_template(
+        tokenizer,
+        [dummy_system, *appended_messages],
+        tokenize=False,
+        add_generation_prompt=True,
+        disable_thinking=disable_thinking,
+    )
+    rendered_base = str(rendered_base)
+    rendered_with_delta = str(rendered_with_delta)
+    if not rendered_with_delta.startswith(rendered_base):
+        raise ValueError("Qwen3 chat template did not produce an append-only rendered suffix")
+
+    suffix = rendered_with_delta[len(rendered_base) :]
+    encoded = tokenizer.encode(suffix, add_special_tokens=False)
+    if hasattr(encoded, "tolist"):
+        encoded = encoded.tolist()
+    encoded = [int(token_id) for token_id in encoded]
+
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    newline_ids = tokenizer.encode("\n", add_special_tokens=False)
+    if hasattr(newline_ids, "tolist"):
+        newline_ids = newline_ids.tolist()
+    newline_ids = [int(token_id) for token_id in newline_ids]
+    if im_end_id is None or im_end_id == getattr(tokenizer, "unk_token_id", None) or not newline_ids:
+        raise ValueError("Qwen3 tokenizer cannot encode the assistant turn boundary")
+
+    # SGLang may include or omit the stop token from output_ids. Complete the
+    # historical assistant boundary exactly once before appending tool/user text.
+    im_end_id = int(im_end_id)
+    if len(prefix_ids) >= len(newline_ids) + 1 and prefix_ids[-len(newline_ids) - 1 :] == [im_end_id, *newline_ids]:
+        bridge_ids: list[int] = []
+    elif prefix_ids and prefix_ids[-1] == im_end_id:
+        bridge_ids = newline_ids
+    else:
+        bridge_ids = [im_end_id, *newline_ids]
+    return bridge_ids + encoded
 
 
 def _last_assistant_context_start_idx(

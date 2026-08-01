@@ -32,9 +32,9 @@ def test_retrieval_request_supports_existing_aliases():
     assert serper_request.result_limit() == 4
 
 
-def test_retrieval_request_defaults_to_eight_results_and_caps_larger_requests():
-    assert serper.RetrievalRequest(query="apple inc").result_limit() == 8
-    assert serper.RetrievalRequest(query="apple inc", max_results=20).result_limit() == 8
+def test_retrieval_request_defaults_to_ten_results_and_caps_larger_requests():
+    assert serper.RetrievalRequest(query="apple inc").result_limit() == 10
+    assert serper.RetrievalRequest(query="apple inc", max_results=20).result_limit() == 10
 
 
 def test_retrieval_request_supports_batches_and_rejects_empty_queries():
@@ -110,7 +110,7 @@ def test_evals_exposes_serper_as_retrieval_backend():
     assert "--retrieval-backend local|serper" in script
     assert 'python3 "${REPO_ROOT}/examples/search-r1/serper_search_server.py"' in script
     assert 'export RETRIEVAL_SERVER_URL="${RETRIEVAL_SERVER_URL:-http://10.2.152.50:65432}"' in script
-    assert 'serper:*) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-8}"' in script
+    assert 'serper:*) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-10}"' in script
 
 
 if __name__ == "__main__":

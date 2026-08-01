@@ -21,6 +21,7 @@ from slime.rollout.fused_agent.generate import (
     _format_tool_observation,
     _initial_messages,
     _last_assistant_context_start_idx,
+    _render_qwen3_tito_delta_ids,
     _render_prompt_ids,
     _default_response_loss_mask,
     _valid_tool_names,
@@ -82,6 +83,21 @@ class FakeChatTemplateTokenizer:
 
     def decode(self, ids, skip_special_tokens=False):
         return "".join(chr(i) for i in ids)
+
+
+class FakeQwen3ChatTemplateTokenizer(FakeChatTemplateTokenizer):
+    name_or_path = "/models/Qwen3-8B"
+    unk_token_id = -1
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(character) for character in text]
+
+    def convert_tokens_to_ids(self, token):
+        if token == "<|im_end|>":
+            # The character tokenizer represents the special token literally;
+            # use a dedicated id so boundary completion is easy to assert.
+            return 0x10FFFF
+        return self.unk_token_id
 
 
 class FakeGemma4Tokenizer:
@@ -453,6 +469,30 @@ def test_make_tool_parser_selects_by_model_name():
     # Qwen3 (and anything else) keeps the JSON parser unchanged.
     assert type(make_tool_parser("/share/nlp/share/plm/Qwen3-4B")) is QwenToolParser
     assert type(make_tool_parser(None)) is QwenToolParser
+
+
+def test_qwen_parser_ignores_tool_tags_inside_thinking_and_requires_closed_calls():
+    parser = make_tool_parser("Qwen3-8B", valid_tools={"web_search"})
+    response = (
+        "<think>do not execute <tool_call>{\"name\":\"web_search\",\"arguments\":{}}</tool_call></think>"
+        "<tool_call>{\"name\":\"web_search\",\"arguments\":{\"query\":\"q\"}}</tool_call>"
+    )
+    calls = parser.parse(response)
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "q"}
+
+    assert parser.parse('<tool_call>{"name":"web_search","arguments":{"query":"q"}}') == []
+
+
+def test_qwen_parser_does_not_execute_malformed_arguments_and_repairs_only_trailing_comma():
+    parser = make_tool_parser("Qwen3-8B", valid_tools={"web_search"})
+    malformed = '<tool_call>{"name":"web_search","arguments":["q"]}</tool_call>'
+    assert parser.parse(malformed) == []
+
+    repaired = '<tool_call>{"name":"web_search","arguments":{"query":"q",}}</tool_call>'
+    calls = parser.parse(repaired)
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "q"}
 
 
 def test_qwen3_coder_parser_parses_xml_calls_with_schema_coercion():
@@ -1724,6 +1764,52 @@ def test_render_prompt_ids_controls_thinking_by_default():
     assert tokenizer.enable_thinking_values == [False, True]
 
 
+def test_qwen3_tito_delta_preserves_raw_assistant_token_prefix():
+    tokenizer = FakeQwen3ChatTemplateTokenizer(drift_assistant_end=True)
+    old_messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "<think> raw spacing </think>\n<tool_call>{}</tool_call>"},
+    ]
+    new_messages = [
+        *old_messages,
+        {"role": "user", "content": "<tool_response>result</tool_response>"},
+    ]
+    raw_prefix = [11, 12, 13]
+
+    delta = _render_qwen3_tito_delta_ids(
+        tokenizer,
+        old_messages,
+        new_messages,
+        raw_prefix,
+        disable_thinking=False,
+    )
+    merged = raw_prefix + delta
+
+    assert merged[: len(raw_prefix)] == raw_prefix
+    assert delta[0] == tokenizer.convert_tokens_to_ids("<|im_end|>")
+    assert "<tool_response>result</tool_response>" in tokenizer.decode(delta[2:])
+    assert tokenizer.decode(delta[2:]).endswith("<|im_start|>assistant\n")
+
+
+def test_qwen3_tito_delta_rejects_history_rewrite():
+    tokenizer = FakeQwen3ChatTemplateTokenizer()
+    old_messages = [{"role": "user", "content": "original"}]
+    rewritten_messages = [
+        {"role": "user", "content": "rewritten"},
+        {"role": "user", "content": "next"},
+    ]
+
+    with pytest.raises(ValueError, match="append-only"):
+        _render_qwen3_tito_delta_ids(
+            tokenizer,
+            old_messages,
+            rewritten_messages,
+            [1, 2, 3],
+            disable_thinking=False,
+        )
+
+
 def test_context_span_rendering_uses_same_thinking_control():
     class FakeTokenizer:
         def __init__(self):
@@ -2633,7 +2719,7 @@ def test_web_search_falls_back_to_one_for_malformed_max_results(monkeypatch):
         env.step(fused_generate.ToolCall("web_search", {"query": "q", "max_results": "10\n</<|im_start|>user>"}))
     )
 
-    assert observation.startswith("[Result 1] Title: Doc\nSnippet: fallback0 fallback1")
+    assert observation.startswith("[Result 1] Title: Doc\nContent: fallback0 fallback1")
     assert reward == 0.0
     assert done is False
     assert info["tools/search_calls"] == 1
@@ -3762,8 +3848,24 @@ def test_rllm_deepresearch_eval_runs_searches_and_finish(monkeypatch):
     assert all(item[2] == 10 for item in searches)
     assert result[0].response == finish
     assert result[0].reward == 1.0
-    assert result[0].metadata["fused_termination"] == "rllm_dr_no_tool_call"
+    assert result[0].metadata["fused_termination"] == "env_done"
     assert result[0].metadata["fused_tool_call_turns"] == 2
+
+
+def test_rllm_deepresearch_eval_keeps_no_tool_call_termination():
+    response = "I cannot find enough information."
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label="Paris", metadata={"question": "Where?"}),
+        [{"text": response}],
+        {
+            "FUSED_HARNESS": "rllm_deepresearch",
+            "RETRIEVAL_SERVER_URL": "http://retriever",
+        },
+        evaluation=True,
+    )
+
+    assert result[0].response == response
+    assert result[0].metadata["fused_termination"] == "rllm_dr_no_tool_call"
 
 
 def test_rllm_deepresearch_eval_accepts_multiple_tool_calls(monkeypatch):
@@ -3794,7 +3896,7 @@ def test_rllm_deepresearch_eval_accepts_multiple_tool_calls(monkeypatch):
     )
 
     assert searches == ["alpha", "beta"]
-    assert result[0].metadata["fused_termination"] == "rllm_dr_no_tool_call"
+    assert result[0].metadata["fused_termination"] == "env_done"
 
 
 def test_rllm_deepresearch_eval_stops_on_duplicate_search(monkeypatch):
@@ -4152,6 +4254,31 @@ def test_long_horizon_visualization_keeps_actions_unmasked_under_assistant_repla
     for index, panel in enumerate(segment_view.renderables[:-1]):
         assert f"drift evidence query {index:02d}" in panel.renderable.plain
     assert '"name":"finish"' in segment_view.renderables[-1].renderable.plain
+
+
+def test_qwen3_incremental_tito_avoids_assistant_replay_drift_segments():
+    tool_turns = [_search_call(f"evidence query {index}") for index in range(3)]
+    finish = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"\\\\boxed{answer}"}}</tool_call>'
+    tokenizer = FakeQwen3ChatTemplateTokenizer(drift_assistant_end=True)
+    prompt_ids_seen: list[list[int]] = []
+
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Find evidence"}),
+        [{"text": text} for text in [*tool_turns, finish]],
+        {"CREDIT_ASSIGNMENT_ENABLE": "False", "FUSED_MAX_STEPS": "8"},
+        tokenizer=tokenizer,
+        prompt_ids_seen=prompt_ids_seen,
+    )
+
+    assert len(result) == 1
+    assert result[0].metadata["segment_count"] == 1
+    assert result[0].metadata["fused_tito_boundary_count"] == 0
+    assert result[0].metadata["fused_tito_incremental_turns"] == 3
+    assert result[0].metadata["fused_tito_prompt_prefix_mismatch_turns"] == 0
+    assert result[0].metadata["fused_tito_incremental_tokenization_failed_turns"] == 0
+    for previous_prompt, generated_text, next_prompt in zip(prompt_ids_seen, tool_turns, prompt_ids_seen[1:]):
+        exact_previous_prefix = previous_prompt + [ord(character) for character in generated_text]
+        assert next_prompt[: len(exact_previous_prefix)] == exact_previous_prefix
 
 
 def test_group_visualization_orders_and_renders_every_segment_without_fuzzy_matching():
@@ -4731,6 +4858,42 @@ def test_eval_accepts_multiple_tool_calls_in_one_response(tmp_path: Path):
     assert sample.metadata["fused_termination"] == "env_done"
     assert "eval_response_anomalies" not in sample.metadata
     assert sample.metadata["fused_tool_call_turns"] == 1
+
+
+def test_mcp_accepts_eight_tool_calls_per_turn_at_configured_limit(tmp_path: Path):
+    calls = "".join(_echo_call(f"call{i}") for i in range(8))
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Use eight tools"),
+        [{"text": calls}, {"text": _finish_call()}],
+        {
+            "CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD": "1.0",
+            "FUSED_MCP_MAX_TOOL_CALLS_PER_TURN": "8",
+        },
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["fused_tool_call_turns"] == 1
+
+
+def test_mcp_rejects_more_than_eight_tool_calls_per_turn(tmp_path: Path):
+    calls = "".join(_echo_call(f"call{i}") for i in range(9))
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Use too many tools"),
+        [{"text": calls}],
+        {
+            "CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS": "True",
+            "FUSED_MCP_MAX_TOOL_CALLS_PER_TURN": "8",
+        },
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.metadata["fused_termination"] == "ABNORMAL_TOOL_BURST"
+    assert sample.metadata["credit_assignment_event"] == "too_many_tool_calls"
 
 
 def test_eval_rejects_ngram_repetition(tmp_path: Path):

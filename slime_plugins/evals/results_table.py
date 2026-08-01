@@ -93,7 +93,7 @@ def _render_table(rows: list[tuple[str, dict[str, float | str]]]) -> str:
     metric_keys = _table_metric_keys(rows)
     columns = (
         _BENCHMARK_COLUMN,
-        *[(f"{key.replace('/', ' ')} (%)", _METRIC_COLUMN_WIDTH, ">") for key in metric_keys],
+        *[(f"% {key} (±)", _METRIC_COLUMN_WIDTH, ">") for key in metric_keys],
         *[(header, width, align) for header, _, width, align in _COUNT_COLUMNS],
         *[(header, width, align) for header, _, width, align in _TERMINATION_COLUMNS],
     )
@@ -103,7 +103,12 @@ def _render_table(rows: list[tuple[str, dict[str, float | str]]]) -> str:
     lines = [header, heavy_rule]
     for index, row in enumerate(rows):
         name, metrics = row
-        values = tuple(_format_metric(metrics[key]) if key in metrics else "" for key in metric_keys)
+        values = tuple(
+            _format_metric(metrics[f"{key}/mean"], metrics[f"{key}/std"])
+            if f"{key}/mean" in metrics and f"{key}/std" in metrics
+            else ""
+            for key in metric_keys
+        )
         counts = tuple(_format_count(metrics[key]) if key in metrics else "" for _, key, _, _ in _COUNT_COLUMNS)
         terminations = tuple(str(metrics.get(key, "")) for _, key, _, _ in _TERMINATION_COLUMNS)
         lines.append(_render_cells((name, *values, *counts, *terminations), columns))
@@ -119,8 +124,8 @@ def _render_cells(values: tuple[str, ...], columns: tuple[tuple[str, int, str], 
     return "  ".join(cells)
 
 
-def _format_metric(value: float | str) -> str:
-    return f"{float(value) * 100:.1f}"
+def _format_metric(mean: float | str, std: float | str) -> str:
+    return f"{float(mean) * 100:.1f} (±{float(std) * 100:.1f})"
 
 
 def _format_count(value: float | str) -> str:
@@ -139,18 +144,17 @@ def _is_table_metric_key(key: str) -> bool:
 
 def _table_metric_keys(rows: list[tuple[str, dict[str, float | str]]]) -> list[str]:
     non_metric_keys = {"steps", "tool_calls", *(column[1] for column in _TERMINATION_COLUMNS)}
-    keys = {key for _, metrics in rows for key in metrics if key not in non_metric_keys}
+    keys = {key.rsplit("/", 1)[0] for _, metrics in rows for key in metrics if key not in non_metric_keys}
     return sorted(keys, key=_metric_key_sort_key)
 
 
-def _metric_key_sort_key(key: str) -> tuple[int, int, int]:
-    match = re.fullmatch(r"pass([@^])(\d+)/(mean|std)", key)
+def _metric_key_sort_key(key: str) -> tuple[int, int]:
+    match = re.fullmatch(r"pass([@^])(\d+)", key)
     if match is None:
-        return (2, 0, 0)
-    symbol, k, stat = match.groups()
+        return (2, 0)
+    symbol, k = match.groups()
     symbol_order = 0 if symbol == "@" else 1
-    stat_order = 0 if stat == "mean" else 1
-    return (symbol_order, int(k), stat_order)
+    return (symbol_order, int(k))
 
 
 def _format_termination_counts(samples: list[Any], group_size: int) -> dict[str, str]:

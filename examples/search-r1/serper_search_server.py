@@ -13,9 +13,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+# Upstream Serper proxy; the local /retrieve adapter listens on its own host/port.
 DEFAULT_SEARCH_URL = "http://10.2.152.50:9999/search"
 DEFAULT_MAX_WORDS = 4096
-MAX_RESULTS = 8
+MAX_RESULTS = 10
 
 
 class RetrievalRequest(BaseModel):

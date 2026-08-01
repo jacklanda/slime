@@ -202,6 +202,7 @@ def _trajectory_table(trajectory: dict[str, Any], num_steps: int):
 
 
 def _print_step(console, step: dict[str, Any], step_idx: int, num_steps: int, *, max_chars: int) -> None:
+    from rich.console import Group
     from rich.panel import Panel
     from rich.table import Table
 
@@ -214,25 +215,26 @@ def _print_step(console, step: dict[str, Any], step_idx: int, num_steps: int, *,
     if timing:
         summary.add_row("time", _format_timing(timing))
 
+    thought, response = _step_thinking_and_response(step)
+    disable_thinking = _step_disables_thinking(step)
+    observation = _display_observation(step.get("observation"), max_chars=min(max_chars, 2000))
+
+    contents = [summary]
+    if thought or disable_thinking:
+        contents.append(_text_panel("Thinking", _strip_think_tags(thought), "yellow", max_chars=min(max_chars, 2000)))
+    if response:
+        contents.append(_text_panel("Actions", response, "magenta", max_chars=min(max_chars, 2000)))
+    if observation:
+        contents.append(_text_panel("Observation", observation, "grey70", max_chars=min(max_chars, 2000)))
+
     console.print(
         Panel(
-            summary,
+            Group(*contents),
             title=f"Step {step_idx + 1}/{num_steps}",
             border_style=_step_border_style(step),
             expand=True,
         )
     )
-
-    thought, response = _step_thinking_and_response(step)
-    disable_thinking = _step_disables_thinking(step)
-    observation = _display_observation(step.get("observation"), max_chars=min(max_chars, 2000))
-
-    if observation:
-        console.print(_text_panel("Observation", observation, "dim", max_chars=min(max_chars, 2000)))
-    if thought or disable_thinking:
-        console.print(_text_panel("Thinking", _strip_think_tags(thought), "yellow", max_chars=min(max_chars, 2000)))
-    if response:
-        console.print(_text_panel("Actions", response, "magenta", max_chars=min(max_chars, 2000)))
 
 
 def _trajectory_console(args):
@@ -736,12 +738,12 @@ def _plain_rllm_episode(
                 [
                     "",
                     f"Step {step_idx + 1}/{len(steps)} | reward={_format_reward_value(step.get('reward'))} | done={bool(step.get('done'))}",
-                    "Observation:",
-                    _clip_text(_display_observation(step.get("observation"), max_chars=max_chars), max_chars),
                     "Thinking:",
                     _clip_text(_strip_think_tags(thought), max_chars),
-                    "Action:",
+                    "Actions:",
                     _clip_text(response, max_chars),
+                    "Observation:",
+                    _clip_text(_display_observation(step.get("observation"), max_chars=max_chars), max_chars),
                 ]
             )
     lines.append("=" * 100)

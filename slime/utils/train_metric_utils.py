@@ -9,6 +9,11 @@ from slime.utils.timer import Timer
 
 logger = logging.getLogger(__name__)
 
+_TRAINER_TIMER_METRIC_NAMES = {
+    "train": "trainer_compute",
+    "train_wait": "trainer_idle",
+}
+
 
 def log_perf_data_raw(
     rollout_id: int,
@@ -24,7 +29,9 @@ def log_perf_data_raw(
     if not is_primary_rank:
         return
 
-    log_dict = {f"perf/{key}_time": val for key, val in log_dict_raw.items()}
+    log_dict = {
+        f"perf/{_TRAINER_TIMER_METRIC_NAMES.get(key, key)}_time": val for key, val in log_dict_raw.items()
+    }
     if extra_metrics:
         log_dict.update(extra_metrics)
 
@@ -42,12 +49,6 @@ def log_perf_data_raw(
             log_dict["perf/actor_train_tok_per_s"] = sum(timer_instance.seq_lens) / log_dict["perf/actor_train_time"]
             log_dict["train/mfu"] = log_dict["perf/actor_train_tflops"]
 
-    if "perf/train_wait_time" in log_dict and "perf/train_time" in log_dict:
-        total_time = log_dict["perf/train_wait_time"] + log_dict["perf/train_time"]
-        if total_time > 0:
-            log_dict["perf/step_time"] = total_time
-            log_dict["perf/wait_time_ratio"] = log_dict["perf/train_wait_time"] / total_time
-
     log_dict.update(_compute_rllm_timing_metrics(log_dict, timer_instance.seq_lens))
 
     logger.info(f"perf {rollout_id}: {log_dict}")
@@ -61,7 +62,6 @@ def _compute_rllm_timing_metrics(log_dict: dict, seq_lens: list[int]) -> dict[st
     timer_to_timing = {
         "perf/update_weights_time": "update_weights",
         "perf/actor_train_time": "update_actor",
-        "perf/step_time": "step",
         "perf/log_probs_time": "old_log_probs",
         "perf/adv_time": "adv",
     }
