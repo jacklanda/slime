@@ -30,6 +30,14 @@ async def _fake_generate_and_rm(_args, sample, _sampling_params, evaluation=Fals
     return sample
 
 
+async def _fake_generate_and_rm_with_one_error(_args, sample, _sampling_params, evaluation=False):
+    if sample.index == 1:
+        raise ValueError("bad Qwen3.5 trajectory")
+    sample.status = Sample.Status.COMPLETED
+    sample.reward = 1.0
+    return sample
+
+
 class _FakeGenerateState:
     aborted = False
 
@@ -61,6 +69,30 @@ def test_generate_group_timeout_returns_failed_tail_sample(monkeypatch):
     assert out[1].status == Sample.Status.FAILED
     assert out[1].reward == 0.0
     assert out[1].metadata["fused_error"] == "rollout_group_timeout"
+
+
+def test_generate_group_isolates_sample_exception(monkeypatch, caplog):
+    monkeypatch.setattr(sglang_rollout, "GenerateState", _FakeGenerateState)
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", _fake_generate_and_rm_with_one_error)
+    group = [Sample(index=0, prompt="a", reward=None), Sample(index=1, prompt="b", reward=None)]
+
+    with caplog.at_level("ERROR", logger="slime.rollout.sglang_rollout"):
+        out = asyncio.run(
+            sglang_rollout.generate_and_rm_group(
+                Namespace(sglang_enable_deterministic_inference=False, group_rm=False),
+                group,
+                sampling_params={},
+            )
+        )
+
+    assert out[0].status == Sample.Status.COMPLETED
+    assert out[0].reward == 1.0
+    assert out[1].status == Sample.Status.FAILED
+    assert out[1].reward == 0.0
+    assert out[1].metadata["fused_termination"] == "rollout_task_exception"
+    assert out[1].metadata["rollout_exception_type"] == "ValueError"
+    assert out[1].metadata["rollout_exception"] == "bad Qwen3.5 trajectory"
+    assert "bad Qwen3.5 trajectory" in caplog.text
 
 
 class _FakeRolloutGenerateState:

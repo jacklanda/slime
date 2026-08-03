@@ -24,7 +24,7 @@ from slime.rollout.rm_hub.f1 import normalize_answer
 from .docker_env import DockerTaskEnvironment, is_et_task
 from .parser import ToolCall, tool_schema
 from .prompts import finish_schema, web_search_schema
-from .search_gym import access_schema, search_schema
+from .search_gym import search_schema
 
 logger = logging.getLogger(__name__)
 
@@ -194,11 +194,76 @@ def _atlas_read_only() -> bool:
 
 
 WEB_SEARCH_OBSERVATION_MAX_WORDS = 256
+RAG_CONTEXT_MAX_WORDS = 1024
 _RETRIEVAL_CHUNK_WORD_BUDGET = 256
 _MIN_RETRIEVAL_DOC_WORDS = 25
-_SUMMARY_REQUEST_MAX_WORDS = 2048
-_MIN_SUMMARY_REQUEST_MAX_WORDS = 128
-_SUMMARY_MAX_REDUCTION_ROUNDS = 4
+SUMMARY_MAX_INPUT_WORDS = 8192
+SUMMARY_MAX_INPUT_CHARS = 32768
+SUMMARY_MAX_NEW_TOKENS = 512
+SUMMARY_OPENROUTER_MODEL = "qwen/qwen3-30b-a3b-instruct-2507"
+SUMMARY_PROMPT = """Summarize these search results into a self-contained summary of at most 300 tokens. Preserve names, dates, numbers, and relationships.
+Do not exhaustively enumerate repetitive records. Aggregate repeated rows into ranges, counts, trends, and representative examples.
+Only state an exact count if it is explicitly present in the input; do not infer counts by manually counting a long list.
+End with a complete sentence.
+
+{documents}"""
+
+
+def _is_cjk(char: str) -> bool:
+    codepoint = ord(char)
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x20000 <= codepoint <= 0x2FA1F
+        or 0x1100 <= codepoint <= 0x11FF
+        or 0x3040 <= codepoint <= 0x30FF
+        or 0x3130 <= codepoint <= 0x318F
+        or 0x31F0 <= codepoint <= 0x31FF
+        or 0xA960 <= codepoint <= 0xA97F
+        or 0xAC00 <= codepoint <= 0xD7AF
+        or 0xD7B0 <= codepoint <= 0xD7FF
+        or 0xFF66 <= codepoint <= 0xFF9D
+    )
+
+
+def _summary_units(text: str) -> int:
+    units = 0
+    in_word = False
+    for char in text:
+        if _is_cjk(char):
+            units += 1
+            in_word = False
+        elif char.isalnum():
+            if not in_word:
+                units += 1
+            in_word = True
+        else:
+            in_word = False
+    return units
+
+
+def _limit_summary_input(text: str) -> str:
+    units = 0
+    in_word = False
+    output: list[str] = []
+    for char in text:
+        if len(output) >= SUMMARY_MAX_INPUT_CHARS:
+            break
+        if _is_cjk(char):
+            next_units = units + 1
+            next_in_word = False
+        elif char.isalnum():
+            next_units = units + (0 if in_word else 1)
+            next_in_word = True
+        else:
+            next_units = units
+            next_in_word = False
+        if next_units > SUMMARY_MAX_INPUT_WORDS:
+            break
+        output.append(char)
+        units, in_word = next_units, next_in_word
+    return "".join(output).rstrip()
 
 
 def _now_monotonic() -> float:
@@ -590,6 +655,8 @@ class FusedEnvironment:
         retrieval_max_results: int = 5,
         enable_tools: bool = True,
         search_gym: bool = False,
+        deepsearch_world: bool = False,
+        rag: bool = False,
     ):
         self.task = normalize_task(task)
         self.mode = resolve_task_mode(self.task)
@@ -597,10 +664,13 @@ class FusedEnvironment:
         self.retrieval_max_results = retrieval_max_results
         self.enable_tools = enable_tools
         self.search_gym = search_gym
+        self.deepsearch_world = deepsearch_world
+        self.rag = rag
         self.answer = ""
         self.tool_calls = 0
         self.web_search_queries: set[str] = set()
         self.web_search_cache: dict[str, Any] = {}
+        self.deepsearch_page_cache: dict[str, str] = {}
         self.reward_debug: dict[str, Any] = {}
         if enable_tools and self.mode == "mcp":
             self.mcp_tools = AtlasMCPToolset(self.task) if _is_atlas_mcp_task(self.task) else LocalMCPToolset(self.task)
@@ -653,8 +723,12 @@ class FusedEnvironment:
         if self.mode in {"cli", "et"} and self.docker_env is not None:
             return self.docker_env.schemas()
         if self.mode == "web_search":
+            if self.deepsearch_world:
+                from .deepsearch_world import tools
+
+                return tools()
             if self.search_gym:
-                return [search_schema(), access_schema(), finish_schema()]
+                return [search_schema()]
             return [web_search_schema(), finish_schema()]
         return [finish_schema()]
 
@@ -684,10 +758,10 @@ class FusedEnvironment:
             reward = self.compute_final_reward()
             return "Submitted.", reward, True, {"reward_debug": self.reward_debug}
         self.tool_calls += 1
-        if self.mode == "web_search" and name in {"web_search", "search"}:
+        if self.mode == "web_search" and name in {"web_search", "search", "web_search_wiki"}:
             return await self._step_web_search(args)
-        if self.mode == "web_search" and self.search_gym and name == "access":
-            return await self._step_web_access(args)
+        if self.mode == "web_search" and self.deepsearch_world and name == "visit_wiki":
+            return await self._step_deepsearch_visit(args)
         if self.mode == "mcp" and self.mcp_tools is not None:
             if self.mcp_tools.load_error:
                 return f"Error: MCP tools failed to load: {self.mcp_tools.load_error}", 0.0, False, {"tools/load_error": 1}
@@ -709,23 +783,24 @@ class FusedEnvironment:
             return self.docker_env.step(name, args)
         return f"Error: tool {name} is not available for task mode {self.mode}", 0.0, False, {}
 
-    async def _step_web_access(self, args: dict[str, Any]) -> tuple[str, float, bool, dict[str, Any]]:
+    async def _step_deepsearch_visit(self, args: dict[str, Any]) -> tuple[str, float, bool, dict[str, Any]]:
         url = str(args.get("url") or "").strip()
         if not url:
-            return "<information>\nNo More Information is Found for this URL.\n</information>", 0.0, False, {}
+            return "Error: visit_wiki requires a URL returned by web_search_wiki.", 0.0, False, {}
+        cached = self.deepsearch_page_cache.get(url)
+        if cached:
+            return cached, 0.0, False, {"tools/visit_cache_hit": 1}
         try:
-            async with _get_shared_http_session().post(
-                _normalize_access_url(self.retrieval_url), json={"urls": [url]}
-            ) as response:
+            async with _get_shared_http_session().post(_normalize_access_url(self.retrieval_url), json={"urls": [url]}) as response:
                 response.raise_for_status()
                 payload = await response.json()
             result = (payload.get("result") or [{}])[0] or {}
-            page = str(result.get("contents") or result.get("page") or "")[:250000]
+            page = str(result.get("contents") or result.get("page") or "").strip()
             if not page:
-                page = "No More Information is Found for this URL."
-            return f"<information>\n>>>> Page 1 >>>>\n\n{page}\n</information>", 0.0, False, {"tools/access_calls": self.tool_calls}
+                return "Error: no page content was returned for this URL.", 0.0, False, {"tools/visit_empty": 1}
+            return page, 0.0, False, {"tools/visit_calls": 1}
         except Exception as exc:
-            return f"<information>\nNo More Information is Found for this URL.\n</information>\nAccess failed: {type(exc).__name__}: {exc}", 0.0, False, {"tools/access_failed": 1}
+            return f"Error: visit_wiki failed: {type(exc).__name__}: {exc}", 0.0, False, {"tools/visit_failed": 1}
 
     async def _step_web_search(self, args: dict[str, Any]) -> tuple[str, float, bool, dict[str, Any]]:
         query = str(args.get("query") or "")
@@ -784,6 +859,13 @@ class FusedEnvironment:
             metrics["tools/search_retrieve_elapsed_s"] = _now_monotonic() - retrieve_started_at
 
         documents, format_metadata = _format_retrieval_documents(data, max_results=max_results)
+        if self.deepsearch_world:
+            urls = _collect_urls(data)
+            for index, document in enumerate(documents):
+                url = urls[index] if index < len(urls) else f"local://retrieval/{len(self.deepsearch_page_cache) + 1}"
+                if os.environ.get("DEEPSEARCH_WORLD_VISIT_MODE", "cache") == "cache":
+                    self.deepsearch_page_cache[url] = document
+                documents[index] = f"{document}\nURL: {url}"
         content = "\n\n".join(documents)
         summary_used = False
         if use_summary_requested:
@@ -825,7 +907,13 @@ class FusedEnvironment:
                 **format_metadata,
             }
         )
-        word_budget = WEB_SEARCH_OBSERVATION_MAX_WORDS if summary_used else _RETRIEVAL_CHUNK_WORD_BUDGET
+        word_budget = (
+            int(os.environ.get("RAG_CONTEXT_MAX_WORDS", str(RAG_CONTEXT_MAX_WORDS)))
+            if self.rag
+            else WEB_SEARCH_OBSERVATION_MAX_WORDS
+            if summary_used
+            else _RETRIEVAL_CHUNK_WORD_BUDGET
+        )
         return _limit_words(content, max_words=word_budget), 0.0, False, metrics
 
     def compute_final_reward(self, *, require_tool_evidence: bool = True) -> float:
@@ -1125,58 +1213,75 @@ async def _summarize_with_retries(
     documents: list[str],
     *,
     retry_budget: int,
-    request_max_words: int | None = None,
-    reduction_round: int = 0,
 ) -> tuple[str | None, int]:
-    request_budget = max(
-        _MIN_SUMMARY_REQUEST_MAX_WORDS,
-        request_max_words if request_max_words is not None else int(os.environ.get("RLLM_RETRIEVAL_SUMMARY_MAX_WORDS_PER_REQUEST", str(_SUMMARY_REQUEST_MAX_WORDS))),
-    )
+    documents_text = _limit_summary_input("\n\n".join(documents))
     summary_url = _normalize_summary_url(retrieval_url)
-    batches = _build_summary_batches(documents, max_words=request_budget)
-    partial_summaries: list[str] = []
-    retries_used = 0
-    try:
-        for batch in batches:
-            payload = {"documents": [{"content": document} for document in batch], "max_length": WEB_SEARCH_OBSERVATION_MAX_WORDS}
-            summary_data, batch_retries = await _post_json_with_retries(
-                session,
-                summary_url,
-                payload,
-                retry_budget=retry_budget,
-            )
-            retries_used += batch_retries
-            candidate = str((summary_data or {}).get("summary", "")).split("# Summary:", 1)[-1].strip()
-            if not candidate:
-                return None, retries_used
-            partial_summaries.append(candidate)
-    except Exception as e:
-        if reduction_round < _SUMMARY_MAX_REDUCTION_ROUNDS and request_budget > _MIN_SUMMARY_REQUEST_MAX_WORDS and _is_summary_length_error(e):
-            fallback_summary, fallback_retries = await _summarize_with_retries(
-                session,
-                retrieval_url,
-                documents,
-                retry_budget=retry_budget,
-                request_max_words=max(_MIN_SUMMARY_REQUEST_MAX_WORDS, request_budget // 2),
-                reduction_round=reduction_round + 1,
-            )
-            return fallback_summary, retries_used + fallback_retries
-        raise
-
-    if len(partial_summaries) == 1:
-        return partial_summaries[0], retries_used
-    if reduction_round >= _SUMMARY_MAX_REDUCTION_ROUNDS:
-        return _limit_words("\n\n".join(partial_summaries)), retries_used
-
-    merged_summary, merge_retries = await _summarize_with_retries(
+    if os.environ.get("RLLM_RETRIEVAL_SUMMARY_BACKEND", "local").strip().lower() == "openrouter":
+        return await _summarize_openrouter_batch(session, documents_text, retry_budget=retry_budget)
+    payload = {"documents": [{"content": documents_text}], "max_length": SUMMARY_MAX_NEW_TOKENS}
+    summary_data, retries = await _post_json_with_retries(
         session,
-        retrieval_url,
-        [f"[Partial Summary {idx}] {summary}" for idx, summary in enumerate(partial_summaries, start=1)],
+        summary_url,
+        payload,
         retry_budget=retry_budget,
-        request_max_words=request_budget,
-        reduction_round=reduction_round + 1,
     )
-    return merged_summary, retries_used + merge_retries
+    candidate = str((summary_data or {}).get("summary", "")).split("# Summary:", 1)[-1].strip()
+    return candidate or None, retries
+
+
+async def _summarize_openrouter_batch(
+    session: aiohttp.ClientSession,
+    documents: str,
+    *,
+    retry_budget: int,
+) -> tuple[str | None, int]:
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is required for the OpenRouter summary backend")
+    payload = {
+        "model": os.environ.get("RLLM_RETRIEVAL_SUMMARY_MODEL", SUMMARY_OPENROUTER_MODEL),
+        "messages": [{"role": "user", "content": SUMMARY_PROMPT.format(documents=documents)}],
+        "max_tokens": SUMMARY_MAX_NEW_TOKENS,
+        "temperature": 0,
+        "reasoning": {"enabled": False},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "search_summary",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"summary": {"type": "string"}},
+                    "required": ["summary"],
+                },
+            },
+        },
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    url = os.environ.get("RLLM_RETRIEVAL_SUMMARY_OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
+    last_error: Exception | None = None
+    for attempt in range(retry_budget + 1):
+        try:
+            async with session.post(url, json=payload, headers=headers) as response:
+                if response.status >= 400:
+                    raise RuntimeError(f"OpenRouter summary HTTP {response.status}: {(await response.text())[:1000]}")
+                response_data = await response.json(content_type=None)
+                choice = ((response_data or {}).get("choices") or [{}])[0] or {}
+                if choice.get("finish_reason") == "length":
+                    return None, attempt
+                content = (choice.get("message") or {}).get("content")
+                if not isinstance(content, str):
+                    return None, attempt
+                parsed = json.loads(content)
+                summary = parsed.get("summary") if isinstance(parsed, dict) else None
+                return (str(summary).strip() if isinstance(summary, str) else None), attempt
+        except Exception as exc:
+            last_error = exc
+            if attempt >= retry_budget:
+                break
+    assert last_error is not None
+    raise last_error
 
 
 def _normalize_retrieve_url(retrieval_url: str) -> str:
@@ -1190,41 +1295,24 @@ def _normalize_access_url(retrieval_url: str) -> str:
     return f"{base}/access"
 
 
+def _collect_urls(value: Any) -> list[str]:
+    urls: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key.lower() in {"url", "link", "source_url"} and isinstance(item, str) and item.startswith("http"):
+                urls.append(item)
+            else:
+                urls.extend(_collect_urls(item))
+    elif isinstance(value, list):
+        for item in value:
+            urls.extend(_collect_urls(item))
+    return list(dict.fromkeys(urls))
+
+
 def _normalize_summary_url(retrieval_url: str) -> str:
     retrieval_url = retrieval_url.rstrip("/")
     base = retrieval_url[: -len("/retrieve")] if retrieval_url.endswith("/retrieve") else retrieval_url
     return f"{base}/summarize"
-
-
-def _build_summary_batches(documents: list[str], *, max_words: int) -> list[list[str]]:
-    batches: list[list[str]] = []
-    current_batch: list[str] = []
-    current_words = 0
-    for document in documents:
-        for chunk in _split_text_word_chunks(document, max_words=max_words):
-            chunk_words = len(chunk.split())
-            if current_batch and current_words + chunk_words > max_words:
-                batches.append(current_batch)
-                current_batch = []
-                current_words = 0
-            current_batch.append(chunk)
-            current_words += chunk_words
-    if current_batch:
-        batches.append(current_batch)
-    return batches or [["No relevant documents found."]]
-
-
-def _split_text_word_chunks(text: str, *, max_words: int) -> list[str]:
-    words = str(text or "").split()
-    if not words:
-        return [""]
-    if len(words) <= max_words:
-        return [" ".join(words)]
-    return [" ".join(words[start : start + max_words]) for start in range(0, len(words), max_words)]
-
-
-def _is_summary_length_error(error: Exception) -> bool:
-    return "longer than the maximum model length" in str(error).lower()
 
 
 def _format_retrieval_documents(data: Any, *, max_results: int) -> tuple[list[str], dict[str, Any]]:

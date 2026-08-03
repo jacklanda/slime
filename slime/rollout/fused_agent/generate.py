@@ -22,6 +22,10 @@ from slime.utils import http_utils
 from slime.utils.prompt_equal import PROMPT_EQUAL_LOSS_ESTIMATORS
 from slime.utils.types import Sample
 
+from . import deepsearch_world as dsw
+from .cut_bill import local_search_schema as cut_bill_search_schema
+from .cut_bill import run_search as run_cut_bill_search
+from .cut_bill import system_prompt as cut_bill_system_prompt
 from .env import FusedEnvironment, _format_retrieval, normalize_task, resolve_task_mode
 from .history import messages_without_historical_thinking as _messages_without_historical_thinking
 from .history import strip_trailing_chat_template_stop as _strip_trailing_chat_template_stop
@@ -29,6 +33,7 @@ from .parser import Gemma4ToolParser, ToolCall, make_tool_parser
 from .prompts import (
     COT_SYSTEM_PROMPT,
     COT_USER_PROMPT,
+    RAG_USER_PROMPT,
     FUSED_MCP_SYSTEM_PROMPT,
     FUSED_MCP_USER_PROMPT,
     FUSED_CLI_SYSTEM_PROMPT,
@@ -47,7 +52,7 @@ from .prompts import (
 )
 from .rllm_deepresearch import SEARCH_SYSTEM_PROMPT as RLLM_DR_SEARCH_SYSTEM_PROMPT
 from .rllm_deepresearch import local_search_schema, run_search as run_rllm_deepresearch_search
-from .search_gym import SEARCH_GYM_SYSTEM_PROMPT, SEARCH_GYM_USER_PROMPT, SearchGymToolParser
+from .search_gym import SEARCH_GYM_SYSTEM_PROMPT, SEARCH_GYM_USER_PROMPT
 
 logger = logging.getLogger(__name__)
 DEFAULT_SGLANG_CONTEXT_LENGTH_MARGIN = 256
@@ -387,9 +392,13 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     task = _task_from_sample(base_sample)
     harness = normalize_harness(os.environ.get("FUSED_HARNESS", getattr(args, "fused_harness", "gem")))
     rllm_deepresearch = harness == "rllm_deepresearch"
+    cut_bill = harness == "cut_bill"
+    research_search = rllm_deepresearch or cut_bill
     search_gym = harness == "search_gym"
-    reasoning_only = harness in {"cot", "bare"}
-    retrieval_max_results = int(os.environ.get("RETRIEVAL_MAX_RESULTS", "10" if rllm_deepresearch else "5"))
+    deepsearch_world = harness == "deepsearch_world"
+    rag = harness == "rag"
+    reasoning_only = harness in {"cot", "rag", "bare"}
+    retrieval_max_results = int(os.environ.get("RETRIEVAL_MAX_RESULTS", "10" if research_search else "5"))
     env = FusedEnvironment(
         task,
         # Training and evaluation may intentionally use different retrieval services.
@@ -400,20 +409,40 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         retrieval_max_results=retrieval_max_results,
         enable_tools=not reasoning_only,
         search_gym=search_gym,
+        deepsearch_world=deepsearch_world,
+        rag=rag,
     )
     observation, info = env.reset()
-    if rllm_deepresearch and env.mode != "web_search":
+    retrieved_context = ""
+    rag_retrieval_info: dict[str, Any] = {}
+    if rag:
+        if env.mode != "web_search":
+            env.close()
+            raise ValueError(f"rag only supports web-search tasks, got task mode {env.mode!r}")
+        retrieved_context, _, _, rag_retrieval_info = await env.step(
+            ToolCall("web_search", {"query": observation, "max_results": retrieval_max_results})
+        )
+    deepsearch_task = observation
+    if research_search and env.mode != "web_search":
         env.close()
-        raise ValueError(f"rllm_deepresearch only supports web-search tasks, got task mode {env.mode!r}")
+        raise ValueError(f"{harness} only supports web-search tasks, got task mode {env.mode!r}")
+    if deepsearch_world and env.mode != "web_search":
+        env.close()
+        raise ValueError(f"deepsearch_world only supports web-search tasks, got task mode {env.mode!r}")
     base_max_steps = int(
         os.environ.get(
-            "RLLM_DR_MAX_TURNS" if rllm_deepresearch else "FUSED_MAX_STEPS",
-            "48" if rllm_deepresearch else getattr(args, "fused_max_steps", "16"),
+            "DEEPSEARCH_WORLD_MAX_STEPS"
+            if deepsearch_world
+            else "CUT_BILL_MAX_TURNS" if cut_bill else "RLLM_DR_MAX_TURNS" if rllm_deepresearch else "FUSED_MAX_STEPS",
+            "30" if deepsearch_world else "48" if research_search else getattr(args, "fused_max_steps", "16"),
         )
     )
     per_step_max_tokens = int(os.environ.get("PER_STEP_MAX_TOKENS", str(sampling_params.get("max_new_tokens", 2048))))
-    disable_thinking = False if rllm_deepresearch else _env_bool("FUSED_DISABLE_THINKING", True)
+    disable_thinking = True if deepsearch_world else False if research_search else _env_bool("FUSED_DISABLE_THINKING", True)
     discard_historical_thinking = not disable_thinking and _env_bool("FUSED_DISCARD_HISTORICAL_THINKING", False)
+    strict_tito = not evaluation and _env_bool("SLIME_FUSED_STRICT_TITO", False)
+    if strict_tito and discard_historical_thinking:
+        raise ValueError("Strict TiTO requires append-only history; historical thinking cannot be discarded")
     prompt_equal_loss = not evaluation and getattr(args, "advantage_estimator", "grpo") in PROMPT_EQUAL_LOSS_ESTIMATORS
     max_context_tokens = _effective_sglang_context_limit(args)
     global_max_tool_calls_per_turn = os.environ.get(
@@ -462,20 +491,39 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     ngram_repetition_threshold = float(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD", "0.35"))
     ngram_repetition_min_tokens = int(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS", "128"))
     repeated_search_max_strikes = max(1, int(os.environ.get("FUSED_REPEATED_SEARCH_MAX_STRIKES", "2")))
-    detect_abnormal_trajectories = not evaluation and not rllm_deepresearch
-    detect_eval_response_anomalies = evaluation
+    detect_abnormal_trajectories = not evaluation and not research_search
+    detect_eval_response_anomalies = evaluation and not deepsearch_world
 
-    tools = [local_search_schema(), finish_schema()] if rllm_deepresearch else env.tools()
+    tools = [cut_bill_search_schema()] if cut_bill else [local_search_schema(), finish_schema()] if rllm_deepresearch else env.tools()
     model_name = getattr(state.tokenizer, "name_or_path", None) or getattr(args, "hf_checkpoint", None)
     parser = (
-        SearchGymToolParser(valid_tools=_valid_tool_names(tools))
-        if search_gym
-        else make_tool_parser(model_name, valid_tools=_valid_tool_names(tools))
+        dsw.DeepSearchWorldParser(valid_tools=_valid_tool_names(tools) | {"finish"})
+        if deepsearch_world
+        else make_tool_parser(
+            model_name,
+            valid_tools=_valid_tool_names(tools) | ({"finish"} if search_gym or cut_bill else set()),
+        )
     )
-    messages = _initial_messages(
-        harness, info.get("task_type", ""), observation, tools, model_name, tool_parser=parser
+    messages = (
+        dsw.plan_messages(observation)
+        if deepsearch_world
+        else _initial_messages(
+            harness,
+            info.get("task_type", ""),
+            observation,
+            tools,
+            model_name,
+            tool_parser=parser,
+            inline_tool_prompt=not _chat_template_accepts_native_tools(state.tokenizer),
+            retrieved_context=retrieved_context,
+        )
     )
-    max_steps = base_max_steps if rllm_deepresearch else _max_steps_for_mode(env.mode, base_max_steps)
+    render_tools = None if deepsearch_world or cut_bill else tools
+    max_steps = (
+        base_max_steps + 2
+        if deepsearch_world
+        else base_max_steps if research_search else _max_steps_for_mode(env.mode, base_max_steps)
+    )
     manager = (
         None
         if evaluation
@@ -489,7 +537,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             session_id,
             max_context_tokens or int(getattr(args, "rollout_max_context_len", 0) or 65536),
         )
-        if evaluation
+        if evaluation and not deepsearch_world
         else None
     )
     capture_eval_details = not evaluation or _should_capture_eval_trajectory(base_sample)
@@ -520,6 +568,10 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     credit_event: str | None = None
     credit_step_index: int | None = None
     eval_response_anomaly_info: dict[str, Any] = {}
+    deepsearch_phase = "plan"
+    deepsearch_state = dict(dsw.EMPTY_STATE)
+    deepsearch_steps: list[dict[str, Any]] = []
+    deepsearch_action_turns = 0
     try:
         for step_idx in range(max_steps):
             rollout_messages = (
@@ -538,7 +590,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     _render_prompt_ids,
                     state.tokenizer,
                     rollout_messages,
-                    tools=tools,
+                    tools=render_tools,
                     disable_thinking=disable_thinking,
                 )
                 prompt_context_start_idx = None
@@ -550,7 +602,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     _render_prompt_ids,
                     state.tokenizer,
                     rollout_messages,
-                    tools=tools,
+                    tools=render_tools,
                     disable_thinking=disable_thinking,
                 )
                 prompt_context_start_idx = None
@@ -569,7 +621,10 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     tito_boundary_before = True
                     context_delta_ids = list(prompt_ids)
                     tito_context_reason = "historical_thinking_discard"
-            elif tito_prefix_ids and tito_messages_snapshot is not None and _tito_model_type(model_name) == "qwen3":
+            elif tito_prefix_ids and tito_messages_snapshot is not None and _tito_model_type(model_name) in {
+                "qwen3",
+                "qwen3_5",
+            }:
                 prompt_context_start_idx = None
                 try:
                     context_delta_ids = await asyncio.to_thread(
@@ -580,13 +635,15 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         tito_prefix_ids,
                         disable_thinking=disable_thinking,
                     )
-                except Exception:
-                    logger.exception("Qwen3 incremental TITO prompt construction failed; starting a new segment.")
+                except Exception as exc:
+                    if strict_tito:
+                        raise RuntimeError("Strict TiTO incremental prompt construction failed") from exc
+                    logger.exception("Qwen3-family incremental TITO prompt construction failed; starting a new segment.")
                     prompt_ids = await asyncio.to_thread(
                         _render_prompt_ids,
                         state.tokenizer,
                         rollout_messages,
-                        tools=tools,
+                        tools=render_tools,
                         disable_thinking=disable_thinking,
                     )
                     tito_boundary_before = True
@@ -601,7 +658,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     _render_prompt_ids,
                     state.tokenizer,
                     rollout_messages,
-                    tools=tools,
+                    tools=render_tools,
                     disable_thinking=disable_thinking,
                 )
                 prompt_context_start_idx = None
@@ -612,6 +669,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 else:
                     context_delta_ids = list(prompt_ids[len(tito_prefix_ids) :])
                     tito_context_reason = "initial" if not tito_prefix_ids else "append_delta"
+            if strict_tito and tito_boundary_before:
+                raise RuntimeError(f"Strict TiTO rejected an unexpected segment boundary: {tito_context_reason}")
             if max_context_tokens and len(prompt_ids) >= max_context_tokens:
                 final_done = True
                 last_info = {
@@ -621,7 +680,18 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 }
                 break
             step_sampling = dict(sampling_params)
-            if rllm_deepresearch:
+            if deepsearch_world:
+                step_sampling.update(
+                    {
+                        "temperature": float(os.environ.get("DEEPSEARCH_WORLD_TEMPERATURE", "0.6")),
+                        "top_p": float(os.environ.get("DEEPSEARCH_WORLD_TOP_P", "0.95")),
+                        "max_new_tokens": min(
+                            per_step_max_tokens,
+                            int(os.environ.get("DEEPSEARCH_WORLD_MAX_TOKENS", "1024")),
+                        ),
+                    }
+                )
+            elif rllm_deepresearch:
                 step_sampling.update(
                     {
                         "temperature": float(os.environ.get("RLLM_DR_TEMPERATURE", "1.0")),
@@ -632,6 +702,13 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             0,
                             int(os.environ.get("RLLM_DR_MAX_TOKENS", "32768")) - len(prompt_ids),
                         ),
+                    }
+                )
+            elif cut_bill:
+                step_sampling.update(
+                    {
+                        "repetition_penalty": 1.0,
+                        "max_new_tokens": per_step_max_tokens,
                     }
                 )
             else:
@@ -755,6 +832,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     output_ids,
                     disable_thinking=disable_thinking,
                 )
+            if deepsearch_world:
+                response = dsw.ensure_think_tags(response)
+                parsed_actions = await asyncio.to_thread(parser.parse, response)
             final_response = response
             finish_reason = output["finish_reason"]
             last_finish_reason = finish_reason
@@ -773,7 +853,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 total_tool_call_turns += 1
 
             assistant_content = response
-            if rllm_deepresearch and parsed_actions:
+            if research_search and parsed_actions:
                 assistant_content = re.sub(
                     r"<tool_call>.*?</tool_call>", "", assistant_content, flags=re.DOTALL
                 ).strip()
@@ -781,7 +861,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     r"<function=[^>]+>.*?(?:</function>|$)", "", assistant_content, flags=re.DOTALL
                 ).strip()
             assistant_msg = {"role": "assistant", "content": assistant_content}
-            if rllm_deepresearch and parsed_actions:
+            if research_search and parsed_actions:
                 assistant_msg["tool_calls"] = [
                     {
                         "id": f"call_{step_idx}_{action_idx}",
@@ -844,6 +924,33 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 # next request is append-only; never re-tokenize this assistant turn.
                 tito_messages_snapshot = copy.deepcopy(messages)
 
+            if deepsearch_world and deepsearch_phase == "plan":
+                deepsearch_state = dsw.parse_plan(response)
+                trajectory_steps.append(
+                    _episode_step(
+                        observation="",
+                        response=response,
+                        action="planning",
+                        reward=0.0,
+                        done=False,
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=False,
+                        llm_time=step_llm_time,
+                        env_time=0.0,
+                        disable_thinking=disable_thinking,
+                    )
+                )
+                deepsearch_phase = "action"
+                messages = dsw.action_messages(deepsearch_task, deepsearch_state, deepsearch_steps)
+                continue
+
+            if deepsearch_world and deepsearch_phase == "action":
+                deepsearch_action_turns += 1
+            elif deepsearch_world and deepsearch_phase == "end":
+                if not parsed_actions:
+                    parsed_actions = [ToolCall("finish", {"command": "submit", "result": response.strip()})]
+
             if detect_abnormal_trajectories and finish_reason == "length":
                 final_done = True
                 last_info = {"termination_reason": "max_response_len_exceeded"}
@@ -868,7 +975,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 env.answer = response
                 final_reward = env.compute_final_reward(require_tool_evidence=False)
                 final_done = True
-                last_info = {"termination_reason": "reasoning_only", "reward_debug": env.reward_debug}
+                last_info = {
+                    "termination_reason": "reasoning_only",
+                    "reward_debug": env.reward_debug,
+                    **rag_retrieval_info,
+                }
                 trajectory_steps.append(
                     _episode_step(
                         observation=observation,
@@ -894,6 +1005,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     actions,
                     state.tokenizer,
                     allow_leading_think_close=not disable_thinking,
+                    allow_action_terminated_think=search_gym,
                     ngram_n=ngram_repetition_n,
                     ngram_threshold=ngram_repetition_threshold,
                     ngram_min_tokens=ngram_repetition_min_tokens,
@@ -919,7 +1031,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         )
                     )
                     break
-            if rllm_deepresearch:
+            if research_search:
                 if not actions:
                     env.answer = response
                     final_reward = env.compute_final_reward(require_tool_evidence=False)
@@ -997,7 +1109,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 batch_start = time.time()
                 results = await asyncio.gather(
                     *(
-                        run_rllm_deepresearch_search(
+                        (run_cut_bill_search if cut_bill else run_rllm_deepresearch_search)(
                             action,
                             retrieval_url=env.retrieval_url,
                             max_results=env.retrieval_max_results,
@@ -1041,7 +1153,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         disable_thinking=disable_thinking,
                     )
                 )
-                if rllm_deepresearch:
+                if research_search:
                     messages.extend(
                         {
                             "role": "tool",
@@ -1102,7 +1214,70 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 )
                 break
 
+            if (
+                detect_abnormal_trajectories
+                and credit_assignment_tool_parser_error
+                and getattr(parser, "last_schema_errors", ())
+            ):
+                final_reward = 0.0
+                final_done = True
+                credit_event = "tool_parser_error"
+                credit_step_index = len(pending_turns) - 1
+                await _mark_pending_turn_error_span(
+                    state.tokenizer,
+                    pending_turns[-1],
+                    response,
+                    _actions_span(actions) or _parser_error_action_span(response),
+                    output_len=len(output_ids),
+                )
+                last_info = {
+                    "termination_reason": "ABNORMAL_PARSE_ERROR",
+                    "credit_assignment_event": credit_event,
+                    "credit_assignment_error_step_index": credit_step_index,
+                    "tool_parser_error_count": 1,
+                    "tool_parser_errors": list(parser.last_schema_errors),
+                }
+                trajectory_steps.append(
+                    _episode_step(
+                        observation=observation,
+                        response=response,
+                        action="",
+                        reward=0.0,
+                        done=True,
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
+                        llm_time=step_llm_time,
+                        env_time=0.0,
+                        disable_thinking=disable_thinking,
+                    )
+                )
+                break
+
             if not actions:
+                if deepsearch_world:
+                    deepsearch_steps.append(dsw.step_record(response))
+                    trajectory_steps.append(
+                        _episode_step(
+                            observation="",
+                            response=response,
+                            action="",
+                            reward=0.0,
+                            done=False,
+                            messages=rollout_messages if capture_eval_details else [],
+                            tito_context_reason=tito_context_reason,
+                            historical_thinking_discarded=False,
+                            llm_time=step_llm_time,
+                            env_time=0.0,
+                            disable_thinking=disable_thinking,
+                        )
+                    )
+                    if deepsearch_action_turns >= base_max_steps:
+                        deepsearch_phase = "end"
+                        messages = dsw.end_messages(deepsearch_task, deepsearch_state, deepsearch_steps)
+                    else:
+                        messages = dsw.action_messages(deepsearch_task, deepsearch_state, deepsearch_steps)
+                    continue
                 if detect_abnormal_trajectories and credit_assignment_tool_parser_error:
                     final_reward = 0.0
                     final_done = True
@@ -1300,7 +1475,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     repeated_search_strikes = 0
                     repeated_action_span = None
                 last_search_query = query
-            repeated_query = repeated_search_strikes > 0
+            repeated_query = repeated_action_span is not None
             if repeated_query and (detect_abnormal_trajectories or evaluation):
                 duplicate_search_info = {
                     "duplicate_search_detected": True,
@@ -1469,6 +1644,13 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 observation = formatted_obs
                 if batch_done:
                     break
+                if deepsearch_world:
+                    deepsearch_steps.append(dsw.step_record(response, executed_actions[0], str(raw_observations[0])))
+                    if deepsearch_action_turns >= base_max_steps:
+                        deepsearch_phase = "end"
+                        messages = dsw.end_messages(deepsearch_task, deepsearch_state, deepsearch_steps)
+                    else:
+                        messages = dsw.action_messages(deepsearch_task, deepsearch_state, deepsearch_steps)
                 continue
 
             action = actions[0]
@@ -1567,6 +1749,13 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             observation = formatted_obs
             if done:
                 break
+            if deepsearch_world:
+                deepsearch_steps.append(dsw.step_record(response, action, str(obs)))
+                if deepsearch_action_turns >= base_max_steps:
+                    deepsearch_phase = "end"
+                    messages = dsw.end_messages(deepsearch_task, deepsearch_state, deepsearch_steps)
+                else:
+                    messages = dsw.action_messages(deepsearch_task, deepsearch_state, deepsearch_steps)
         else:
             last_info = {**last_info, "termination_reason": "max_turns_exceeded"}
             if detect_abnormal_trajectories and credit_assignment_max_turns and pending_turns:
@@ -1885,16 +2074,22 @@ def _initial_messages(
     model_name: str | None = None,
     *,
     tool_parser=None,
+    inline_tool_prompt: bool = True,
+    retrieved_context: str = "",
 ) -> list[dict[str, str]]:
     if harness == "rllm_deepresearch":
-        system = build_system_prompt(RLLM_DR_SEARCH_SYSTEM_PROMPT, tools, model_name, tool_parser=tool_parser)
+        system = build_system_prompt(RLLM_DR_SEARCH_SYSTEM_PROMPT, tools, model_name, tool_parser=tool_parser, inline_tool_prompt=inline_tool_prompt)
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": _strip_conflicting_answer_tag_instruction(observation)},
         ]
+    if harness == "cut_bill":
+        return [
+            {"role": "system", "content": cut_bill_system_prompt()},
+            {"role": "user", "content": _strip_conflicting_answer_tag_instruction(observation)},
+        ]
     if harness == "search_gym":
-        schemas_str = "\n".join(json.dumps(schema, ensure_ascii=False) for schema in tools)
-        system = SEARCH_GYM_SYSTEM_PROMPT + "\n" + SearchGymToolParser().get_tool_prompt(schemas_str)
+        system = build_system_prompt(SEARCH_GYM_SYSTEM_PROMPT, tools, model_name, tool_parser=tool_parser, inline_tool_prompt=inline_tool_prompt)
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": SEARCH_GYM_USER_PROMPT.format(question=observation)},
@@ -1906,24 +2101,35 @@ def _initial_messages(
             {"role": "system", "content": COT_SYSTEM_PROMPT},
             {"role": "user", "content": COT_USER_PROMPT.format(problem_statement=observation)},
         ]
+    if harness == "rag":
+        return [
+            {"role": "system", "content": COT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": RAG_USER_PROMPT.format(
+                    problem_statement=observation,
+                    retrieved_context=retrieved_context,
+                ),
+            },
+        ]
     if harness == "react":
-        system = build_system_prompt(REACT_SYSTEM_PROMPT, tools, model_name, tool_parser=tool_parser)
+        system = build_system_prompt(REACT_SYSTEM_PROMPT, tools, model_name, tool_parser=tool_parser, inline_tool_prompt=inline_tool_prompt)
         user = REACT_USER_PROMPT.format(problem_statement=observation)
     elif task_type == "mcp":
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_MCP_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser)
+        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser, inline_tool_prompt=inline_tool_prompt)
         user = FUSED_MCP_USER_PROMPT.format(problem_statement=observation)
     elif task_type == "cli":
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_CLI_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser)
+        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser, inline_tool_prompt=inline_tool_prompt)
         user = FUSED_CLI_USER_PROMPT.format(problem_statement=observation)
     elif task_type == "et":
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_ET_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser)
+        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser, inline_tool_prompt=inline_tool_prompt)
         user = FUSED_ET_USER_PROMPT.format(problem_statement=observation)
     else:
         base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_SEARCH_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser)
+        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser, inline_tool_prompt=inline_tool_prompt)
         observation = _strip_conflicting_answer_tag_instruction(observation)
         user_prompt = (
             FUSED_SEARCH_LONG_USER_PROMPT
@@ -2018,6 +2224,11 @@ def _common_token_prefix_length(left: list[int], right: list[int]) -> int:
 
 
 def _tito_model_type(model_name: str | None) -> str | None:
+    explicit_series = os.environ.get("FUSED_MODEL_SERIES", "").strip().lower().replace("-", "_")
+    if explicit_series in {"qwen3.5", "qwen3_5"}:
+        return "qwen3_5"
+    if explicit_series == "qwen3":
+        return "qwen3"
     normalized = str(model_name or "").lower().replace("-", "_")
     if "gemma4" in normalized or "gemma_4" in normalized:
         return "gemma4"
@@ -2136,6 +2347,7 @@ def _eval_response_anomaly_info(
     tokenizer,
     *,
     allow_leading_think_close: bool,
+    allow_action_terminated_think: bool = False,
     ngram_n: int,
     ngram_threshold: float,
     ngram_min_tokens: int,
@@ -2155,6 +2367,14 @@ def _eval_response_anomaly_info(
         response,
         allow_leading_think_close=allow_leading_think_close,
     )
+    if (
+        allow_action_terminated_think
+        and tag_imbalances.get("think") == {"open": 1, "close": 0, "misordered": False}
+        and len(actions) == 1
+        and actions[0].end is not None
+        and not response[actions[0].end :].strip()
+    ):
+        tag_imbalances.pop("think")
     if tag_imbalances:
         anomalies.append("unbalanced_tags")
         info["unbalanced_response_tags"] = tag_imbalances
@@ -2611,33 +2831,52 @@ def _render_qwen3_tito_delta_ids(
     *,
     disable_thinking: bool,
 ) -> list[int]:
-    """Encode only the Qwen3 chat-template suffix added since the last turn.
+    """Encode only the Qwen3-family chat-template suffix added since the last turn.
 
     The caller prepends these ids to the exact prompt/output ids served on the
     previous turn. This avoids decoding and re-tokenizing generated assistant
     tokens, whose thinking whitespace can be canonicalized by Qwen3's template.
     """
     if len(new_messages) < len(old_messages) or new_messages[: len(old_messages)] != old_messages:
-        raise ValueError("Qwen3 TITO requires append-only message history")
+        raise ValueError("Qwen3-family TITO requires append-only message history")
 
     appended_messages = new_messages[len(old_messages) :]
     if not appended_messages:
-        raise ValueError("Qwen3 TITO continuation has no appended messages")
+        raise ValueError("Qwen3-family TITO continuation has no appended messages")
     unsupported_roles = [message.get("role") for message in appended_messages if message.get("role") not in {"tool", "user"}]
     if unsupported_roles:
-        raise ValueError(f"Qwen3 TITO cannot append message roles {unsupported_roles!r}")
+        raise ValueError(f"Qwen3-family TITO cannot append message roles {unsupported_roles!r}")
 
+    # Qwen3.5's template validates that every rendered conversation contains a
+    # user query.  Render the actual last user message in both anchors so it is
+    # part of the common prefix and only the newly appended tool/user messages
+    # become the delta.  Qwen3's older template did not require this, but the
+    # same construction is valid for both model families.
+    # Qwen3.5 distinguishes the actual query user turn from synthetic user
+    # turns carrying prior tool responses.  The latter are valid history but
+    # do not satisfy the template's ``last_query_index`` check.
+    last_user = next(
+        (
+            message
+            for message in reversed(old_messages)
+            if message.get("role") == "user"
+            and not str(message.get("content", "")).lstrip().startswith("<tool_response>")
+        ),
+        None,
+    )
+    if last_user is None:
+        raise ValueError("Qwen3-family TITO requires an existing user query")
     dummy_system = {"role": "system", "content": "slime tito anchor"}
     rendered_base = _apply_chat_template(
         tokenizer,
-        [dummy_system],
+        [dummy_system, last_user],
         tokenize=False,
         add_generation_prompt=False,
         disable_thinking=disable_thinking,
     )
     rendered_with_delta = _apply_chat_template(
         tokenizer,
-        [dummy_system, *appended_messages],
+        [dummy_system, last_user, *appended_messages],
         tokenize=False,
         add_generation_prompt=True,
         disable_thinking=disable_thinking,
@@ -2645,7 +2884,7 @@ def _render_qwen3_tito_delta_ids(
     rendered_base = str(rendered_base)
     rendered_with_delta = str(rendered_with_delta)
     if not rendered_with_delta.startswith(rendered_base):
-        raise ValueError("Qwen3 chat template did not produce an append-only rendered suffix")
+        raise ValueError("Qwen3-family chat template did not produce an append-only rendered suffix")
 
     suffix = rendered_with_delta[len(rendered_base) :]
     encoded = tokenizer.encode(suffix, add_special_tokens=False)
@@ -2659,7 +2898,7 @@ def _render_qwen3_tito_delta_ids(
         newline_ids = newline_ids.tolist()
     newline_ids = [int(token_id) for token_id in newline_ids]
     if im_end_id is None or im_end_id == getattr(tokenizer, "unk_token_id", None) or not newline_ids:
-        raise ValueError("Qwen3 tokenizer cannot encode the assistant turn boundary")
+        raise ValueError("Qwen3-family tokenizer cannot encode the assistant turn boundary")
 
     # SGLang may include or omit the stop token from output_ids. Complete the
     # historical assistant boundary exactly once before appending tool/user text.
@@ -2773,7 +3012,7 @@ def _apply_chat_template(
 
 def _chat_template_accepts_native_tools(tokenizer) -> bool:
     name = str(getattr(tokenizer, "name_or_path", "") or "").lower().replace("-", "_")
-    return "gemma4" in name or "gemma_4" in name
+    return "gemma4" in name or "gemma_4" in name or "qwen3.5" in name or "qwen3_5" in name
 
 
 def _type_error_mentions_kwarg(exc: TypeError, kwarg: str) -> bool:

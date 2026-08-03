@@ -100,8 +100,8 @@ Core:
   --ray-num-cpus N                     Ray CPU resources. Default: 64.
 
 Generation/eval:
-  --harness NAME                       Harness: bare, cot, react, gem, unified_gem,
-                                       search_gym, rllm_deepresearch (alias: rllm_dr). Default: cot.
+  --harness NAME                       Harness: bare, cot, rag, react, gem, unified_gem,
+                                       search_gym, deepsearch_world, rllm_deepresearch (alias: rllm_dr), cut_bill. Default: cot.
   --user_prompt long|short             Web-search user prompt. Default: short.
   --rllm-dr-refine-server-url URLS     Comma-separated OpenAI-compatible Refine server base URLs.
   --unified-system-prompt              Sets harness to unified_gem unless --harness is later set.
@@ -137,6 +137,9 @@ Generation/eval:
   --retrieval-concurrency N            Concurrent retrieval requests. Default: 176.
   --retrieval-mode NAME                dense, lexical, or hybrid. Default: dense.
   --retrieval-cache-size N             Cross-episode retrieval LRU entries. Default: 4096.
+  --rag-context-max-words N            Maximum words of retrieved context for rag. Default: 1024.
+  --summary-backend local|openrouter   Retrieval summary service. Default: openrouter.
+  --summary-model NAME                 OpenRouter summary model. Default: qwen/qwen3-30b-a3b-instruct-2507.
   --eval-initial-inflight-tasks N      Initial scheduled eval trajectories. Default: cot=4/engine, agent=384.
   --eval-max-inflight-tasks N          Adaptive hard limit. Default: cot=8/engine, agent=576.
   --eval-adaptive-concurrency BOOL     Adjust inflight work from engine metrics. Default: true.
@@ -260,6 +263,9 @@ SERPER_SERVICE_PID=""
 RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-176}"
 RETRIEVAL_MODE="${RETRIEVAL_MODE:-dense}"
 RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE:-4096}"
+RAG_CONTEXT_MAX_WORDS="${RAG_CONTEXT_MAX_WORDS:-1024}"
+SUMMARY_BACKEND="${SUMMARY_BACKEND:-openrouter}"
+SUMMARY_MODEL="${SUMMARY_MODEL:-qwen/qwen3-30b-a3b-instruct-2507}"
 EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-}"
 EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-}"
 EVAL_ADAPTIVE_CONCURRENCY="${EVAL_ADAPTIVE_CONCURRENCY:-true}"
@@ -449,7 +455,7 @@ while [ "$#" -gt 0 ]; do
       --no-unified-system-prompt) UNIFIED_SYSTEM_PROMPT=False; if [ "${harness_explicit}" = "false" ]; then FUSED_HARNESS=gem; fi; shift ;;
       --disable-thinking) DISABLE_THINKING="${2:?Missing value for --disable-thinking}"; shift 2 ;;
       --discard-historical-thinking) DISCARD_HISTORICAL_THINKING="${2:?Missing value for --discard-historical-thinking}"; shift 2 ;;
-      --max-steps) MAX_STEPS="${2:?Missing value for --max-steps}"; shift 2 ;;
+      --max-steps) MAX_STEPS="${2:?Missing value for --max-steps}"; DEEPSEARCH_WORLD_MAX_STEPS="${MAX_STEPS}"; shift 2 ;;
       --mcp-max-steps) MCP_MAX_STEPS="${2:?Missing value for --mcp-max-steps}"; shift 2 ;;
       --web-search-max-steps) WEB_SEARCH_MAX_STEPS="${2:?Missing value for --web-search-max-steps}"; shift 2 ;;
       --cli-max-steps) CLI_MAX_STEPS="${2:?Missing value for --cli-max-steps}"; shift 2 ;;
@@ -473,6 +479,9 @@ while [ "$#" -gt 0 ]; do
       --retrieval-concurrency) RETRIEVAL_CONCURRENCY="${2:?Missing value for --retrieval-concurrency}"; shift 2 ;;
       --retrieval-mode) RETRIEVAL_MODE="${2:?Missing value for --retrieval-mode}"; shift 2 ;;
       --retrieval-cache-size) RETRIEVAL_CACHE_SIZE="${2:?Missing value for --retrieval-cache-size}"; shift 2 ;;
+      --rag-context-max-words) RAG_CONTEXT_MAX_WORDS="${2:?Missing value for --rag-context-max-words}"; shift 2 ;;
+      --summary-backend) SUMMARY_BACKEND="${2:?Missing value for --summary-backend}"; shift 2 ;;
+      --summary-model) SUMMARY_MODEL="${2:?Missing value for --summary-model}"; shift 2 ;;
       --eval-initial-inflight-tasks) EVAL_INITIAL_INFLIGHT_TASKS="${2:?Missing value for --eval-initial-inflight-tasks}"; shift 2 ;;
       --eval-max-inflight-tasks) EVAL_MAX_INFLIGHT_TASKS="${2:?Missing value for --eval-max-inflight-tasks}"; shift 2 ;;
       --eval-adaptive-concurrency) EVAL_ADAPTIVE_CONCURRENCY="${2:?Missing value for --eval-adaptive-concurrency}"; shift 2 ;;
@@ -669,6 +678,14 @@ case "${RETRIEVAL_BACKEND}" in
    local|serper) ;;
    *) echo "Unsupported --retrieval-backend ${RETRIEVAL_BACKEND}; expected local or serper." >&2; exit 2 ;;
 esac
+case "${SUMMARY_BACKEND}" in
+   local|openrouter) ;;
+   *) echo "Unsupported --summary-backend ${SUMMARY_BACKEND}; expected local or openrouter." >&2; exit 2 ;;
+esac
+if ! [[ "${RAG_CONTEXT_MAX_WORDS}" =~ ^[1-9][0-9]*$ ]]; then
+   echo "--rag-context-max-words must be a positive integer" >&2
+   exit 2
+fi
 if ! [[ "${SERPER_SERVER_PORT}" =~ ^[1-9][0-9]*$ ]] || [ "${SERPER_SERVER_PORT}" -gt 65535 ]; then
    echo "SERPER_SERVER_PORT must be an integer in [1, 65535]" >&2
    exit 2
@@ -1414,6 +1431,12 @@ if [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
    exit 2
 fi
 case "${FUSED_HARNESS}" in
+   deepsearch_world)
+      if ! is_truthy "${DISABLE_THINKING}"; then
+         echo "deepsearch_world disables the model chat-template thinking mode; textual <think> tags remain enabled."
+         DISABLE_THINKING=true
+      fi
+      ;;
    rllm_deepresearch|rllm_dr|rllm-dr|deepresearch)
       if is_truthy "${RLLM_DR_USE_REFINE}" && [ -z "${RLLM_DR_REFINE_SERVER_URL}" ]; then
          echo "rllm_deepresearch requires --rllm-dr-refine-server-url (or RLLM_DR_USE_REFINE=0)" >&2
@@ -1423,10 +1446,10 @@ case "${FUSED_HARNESS}" in
 esac
 ROLLOUT_NUM_ENGINES=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
 case "${FUSED_HARNESS}" in
-   cot|bare) UNIFIED_SYSTEM_PROMPT=False ;;
+   cot|rag|bare) UNIFIED_SYSTEM_PROMPT=False ;;
 esac
 if [ -z "${PER_STEP_MAX_TOKENS:-}" ]; then
-   if [ "${FUSED_HARNESS}" = "cot" ]; then
+   if [ "${FUSED_HARNESS}" = "cot" ] || [ "${FUSED_HARNESS}" = "rag" ]; then
       PER_STEP_MAX_TOKENS="${EVAL_MAX_RESPONSE_LEN}"
    else
       PER_STEP_MAX_TOKENS=38000
@@ -1436,7 +1459,7 @@ if is_truthy "${MCP_ATLAS_ONLY}"; then
    EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-${MCP_ATLAS_CONCURRENCY}}"
    EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-${MCP_ATLAS_CONCURRENCY}}"
    SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-${MCP_ATLAS_CONCURRENCY}}"
-elif [ "${FUSED_HARNESS}" = "cot" ]; then
+elif [ "${FUSED_HARNESS}" = "cot" ] || [ "${FUSED_HARNESS}" = "rag" ]; then
    # Long CoT requests retain generation state for the full response, so keep
    # actual engine concurrency low even while the rollout queue stays buffered.
    EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-$((4 * ROLLOUT_NUM_ENGINES))}"
@@ -1469,6 +1492,10 @@ if ! [[ "${MCP_ATLAS_EXPECTED_SERVERS}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if is_truthy "${ENABLE_USE_GRM_EVALS}" && [ -z "${OPENROUTER_API_KEY:-}" ]; then
    echo "OPENROUTER_API_KEY is required when --enable-use-grm-evals is true" >&2
+   exit 2
+fi
+if [ "${SUMMARY_BACKEND}" = "openrouter" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
+   echo "OPENROUTER_API_KEY is required when --summary-backend openrouter" >&2
    exit 2
 fi
 
@@ -1733,9 +1760,12 @@ export RLLM_RETRIEVAL_MODE="${RETRIEVAL_MODE}"
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
 export RLLM_RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY}"
 export RLLM_RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE}"
+export RAG_CONTEXT_MAX_WORDS
+export RLLM_RETRIEVAL_SUMMARY_BACKEND="${SUMMARY_BACKEND}"
+export RLLM_RETRIEVAL_SUMMARY_MODEL="${SUMMARY_MODEL}"
 case "${RETRIEVAL_BACKEND}:${FUSED_HARNESS}" in
    serper:*) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-10}" ;;
-   local:rllm_deepresearch|local:rllm_dr|local:rllm-dr|local:deepresearch)
+   local:rllm_deepresearch|local:rllm_dr|local:rllm-dr|local:deepresearch|local:cut_bill|local:cut-bill|local:cutbill)
       export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-10}"
       ;;
    local:*) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-4}" ;;
@@ -1748,6 +1778,16 @@ export DOCKER_API_VERSION="${DOCKER_API_VERSION:-1.44}"
 export OPENROUTER_API_KEY
 export MCP_SANDBOX_URL MCP_ATLAS_AUTH_TOKEN MCP_ATLAS_CONCURRENCY MCP_ATLAS_TOOL_TIMEOUT MCP_ATLAS_LIST_TOOLS_TIMEOUT MCP_ATLAS_READ_ONLY
 export FUSED_HARNESS="${FUSED_HARNESS}"
+export DEEPSEARCH_WORLD_MAX_STEPS="${DEEPSEARCH_WORLD_MAX_STEPS:-30}"
+export DEEPSEARCH_WORLD_MAX_TOKENS="${DEEPSEARCH_WORLD_MAX_TOKENS:-1024}"
+if [ -z "${DEEPSEARCH_WORLD_VISIT_MODE:-}" ]; then
+   if [ "${RETRIEVAL_BACKEND}" = "serper" ]; then
+      DEEPSEARCH_WORLD_VISIT_MODE=access
+   else
+      DEEPSEARCH_WORLD_VISIT_MODE=cache
+   fi
+fi
+export DEEPSEARCH_WORLD_VISIT_MODE
 export FUSED_WEB_SEARCH_USER_PROMPT="${USER_PROMPT}"
 export FUSED_MODEL_SERIES="${MODEL_SERIES}"
 export FUSED_UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT}"
@@ -1792,7 +1832,9 @@ keys = (
     "DOCKER_HOST", "DOCKER_API_VERSION", "MCP_SANDBOX_URL", "MCP_ATLAS_AUTH_TOKEN", "MCP_ATLAS_CONCURRENCY",
     "MCP_ATLAS_TOOL_TIMEOUT", "MCP_ATLAS_LIST_TOOLS_TIMEOUT", "MCP_ATLAS_READ_ONLY",
     "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL",
-    "OPENROUTER_APP_NAME", "FUSED_HARNESS", "FUSED_WEB_SEARCH_USER_PROMPT",
+    "OPENROUTER_APP_NAME", "FUSED_HARNESS", "FUSED_WEB_SEARCH_USER_PROMPT", "DEEPSEARCH_WORLD_MAX_STEPS",
+    "DEEPSEARCH_WORLD_MAX_TOKENS",
+    "DEEPSEARCH_WORLD_VISIT_MODE",
     "FUSED_MODEL_SERIES", "FUSED_UNIFIED_SYSTEM_PROMPT",
     "FUSED_DISABLE_THINKING", "FUSED_DISCARD_HISTORICAL_THINKING",
     "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS",
@@ -1818,7 +1860,7 @@ echo "Benchmarks root: ${BENCHMARKS_ROOT}"
 echo "Eval config: ${EVAL_CONFIG}"
 echo "Log root: ${LOG_ROOT}"
 echo "GPUs: ${ROLLOUT_GPUS}; gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}; engines=${ROLLOUT_NUM_ENGINES}"
-echo "Harness: ${FUSED_HARNESS}; user_prompt=${USER_PROMPT}; disable_thinking=${DISABLE_THINKING}; discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}; n=${N_SAMPLES_PER_PROMPT}; per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
+echo "Harness: ${FUSED_HARNESS}; user_prompt=${USER_PROMPT}; disable_thinking=${DISABLE_THINKING}; discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}; n=${N_SAMPLES_PER_PROMPT}; per_step_max_tokens=${PER_STEP_MAX_TOKENS}; deepsearch_world_max_tokens=${DEEPSEARCH_WORLD_MAX_TOKENS}"
 echo "Sampling: temperature=${TEMPERATURE}; top_p=${TOP_P}; top_k=${TOP_K}; seed=${ROLLOUT_SEED}; deterministic=${DETERMINISTIC_INFERENCE}"
 echo "Concurrency: eval=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS} adaptive=${EVAL_ADAPTIVE_CONCURRENCY}; sglang_http_per_engine=${SGLANG_SERVER_CONCURRENCY}; sglang_running_per_engine=${SGLANG_MAX_RUNNING_REQUESTS}; retrieval=${RETRIEVAL_CONCURRENCY}"
 echo "Eval termination retries: ${EVAL_TERMINATION_RETRY_TIMES} (termination_reason != env_done)"

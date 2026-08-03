@@ -10,6 +10,30 @@ from functools import lru_cache
 from typing import Any
 
 logger = logging.getLogger(__name__)
+_MISSING_PARAMETER = object()
+_INVALID_PARAMETER = object()
+
+
+def _normalize_xml_parameter_name(name: str) -> str:
+    """Normalize Qwen's occasionally quoted XML attribute names."""
+    # XML syntax is ``parameter=name``; generation sometimes copies JSON and
+    # emits ``parameter="name"`` (or leaves only the opening quote).  Strip
+    # quote/punctuation noise before schema lookup.
+    return name.strip().strip('"\'`').strip().rstrip(':').strip()
+
+
+def _repair_xml_scalar_value(value: str) -> str:
+    """Remove a leaked XML-like closing fragment from scalar values.
+
+    Qwen3.5 occasionally emits ``10</result>`` or ``True</ Personnel>`` when
+    closing a parameter block.  The fragment is outside the scalar token and
+    must not change the typed argument.
+    """
+    value = value.strip()
+    marker = value.find("</")
+    if marker > 0:
+        value = value[:marker].rstrip()
+    return value.strip().strip('"\'`')
 
 
 @dataclass
@@ -288,9 +312,11 @@ class Qwen3CoderToolParser(QwenToolParser):
         super().__init__(valid_tools=valid_tools)
         self.tool_call_prefix = "<function="
         self._tool_parameter_config: dict[str, dict[str, dict[str, Any]]] = {}
+        self.last_schema_errors: list[str] = []
 
     def parse(self, model_response: str) -> list[ToolCall]:
         text = model_response or ""
+        self.last_schema_errors = []
         calls: list[ToolCall] = []
         for inner, start, end in self._iter_tool_call_regions(text):
             for function_name, parameters in self._FUNCTION_RE.findall(inner):
@@ -396,15 +422,25 @@ class Qwen3CoderToolParser(QwenToolParser):
             return None
         if param_name not in param_config:
             if param_config:
-                logger.warning(
-                    "Parsed parameter '%s' is not defined in the tool parameters for tool '%s'; returning string value.",
+                # Models occasionally emit optional-looking fields that are not
+                # part of the advertised schema.  Do not turn these into
+                # executable arguments (or flood rollout logs); the caller can
+                # still execute the well-formed subset of the tool call.
+                logger.debug(
+                    "Ignoring parameter '%s' not defined in the tool parameters for tool '%s'.",
                     param_name,
                     func_name,
                 )
+                return _MISSING_PARAMETER
+            # Without a schema (for example a standalone parser used by a
+            # verifier), preserve the historical permissive behavior.
             return param_value
 
         param_schema = param_config[param_name]
         param_type = str(param_schema.get("type", "string")).strip().lower()
+
+        if param_type not in {"object", "array"} and not param_type.startswith(("dict", "list")):
+            param_value = _repair_xml_scalar_value(param_value)
 
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
             return param_value
@@ -415,33 +451,34 @@ class Qwen3CoderToolParser(QwenToolParser):
                 return int(re.sub(r"^:\s*", "", param_value))
             except Exception:
                 logger.warning(
-                    "Parsed value '%s' of parameter '%s' is not an integer in tool '%s'; returning string value.",
+                    "Parsed value '%s' of parameter '%s' is not an integer in tool '%s'; rejecting tool call.",
                     param_value,
                     param_name,
                     func_name,
                 )
-                return param_value
+                return _INVALID_PARAMETER
         if param_type.startswith("num") or param_type.startswith("float"):
             try:
                 float_value = float(param_value)
                 return float_value if float_value - int(float_value) != 0 else int(float_value)
             except Exception:
                 logger.warning(
-                    "Parsed value '%s' of parameter '%s' is not a float in tool '%s'; returning string value.",
+                    "Parsed value '%s' of parameter '%s' is not a float in tool '%s'; rejecting tool call.",
                     param_value,
                     param_name,
                     func_name,
                 )
-                return param_value
+                return _INVALID_PARAMETER
         if param_type in ["boolean", "bool", "binary"]:
             bool_value = param_value.lower()
             if bool_value not in ["true", "false"]:
                 logger.warning(
-                    "Parsed value '%s' of parameter '%s' is not a boolean in tool '%s'; degenerating to false.",
+                    "Parsed value '%s' of parameter '%s' is not a boolean in tool '%s'; rejecting tool call.",
                     param_value,
                     param_name,
                     func_name,
                 )
+                return _INVALID_PARAMETER
             return bool_value == "true"
         if param_type in ["object", "array"] or param_type.startswith("dict") or param_type.startswith("list"):
             try:
@@ -457,20 +494,33 @@ class Qwen3CoderToolParser(QwenToolParser):
             return ast.literal_eval(param_value)
         except Exception:
             logger.warning(
-                "Parsed value '%s' of parameter '%s' cannot be converted via ast.literal_eval() in tool '%s'; " "returning string value.",
+                "Parsed value '%s' of parameter '%s' cannot be converted via ast.literal_eval() in tool '%s'; rejecting tool call.",
                 param_value,
                 param_name,
                 func_name,
             )
-            return param_value
+            return _INVALID_PARAMETER
 
     def _parse_xml_function_call(self, function_name: str, parameters: str) -> dict[str, Any]:
         param_config = self._tool_parameter_config.get(function_name, {})
         arguments: dict[str, Any] = {}
-        for param_name, param_value in self._PARAMETER_RE.findall(parameters):
-            param_name = param_name.strip()
+        for raw_param_name, param_value in self._PARAMETER_RE.findall(parameters):
+            param_name = _normalize_xml_parameter_name(raw_param_name)
+            if not param_name:
+                continue
+            if param_name != raw_param_name.strip():
+                self.last_schema_errors.append(f"malformed parameter name {raw_param_name.strip()!r}")
             param_value = self._strip_outer_newline(str(param_value))
-            arguments[param_name] = self._convert_param_value(param_value, param_name, param_config, function_name)
+            value = self._convert_param_value(param_value, param_name, param_config, function_name)
+            if value is not _MISSING_PARAMETER:
+                if value is not _INVALID_PARAMETER:
+                    arguments[param_name] = value
+                else:
+                    self.last_schema_errors.append(
+                        f"invalid value for parameter {param_name!r} of tool {function_name!r}"
+                    )
+            else:
+                self.last_schema_errors.append(f"unknown parameter {param_name!r} for tool {function_name!r}")
         return {"name": function_name.strip(), "arguments": arguments}
 
     def get_tool_prompt(self, tools_schema: str) -> str:

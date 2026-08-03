@@ -13,6 +13,8 @@ from slime.rollout.fused_agent.env import (
     FusedEnvironment,
     _exact_match_reward,
     _format_retrieval,
+    _limit_summary_input,
+    _summary_units,
     normalize_task,
     resolve_task_mode,
 )
@@ -46,6 +48,8 @@ from slime.rollout.fused_agent.rllm_deepresearch import (
     local_search_schema,
     parse_refine_response,
 )
+from slime.rollout.fused_agent import deepsearch_world as dsw
+from slime.rollout.fused_agent.search_gym import SEARCH_GYM_SYSTEM_PROMPT
 from slime.utils import visualization as rollout_visualization
 from slime.utils.types import Sample
 
@@ -98,6 +102,44 @@ class FakeQwen3ChatTemplateTokenizer(FakeChatTemplateTokenizer):
             # use a dedicated id so boundary completion is easy to assert.
             return 0x10FFFF
         return self.unk_token_id
+
+
+class FakeQwen35ChatTemplateTokenizer(FakeQwen3ChatTemplateTokenizer):
+    name_or_path = "/models/Qwen3.5-4B"
+
+    def __init__(self, *, drift_assistant_end: bool = False):
+        super().__init__(drift_assistant_end=drift_assistant_end)
+        self.tools_seen = []
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, **kwargs):
+        self.tools_seen.append(kwargs.pop("tools", None))
+        kwargs.pop("enable_thinking", None)
+        if any(message.get("role") == "tool" for message in messages) and not any(
+            message.get("role") == "user" for message in messages
+        ):
+            raise ValueError("No user query found in messages")
+        return super().apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+
+
+class RecordingToolsTokenizer(FakeTokenizer):
+    name_or_path = "/models/Qwen3-8B"
+
+    def __init__(self):
+        self.tools_seen = []
+        self.chat_template_kwargs_seen = []
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, tools=None, **_kwargs):
+        self.tools_seen.append(tools)
+        self.chat_template_kwargs_seen.append(_kwargs)
+        return super().apply_chat_template(messages, tokenize=tokenize, add_generation_prompt=add_generation_prompt)
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(character) for character in text]
 
 
 class FakeGemma4Tokenizer:
@@ -324,6 +366,184 @@ def _search_call(query: str) -> str:
     return f'<tool_call>{{"name":"web_search","arguments":{{"query":"{query}","max_results":3}}}}</tool_call>'
 
 
+def test_search_gym_uses_checkpoint_tool_call_protocol(monkeypatch):
+    tokenizer = RecordingToolsTokenizer()
+    sample = Sample(
+        prompt="placeholder",
+        label="answer",
+        metadata={"question": "What is the answer?", "data_source": "searchR1_nq"},
+    )
+
+    async def fake_retrieve(_url, payload, *, retry_budget, episode_cache):
+        del payload, retry_budget, episode_cache
+        return {"results": [{"content": {"title": "Doc", "chunk_text": "evidence"}}]}, 0, None
+
+    monkeypatch.setattr(fused_env, "_retrieve_json_cached", fake_retrieve)
+
+    result = _run_generate_with_fake_sglang(
+        sample,
+        [
+            {"text": '<think>reasoning\n<tool_call>{"name":"search","arguments":{"query":"facts"}}</tool_call>'},
+            {"text": "more reasoning</think>\n<answer>answer</answer>"},
+        ],
+        {"FUSED_HARNESS": "search_gym", "FUSED_DISABLE_THINKING": "False"},
+        evaluation=True,
+        tokenizer=tokenizer,
+    )
+
+    assert result[0].metadata["fused_termination"] == "env_done"
+    assert result[0].metadata["fused_tool_call_turns"] == 1
+    assert tokenizer.tools_seen
+    assert all(tools is None for tools in tokenizer.tools_seen)
+    assert "<tool_call>" in SEARCH_GYM_SYSTEM_PROMPT
+    assert "<search>" not in SEARCH_GYM_SYSTEM_PROMPT
+    parser = make_tool_parser(tokenizer.name_or_path, valid_tools={"search", "finish"})
+    assert parser.parse("reasoning</think><search>legacy</search>") == []
+
+
+def test_search_gym_rejects_unclosed_think_with_text_after_action():
+    response = '<think>reasoning<tool_call>{"name":"search","arguments":{"query":"facts"}}</tool_call>tail'
+
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label="answer", metadata={"question": "What is the answer?"}),
+        [{"text": response}],
+        {"FUSED_HARNESS": "search_gym", "FUSED_DISABLE_THINKING": "False"},
+        evaluation=True,
+        tokenizer=RecordingToolsTokenizer(),
+    )
+
+    assert result[0].metadata["fused_termination"] == "ABNORMAL_EVAL_RESPONSE"
+    assert result[0].metadata["eval_response_anomalies"] == ["unbalanced_tags"]
+
+
+def test_deepsearch_world_plan_then_answer_uses_independent_prompts():
+    tokenizer = RecordingToolsTokenizer()
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label="Ulm", metadata={"question": "Where was Einstein born?"}),
+        [
+            {
+                "text": '<think>Plan the entity.</think>\n{"completed_list":[],"todo_list":["Einstein"],"experience":[],"information":[]}'
+            },
+            {"text": "<think>The visited evidence confirms the answer.</think><answer>Ulm</answer>"},
+        ],
+        {
+            "FUSED_HARNESS": "deepsearch_world",
+            "FUSED_DISABLE_THINKING": "False",
+            "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE": "1",
+        },
+        evaluation=True,
+        tokenizer=tokenizer,
+    )
+
+    sample = result[0]
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["fused_traj_steps"] == 2
+    assert sample.response.endswith("<answer>Ulm</answer>")
+    assert tokenizer.tools_seen == [None, None]
+    assert all(kwargs["enable_thinking"] is False for kwargs in tokenizer.chat_template_kwargs_seen)
+
+
+def test_deepsearch_world_parser_accepts_json_tools_for_qwen35_checkpoint():
+    parser = dsw.DeepSearchWorldParser(valid_tools={"web_search_wiki", "visit_wiki", "finish"})
+    response = '<think>Search next.</think><tool_call>{"name":"web_search_wiki","arguments":{"query":"Ulm"}}</tool_call>'
+
+    assert parser.parse(response) == [
+        ToolCall("web_search_wiki", {"query": "Ulm"}, response.index("<tool_call>"), len(response))
+    ]
+
+
+def test_deepsearch_world_parser_uses_last_action_after_replayed_example():
+    parser = dsw.DeepSearchWorldParser(valid_tools={"web_search_wiki", "visit_wiki", "finish"})
+    response = (
+        "replayed example <answer>South Melbourne</answer>\n"
+        '<think>Now handle the real task.</think><tool_call>{"name":"web_search_wiki",'
+        '"arguments":{"query":"Khanzada Begum"}}</tool_call>'
+    )
+
+    action = parser.parse(response)[0]
+
+    assert action.name == "web_search_wiki"
+    assert action.arguments == {"query": "Khanzada Begum"}
+
+
+def test_deepsearch_world_caps_generation_at_historical_1024_tokens():
+    sampling_params_seen = []
+    _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label="Ulm", metadata={"question": "Where was Einstein born?"}),
+        [
+            {"text": '<think>Plan.</think>{"completed_list":[],"todo_list":[],"experience":[],"information":[]}'},
+            {"text": "<think>Known.</think><answer>Ulm</answer>"},
+        ],
+        {"FUSED_HARNESS": "deepsearch_world", "PER_STEP_MAX_TOKENS": "8192"},
+        evaluation=True,
+        sampling_params_seen=sampling_params_seen,
+    )
+
+    assert [params["max_new_tokens"] for params in sampling_params_seen] == [1024, 1024]
+
+
+def test_deepsearch_world_runs_end_phase_after_action_limit():
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label="Ulm", metadata={"question": "Where was Einstein born?"}),
+        [
+            {"text": '<think>Plan.</think>{"completed_list":[],"todo_list":[],"experience":[],"information":[]}'},
+            {"text": "<think>I need more evidence.</think>"},
+            {"text": "<think>Best answer from the available evidence.</think><answer>Ulm</answer>"},
+        ],
+        {
+            "FUSED_HARNESS": "deepsearch_world",
+            "DEEPSEARCH_WORLD_MAX_STEPS": "1",
+            "FUSED_DISABLE_THINKING": "False",
+        },
+        evaluation=True,
+    )
+
+    assert result[0].metadata["fused_termination"] == "env_done"
+    assert result[0].metadata["fused_traj_steps"] == 3
+
+
+def test_deepsearch_world_recent_steps_keeps_only_last_two():
+    steps = [dsw.step_record(f"<think>thought {index}</think>") for index in range(3)]
+    recent = dsw.format_recent_steps(steps)
+
+    assert "thought 0" not in recent
+    assert "thought 1" in recent
+    assert "thought 2" in recent
+
+
+def test_deepsearch_world_local_search_result_can_be_visited(monkeypatch):
+    async def fake_retrieve(_url, _payload, *, retry_budget, episode_cache):
+        del retry_budget, episode_cache
+        return {
+            "results": [
+                {
+                    "title": "Albert Einstein",
+                    "document": {
+                        "text": (
+                            "Albert Einstein was born in Ulm, Germany, on 14 March 1879. "
+                            "He later became a theoretical physicist known for developing the theory of relativity. "
+                            "The biographical page identifies Ulm as his place of birth."
+                        )
+                    },
+                }
+            ]
+        }, 0, None
+
+    monkeypatch.setattr(fused_env, "_retrieve_json_cached", fake_retrieve)
+    env = FusedEnvironment(
+        {"question": "Where was Einstein born?", "data_source": "asearcher"},
+        retrieval_url="http://retriever",
+        deepsearch_world=True,
+    )
+
+    search_result, _, _, _ = asyncio.run(env.step(ToolCall("web_search_wiki", {"query": "Albert Einstein"})))
+    url = next(line.removeprefix("URL: ") for line in search_result.splitlines() if line.startswith("URL: "))
+    page, _, _, info = asyncio.run(env.step(ToolCall("visit_wiki", {"url": url})))
+
+    assert "born in Ulm" in page
+    assert info["tools/visit_cache_hit"] == 1
+
+
 def test_normalize_rllm_extra_info_task():
     row = {
         "prompt": [{"role": "user", "content": "placeholder"}],
@@ -345,6 +565,8 @@ def test_normalize_rllm_extra_info_task():
 def test_rllm_deepresearch_harness_aliases_and_prompt():
     assert normalize_harness("rllm_dr") == "rllm_deepresearch"
     assert normalize_harness("deepresearch") == "rllm_deepresearch"
+    assert normalize_harness("cutbill") == "cut_bill"
+    assert normalize_harness("cut-bill") == "cut_bill"
     tools = [local_search_schema(), finish_schema()]
     question = (
         "Who?When ready, output the final answer enclosed in <answer> and </answer> tags. "
@@ -540,6 +762,28 @@ def test_initial_messages_configure_runtime_qwen35_parser_schema():
     assert call.arguments == {"query": "query", "max_results": 10}
 
 
+def test_qwen35_native_tool_template_is_the_only_tool_prompt():
+    tools = [web_search_schema(), finish_schema()]
+    tokenizer = FakeQwen35ChatTemplateTokenizer()
+    parser = make_tool_parser(tokenizer.name_or_path, valid_tools={"web_search", "finish"})
+    messages = _initial_messages(
+        "gem",
+        "web_search",
+        "question",
+        tools,
+        tokenizer.name_or_path,
+        tool_parser=parser,
+        inline_tool_prompt=False,
+    )
+
+    assert "<tools>" not in messages[0]["content"]
+    _render_prompt_ids(tokenizer, messages, tools=tools, disable_thinking=False)
+    assert tokenizer.tools_seen == [tools]
+    assert parser.parse(
+        "<tool_call>\n<function=web_search>\n<parameter=query>q</parameter>\n</function>\n</tool_call>"
+    )[0].arguments == {"query": "q"}
+
+
 def test_qwen3_coder_parser_accepts_colon_before_integer_value():
     tools = [web_search_schema()]
     parser = make_tool_parser("Qwen3.5-4B", valid_tools={"web_search"})
@@ -553,6 +797,97 @@ def test_qwen3_coder_parser_accepts_colon_before_integer_value():
     )[0]
 
     assert call.arguments == {"query": ": 10", "max_results": 10}
+
+
+def test_qwen3_coder_parser_normalizes_quoted_parameter_names_and_drops_unknown_fields(caplog):
+    tools = [web_search_schema()]
+    parser = make_tool_parser("Qwen3.5-4B", valid_tools={"web_search"})
+    parser.get_tool_prompt("\n".join(json.dumps(t, indent=0, ensure_ascii=False) for t in tools))
+
+    with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
+        calls = parser.parse(
+            "<tool_call>\n<function=web_search>\n"
+            '<parameter="query>\nseed cone\n</parameter>\n'
+            "<parameter=include_full_text>\ntrue\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "seed cone"}
+    assert parser.last_schema_errors == [
+        'malformed parameter name \'"query\'',
+        "unknown parameter 'include_full_text' for tool 'web_search'",
+    ]
+    assert "not defined in the tool parameters" not in caplog.text
+
+
+def test_qwen35_schema_violation_terminates_current_turn_as_tool_parser_error():
+    bad = (
+        "<tool_call>\n<function=web_search>\n"
+        '<parameter="query>seed cone</parameter>\n'
+        "<parameter=include_full_text>true</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+
+    result = _run_generate_with_fake_sglang(
+        Sample(
+            prompt="placeholder",
+            label={"answer": "answer"},
+            metadata={"question": "Use web_search before submit"},
+        ),
+        [{"text": bad}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeQwen35ChatTemplateTokenizer(),
+    )
+
+    assert len(result) == 1
+    sample = result[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
+    assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
+    assert sample.metadata["tool_parser_errors"] == [
+        'malformed parameter name \'"query\'',
+        "unknown parameter 'include_full_text' for tool 'web_search'",
+    ]
+    assert _policy_masked_text(sample) == bad
+
+
+def test_qwen35_invalid_typed_parameter_is_a_schema_error():
+    parser = make_tool_parser("Qwen3.5-4B", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+
+    calls = parser.parse(
+        "<tool_call>\n<function=web_search>\n"
+        "<parameter=query>facts</parameter>\n"
+        "<parameter=max_results>5junk</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+
+    assert calls[0].arguments == {"query": "facts"}
+    assert parser.last_schema_errors == ["invalid value for parameter 'max_results' of tool 'web_search'"]
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value", "expected"),
+    [
+        ("max_results", "10</result>", 10),
+        ("max_results", "10", 10),
+        ("query", "literal < tag", "literal < tag"),
+    ],
+)
+def test_qwen35_parser_repairs_only_leaked_scalar_closing_fragment(parameter, value, expected):
+    parser = make_tool_parser("Qwen3.5-4B", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+    calls = parser.parse(
+        f"<tool_call>\n<function=web_search>\n<parameter={parameter}>{value}</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    assert calls[0].arguments[parameter] == expected
+    assert parser.last_schema_errors == []
 
 
 def test_qwen3_coder_parser_normalizes_submit_and_keeps_boxed_fallback():
@@ -1792,6 +2127,24 @@ def test_qwen3_tito_delta_preserves_raw_assistant_token_prefix():
     assert tokenizer.decode(delta[2:]).endswith("<|im_start|>assistant\n")
 
 
+def test_qwen35_tito_delta_uses_original_query_after_tool_response_users():
+    tokenizer = FakeQwen35ChatTemplateTokenizer()
+    old_messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "original question"},
+        {"role": "assistant", "content": "<think>x</think><tool_call>{}</tool_call>"},
+        {"role": "user", "content": "<tool_response>evidence</tool_response>"},
+        {"role": "assistant", "content": "<think>next</think><tool_call>{}</tool_call>"},
+    ]
+    new_messages = [*old_messages, {"role": "user", "content": "<tool_response>more</tool_response>"}]
+
+    delta = _render_qwen3_tito_delta_ids(
+        tokenizer, old_messages, new_messages, [11, 12, 13], disable_thinking=False
+    )
+
+    assert tokenizer.decode(delta[2:]).endswith("<|im_start|>assistant\n")
+
+
 def test_qwen3_tito_delta_rejects_history_rewrite():
     tokenizer = FakeQwen3ChatTemplateTokenizer()
     old_messages = [{"role": "user", "content": "original"}]
@@ -2549,6 +2902,45 @@ def test_cot_initial_messages_do_not_include_fused_tool_prompt():
     assert "research assistant" not in messages[0]["content"]
 
 
+def test_rag_initial_messages_include_retrieved_context_without_tools():
+    messages = _initial_messages(
+        "rag",
+        "web search",
+        "Who?",
+        [web_search_schema(), finish_schema()],
+        retrieved_context="[1] Source: Evidence.",
+    )
+
+    assert messages[0]["content"] == fused_generate.COT_SYSTEM_PROMPT
+    assert "<question>\nWho?\n</question>" in messages[1]["content"]
+    assert "<context>\n[1] Source: Evidence.\n</context>" in messages[1]["content"]
+    assert "web_search" not in messages[0]["content"]
+
+
+def test_rag_generate_retrieves_once_then_scores_as_reasoning_only(monkeypatch):
+    calls = []
+
+    async def fake_step(self, action):
+        calls.append(action)
+        self.tool_calls += 1
+        return "[1] Source: answer evidence.", 0.0, False, {"tools/search_calls": 1}
+
+    monkeypatch.setattr(FusedEnvironment, "step", fake_step)
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Find evidence"}),
+        [{"text": "\\boxed{answer}"}],
+        {"FUSED_HARNESS": "rag", "CREDIT_ASSIGNMENT_ENABLE": "False"},
+    )
+
+    sample = result[0]
+    assert [(call.name, call.arguments) for call in calls] == [
+        ("web_search", {"query": "Find evidence", "max_results": 5})
+    ]
+    assert sample.reward == 1.0
+    assert sample.metadata["fused_termination"] == "reasoning_only"
+    assert sample.metadata["fused_reward_debug"]["tool_calls"] == 1
+
+
 def test_cot_generate_ignores_tool_calls_and_scores_as_reasoning_only(monkeypatch):
     async def fail_step(self, action):
         raise AssertionError(f"cot harness must not execute tools: {action}")
@@ -2662,6 +3054,29 @@ def test_web_search_retrieval_limits_observation_to_256_words():
     assert "beta179" not in text
 
 
+def test_rag_search_retrieval_uses_configured_context_word_limit(monkeypatch):
+    async def fake_retrieve(_url, _payload, *, retry_budget, episode_cache):
+        return {
+            "results": [
+                {
+                    "content": {
+                        "title": "Long",
+                        "chunk_text": " ".join(f"token{i}" for i in range(1200)),
+                    }
+                }
+            ]
+        }, 0, None
+
+    monkeypatch.setattr(fused_env, "_retrieve_json_cached", fake_retrieve)
+    monkeypatch.setenv("RAG_CONTEXT_MAX_WORDS", "1024")
+    env = FusedEnvironment({"question": "q"}, rag=True)
+
+    observation, _, _, _ = asyncio.run(env.step(ToolCall("web_search", {"query": "q"})))
+
+    assert len(observation.split()) == 1024
+    assert "token1199" not in observation
+
+
 def test_web_search_tool_observation_limits_json_string_to_256_words():
     raw_json = json.dumps(
         [
@@ -2683,6 +3098,8 @@ def test_web_search_tool_observation_limits_json_string_to_256_words():
 
 def test_web_search_falls_back_to_one_for_malformed_max_results(monkeypatch):
     class FakeResponse:
+        status = 200
+
         status = 200
         reason = "OK"
         request_info = SimpleNamespace(real_url="http://127.0.0.1:65432/retrieve")
@@ -2911,6 +3328,88 @@ def test_web_search_uses_summary_when_enabled(monkeypatch):
     ]
 
 
+def test_openrouter_summary_backend_returns_raw_message_content(monkeypatch):
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self, content_type=None):
+            return {"choices": [{"finish_reason": "stop", "message": {"content": '{"summary": "Raw model answer"}'}}]}
+
+    class FakeSession:
+        calls = []
+
+        def post(self, url, json=None, headers=None):
+            self.calls.append((url, json, headers))
+            return FakeResponse()
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("RLLM_RETRIEVAL_SUMMARY_MODEL", "test/model")
+    session = FakeSession()
+
+    summary, retries = asyncio.run(
+        fused_env._summarize_openrouter_batch(session, "First document\n\nSecond document", retry_budget=0)
+    )
+
+    assert summary == "Raw model answer"
+    assert retries == 0
+    url, payload, headers = session.calls[0]
+    assert url == "https://openrouter.ai/api/v1/chat/completions"
+    assert payload["model"] == "test/model"
+    assert payload["max_tokens"] == 512
+    assert payload["temperature"] == 0
+    assert payload["reasoning"] == {"enabled": False}
+    assert payload["response_format"]["type"] == "json_schema"
+    assert "First document\n\nSecond document" in payload["messages"][0]["content"]
+    assert headers["Authorization"] == "Bearer test-key"
+
+
+def test_summary_units_handle_latin_and_cjk_without_extra_dependencies():
+    assert _summary_units("Microsoft was founded in 1975.") == 5
+    assert _summary_units("微软成立于1975年。") == 7
+
+
+def test_summary_input_limit_applies_units_and_character_cap():
+    mixed = "微软成立于1975年。 Microsoft was founded in 1975. "
+    limited = _limit_summary_input(mixed * 1000)
+    assert _summary_units(limited) <= fused_env.SUMMARY_MAX_INPUT_WORDS
+    assert len(limited) <= fused_env.SUMMARY_MAX_INPUT_CHARS
+
+    cjk_limited = _limit_summary_input("中" * 9000)
+    assert len(cjk_limited) == fused_env.SUMMARY_MAX_INPUT_WORDS
+    assert _summary_units(cjk_limited) == fused_env.SUMMARY_MAX_INPUT_WORDS
+
+
+def test_openrouter_summary_length_finish_reason_falls_back_without_parsing(monkeypatch):
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self, content_type=None):
+            return {"choices": [{"finish_reason": "length", "message": {"content": "{}"}}]}
+
+    class FakeSession:
+        def post(self, url, json=None, headers=None):
+            return FakeResponse()
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    summary, retries = asyncio.run(
+        fused_env._summarize_openrouter_batch(FakeSession(), "document", retry_budget=0)
+    )
+    assert summary is None
+    assert retries == 0
+
+
 def test_web_search_summary_failure_falls_back_to_documents(monkeypatch):
     class FakeResponse:
         def __init__(self, status: int, payload):
@@ -3059,7 +3558,7 @@ def test_web_search_summary_failure_does_not_disable_future_summary_attempts(mon
     assert len([url for url, _ in FakeSession.calls if url.endswith("/summarize")]) == 6
 
 
-def test_web_search_summary_splits_oversized_requests(monkeypatch):
+def test_web_search_summary_uses_one_request_with_8192_word_input(monkeypatch):
     class FakeResponse:
         def __init__(self, status: int, payload):
             self.status = status
@@ -3096,7 +3595,7 @@ def test_web_search_summary_splits_oversized_requests(monkeypatch):
         def post(self, url, json=None):
             FakeSession.calls.append((url, json))
             if url.endswith("/retrieve"):
-                long_doc = " ".join(f"word{i}" for i in range(1500))
+                long_doc = " ".join(f"word{i}" for i in range(9000))
                 payload = {
                     "results": [
                         {
@@ -3111,13 +3610,6 @@ def test_web_search_summary_splits_oversized_requests(monkeypatch):
             if url.endswith("/summarize"):
                 documents = json["documents"]
                 total_words = sum(len(str(item.get("content", "")).split()) for item in documents)
-                if total_words > 700:
-                    return FakeResponse(
-                        500,
-                        {
-                            "detail": "Summarization Error: ValueError('The decoder prompt (length 9000) is longer than the maximum model length of 8192. Make sure that `max_model_len` is no smaller than the number of text tokens.')"
-                        },
-                    )
                 return FakeResponse(200, {"summary": f"# Summary: summarized {total_words}"})
             raise AssertionError(url)
 
@@ -3126,7 +3618,6 @@ def test_web_search_summary_splits_oversized_requests(monkeypatch):
     monkeypatch.setattr("slime.rollout.fused_agent.env._now_monotonic", lambda: next(monotonic_values))
     monkeypatch.setenv("RLLM_RETRIEVAL_SUMMARIZE", "1")
     monkeypatch.setenv("RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET", "0")
-    monkeypatch.setenv("RLLM_RETRIEVAL_SUMMARY_MAX_WORDS_PER_REQUEST", "1200")
     env = FusedEnvironment({"question": "Find evidence"})
 
     observation, reward, done, info = asyncio.run(env.step(fused_generate.ToolCall("web_search", {"query": "q"})))
@@ -3136,15 +3627,12 @@ def test_web_search_summary_splits_oversized_requests(monkeypatch):
     assert done is False
     assert info["search_summary_used"] is True
     summarize_calls = [payload for url, payload in FakeSession.calls if url.endswith("/summarize")]
-    assert len(summarize_calls) == 5
-    assert sum(len(str(item.get("content", "")).split()) for item in summarize_calls[0]["documents"]) > 700
-    assert (
-        max(
-            sum(len(str(item.get("content", "")).split()) for item in payload["documents"])
-            for payload in summarize_calls[1:]
-        )
-        <= 700
-    )
+    assert len(summarize_calls) == 1
+    assert len(summarize_calls[0]["documents"]) == 1
+    summary_input = summarize_calls[0]["documents"][0]["content"]
+    assert len(summary_input) == fused_env.SUMMARY_MAX_INPUT_CHARS
+    assert _summary_units(summary_input) <= fused_env.SUMMARY_MAX_INPUT_WORDS
+    assert summarize_calls[0]["max_length"] == 512
 
 
 def test_web_search_skips_summary_when_disabled(monkeypatch):
@@ -3852,6 +4340,43 @@ def test_rllm_deepresearch_eval_runs_searches_and_finish(monkeypatch):
     assert result[0].metadata["fused_tool_call_turns"] == 2
 
 
+def test_cut_bill_eval_runs_search_and_finishes_with_boxed_answer(monkeypatch):
+    searches = []
+    sampling_params_seen = []
+
+    async def fake_search(action, *, retrieval_url, max_results):
+        searches.append((action.arguments["query"], retrieval_url, max_results))
+        return "Your query is: capital. The search results are summarized as following: Paris.", {
+            "tool_return_error": 0,
+            "refine_error": 0,
+        }
+
+    monkeypatch.setattr(fused_generate, "run_cut_bill_search", fake_search)
+    search = (
+        "<think>\nI should search.\n</think>\n\n"
+        '<tool_call>\n{"name": "local_search", "arguments": {"query": "capital"}}\n</tool_call>'
+    )
+    answer = "<think>\nThe result identifies Paris.\n</think>\n\n\\boxed{Paris}"
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label="Paris", metadata={"question": "Where?"}),
+        [{"text": search}, {"text": answer}],
+        {
+            "FUSED_HARNESS": "cut_bill",
+            "RETRIEVAL_SERVER_URL": "http://retriever",
+            "PER_STEP_MAX_TOKENS": "8192",
+        },
+        evaluation=True,
+        sampling_params_seen=sampling_params_seen,
+    )
+
+    assert searches == [("capital", "http://retriever", 10)]
+    assert result[0].response == answer
+    assert result[0].reward == 1.0
+    assert result[0].metadata["fused_termination"] == "env_done"
+    assert result[0].metadata["fused_tool_call_turns"] == 1
+    assert [params["max_new_tokens"] for params in sampling_params_seen] == [8192, 8192]
+
+
 def test_rllm_deepresearch_eval_keeps_no_tool_call_termination():
     response = "I cannot find enough information."
     result = _run_generate_with_fake_sglang(
@@ -4256,16 +4781,33 @@ def test_long_horizon_visualization_keeps_actions_unmasked_under_assistant_repla
     assert '"name":"finish"' in segment_view.renderables[-1].renderable.plain
 
 
-def test_qwen3_incremental_tito_avoids_assistant_replay_drift_segments():
-    tool_turns = [_search_call(f"evidence query {index}") for index in range(3)]
-    finish = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"\\\\boxed{answer}"}}</tool_call>'
-    tokenizer = FakeQwen3ChatTemplateTokenizer(drift_assistant_end=True)
+@pytest.mark.parametrize("tokenizer", [FakeQwen3ChatTemplateTokenizer(), FakeQwen35ChatTemplateTokenizer()])
+def test_qwen3_family_incremental_tito_avoids_assistant_replay_drift_segments(tokenizer):
+    if isinstance(tokenizer, FakeQwen35ChatTemplateTokenizer):
+        tool_turns = [
+            "<tool_call>\n<function=web_search>\n"
+            f"<parameter=query>evidence query {index}</parameter>\n"
+            "<parameter=max_results>3</parameter>\n</function>\n</tool_call>"
+            for index in range(3)
+        ]
+        finish = (
+            "<tool_call>\n<function=finish>\n<parameter=command>submit</parameter>\n"
+            "<parameter=result>\\boxed{answer}</parameter>\n</function>\n</tool_call>"
+        )
+    else:
+        tool_turns = [_search_call(f"evidence query {index}") for index in range(3)]
+        finish = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"\\\\boxed{answer}"}}</tool_call>'
+    tokenizer.drift_assistant_end = True
     prompt_ids_seen: list[list[int]] = []
 
     result = _run_generate_with_fake_sglang(
         Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Find evidence"}),
         [{"text": text} for text in [*tool_turns, finish]],
-        {"CREDIT_ASSIGNMENT_ENABLE": "False", "FUSED_MAX_STEPS": "8"},
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+            "FUSED_MAX_STEPS": "8",
+            "SLIME_FUSED_STRICT_TITO": "True",
+        },
         tokenizer=tokenizer,
         prompt_ids_seen=prompt_ids_seen,
     )
@@ -4279,6 +4821,20 @@ def test_qwen3_incremental_tito_avoids_assistant_replay_drift_segments():
     for previous_prompt, generated_text, next_prompt in zip(prompt_ids_seen, tool_turns, prompt_ids_seen[1:]):
         exact_previous_prefix = previous_prompt + [ord(character) for character in generated_text]
         assert next_prompt[: len(exact_previous_prefix)] == exact_previous_prefix
+
+
+def test_strict_tito_rejects_historical_thinking_discard():
+    with pytest.raises(ValueError, match="Strict TiTO requires append-only history"):
+        _run_generate_with_fake_sglang(
+            Sample(prompt="placeholder", label="answer", metadata={"question": "Find evidence"}),
+            [{"text": _search_call("evidence")}],
+            {
+                "FUSED_DISABLE_THINKING": "False",
+                "FUSED_DISCARD_HISTORICAL_THINKING": "True",
+                "SLIME_FUSED_STRICT_TITO": "True",
+            },
+            tokenizer=FakeQwen35ChatTemplateTokenizer(),
+        )
 
 
 def test_group_visualization_orders_and_renders_every_segment_without_fuzzy_matching():
@@ -4818,6 +5374,26 @@ def test_eval_stops_repeated_search_with_distinct_termination_reason():
     assert sample.metadata["duplicate_query_count"] == 1
     assert sample.metadata["fused_traj_steps"] == 2
     assert sample.tokens == []
+
+
+def test_eval_accepts_finish_after_repeated_search_warning():
+    search = _search_call("same query")
+    finish = '<tool_call>{"name":"finish","arguments":{"command":"submit","result":"answer"}}</tool_call>'
+
+    result = _run_generate_with_fake_sglang(
+        Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Search then answer"}),
+        [{"text": search}, {"text": search}, {"text": finish}],
+        {
+            "FUSED_REPEATED_SEARCH_MAX_STRIKES": "2",
+            "CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD": "1.0",
+        },
+        evaluation=True,
+    )
+
+    sample = result[0]
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["fused_traj_steps"] == 3
+    assert sample.response == finish
 
 
 def test_eval_disables_parser_error_abnormal_detection(tmp_path: Path):

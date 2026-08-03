@@ -117,6 +117,15 @@ REACT_USER_PROMPT = """Task:
 Use the ReAct loop and call available tools in the format shown in the Tools section."""
 COT_SYSTEM_PROMPT = """Please reason step by step, and put your final answer within \\boxed{}."""
 COT_USER_PROMPT = "{problem_statement}"
+RAG_USER_PROMPT = """Answer the question using the retrieved context below. Reason step by step, and put your final answer within \\boxed{{}}.
+
+<question>
+{problem_statement}
+</question>
+
+<context>
+{retrieved_context}
+</context>"""
 
 
 def finish_schema() -> dict:
@@ -149,12 +158,14 @@ def build_system_prompt(
     model_name: str | None = None,
     *,
     tool_parser=None,
+    inline_tool_prompt: bool = True,
 ) -> str:
     parser = tool_parser or make_tool_parser(model_name)
-    if isinstance(parser, Gemma4ToolParser):
-        return base_prompt.strip()
     schemas_str = "\n".join(json.dumps(schema, indent=0, ensure_ascii=False) for schema in schemas)
-    return base_prompt.strip() + "\n" + parser.get_tool_prompt(schemas_str)
+    tool_prompt = parser.get_tool_prompt(schemas_str)
+    if isinstance(parser, Gemma4ToolParser) or not inline_tool_prompt:
+        return base_prompt.strip()
+    return base_prompt.strip() + "\n" + tool_prompt
 
 
 def normalize_harness(harness: str | None) -> str:
@@ -166,8 +177,10 @@ def normalize_harness(harness: str | None) -> str:
         "no_system": "bare",
         "rllm_dr": "rllm_deepresearch",
         "deepresearch": "rllm_deepresearch",
+        "cutbill": "cut_bill",
+        "deepsearch_world": "deepsearch_world",
     }
     value = aliases.get(value, value)
-    if value not in {"gem", "unified_gem", "react", "cot", "bare", "rllm_deepresearch", "search_gym"}:
+    if value not in {"gem", "unified_gem", "react", "cot", "rag", "bare", "rllm_deepresearch", "cut_bill", "search_gym", "deepsearch_world"}:
         raise ValueError(f"Invalid fused harness: {harness!r}")
     return value

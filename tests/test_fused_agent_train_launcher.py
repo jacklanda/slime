@@ -21,6 +21,15 @@ def test_qwen3_sync_launcher_defaults_to_colocated_trainer_offload():
 
 
 @pytest.mark.unit
+def test_qwen35_sync_launcher_does_not_reset_unsynced_visual_weights_by_default():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_qwen3.5_fused_agent_sync.sh").read_text(encoding="utf-8")
+
+    assert 'if is_truthy "${CHECK_WEIGHT_UPDATE_EQUAL:-0}"; then' in launcher
+    assert "MISC_ARGS+=(--check-weight-update-equal)" in launcher
+
+
+@pytest.mark.unit
 def test_qwen3_sync_launcher_resolves_and_validates_grm_credentials():
     repo_root = Path(__file__).resolve().parents[1]
     launcher = (repo_root / "experiments/train_qwen3_fused_agent_sync.sh").read_text(encoding="utf-8")

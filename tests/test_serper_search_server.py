@@ -104,6 +104,31 @@ def test_retrieve_returns_flat_legacy_document_list_after_search():
     assert calls == [(["apple"], 2, 3, serper.DEFAULT_MAX_WORDS)]
     assert response == {"result": [{"document": {"contents": "Scraped page content"}}]}
 
+
+def test_html_to_text_removes_script_and_style_content():
+    text = serper._html_to_text(
+        "<html><style>hidden css</style><body><h1>Title</h1><script>hidden js</script><p>Page fact</p></body></html>"
+    )
+
+    assert text == "Title Page fact"
+
+
+def test_access_endpoint_returns_page_contents_and_per_url_errors():
+    class FakeClient:
+        async def access(self, url):
+            if url.endswith("bad"):
+                raise ValueError("blocked")
+            return "Full page content"
+
+    serper.app.state.serper_client = FakeClient()
+    response = asyncio.run(
+        serper.access(serper.AccessRequest(urls=["https://example.com/good", "https://example.com/bad"]))
+    )
+
+    assert response["result"][0] == {"url": "https://example.com/good", "contents": "Full page content"}
+    assert response["result"][1]["contents"] == ""
+    assert "ValueError: blocked" in response["result"][1]["error"]
+
 def test_evals_exposes_serper_as_retrieval_backend():
     script = (Path(__file__).resolve().parents[1] / "experiments" / "evals.sh").read_text(encoding="utf-8")
 
@@ -111,6 +136,20 @@ def test_evals_exposes_serper_as_retrieval_backend():
     assert 'python3 "${REPO_ROOT}/examples/search-r1/serper_search_server.py"' in script
     assert 'export RETRIEVAL_SERVER_URL="${RETRIEVAL_SERVER_URL:-http://10.2.152.50:65432}"' in script
     assert 'serper:*) export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-10}"' in script
+
+
+def test_evals_exposes_rag_harness_with_cot_runtime_defaults():
+    script = (Path(__file__).resolve().parents[1] / "experiments" / "evals.sh").read_text()
+
+    assert "Harness: bare, cot, rag, react" in script
+    assert 'cot|rag|bare) UNIFIED_SYSTEM_PROMPT=False' in script
+    assert '[ "${FUSED_HARNESS}" = "cot" ] || [ "${FUSED_HARNESS}" = "rag" ]' in script
+    assert "--rag-context-max-words N" in script
+    assert 'RAG_CONTEXT_MAX_WORDS="${RAG_CONTEXT_MAX_WORDS:-1024}"' in script
+    assert "export RAG_CONTEXT_MAX_WORDS" in script
+    assert "--summary-backend local|openrouter" in script
+    assert 'SUMMARY_BACKEND="${SUMMARY_BACKEND:-openrouter}"' in script
+    assert 'SUMMARY_MODEL="${SUMMARY_MODEL:-qwen/qwen3-30b-a3b-instruct-2507}"' in script
 
 
 if __name__ == "__main__":
