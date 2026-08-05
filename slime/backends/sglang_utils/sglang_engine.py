@@ -428,7 +428,9 @@ class SGLangEngine(RayActor):
         weight_version: str | None = None,
     ):
         """Reload weights from the checkpoint at *model_path* without restarting the engine."""
-        payload: dict = {"model_path": model_path}
+        # Shard loading uses temporary CUDA tensors. Release their allocator
+        # cache before the offloaded KV pool and CUDA graphs are resumed.
+        payload: dict = {"model_path": model_path, "torch_empty_cache": True}
         if load_format is not None:
             payload["load_format"] = load_format
         if weight_version is not None:

@@ -1,6 +1,19 @@
 import gc
 import os
 import shutil
+import sys
+from pathlib import Path
+
+
+# Megatron-LM only packages megatron-core; megatron.training is loaded from
+# the source checkout. Discover the standard sibling checkout used by slime.
+megatron_lm_path = os.environ.get("MEGATRON_LM_PATH")
+if megatron_lm_path is None:
+    sibling_checkout = Path(__file__).resolve().parents[2] / "Megatron-LM"
+    if (sibling_checkout / "megatron" / "training").is_dir():
+        megatron_lm_path = str(sibling_checkout)
+if megatron_lm_path is not None and megatron_lm_path not in sys.path:
+    sys.path.insert(0, megatron_lm_path)
 
 import torch
 import torch.distributed as dist
@@ -20,7 +33,8 @@ from slime.utils.memory_utils import print_memory
 
 def add_convertion_args(parser):
     """Add conversion arguments to the parser"""
-    parser.add_argument("--hf-checkpoint", type=str, required=True, help="HuggingFace model path")
+    parser.add_argument("hf_checkpoint_positional", nargs="?", help="HuggingFace model path")
+    parser.add_argument("--hf-checkpoint", type=str, default=None, help="HuggingFace model path")
     parser.add_argument(
         "--custom-model-provider-path",
         type=str,
@@ -43,6 +57,12 @@ def add_convertion_args(parser):
 
 def get_args():
     args = parse_args(add_convertion_args)
+    if args.hf_checkpoint is not None and args.hf_checkpoint_positional is not None:
+        raise ValueError("Specify the HuggingFace checkpoint either positionally or with --hf-checkpoint, not both.")
+    args.hf_checkpoint = args.hf_checkpoint or args.hf_checkpoint_positional
+    if args.hf_checkpoint is None:
+        raise ValueError("A HuggingFace checkpoint path is required.")
+    del args.hf_checkpoint_positional
     args = set_default_megatron_args(args)
 
     # set to pass megatron validate_args

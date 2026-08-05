@@ -3,6 +3,8 @@ import os
 import re
 from pathlib import Path
 
+import torch
+
 # TODO: may need to copy those 2 functions and do refactoring.
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_megatron
 from megatron.training.checkpointing import save_checkpoint
@@ -91,6 +93,48 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+try:
+    # Checkpoint staging copies every shard GPU->CPU with `non_blocking=True`, which makes
+    # torch allocate a *pinned* host buffer per tensor. On this CUDA/driver stack that
+    # cudaHostAlloc can fail with cudaErrorInvalidValue once the process has already
+    # registered a lot of pinned memory (the weight backuper pins a full model copy, and
+    # release-train recreates the actor every step so registrations churn). The failure is
+    # per-rank and non-deterministic: some ranks write their .distcp shards fine while
+    # others die, leaving a torn checkpoint dir with no latest_checkpointed_iteration.txt.
+    #
+    # Retry the bucket with blocking (pageable) copies instead of taking the job down. This
+    # is slower for the affected bucket but produces an identical checkpoint.
+    from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
+
+    _ACCELERATOR_ERROR = getattr(torch, "AcceleratorError", RuntimeError)
+
+    @staticmethod
+    def _preload_tensors_with_pinned_fallback(write_buckets, non_blocking=True):
+        result = []
+        for bucket in write_buckets:
+            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            try:
+                staged = [(item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data]
+                if non_blocking:
+                    torch.cuda.synchronize()
+            except (_ACCELERATOR_ERROR, RuntimeError):
+                if not non_blocking:
+                    raise
+                logger.warning(
+                    "Pinned checkpoint staging failed for %s; retrying with blocking copies.",
+                    file_name,
+                    exc_info=True,
+                )
+                torch.cuda.synchronize()
+                staged = [(item, tensor.to("cpu", non_blocking=False)) for item, tensor in tensor_data]
+            result.append((file_name, storage_key, (bytes_data, staged)))
+        return result
+
+    FileSystemWriterAsync.preload_tensors = _preload_tensors_with_pinned_fallback
+
+except ImportError:
+    pass
+
 __all__ = ["save_checkpoint"]
 
 
@@ -99,9 +143,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     args = get_args()
     load_path = args.load
 
-    assert Path(load_path).exists() and _is_dir_nonempty(
-        load_path
-    ), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
+    assert Path(load_path).exists() and _is_dir_nonempty(load_path), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
 
     if _is_megatron_checkpoint(load_path):
         return _load_checkpoint_megatron(
@@ -121,9 +163,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
 
 
 def _is_megatron_checkpoint(path: str | Path) -> bool:
-    return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(
-        re.fullmatch(r"iter_\d{7}", Path(path).name)
-    )
+    return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(re.fullmatch(r"iter_\d{7}", Path(path).name))
 
 
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
@@ -135,9 +175,7 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     logger.info(f"Load checkpoint from HuggingFace model into Megatron (path={load_path})")
 
     with megatron_bridge_utils.patch_megatron_model(ddp_model):
-        bridge = megatron_bridge_utils.patch_auto_bridge_hf_config(
-            AutoBridge.from_hf_pretrained(load_path, trust_remote_code=True)
-        )
+        bridge = megatron_bridge_utils.patch_auto_bridge_hf_config(AutoBridge.from_hf_pretrained(load_path, trust_remote_code=True))
         bridge.load_hf_weights(ddp_model)
 
     # Copied from Megatron-core :: load_checkpoint (with simplifications)

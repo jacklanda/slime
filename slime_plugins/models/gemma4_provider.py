@@ -10,6 +10,7 @@ Installs Gemma4-specific behaviors that sit outside the transformer layer:
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from types import MethodType
 
 import torch.nn.functional as F
@@ -22,6 +23,18 @@ from megatron.training.arguments import core_transformer_config_from_args
 from slime_plugins.models.gemma4 import _load_hf_text_config
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _Gemma4RuntimeState:
+    """Per-forward state shared by the GPT model and all cloned layer configs."""
+
+    per_layer_inputs: torch.Tensor | None = None
+    shared_kv_states: dict = field(default_factory=dict)
+
+    def reset(self) -> None:
+        self.per_layer_inputs = None
+        self.shared_kv_states.clear()
 
 
 def _is_rank_zero() -> bool:
@@ -148,14 +161,32 @@ def _install_per_layer_input_modules(inner, args, config, hf_text):
     inner._gemma4_per_layer_input_scale = 2.0**-0.5
     inner._gemma4_per_layer_model_projection_scale = config.hidden_size**-0.5
 
+
+def _install_runtime_state(inner) -> _Gemma4RuntimeState:
+    """Bind one runtime state to the model, layers, and attention modules.
+
+    Global Gemma4 layers are built with ``dataclasses.replace(config, ...)``.
+    Runtime tensors therefore cannot live on the config object: each cloned
+    config would see different state. Module attributes preserve the intended
+    model ownership and make that sharing explicit.
+    """
+
+    state = _Gemma4RuntimeState()
+    inner._gemma4_runtime_state = state
+    if hasattr(inner, "decoder"):
+        for layer in inner.decoder.layers:
+            layer._gemma4_runtime_state = state
+            if hasattr(layer, "self_attention"):
+                layer.self_attention._gemma4_runtime_state = state
+
     orig_forward = inner.forward
 
     def _forward_with_gemma4_state(self, *f_args, **f_kwargs):
-        self.config._gemma4_shared_kv_states = {}
-        self.config._gemma4_per_layer_inputs = None
+        self._gemma4_runtime_state.reset()
         return orig_forward(*f_args, **f_kwargs)
 
     inner.forward = MethodType(_forward_with_gemma4_state, inner)
+    return state
 
 
 def _install_hooks(model, args, config, pre_process, post_process):
@@ -178,6 +209,7 @@ def _install_hooks(model, args, config, pre_process, post_process):
 
     inner = model.module if hasattr(model, "module") else model
     _install_per_layer_input_modules(inner, args, config, hf_text)
+    runtime_state = _install_runtime_state(inner)
 
     # Embedding scaling - HF applies this inside the embedding module.
     # See ``Gemma4TextScaledWordEmbedding``: the scale is stored as an fp32
@@ -187,12 +219,16 @@ def _install_hooks(model, args, config, pre_process, post_process):
     if pre_process and hasattr(inner, "embedding"):
         embed_scale = torch.tensor(hidden_size**0.5)  # fp32
 
-        def _embed_hook(module, inp, output):
+        def _embed_hook(module, inp, kwargs, output):
             scaled = output * embed_scale.to(output.dtype)
             if not hasattr(module, "per_layer_embeddings"):
                 return scaled
 
-            input_ids = inp[0]
+            input_ids = kwargs.get("input_ids")
+            if input_ids is None and inp:
+                input_ids = inp[0]
+            if input_ids is None:
+                raise ValueError("Gemma4 per-layer embeddings require input_ids in embedding forward inputs")
             token_ple = module.per_layer_embeddings(input_ids)
             token_ple = token_ple.transpose(0, 1).contiguous()
             if token_ple.shape[0] != scaled.shape[0]:
@@ -218,10 +254,10 @@ def _install_hooks(model, args, config, pre_process, post_process):
                 inner._gemma4_num_layers,
                 inner._gemma4_ple_dim,
             )
-            config._gemma4_per_layer_inputs = (projected + token_ple) * inner._gemma4_per_layer_input_scale
+            runtime_state.per_layer_inputs = (projected + token_ple) * inner._gemma4_per_layer_input_scale
             return scaled
 
-        inner.embedding.register_forward_hook(_embed_hook)
+        inner.embedding.register_forward_hook(_embed_hook, with_kwargs=True)
 
     # Final logit softcapping - HF applies tanh(logits / cap) * cap.
     # Some Megatron output_layer variants (parallel_output paths) return

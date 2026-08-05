@@ -7,6 +7,7 @@ import torch
 from tests.gemma4._standalone_imports import load_gemma4_provider_module
 
 _provider = load_gemma4_provider_module()
+NUM_GPUS = 0
 
 
 def test_install_hooks_softcap_wraps_tensor_output():
@@ -160,6 +161,7 @@ def _install_embed_hook(inner, hidden):
         )
     finally:
         _provider._load_hf_text_config = orig
+    return config
 
 
 def test_install_hooks_embedding_scale_fp32_weight():
@@ -186,6 +188,66 @@ def test_install_hooks_embedding_scale_bf16_weight():
     raw = inner.embedding.weight[ids]
     expected_scale = torch.tensor(hidden**0.5).to(torch.bfloat16)
     assert torch.allclose(hooked, raw * expected_scale, atol=1e-2)
+
+
+def test_install_hooks_per_layer_embedding_reads_keyword_input_ids():
+    class _KeywordEmbedding(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.word_embeddings = torch.nn.Embedding(32, 4)
+            self.per_layer_embeddings = torch.nn.Embedding(32, 6)
+
+        def forward(self, *, input_ids, position_ids=None):
+            del position_ids
+            return self.word_embeddings(input_ids).transpose(0, 1).contiguous()
+
+    inner = torch.nn.Module()
+    inner.embedding = _KeywordEmbedding()
+    inner.per_layer_model_projection = torch.nn.Linear(4, 6, bias=False)
+    inner.per_layer_projection_norm = torch.nn.Identity()
+    inner._gemma4_num_layers = 2
+    inner._gemma4_ple_dim = 3
+    inner._gemma4_per_layer_input_scale = 2.0**-0.5
+    inner._gemma4_per_layer_model_projection_scale = 4**-0.5
+    inner.decoder = torch.nn.Module()
+    layer = torch.nn.Module()
+    layer.self_attention = torch.nn.Module()
+    inner.decoder.layers = torch.nn.ModuleList([layer])
+    config = _install_embed_hook(inner, hidden=4)
+
+    input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+    output = inner.embedding(input_ids=input_ids, position_ids=torch.arange(3))
+
+    assert output.shape == (3, 2, 4)
+    assert not hasattr(config, "_gemma4_per_layer_inputs")
+    assert inner._gemma4_runtime_state.per_layer_inputs.shape == (3, 2, 2, 3)
+    assert layer._gemma4_runtime_state is inner._gemma4_runtime_state
+    assert layer.self_attention._gemma4_runtime_state is inner._gemma4_runtime_state
+
+
+def test_install_hooks_runtime_state_is_shared_across_cloned_layer_config():
+    inner = torch.nn.Module()
+    inner.embedding = torch.nn.Embedding(8, 4)
+    inner.decoder = torch.nn.Module()
+    layer = torch.nn.Module()
+    layer.config = SimpleNamespace(name="cloned-global-layer-config")
+    layer.self_attention = torch.nn.Module()
+    layer.self_attention.config = layer.config
+    inner.decoder.layers = torch.nn.ModuleList([layer])
+    inner.forward = lambda *, input_ids: inner.embedding(input_ids)
+
+    _install_embed_hook(inner, hidden=4)
+
+    state = inner._gemma4_runtime_state
+    state.per_layer_inputs = torch.ones(1)
+    state.shared_kv_states[3] = (torch.ones(1), torch.ones(1))
+    inner(input_ids=torch.tensor([[1, 2]]))
+
+    assert state.per_layer_inputs is None
+    assert state.shared_kv_states == {}
+    assert layer._gemma4_runtime_state is state
+    assert layer.self_attention._gemma4_runtime_state is state
+    assert not hasattr(layer.config, "_gemma4_runtime_state")
 
 
 def _write_fake_safetensors_layer_scalars(ckpt_dir, scalars):

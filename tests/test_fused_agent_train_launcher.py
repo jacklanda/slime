@@ -7,6 +7,36 @@ NUM_GPUS = 0
 
 
 @pytest.mark.unit
+def test_gemma4_e4b_sync_launcher_uses_e4b_model_shape():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_gemma4_fused_agent_sync.sh").read_text(encoding="utf-8")
+
+    assert "--num-layers 42" in launcher
+    assert "--hidden-size 2560" in launcher
+    assert "--ffn-hidden-size 10240" in launcher
+    assert "--num-query-groups 2" in launcher
+    assert "--moe-token-dispatcher-type alltoall" in launcher
+    assert "--no-pin-cpu-params" in launcher
+    assert "--no-pin-cpu-grads" in launcher
+    assert "--overlap-cpu-optimizer-d2h-h2d" not in launcher
+    assert 'CHECK_WEIGHT_UPDATE_EQUAL:-0' in launcher
+    assert 'SLIME_TENSOR_BACKUP_PIN_MEMORY:-0' in launcher
+    assert 'os.path.join(sys.prefix, "lib"), os.environ.get("LD_LIBRARY_PATH")' in launcher
+    assert 'TOP_P="${TOP_P:-1.0}"' in launcher
+    assert 'TOP_K="${TOP_K:-64}"' in launcher
+    assert '--rollout-top-p "${TOP_P}"' in launcher
+    assert '--rollout-top-k "${TOP_K}"' in launcher
+    assert 'SGLANG_DETERMINISTIC_INFERENCE="${SGLANG_DETERMINISTIC_INFERENCE:-false}"' in launcher
+    assert 'if is_truthy "${SGLANG_DETERMINISTIC_INFERENCE}"; then' in launcher
+    assert 'CP_SIZE="${CP_SIZE:-2}"' in launcher
+    assert 'MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-20480}"' in launcher
+    assert 'LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"' in launcher
+    assert 'LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-8192}"' in launcher
+    assert 'export FUSED_MODEL_SERIES="gemma4"' in launcher
+    assert 'export FUSED_WEBQA_REWARD_MATCH_MODE="normalized_target_span"' in launcher
+
+
+@pytest.mark.unit
 def test_qwen3_sync_launcher_defaults_to_colocated_trainer_offload():
     repo_root = Path(__file__).resolve().parents[1]
     launcher = (repo_root / "experiments/train_qwen3_fused_agent_sync.sh").read_text(encoding="utf-8")
@@ -18,6 +48,10 @@ def test_qwen3_sync_launcher_defaults_to_colocated_trainer_offload():
     assert '--release-train' in launcher
     assert '--update-weight-transport disk' in launcher
     assert '--save-interval "${SAVE_INTERVAL:-20}"' in launcher
+    assert 'CP_SIZE="${CP_SIZE:-2}"' in launcher
+    assert 'MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-20480}"' in launcher
+    assert 'LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"' in launcher
+    assert 'LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-8192}"' in launcher
 
 
 @pytest.mark.unit
@@ -27,6 +61,35 @@ def test_qwen35_sync_launcher_does_not_reset_unsynced_visual_weights_by_default(
 
     assert 'if is_truthy "${CHECK_WEIGHT_UPDATE_EQUAL:-0}"; then' in launcher
     assert "MISC_ARGS+=(--check-weight-update-equal)" in launcher
+
+
+@pytest.mark.unit
+def test_qwen35_sync_launcher_avoids_train_memory_saver_by_default():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_qwen3.5_fused_agent_sync.sh").read_text(encoding="utf-8")
+
+    assert 'COLOCATE="${COLOCATE:-true}"' in launcher
+    assert 'RELEASE_TRAIN="${RELEASE_TRAIN:-true}"' in launcher
+    assert 'OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${COLOCATE}}"' in launcher
+    assert 'OFFLOAD_TRAIN=false' in launcher
+    assert '--update-weight-mode full' in launcher
+    assert '--update-weight-transport disk' in launcher
+    assert 'SGLANG_MEM_FRACTION_STATIC=0.6' in launcher
+    assert '--rollout-top-p "${TOP_P:-1.0}"' in launcher
+    assert '--rollout-presence-penalty "${PRESENCE_PENALTY:-0.0}"' in launcher
+    assert 'ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"' in launcher
+    assert 'ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"' in launcher
+
+
+@pytest.mark.unit
+def test_qwen35_sync_launcher_defaults_to_cp2_memory_budget():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_qwen3.5_fused_agent_sync.sh").read_text(encoding="utf-8")
+
+    assert 'CP_SIZE="${CP_SIZE:-2}"' in launcher
+    assert 'MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-20480}"' in launcher
+    assert 'LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"' in launcher
+    assert 'LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-8192}"' in launcher
 
 
 @pytest.mark.unit

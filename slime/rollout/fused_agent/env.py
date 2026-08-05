@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 from collections import OrderedDict
+import enum
 import functools
 import importlib.util
 import inspect
@@ -15,18 +17,63 @@ import time
 import types
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Union, get_args, get_origin
 
 import aiohttp
 
 from slime.rollout.rm_hub.f1 import normalize_answer
 
+from .agentcpm_explore import fetch_url_schema as agentcpm_fetch_url_schema
+from .agentcpm_explore import search_schema as agentcpm_search_schema
 from .docker_env import DockerTaskEnvironment, is_et_task
 from .parser import ToolCall, tool_schema
 from .prompts import finish_schema, web_search_schema
 from .search_gym import search_schema
 
 logger = logging.getLogger(__name__)
+
+
+def _compile_generated_mcp_module(tools_py: Path):
+    """Compile an asset, repairing generated Enum classes missing an ``ALL`` member."""
+    source = tools_py.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(tools_py))
+    referenced_all = {
+        node.value.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "ALL"
+        and isinstance(node.ctx, ast.Load)
+        and isinstance(node.value, ast.Name)
+    }
+    repaired = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name not in referenced_all:
+            continue
+        is_enum = any(
+            (isinstance(base, ast.Name) and base.id == "Enum")
+            or (isinstance(base, ast.Attribute) and base.attr == "Enum")
+            for base in node.bases
+        )
+        has_all = any(
+            isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name) and target.id == "ALL"
+                for target in (statement.targets if isinstance(statement, ast.Assign) else [statement.target])
+            )
+            for statement in node.body
+        )
+        if is_enum and not has_all:
+            node.body.append(
+                ast.Assign(
+                    targets=[ast.Name(id="ALL", ctx=ast.Store())],
+                    value=ast.Constant(value="all"),
+                )
+            )
+            repaired.append(node.name)
+    if repaired:
+        ast.fix_missing_locations(tree)
+        logger.info("Repaired missing ALL member in generated MCP enums %s: %s", tools_py, repaired)
+    return compile(tree, str(tools_py), "exec")
 
 # One keepalive HTTP session per event loop for retrieval/summarize calls.
 # The previous per-call ClientSession forced a fresh TCP handshake for every
@@ -522,7 +569,7 @@ class LocalMCPToolset:
             module.mcp = FakeFastMCP("Tools")
             sys.modules[module_name] = module
             sys.modules["tools"] = module
-            spec.loader.exec_module(module)
+            exec(_compile_generated_mcp_module(tools_py), module.__dict__)
         except Exception as e:
             exec_error = e
         finally:
@@ -580,7 +627,7 @@ class LocalMCPToolset:
             required = []
             for param_name, param in sig.parameters.items():
                 default = param.default
-                ann = param.annotation
+                ann = _parameter_annotation(fn, param_name, param.annotation)
                 typ = "string"
                 if ann in (int, "int"):
                     typ = "integer"
@@ -591,6 +638,8 @@ class LocalMCPToolset:
                 elif getattr(ann, "__origin__", None) is list or ann in (list, "list"):
                     typ = "array"
                 properties[param_name] = {"type": typ, "description": ""}
+                if inspect.isclass(ann) and issubclass(ann, enum.Enum):
+                    properties[param_name]["enum"] = [member.value for member in ann]
                 if default is inspect._empty:
                     required.append(param_name)
             schemas.append(tool_schema(name, self.descriptions.get(name, ""), properties, required))
@@ -632,7 +681,7 @@ def _coerce_kwargs(fn: Callable[..., Any], arguments: dict[str, Any]) -> dict[st
         if name not in arguments:
             continue
         value = arguments[name]
-        ann = param.annotation
+        ann = _parameter_annotation(fn, name, param.annotation)
         try:
             if ann in (int, "int"):
                 value = int(value)
@@ -640,10 +689,29 @@ def _coerce_kwargs(fn: Callable[..., Any], arguments: dict[str, Any]) -> dict[st
                 value = float(value)
             elif ann in (bool, "bool") and isinstance(value, str):
                 value = value.lower() in {"1", "true", "yes", "y", "on"}
+            elif inspect.isclass(ann) and issubclass(ann, enum.Enum) and not isinstance(value, ann):
+                try:
+                    value = ann(value)
+                except ValueError:
+                    value = ann[str(value)]
         except Exception:
             pass
         kwargs[name] = value
     return kwargs
+
+
+def _parameter_annotation(fn: Callable[..., Any], name: str, fallback: Any) -> Any:
+    try:
+        annotation = inspect.get_annotations(fn, eval_str=True).get(name, fallback)
+    except (NameError, TypeError):
+        annotation = fallback
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin in (types.UnionType, Union):
+        non_none = [arg for arg in args if arg is not type(None)]
+        if len(non_none) == 1:
+            return non_none[0]
+    return annotation
 
 
 class FusedEnvironment:
@@ -655,6 +723,7 @@ class FusedEnvironment:
         retrieval_max_results: int = 5,
         enable_tools: bool = True,
         search_gym: bool = False,
+        agentcpm_explore: bool = False,
         deepsearch_world: bool = False,
         rag: bool = False,
     ):
@@ -664,6 +733,7 @@ class FusedEnvironment:
         self.retrieval_max_results = retrieval_max_results
         self.enable_tools = enable_tools
         self.search_gym = search_gym
+        self.agentcpm_explore = agentcpm_explore
         self.deepsearch_world = deepsearch_world
         self.rag = rag
         self.answer = ""
@@ -729,6 +799,8 @@ class FusedEnvironment:
                 return tools()
             if self.search_gym:
                 return [search_schema()]
+            if self.agentcpm_explore:
+                return [agentcpm_search_schema(), agentcpm_fetch_url_schema()]
             return [web_search_schema(), finish_schema()]
         return [finish_schema()]
 
@@ -759,7 +831,11 @@ class FusedEnvironment:
             return "Submitted.", reward, True, {"reward_debug": self.reward_debug}
         self.tool_calls += 1
         if self.mode == "web_search" and name in {"web_search", "search", "web_search_wiki"}:
+            if self.agentcpm_explore:
+                return await self._step_agentcpm_search(args)
             return await self._step_web_search(args)
+        if self.mode == "web_search" and self.agentcpm_explore and name in {"fetch_url", "visit"}:
+            return await self._step_agentcpm_fetch_url(args)
         if self.mode == "web_search" and self.deepsearch_world and name == "visit_wiki":
             return await self._step_deepsearch_visit(args)
         if self.mode == "mcp" and self.mcp_tools is not None:
@@ -801,6 +877,37 @@ class FusedEnvironment:
             return page, 0.0, False, {"tools/visit_calls": 1}
         except Exception as exc:
             return f"Error: visit_wiki failed: {type(exc).__name__}: {exc}", 0.0, False, {"tools/visit_failed": 1}
+
+    async def _step_agentcpm_search(self, args: dict[str, Any]) -> tuple[str, float, bool, dict[str, Any]]:
+        raw_queries = args.get("query")
+        queries = raw_queries if isinstance(raw_queries, list) else [raw_queries]
+        queries = [str(query).strip() for query in queries if str(query or "").strip()]
+        if not queries:
+            return "Error: search requires at least one query.", 0.0, False, {}
+        outputs = []
+        merged_info: dict[str, Any] = {}
+        for query in queries:
+            output, _, _, info = await self._step_web_search({**args, "query": query})
+            outputs.append(output)
+            merged_info.update(info)
+        return "\n\n".join(outputs), 0.0, False, merged_info
+
+    async def _step_agentcpm_fetch_url(self, args: dict[str, Any]) -> tuple[str, float, bool, dict[str, Any]]:
+        raw_urls = args.get("url") or args.get("urls")
+        urls = raw_urls if isinstance(raw_urls, list) else [raw_urls]
+        urls = [str(url).strip() for url in urls if str(url or "").strip()]
+        if not urls:
+            return "Error: fetch_url requires at least one URL.", 0.0, False, {}
+        outputs = []
+        failures = 0
+        for url in urls:
+            output, _, _, info = await self._step_deepsearch_visit({"url": url})
+            outputs.append(f"URL: {url}\n{output}")
+            failures += int(bool(info.get("tools/visit_failed") or info.get("tools/visit_empty")))
+        return "\n\n".join(outputs), 0.0, False, {
+            "tools/fetch_url_calls": len(urls),
+            "tools/fetch_url_failures": failures,
+        }
 
     async def _step_web_search(self, args: dict[str, Any]) -> tuple[str, float, bool, dict[str, Any]]:
         query = str(args.get("query") or "")
@@ -951,11 +1058,19 @@ class FusedEnvironment:
                 "tool_calls": self.tool_calls,
             }
             return 0.0
-        reward = _exact_match_reward(pred, gt)
+        match_mode = os.environ.get("FUSED_WEBQA_REWARD_MATCH_MODE", "exact").strip().lower()
+        exact_match = _exact_match_reward(pred, gt)
+        if match_mode == "exact":
+            reward = exact_match
+        elif match_mode == "normalized_target_span":
+            reward = _normalized_target_span_reward(pred, gt)
+        else:
+            raise ValueError(f"Unsupported FUSED_WEBQA_REWARD_MATCH_MODE: {match_mode!r}")
         self.reward_debug = {
             "type": self.mode,
             "reward": reward,
-            "exact_match": bool(reward),
+            "match_mode": match_mode,
+            "exact_match": bool(exact_match),
             "prediction": pred,
             "ground_truth": gt,
             "tool_calls": self.tool_calls,
@@ -963,6 +1078,8 @@ class FusedEnvironment:
         if self.mode == "web_search":
             self.reward_debug["unique_search_calls"] = len(self.web_search_queries)
             self.reward_debug["min_unique_search_calls"] = min_unique_searches
+            if match_mode == "normalized_target_span":
+                self.reward_debug["normalized_target_span_match"] = bool(reward)
         return float(reward)
 
     def _compute_verifier_reward(self, *, require_tool_evidence: bool = True) -> float | None:
@@ -1050,6 +1167,13 @@ def _exact_match_reward(prediction: str, ground_truth: Any) -> float:
     targets = ground_truth if isinstance(ground_truth, list) else [ground_truth]
     normalized_prediction = normalize_answer(str(prediction))
     return 1.0 if any(normalize_answer(str(target)) == normalized_prediction for target in targets) else 0.0
+
+
+def _normalized_target_span_reward(prediction: str, ground_truth: Any) -> float:
+    targets = ground_truth if isinstance(ground_truth, list) else [ground_truth]
+    normalized_prediction = f" {normalize_answer(str(prediction))} "
+    normalized_targets = [normalize_answer(str(target)) for target in targets]
+    return 1.0 if any(target and f" {target} " in normalized_prediction for target in normalized_targets) else 0.0
 
 
 def _normalize_search_query(query: str) -> str:

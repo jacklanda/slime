@@ -101,7 +101,8 @@ Core:
 
 Generation/eval:
   --harness NAME                       Harness: bare, cot, rag, react, gem, unified_gem,
-                                       search_gym, deepsearch_world, rllm_deepresearch (alias: rllm_dr), cut_bill. Default: cot.
+                                       search_gym, agentcpm_explore, deepsearch_world,
+                                       rllm_deepresearch (alias: rllm_dr), cut_bill. Default: cot.
   --user_prompt long|short             Web-search user prompt. Default: short.
   --rllm-dr-refine-server-url URLS     Comma-separated OpenAI-compatible Refine server base URLs.
   --unified-system-prompt              Sets harness to unified_gem unless --harness is later set.
@@ -145,7 +146,7 @@ Generation/eval:
   --eval-adaptive-concurrency BOOL     Adjust inflight work from engine metrics. Default: true.
   --eval-mix-datasets BOOL            Interleave multiple benchmarks under one inflight budget. Default: true.
   --eval-termination-retry-times N     Retry an eval trajectory unless termination_reason is successful
-                                       (env_done or reasoning_only).
+                                       (env_done or reasoning_only) or duplicate_search.
                                        Default: 4 retries after the initial attempt; 0 disables retries.
   --eval-trajectory-sample-rate X      Full trajectory dump fraction. Default: 1.
   --eval-dump-failures BOOL            Dump failed eval trajectories. Default: true.
@@ -1863,7 +1864,7 @@ echo "GPUs: ${ROLLOUT_GPUS}; gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}; eng
 echo "Harness: ${FUSED_HARNESS}; user_prompt=${USER_PROMPT}; disable_thinking=${DISABLE_THINKING}; discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}; n=${N_SAMPLES_PER_PROMPT}; per_step_max_tokens=${PER_STEP_MAX_TOKENS}; deepsearch_world_max_tokens=${DEEPSEARCH_WORLD_MAX_TOKENS}"
 echo "Sampling: temperature=${TEMPERATURE}; top_p=${TOP_P}; top_k=${TOP_K}; seed=${ROLLOUT_SEED}; deterministic=${DETERMINISTIC_INFERENCE}"
 echo "Concurrency: eval=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS} adaptive=${EVAL_ADAPTIVE_CONCURRENCY}; sglang_http_per_engine=${SGLANG_SERVER_CONCURRENCY}; sglang_running_per_engine=${SGLANG_MAX_RUNNING_REQUESTS}; retrieval=${RETRIEVAL_CONCURRENCY}"
-echo "Eval termination retries: ${EVAL_TERMINATION_RETRY_TIMES} (termination_reason != env_done)"
+echo "Eval termination retries: ${EVAL_TERMINATION_RETRY_TIMES} (excluding successful and duplicate-search terminations)"
 echo "Retrieval: backend=${RETRIEVAL_BACKEND}; url=${RETRIEVAL_SERVER_URL}; mode=${RLLM_RETRIEVAL_MODE}; max_results=${RETRIEVAL_MAX_RESULTS}; cache_size=${RLLM_RETRIEVAL_CACHE_SIZE}"
 echo "Validation: hybrid=${ENABLE_USE_GRM_EVALS}; rule=benchmark_verifier; semantic_fallback=${GRM_MODEL}; temperature=${GRM_TEMPERATURE}; max_input_tokens=${GRM_MAX_INPUT_TOKENS}; max_new_tokens=${GRM_MAX_NEW_TOKENS}; concurrency=${GRM_CONCURRENCY}; timeout=${GRM_TIMEOUT}; retries=${GRM_MAX_RETRIES}"
 

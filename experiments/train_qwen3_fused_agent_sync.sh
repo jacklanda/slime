@@ -125,7 +125,7 @@ Options:
   --offload-train BOOL                   Offload trainer model between phases. Disabled by --release-train.
   --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: false.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 128.
+  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 64.
   --sglang-router-request-timeout-secs N Router request timeout. Default: 21600.
   --sglang-max-running-requests N        SGLang max running requests. Default: 64.
   --colocate / --no-colocate             Share trainer and rollout GPUs with offload. Default: enabled.
@@ -142,7 +142,7 @@ is_truthy() {
 }
 
 PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
-ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"
+ROUTER_POLICY="${ROUTER_POLICY:-cache_aware}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 # Alternate training and rollout across all eight GPUs. The pinned
@@ -209,8 +209,8 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-128}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-64}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-48}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
@@ -232,7 +232,7 @@ EVAL_TERMINATION_RETRY_TIMES="${EVAL_TERMINATION_RETRY_TIMES:-4}"
 EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-1}"
 EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES:-true}"
 NATIVE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION:-true}"
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-false}}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
 # Resolve the offload default after CLI parsing so --colocate/--no-colocate also
@@ -526,7 +526,7 @@ if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -lt 1 ] \
 fi
 ROLLOUT_ENGINE_COUNT=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
 
-# Keep context parallelism disabled for the train/infer consistency baseline.
+# CP2 halves the per-GPU sequence/logits footprint for the 40K context default.
 # Explicit CP overrides still clamp TP to the remaining actor-GPU dimension.
 if [ "${CP_SIZE}" -lt 1 ] || [ "${PP_SIZE}" -lt 1 ]; then
    echo "CP_SIZE and PP_SIZE must be positive; got CP_SIZE=${CP_SIZE}, PP_SIZE=${PP_SIZE}" >&2
@@ -810,13 +810,13 @@ fi
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-15472}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-24576}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$(((MAX_CONTEXT_LEN + CP_SIZE - 1) / CP_SIZE))}"
-LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
-LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-4096}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-40960}"
+LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-40960}"
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-8192}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 # Keep enough candidate groups queued to feed the default four TP2 rollout
 # engines without generating the much larger surplus created by a batch of 64.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-16}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"  # equivalent to "parallel agent/trace num"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"

@@ -12,6 +12,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 _MISSING_PARAMETER = object()
 _INVALID_PARAMETER = object()
+# A typed parameter the model opened but left empty (``<parameter=n></parameter>``).
+# Distinct from _INVALID_PARAMETER: the value is absent rather than malformed, so
+# the argument is dropped without recording a schema error.
+_OMITTED_PARAMETER = object()
 
 
 def _normalize_xml_parameter_name(name: str) -> str:
@@ -19,7 +23,7 @@ def _normalize_xml_parameter_name(name: str) -> str:
     # XML syntax is ``parameter=name``; generation sometimes copies JSON and
     # emits ``parameter="name"`` (or leaves only the opening quote).  Strip
     # quote/punctuation noise before schema lookup.
-    return name.strip().strip('"\'`').strip().rstrip(':').strip()
+    return name.strip().strip("\"'`").strip().rstrip(":").strip()
 
 
 def _repair_xml_scalar_value(value: str) -> str:
@@ -33,7 +37,7 @@ def _repair_xml_scalar_value(value: str) -> str:
     marker = value.find("</")
     if marker > 0:
         value = value[:marker].rstrip()
-    return value.strip().strip('"\'`')
+    return value.strip().strip("\"'`")
 
 
 @dataclass
@@ -328,6 +332,9 @@ class Qwen3CoderToolParser(QwenToolParser):
                 if not name:
                     continue
                 calls.append(ToolCall(name=name, arguments=parsed["arguments"], start=start, end=end))
+        if not calls and self.tool_call_prefix in text:
+            self.last_schema_errors.append("tool function block is missing the required <tool_call> wrapper")
+            return []
         if not calls:
             calls.extend(self._extract_answer_fallback(text))
         return calls
@@ -348,14 +355,14 @@ class Qwen3CoderToolParser(QwenToolParser):
         return "\n".join(lines)
 
     def _iter_tool_call_regions(self, text: str) -> list[tuple[str, int, int]]:
-        regions = [(match.group(1) if match.group(1) is not None else (match.group(2) or ""), match.start(), match.end()) for match in self._TOOL_CALL_RE.finditer(text)]
-        if regions:
-            return regions
-        # No <tool_call> wrapper: accept bare <function=...></function> blocks, each
-        # its own region so start/end bound the function span for finish-call checks.
-        if self.tool_call_prefix in text:
-            return [(match.group(0), match.start(), match.end()) for match in self._FUNCTION_RE.finditer(text)]
-        return regions
+        return [
+            (
+                match.group(1) if match.group(1) is not None else (match.group(2) or ""),
+                match.start(),
+                match.end(),
+            )
+            for match in self._TOOL_CALL_RE.finditer(text)
+        ]
 
     @staticmethod
     def _strip_outer_newline(value: str) -> str:
@@ -444,6 +451,18 @@ class Qwen3CoderToolParser(QwenToolParser):
 
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
             return param_value
+
+        # An empty typed block (``<parameter=step_number></parameter>``) carries no
+        # value to coerce.  Treat it as an omitted argument rather than a malformed
+        # one: the tool then raises a missing-argument error the model can read and
+        # retry, instead of the schema error terminating the whole trajectory.
+        if not param_value:
+            logger.debug(
+                "Parameter '%s' of tool '%s' was left empty; omitting the argument.",
+                param_name,
+                func_name,
+            )
+            return _OMITTED_PARAMETER
         if param_type.startswith("int") or param_type.startswith("uint") or param_type.startswith("long") or param_type.startswith("short") or param_type.startswith("unsigned"):
             try:
                 # Qwen3.5 occasionally emits ``<parameter=name>: 10``. Treat the
@@ -512,13 +531,15 @@ class Qwen3CoderToolParser(QwenToolParser):
                 self.last_schema_errors.append(f"malformed parameter name {raw_param_name.strip()!r}")
             param_value = self._strip_outer_newline(str(param_value))
             value = self._convert_param_value(param_value, param_name, param_config, function_name)
+            if value is _OMITTED_PARAMETER:
+                # Empty typed block: drop the argument and let the tool report the
+                # missing parameter as a recoverable observation.
+                continue
             if value is not _MISSING_PARAMETER:
                 if value is not _INVALID_PARAMETER:
                     arguments[param_name] = value
                 else:
-                    self.last_schema_errors.append(
-                        f"invalid value for parameter {param_name!r} of tool {function_name!r}"
-                    )
+                    self.last_schema_errors.append(f"invalid value for parameter {param_name!r} of tool {function_name!r}")
             else:
                 self.last_schema_errors.append(f"unknown parameter {param_name!r} for tool {function_name!r}")
         return {"name": function_name.strip(), "arguments": arguments}
@@ -563,22 +584,61 @@ class Gemma4ToolParser(QwenToolParser):
     tool_output_end = "<tool_response|>"
     _CALL_PREFIX_RE = re.compile(r"\s*call:([A-Za-z0-9_.-]+)\s*", re.DOTALL)
 
+    def __init__(self, valid_tools: set[str] | None = None):
+        super().__init__(valid_tools=valid_tools)
+        self.last_schema_errors: list[str] = []
+        self.last_schema_error_spans: list[tuple[int, int]] = []
+        self._tool_parameter_schemas: dict[str, dict[str, Any]] = {}
+
+    def _normalize_name(self, name: str) -> str:
+        name = name.strip()
+        if self.valid_tools is None or name in self.valid_tools:
+            return name
+        return ""
+
     def get_tool_prompt(self, tools_schema: str) -> str:
         declarations = []
+        self._tool_parameter_schemas = {}
         for schema in Qwen3CoderToolParser._iter_tool_schemas(tools_schema):
+            function = schema.get("function", schema)
+            if isinstance(function, dict) and isinstance(function.get("name"), str):
+                parameters = function.get("parameters")
+                if isinstance(parameters, dict):
+                    self._tool_parameter_schemas[function["name"]] = parameters
             declaration = self._format_function_declaration(schema)
             if declaration:
                 declarations.append(f"<|tool>{declaration}<tool|>")
         if not declarations:
             return ""
-        return (
-            "\n"
-            + "".join(declarations)
-            + "\n"
-            "When you need to call a tool, emit exactly:\n"
-            "<|tool_call>call:TOOL_NAME{ARGUMENT_NAME:<|\"|>ARGUMENT_VALUE<|\"|>}<tool_call|><|tool_response>\n"
-            "Wait for the tool response before continuing. Do not wrap Gemma4 tool calls in XML or JSON."
+        return "\n" + "".join(declarations) + "\n" + self.get_tool_contract()
+
+    def get_tool_contract(self) -> str:
+        tool_names = sorted(self._tool_parameter_schemas)
+        if not tool_names:
+            return ""
+        structured_parameters = sorted(
+            f"{tool_name}.{parameter_name}"
+            for tool_name, parameters in self._tool_parameter_schemas.items()
+            for parameter_name, schema in (parameters.get("properties") or {}).items()
+            if isinstance(schema, dict) and str(schema.get("type", "")).lower() in {"object", "array"}
         )
+        contract = [
+            "Gemma4 native tool-call contract:",
+            "- Emit exactly one native call per assistant response:",
+            '  <|tool_call>call:TOOL_NAME{ARGUMENT_NAME:<|"|>STRING_VALUE<|"|>}<tool_call|><|tool_response>',
+            "- TOOL_NAME must exactly match one of: " + ", ".join(tool_names),
+            "- Copy tool and parameter names verbatim. Never add prefixes, remove words, translate names, or escape underscores.",
+            '- Use <|"|> only around STRING values. Emit OBJECT values as {...} and ARRAY values as [...] without quoting or escaping the structured value.',
+            "- Balance every brace, bracket, string delimiter, and tool-call marker.",
+            "- Never emit <|channel>call:, finish.result:, XML tool syntax, bare JSON, or plain final-answer prose.",
+        ]
+        if "finish" in tool_names:
+            contract.append(
+                '- To finish, emit exactly: <|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>CONCISE_FINAL_ANSWER<|"|>}<tool_call|>'
+            )
+        if structured_parameters:
+            contract.append("- These parameters require unquoted structured values: " + ", ".join(structured_parameters))
+        return "\n".join(contract)
 
     def format_action(self, action: ToolCall) -> str:
         return f"<|tool_call>call:{action.name}{self._format_argument(action.arguments or {}, escape_keys=False)}<tool_call|>"
@@ -597,27 +657,26 @@ class Gemma4ToolParser(QwenToolParser):
             tool_responses.append({"name": action.name, "response": response})
         return {
             "role": "assistant",
-            "tool_calls": [
-                {"function": {"name": action.name, "arguments": action.arguments or {}}}
-                for action in actions
-            ],
+            "tool_calls": [{"function": {"name": action.name, "arguments": action.arguments or {}}} for action in actions],
             "tool_responses": tool_responses,
         }
 
     def parse(self, model_response: str) -> list[ToolCall]:
         text = model_response or ""
+        self.last_schema_errors = []
+        self.last_schema_error_spans = []
         calls: list[ToolCall] = []
         for raw_name, raw_args, start, end in self._iter_native_tool_calls(text):
             name = self._normalize_name(raw_name)
             if not name:
+                self.last_schema_errors.append(f"unknown tool name {raw_name!r}")
+                self.last_schema_error_spans.append((start, end))
                 continue
             try:
-                args = self._parse_object(raw_args)
+                args = self._parse_object(raw_args, parameter_schema=self._tool_parameter_schemas.get(name))
             except ValueError as exc:
-                args = self._repair_arguments(name, raw_args)
-                if args is not None:
-                    calls.append(ToolCall(name=name, arguments=args, start=start, end=end))
-                    continue
+                self.last_schema_errors.append(f"invalid arguments for tool {name!r}: {exc}")
+                self.last_schema_error_spans.append((start, end))
                 logger.warning(
                     "Failed to parse Gemma4 tool-call arguments for tool '%s': %s. raw_args=%r",
                     raw_name,
@@ -626,192 +685,59 @@ class Gemma4ToolParser(QwenToolParser):
                 )
                 logger.debug("Gemma4 tool-call argument parse failure.", exc_info=True)
                 continue
-            if name == "finish" and isinstance(args, dict):
-                cls_command = self._normalize_finish_command(str(args.get("command", "")))
-                if cls_command is not None:
-                    args["command"] = cls_command
+            schema_errors = self._validate_arguments(name, args)
+            if schema_errors:
+                self.last_schema_errors.extend(schema_errors)
+                self.last_schema_error_spans.append((start, end))
+                continue
             calls.append(ToolCall(name=name, arguments=args if isinstance(args, dict) else {}, start=start, end=end))
-        if not calls:
-            calls.extend(self._extract_answer_fallback(text))
         return calls
 
-    @classmethod
-    def _repair_arguments(cls, name: str, raw_args: str) -> dict[str, Any] | None:
-        if name == "finish":
-            return cls._repair_finish_arguments(raw_args)
-        if name == "web_search":
-            return cls._repair_web_search_arguments(raw_args)
-        return None
-
-    @classmethod
-    def _repair_web_search_arguments(cls, raw_args: str) -> dict[str, Any] | None:
-        text = raw_args.strip()
-        if not text.startswith("{"):
-            return None
-        inner = text[1:-1] if text.endswith("}") else text[1:]
-        for separator in (":", "="):
-            prefix = f"query{separator}"
-            if inner.strip().startswith(prefix):
-                raw_value = inner.strip()[len(prefix) :]
-                query = cls._repair_text_value(
-                    raw_value,
-                    allow_unclosed_native=raw_value.strip().startswith('<|"|>'),
+    def _validate_arguments(self, tool_name: str, arguments: dict[str, Any]) -> list[str]:
+        parameter_schema = self._tool_parameter_schemas.get(tool_name)
+        if parameter_schema is None:
+            return []
+        properties = parameter_schema.get("properties") or {}
+        if not isinstance(properties, dict):
+            properties = {}
+        errors = [
+            f"missing required parameter {name!r} for tool {tool_name!r}"
+            for name in parameter_schema.get("required") or []
+            if name not in arguments
+        ]
+        for name, value in arguments.items():
+            schema = properties.get(name)
+            if not isinstance(schema, dict):
+                errors.append(f"unknown parameter {name!r} for tool {tool_name!r}")
+                continue
+            if not self._value_matches_schema(value, schema):
+                errors.append(
+                    f"invalid type for parameter {name!r} of tool {tool_name!r}: "
+                    f"expected {schema.get('type')!r}, got {type(value).__name__}"
                 )
-                if query:
-                    return {"query": query}
-        return None
+        return errors
 
     @classmethod
-    def _repair_finish_arguments(cls, raw_args: str) -> dict[str, Any] | None:
-        text = raw_args.strip()
-        if not text.startswith("{"):
-            return None
-
-        command_marker = 'command:<|"|>'
-        command_start = text.find(command_marker)
-        if command_start < 0:
-            return None
-        command_value_start = command_start + len(command_marker)
-        result_key = ""
-        result_start = -1
-        for candidate in (",result:", ",result=", "{result:"):
-            result_start = text.find(candidate, command_value_start)
-            if result_start >= 0:
-                result_key = candidate
-                break
-        if result_start < 0:
-            payload_end = -1 if text.endswith("}") else len(text)
-            return cls._repair_finish_command_payload(text[command_value_start:payload_end])
-
-        command_close = text.find('<|"|>', command_value_start, result_start)
-        if command_close >= 0:
-            command = text[command_value_start:command_close].strip()
-            if text[command_close + len('<|"|>') : result_start].strip():
-                return None
-        else:
-            command = text[command_value_start:result_start].strip()
-        command = cls._normalize_finish_command(command)
-        if command is None:
-            return None
-
-        if result_key.startswith("{") and text.endswith("}}"):
-            result_end = -2
-        elif text.endswith("}"):
-            result_end = -1
-        else:
-            result_end = len(text)
-        result = cls._repair_finish_result_value(text[result_start + len(result_key) : result_end])
-        if result is None:
-            return None
-        return {"command": command, "result": result}
-
-    @staticmethod
-    def _normalize_finish_command(command: str) -> str | None:
-        command = command.strip()
-        if command in {"submit", "finish"}:
-            return command
-        normalized = command.lower()
-        if normalized.startswith(("finish(", "submit(")):
-            return normalized.split("(", 1)[0]
-        if "submit" in normalized or "final result" in normalized:
-            return "submit"
-        if "synthesize" in normalized and "answer" in normalized:
-            return "submit"
-        return None
-
-    @classmethod
-    def _repair_finish_result_value(cls, raw_value: str) -> Any:
-        return cls._repair_text_value(raw_value, allow_unclosed_native=True)
-
-    @classmethod
-    def _repair_text_value(cls, raw_value: str, *, allow_unclosed_native: bool) -> Any:
-        text = raw_value.strip()
-        if not text:
-            return None
-        marker = '<|"|>'
-        if text.startswith(marker):
-            end = text.rfind(marker, len(marker))
-            if end < len(marker):
-                if not allow_unclosed_native:
-                    return None
-                return text[len(marker) :].rstrip('"}').rstrip('"').strip()
-            if text[end + len(marker) :].strip():
-                return None
-            return text[len(marker) : end]
-        if text[0] in {'"', "'"}:
-            quote = text[0]
-            end = text.rfind(quote, 1)
-            if end <= 0:
-                if allow_unclosed_native:
-                    return text[1:].rstrip('"}').rstrip('"').strip()
-                return None
-            if text[end + 1 :].strip().strip(")"):
-                return None
-            return text[1:end]
-        try:
-            return cls._parse_object("{result:" + text + "}")["result"]
-        except ValueError:
-            return None
-
-    @classmethod
-    def _repair_finish_command_payload(cls, raw_payload: str) -> dict[str, Any] | None:
-        text = raw_payload.strip()
-        for command in ("submit", "finish"):
-            prefix = f'{command}(result='
-            if text.startswith(prefix):
-                result_text = text[len(prefix) :].strip()
-                if result_text.endswith(')"'):
-                    result_text = result_text[:-1].rstrip()
-                if result_text.endswith(")"):
-                    result_text = result_text[:-1].rstrip()
-                result = cls._repair_finish_result_value(result_text)
-                if result is not None:
-                    return {"command": command, "result": result}
-            prefix = f'{command}(command='
-            if text.startswith(prefix):
-                result_text = text[len(prefix) :].strip()
-                if result_text.endswith(')"'):
-                    result_text = result_text[:-1].rstrip()
-                if result_text.endswith(")"):
-                    result_text = result_text[:-1].rstrip()
-                result = cls._repair_finish_result_value(result_text)
-                if result is not None:
-                    return {"command": command, "result": result}
-
-        for command in ("submit", "finish"):
-            if text == command:
-                return None
-            if text.startswith(command + ","):
-                result = cls._repair_finish_json_payload(text[len(command) + 1 :].strip())
-                if result is not None:
-                    return {"command": command, "result": result}
-            if text.startswith(command) and text[len(command) : len(command) + 1].isspace():
-                result = text[len(command) :].strip()
-                if result:
-                    return {"command": command, "result": result}
-        return None
-
-    @classmethod
-    def _repair_finish_json_payload(cls, raw_payload: str) -> Any:
-        try:
-            payload = json.loads(raw_payload)
-        except json.JSONDecodeError:
-            return cls._repair_incomplete_finish_json_payload(raw_payload)
-        if isinstance(payload, dict):
-            if "result" in payload:
-                return payload["result"]
-            if "answer" in payload:
-                return payload["answer"]
-        return payload
-
-    @classmethod
-    def _repair_incomplete_finish_json_payload(cls, raw_payload: str) -> Any:
-        text = raw_payload.strip()
-        for key in ("answer", "result"):
-            prefix = f'{{"{key}":'
-            if text.startswith(prefix):
-                return cls._repair_text_value(text[len(prefix) :], allow_unclosed_native=True)
-        return None
+    def _value_matches_schema(cls, value: Any, schema: dict[str, Any]) -> bool:
+        variants = schema.get("anyOf") or schema.get("oneOf")
+        if isinstance(variants, list):
+            return any(isinstance(variant, dict) and cls._value_matches_schema(value, variant) for variant in variants)
+        expected = schema.get("type")
+        if isinstance(expected, list):
+            return any(cls._value_matches_schema(value, {**schema, "type": item}) for item in expected)
+        if expected is None:
+            return True
+        expected = str(expected).lower()
+        checks = {
+            "array": lambda: isinstance(value, list),
+            "boolean": lambda: isinstance(value, bool),
+            "integer": lambda: isinstance(value, int) and not isinstance(value, bool),
+            "null": lambda: value is None,
+            "number": lambda: isinstance(value, (int, float)) and not isinstance(value, bool),
+            "object": lambda: isinstance(value, dict),
+            "string": lambda: isinstance(value, str),
+        }
+        return checks.get(expected, lambda: True)()
 
     @classmethod
     def _iter_native_tool_calls(cls, text: str) -> list[tuple[str, str, int, int]]:
@@ -1073,8 +999,14 @@ class Gemma4ToolParser(QwenToolParser):
         return str(argument)
 
     @classmethod
-    def _parse_object(cls, text: str) -> dict[str, Any]:
-        parser = _Gemma4ArgumentParser(text)
+    def _parse_object(cls, text: str, *, parameter_schema: dict[str, Any] | None = None) -> dict[str, Any]:
+        properties = (parameter_schema or {}).get("properties") or {}
+        string_keys = {
+            str(name)
+            for name, schema in properties.items()
+            if isinstance(schema, dict) and cls._value_matches_schema("", schema)
+        }
+        parser = _Gemma4ArgumentParser(text, top_level_string_keys=string_keys)
         value = parser.parse_value()
         parser.skip_ws()
         if parser.pos != len(parser.text):
@@ -1085,15 +1017,19 @@ class Gemma4ToolParser(QwenToolParser):
 
 
 class _Gemma4ArgumentParser:
-    def __init__(self, text: str):
+    def __init__(self, text: str, *, top_level_string_keys: set[str] | None = None):
         self.text = text.strip()
         self.pos = 0
+        self.top_level_string_keys = top_level_string_keys or set()
+        self.object_depth = 0
 
-    def parse_value(self) -> Any:
+    def parse_value(self, *, schema_string: bool = False) -> Any:
         self.skip_ws()
         if self.text.startswith('<|"|>', self.pos):
             return self.parse_gemma_string()
         ch = self.peek()
+        if schema_string and ch in {'"', "'"}:
+            return self.parse_schema_string()
         if ch in {'"', "'"}:
             return self.parse_quoted_string(close_follow={",", "}", "]"})
         if ch == "{":
@@ -1118,16 +1054,25 @@ class _Gemma4ArgumentParser:
 
     def parse_object(self) -> dict[str, Any]:
         self.expect("{")
+        self.object_depth += 1
         result: dict[str, Any] = {}
         self.skip_ws()
         if self.peek() == "}":
             self.pos += 1
+            self.object_depth -= 1
             return result
         while True:
             key = self.parse_key()
             self.skip_ws()
-            self.expect(":")
-            result[key] = self.parse_value()
+            schema_string = self.object_depth == 1 and key in self.top_level_string_keys
+            if self.peek() in {":", "="}:
+                self.pos += 1
+            elif not (
+                schema_string
+                and (self.text.startswith('<|"|>', self.pos) or self.peek() in {'"', "'"})
+            ):
+                raise ValueError(f"Expected ':' at offset {self.pos}.")
+            result[key] = self.parse_value(schema_string=schema_string)
             self.skip_ws()
             ch = self.peek()
             if ch == ",":
@@ -1135,7 +1080,16 @@ class _Gemma4ArgumentParser:
                 continue
             if ch == "}":
                 self.pos += 1
+                self.object_depth -= 1
                 return result
+            if schema_string and ch == "]":
+                next_pos = self._skip_ws_pos(self.pos + 1)
+                if next_pos < len(self.text) and self.text[next_pos] == "}" and not self.text[next_pos + 1 :].strip():
+                    self.pos = next_pos + 1
+                    self.object_depth -= 1
+                    return result
+            if self._declared_key_at(self.pos) is not None:
+                continue
             raise ValueError(f"Expected ',' or '}}' at offset {self.pos}.")
 
     def parse_array(self) -> list[Any]:
@@ -1163,7 +1117,50 @@ class _Gemma4ArgumentParser:
             return self.parse_gemma_string()
         if self.peek() in {'"', "'"}:
             return self.parse_quoted_string(close_follow={":"})
-        return self.parse_token(stop_chars={":", " ", "\n", "\t", "\r"})
+        return self.parse_token(stop_chars={":", "=", "<", '"', "'", " ", "\n", "\t", "\r"})
+
+    def parse_schema_string(self) -> str:
+        quote = self.peek()
+        self.pos += 1
+        start = self.pos
+        marker = '<|"|>'
+        while self.pos < len(self.text):
+            ch = self.text[self.pos]
+            if ch == "," and self._declared_key_at(self.pos + 1) is not None:
+                break
+            if ch.isspace() and self._declared_key_at(self.pos) is not None:
+                break
+            if ch == "}" and not self.text[self.pos + 1 :].strip():
+                break
+            self.pos += 1
+
+        value = self.text[start : self.pos].rstrip()
+        if value.endswith(quote):
+            return value[: -len(quote)]
+        if value.endswith(marker):
+            return value[: -len(marker)]
+        # Multiple quote characters inside the value prove that the model used
+        # ordinary quotes as query punctuation and omitted only the outer close.
+        # A plain one-sided quote remains an ambiguous truncation and is rejected.
+        if quote in value:
+            return value
+        raise ValueError("Unterminated quoted Gemma4 string.")
+
+    def _declared_key_at(self, pos: int) -> str | None:
+        pos = self._skip_ws_pos(pos)
+        for key in sorted(self.top_level_string_keys):
+            if not self.text.startswith(key, pos):
+                continue
+            end = self._skip_ws_pos(pos + len(key))
+            if end < len(self.text) and (
+                self.text[end] in {":", "="} or self.text.startswith('<|"|>', end)
+            ):
+                return key
+        # Non-string siblings such as max_results are valid implicit-comma
+        # boundaries too; identify their key lexically and let normal parsing
+        # and schema validation decide whether they are declared and well typed.
+        match = re.match(r"[A-Za-z_][A-Za-z0-9_.-]*\s*[:=]", self.text[pos:])
+        return match.group(0).rstrip(":=").strip() if match else None
 
     def parse_gemma_string(self) -> str:
         marker = '<|"|>'

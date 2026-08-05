@@ -472,7 +472,8 @@ class Gemma4TransformerLayer(TransformerLayer):
         return mlp_output + moe_output
 
     def _forward_per_layer_input(self, hidden_states):
-        per_layer_inputs = getattr(self.config, "_gemma4_per_layer_inputs", None)
+        runtime_state = getattr(self, "_gemma4_runtime_state", None)
+        per_layer_inputs = None if runtime_state is None else runtime_state.per_layer_inputs
         if per_layer_inputs is None:
             raise RuntimeError(
                 "Gemma4 per-layer inputs are missing. E2B/E4B PLE currently requires "
@@ -985,10 +986,13 @@ class Gemma4SelfAttention(SelfAttention):
         return self._apply_kv_sharing(query, key, value)
 
     def _apply_kv_sharing(self, query, key, value):
-        shared_states = getattr(self.config, "_gemma4_shared_kv_states", None)
-        if shared_states is None:
-            shared_states = {}
-            self.config._gemma4_shared_kv_states = shared_states
+        runtime_state = getattr(self, "_gemma4_runtime_state", None)
+        if runtime_state is None:
+            raise RuntimeError(
+                "Gemma4 KV-sharing runtime state is missing. E2B/E4B requires "
+                "the Gemma4 provider hooks installed by --custom-model-provider-path."
+            )
+        shared_states = runtime_state.shared_kv_states
 
         if self._store_full_length_kv and self._global_layer_idx is not None:
             shared_states[self._global_layer_idx] = (key, value)

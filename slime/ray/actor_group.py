@@ -6,12 +6,60 @@ from pathlib import Path
 
 import ray
 from ray.util.placement_group import PlacementGroup
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
+from ray.util.state import get_actor
 
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, add_default_ray_env_vars
 from slime.utils.train_infer_consistency import validate_rollout_weight_versions
 
 logger = logging.getLogger(__name__)
+
+# Tearing down eight trainer processes that each hold tens of GB of device
+# memory is dominated by CUDA context teardown, not by the kill itself.
+_TRAIN_ACTOR_SHUTDOWN_TIMEOUT = float(os.environ.get("SLIME_TRAIN_ACTOR_SHUTDOWN_TIMEOUT", "180"))
+_TRAIN_ACTOR_SHUTDOWN_POLL_INTERVAL = 0.25
+
+
+@ray.remote(num_cpus=0)
+def _surviving_train_processes(pids):
+    """Return which of ``pids`` still exist or still hold device memory on this node.
+
+    ``ray.kill`` only guarantees the actor is unreachable; the worker process
+    keeps its CUDA context -- and therefore its device memory -- until the
+    driver finishes reclaiming it. NVML's compute-process list is the ground
+    truth for "the memory is actually back", so it is what gates the resume of
+    the colocated SGLang KV pool.
+    """
+    import psutil
+
+    pids = set(pids)
+    surviving = set()
+    for pid in pids:
+        try:
+            if psutil.Process(pid).status() != psutil.STATUS_ZOMBIE:
+                surviving.add(pid)
+        except psutil.NoSuchProcess:
+            continue
+        except Exception:
+            # Unknown liveness must not be read as "exited"; retry next poll.
+            surviving.add(pid)
+
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            for index in range(pynvml.nvmlDeviceGetCount()):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+                for proc in pynvml.nvmlDeviceGetComputeRunningProcesses(handle):
+                    if proc.pid in pids:
+                        surviving.add(proc.pid)
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.warning("Cannot verify trainer GPU memory release via NVML, falling back to process liveness: %s", e)
+
+    return surviving
 
 
 class RayTrainGroup:
@@ -90,9 +138,7 @@ class RayTrainGroup:
                 if os.path.exists(dynlib_path):
                     break
             else:
-                raise FileNotFoundError(
-                    "Cannot find torch_memory_saver dynamic library. Please make sure torch_memory_saver is properly installed."
-                )
+                raise FileNotFoundError("Cannot find torch_memory_saver dynamic library. Please make sure torch_memory_saver is properly installed.")
 
             env_vars["LD_PRELOAD"] = dynlib_path
             env_vars["TMS_INIT_ENABLE"] = "1"
@@ -144,14 +190,8 @@ class RayTrainGroup:
         """
         if isinstance(external_data, list):
             assert len(external_data) == len(self._actor_handlers)
-            return [
-                actor.train.remote(rollout_id, rollout_data_ref, external_data=ed)
-                for actor, ed in zip(self._actor_handlers, external_data, strict=False)
-            ]
-        return [
-            actor.train.remote(rollout_id, rollout_data_ref, external_data=external_data)
-            for actor in self._actor_handlers
-        ]
+            return [actor.train.remote(rollout_id, rollout_data_ref, external_data=ed) for actor, ed in zip(self._actor_handlers, external_data, strict=False)]
+        return [actor.train.remote(rollout_id, rollout_data_ref, external_data=external_data) for actor in self._actor_handlers]
 
     def save_model(self, rollout_id, force_sync=False):
         """Save actor model"""
@@ -198,11 +238,40 @@ class RayTrainGroup:
         return ray.get([actor.sleep.remote() for actor in self._actor_handlers])
 
     def release(self):
-        actors, self._actor_handlers = self._actor_handlers, []
+        actors = self._actor_handlers
+        if not actors:
+            return
+
+        actor_ids = [actor._ray_actor_id.hex() for actor in actors]
+        node_processes: dict[str, set[int]] = {}
+        for actor_id in actor_ids:
+            state = get_actor(actor_id, timeout=1)
+            if state is None or state.node_id is None or state.pid is None:
+                raise RuntimeError(f"Cannot identify training actor process before release: actor_id={actor_id}")
+            node_processes.setdefault(state.node_id, set()).add(int(state.pid))
+
+        self._actor_handlers = []
         for actor in actors:
             ray.kill(actor, no_restart=True)
-        if actors:
-            time.sleep(5)
+
+        # Wait until every trainer process is actually gone from its node's
+        # GPUs. The colocated SGLang engines resume their KV pool right after
+        # this returns, and that allocation dies with CUDA_ERROR_OUT_OF_MEMORY
+        # -- taking the scheduler subprocess with it -- if a trainer still
+        # holds the memory. ray.kill only makes the actor unreachable; the
+        # worker keeps its CUDA context for as long as teardown takes.
+        deadline = time.monotonic() + _TRAIN_ACTOR_SHUTDOWN_TIMEOUT
+        pending = dict(node_processes)
+        while pending:
+            node_ids = list(pending)
+            surviving_per_node = ray.get([_surviving_train_processes.options(scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)).remote(sorted(pending[node_id])) for node_id in node_ids])
+            pending = {node_id: surviving for node_id, surviving in zip(node_ids, surviving_per_node, strict=True) if surviving}
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                remaining = {node_id: sorted(pids) for node_id, pids in pending.items()}
+                raise TimeoutError(f"Timed out waiting for {sum(len(p) for p in pending.values())} training actor processes to " f"release their GPU memory after {_TRAIN_ACTOR_SHUTDOWN_TIMEOUT}s: {remaining}")
+            time.sleep(_TRAIN_ACTOR_SHUTDOWN_POLL_INTERVAL)
 
     def create(self, rollout_manager=None):
         if self._actor_handlers:
@@ -237,11 +306,7 @@ class RayTrainGroup:
         return self.role == "actor" and getattr(self.args, "release_train", False)
 
     def _full_disk_weight_update_enabled(self):
-        return (
-            self.role == "actor"
-            and self.args.update_weight_mode == "full"
-            and self.args.update_weight_transport == "disk"
-        )
+        return self.role == "actor" and self.args.update_weight_mode == "full" and self.args.update_weight_transport == "disk"
 
     def _reload_rollout_weights_from_disk(self, disk_weight_dir, weight_version):
         assert self._rollout_manager is not None, "disk weight update requires a rollout manager."

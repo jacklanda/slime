@@ -30,6 +30,7 @@ from .env import FusedEnvironment, _format_retrieval, normalize_task, resolve_ta
 from .history import messages_without_historical_thinking as _messages_without_historical_thinking
 from .history import strip_trailing_chat_template_stop as _strip_trailing_chat_template_stop
 from .parser import Gemma4ToolParser, ToolCall, make_tool_parser
+from .agentcpm_explore import build_messages as build_agentcpm_explore_messages
 from .prompts import (
     COT_SYSTEM_PROMPT,
     COT_USER_PROMPT,
@@ -395,6 +396,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     cut_bill = harness == "cut_bill"
     research_search = rllm_deepresearch or cut_bill
     search_gym = harness == "search_gym"
+    agentcpm_explore = harness == "agentcpm_explore"
     deepsearch_world = harness == "deepsearch_world"
     rag = harness == "rag"
     reasoning_only = harness in {"cot", "rag", "bare"}
@@ -409,6 +411,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         retrieval_max_results=retrieval_max_results,
         enable_tools=not reasoning_only,
         search_gym=search_gym,
+        agentcpm_explore=agentcpm_explore,
         deepsearch_world=deepsearch_world,
         rag=rag,
     )
@@ -518,7 +521,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             retrieved_context=retrieved_context,
         )
     )
-    render_tools = None if deepsearch_world or cut_bill else tools
+    render_tools = None if deepsearch_world or cut_bill or agentcpm_explore else tools
     max_steps = (
         base_max_steps + 2
         if deepsearch_world
@@ -1004,8 +1007,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     response,
                     actions,
                     state.tokenizer,
+                    allow_gemma4_native_tool_response_handoff=_tito_model_type(model_name) == "gemma4",
                     allow_leading_think_close=not disable_thinking,
-                    allow_action_terminated_think=search_gym,
+                    allow_action_terminated_think=search_gym or agentcpm_explore,
                     ngram_n=ngram_repetition_n,
                     ngram_threshold=ngram_repetition_threshold,
                     ngram_min_tokens=ngram_repetition_min_tokens,
@@ -1087,20 +1091,13 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     break
 
                 call_keys = [
-                    (
-                        action.name,
-                        (
-                            response[action.start : action.end]
-                            if action.start is not None and action.end is not None
-                            else json.dumps(action.arguments or {}, ensure_ascii=False)
-                        ),
-                    )
+                    (action.name, json.dumps(action.arguments or {}, ensure_ascii=False, sort_keys=True))
                     for action in actions
                 ]
                 if any(key in seen_rllm_calls for key in call_keys) or len(set(call_keys)) != len(call_keys):
                     final_done = True
                     last_info = {
-                        "termination_reason": "rllm_dr_duplicate_search",
+                        "termination_reason": "cut_bill_duplicate_search" if cut_bill else "rllm_dr_duplicate_search",
                         "duplicate_search_detected": True,
                     }
                     break
@@ -1223,11 +1220,15 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 final_done = True
                 credit_event = "tool_parser_error"
                 credit_step_index = len(pending_turns) - 1
+                if isinstance(parser, Gemma4ToolParser):
+                    error_span = next(iter(parser.last_schema_error_spans), None) or _parser_error_action_span(response)
+                else:
+                    error_span = _actions_span(actions) or _parser_error_action_span(response)
                 await _mark_pending_turn_error_span(
                     state.tokenizer,
                     pending_turns[-1],
                     response,
-                    _actions_span(actions) or _parser_error_action_span(response),
+                    error_span,
                     output_len=len(output_ids),
                 )
                 last_info = {
@@ -2094,6 +2095,8 @@ def _initial_messages(
             {"role": "system", "content": system},
             {"role": "user", "content": SEARCH_GYM_USER_PROMPT.format(question=observation)},
         ]
+    if harness == "agentcpm_explore":
+        return build_agentcpm_explore_messages(observation, tools)
     if harness == "bare":
         return [{"role": "user", "content": observation}]
     if harness == "cot":
@@ -2346,6 +2349,7 @@ def _eval_response_anomaly_info(
     actions: list[ToolCall],
     tokenizer,
     *,
+    allow_gemma4_native_tool_response_handoff: bool = False,
     allow_leading_think_close: bool,
     allow_action_terminated_think: bool = False,
     ngram_n: int,
@@ -2355,7 +2359,12 @@ def _eval_response_anomaly_info(
     anomalies = []
     info: dict[str, Any] = {}
 
-    normalized_response = response.lower()
+    protocol_response = (
+        _strip_gemma4_native_tool_response_handoff(response, actions)
+        if allow_gemma4_native_tool_response_handoff
+        else response
+    )
+    normalized_response = protocol_response.lower()
     if any(
         marker in normalized_response
         for marker in ("<tool_response>", "</tool_response>", "<|tool_response>", "<tool_response|>")
@@ -2364,7 +2373,7 @@ def _eval_response_anomaly_info(
         info["forged_tool_response_detected"] = True
 
     tag_imbalances = _response_tag_imbalances(
-        response,
+        protocol_response,
         allow_leading_think_close=allow_leading_think_close,
     )
     if (
@@ -2400,6 +2409,24 @@ def _eval_response_anomaly_info(
     if not anomalies:
         return {}
     return {"eval_response_anomalies": anomalies, **info}
+
+
+def _strip_gemma4_native_tool_response_handoff(response: str, actions: list[ToolCall]) -> str:
+    """Strip only Gemma4's empty trailing handoff marker from protocol checks.
+
+    The native chat template asks the model to end a parsed tool call with an
+    opening ``<|tool_response>`` marker. The runtime, not the model, supplies
+    the response payload. A marker anywhere else, or anything after it, remains
+    visible to the forged-response and tag-balance checks.
+    """
+    action_ends = [action.end for action in actions if action.end is not None]
+    if not action_ends:
+        return response
+    last_action_end = max(action_ends)
+    suffix = response[last_action_end:]
+    if re.fullmatch(r"\s*<\|tool_response>\s*", suffix, flags=re.IGNORECASE) is None:
+        return response
+    return response[:last_action_end]
 
 
 def _response_tag_imbalances(
@@ -3393,6 +3420,18 @@ async def _call_sglang(
 ) -> dict[str, Any]:
     global _LAST_SGLANG_REQUEST_LOG_TS
     max_new_tokens = int(sampling_params.get("max_new_tokens", 0) or 0)
+    request_sampling_params = {
+        **sampling_params,
+        "skip_special_tokens": False,
+        "spaces_between_special_tokens": False,
+        "no_stop_trim": True,
+    }
+    top_p_replay_required = not evaluation and float(getattr(args, "rollout_top_p", 1.0)) != 1.0
+    if top_p_replay_required:
+        request_sampling_params["custom_params"] = {
+            **dict(request_sampling_params.get("custom_params") or {}),
+            "return_top_p_token_ids": True,
+        }
     max_context_tokens = _effective_sglang_context_limit(args)
     effective_prompt_tokens = context_token_count if context_token_count is not None else len(prompt_ids)
     requested_tokens = effective_prompt_tokens + max_new_tokens
@@ -3410,12 +3449,7 @@ async def _call_sglang(
     payload = {
         "rid": rid,
         "input_ids": prompt_ids,
-        "sampling_params": {
-            **sampling_params,
-            "skip_special_tokens": False,
-            "spaces_between_special_tokens": False,
-            "no_stop_trim": True,
-        },
+        "sampling_params": request_sampling_params,
         "return_logprob": not evaluation,
     }
     if session_params is not None:
@@ -3486,6 +3520,8 @@ async def _call_sglang(
         output_ids, output_logprobs, top_p_data = _unpack_generate_meta(meta, token_logprobs)
     if output.get("text") and not output_ids:
         raise ValueError("SGLang returned generated text without output token/logprob evidence")
+    if top_p_replay_required and top_p_data is None:
+        raise ValueError("SGLang response omitted top-p token replay metadata requested for fused-agent training")
     invalid_logprobs = [index for index, value in enumerate(output_logprobs) if not math.isfinite(value)]
     if invalid_logprobs:
         raise ValueError(f"SGLang returned non-finite output logprobs at indices {invalid_logprobs[:8]}")

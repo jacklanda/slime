@@ -531,7 +531,7 @@ async def generate_and_rm(
 
         generated_samples = sample if isinstance(sample, list) else [sample]
         termination_reason = _eval_termination_reason(generated_samples)
-        if termination_reason in {None, "env_done", "reasoning_only"} or attempt >= retry_times:
+        if not _is_retryable_eval_termination(termination_reason) or attempt >= retry_times:
             if evaluation:
                 for generated_sample in generated_samples:
                     generated_sample.metadata = {
@@ -597,6 +597,14 @@ def _eval_termination_reason(samples: list[Sample]) -> str | None:
         if reason:
             return str(reason)
     return None
+
+
+def _is_retryable_eval_termination(reason: str | None) -> bool:
+    if reason in {None, "env_done", "reasoning_only"}:
+        return False
+    # Repeating the same parsed search action is a deterministic model behavior.
+    # Retrying the whole trajectory only multiplies requests and warning logs.
+    return not reason.endswith("_duplicate_search")
 
 
 def _should_rescore_eval_sample(args: Namespace, sample: Sample, evaluation: bool) -> bool:
@@ -904,9 +912,26 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
                 pbar.update(args.n_samples_per_prompt)
         now = time.time()
         if now - last_log > 30.0:
+            # logger.info(
+                # "sync rollout %d: collected %d/%d, dropped=%d/%d, pending=%d, elapsed=%.1fs, "
+                # "drop_reasons=%s, terminations=%s, rewards=%s",
+                # rollout_id,
+                # len(data),
+                # target_data_size,
+                # dropped_groups,
+                # completed_groups,
+                # len(state.pendings),
+                # now - started,
+                # json.dumps(dict(drop_reasons.most_common(5))),
+                # json.dumps(dict(dropped_terminations.most_common(5))),
+                # "["
+                # + ", ".join(
+                    # f"({json.dumps(reward)}, {count})" for reward, count in dropped_rewards.most_common(5)
+                # )
+                # + "]",
+            # )
             logger.info(
-                "sync rollout %d: collected %d/%d, dropped=%d/%d, pending=%d, elapsed=%.1fs, "
-                "drop_reasons=%s, terminations=%s, rewards=%s",
+                "sync rollout %d: collected %d/%d, dropped=%d/%d, pending=%d, elapsed=%.1fs",
                 rollout_id,
                 len(data),
                 target_data_size,
@@ -914,9 +939,6 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
                 completed_groups,
                 len(state.pendings),
                 now - started,
-                drop_reasons.most_common(5),
-                dropped_terminations.most_common(5),
-                dropped_rewards.most_common(5),
             )
             last_log = now
 

@@ -35,7 +35,12 @@ from slime.utils.visualization import print_metrics_table
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
 from .data import DataIterator, get_batch
-from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
+from .loss import (
+    ROLLOUT_TOP_P_TOKEN_KEYS,
+    get_log_probs_and_entropy,
+    get_rollout_top_p_logprob_kwargs,
+    loss_function,
+)
 from .model_provider import get_model_provider_func
 from .stateless_adam import StatelessAdam
 
@@ -721,6 +726,9 @@ def forward_only(
             "labels": None,
             "packed_seq_params": packed_seq_params,
             "loss_mask": batch["full_loss_masks"],
+            # Log-prob kernels upcast one bounded chunk at a time. Upcasting the
+            # full [tokens, vocab/TP] output here can require tens of GiB.
+            "fp32_output": not ((args.fp16 or args.bf16) and f is get_log_probs_and_entropy),
         }
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
@@ -921,6 +929,7 @@ def train_one_step(
                 "labels": None,
                 "packed_seq_params": batch["packed_seq_params"],
                 "loss_mask": batch["full_loss_masks"],
+                "fp32_output": not ((args.fp16 or args.bf16) and args.loss_type == "policy_loss"),
             }
 
             if batch["multimodal_train_inputs"] is not None:

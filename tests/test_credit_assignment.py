@@ -916,7 +916,7 @@ def test_prompt_equal_denominator_pools_all_segments_and_rollouts_by_instance_id
     assert train_data["rollout_mask_sums"] == [4.0, 4.0, 4.0, 2.0, 2.0]
 
 
-def test_prompt_equal_policy_denominator_uses_live_policy_tokens_and_excludes_dead_prompts():
+def test_prompt_equal_policy_mask_preserves_original_prompt_weight():
     samples = [
         _prompt_equal_sample(
             group_index=0,
@@ -956,7 +956,7 @@ def test_prompt_equal_policy_denominator_uses_live_policy_tokens_and_excludes_de
     train_data = convert_samples_to_train_data(_args(global_batch_size=4, rewards_normalization=False), samples)
 
     assert train_data["rollout_mask_sums"] == [2.5, 2.5, 1.0, 0.0]
-    assert train_data["policy_rollout_mask_sums"] == [1.5, 1.5, 1.0, 0.0]
+    assert train_data["policy_rollout_mask_sums"] == [2.5, 2.5, 1.0, 0.0]
 
 
 def test_prompt_equal_denominators_are_computed_within_each_training_step():

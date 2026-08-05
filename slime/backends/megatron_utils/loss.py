@@ -517,7 +517,7 @@ def get_log_probs_and_entropy(
     log-probabilities; entropy is always computed from the unmasked logits.
     """
     assert non_loss_data
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    assert logits.dtype in (torch.float16, torch.bfloat16, torch.float32), f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
@@ -693,7 +693,8 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     estimator. Supported methods: "grpo", "gspo", "cispo", "ppo",
     "reinforce_plus_plus", and "reinforce_plus_plus_baseline". When
     `args.normalize_advantages` is True, advantages are whitened across the
-    data-parallel group using masked statistics.
+    data-parallel group using the policy mask for policy loss and the base
+    loss mask otherwise.
 
     Early returns if both `log_probs` and `values` are None (intermediate
     pipeline stages).
@@ -804,9 +805,14 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.
     if args.normalize_advantages:
         all_advs = torch.cat(advantages)
+        advantage_masks = (
+            rollout_data["policy_loss_masks"]
+            if args.loss_type == "policy_loss" and rollout_data.get("policy_loss_masks") is not None
+            else loss_masks
+        )
         cp_size = mpu.get_context_parallel_world_size()
         if cp_size == 1:
-            all_masks = torch.cat(loss_masks)
+            all_masks = torch.cat(advantage_masks)
         else:
             mask_chunks = []
             for i in range(len(advantages)):
@@ -822,7 +828,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
                 res_s1, res_e1 = max(0, s1 - prompt_len), max(0, e1 - prompt_len)
 
                 local_mask_parts = []
-                full_mask = loss_masks[i]
+                full_mask = advantage_masks[i]
                 if res_e0 > res_s0:
                     local_mask_parts.append(full_mask[res_s0:res_e0])
                 if res_e1 > res_s1:

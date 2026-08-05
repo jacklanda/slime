@@ -286,6 +286,41 @@ def test_calculate_log_probs_and_entropy_handles_empty_input(with_entropy: bool)
         assert entropy is None
 
 
+@pytest.mark.parametrize("with_entropy_grad", [False, True])
+def test_calculate_log_probs_and_entropy_checkpoints_mixed_precision_chunks(
+    monkeypatch, with_entropy_grad: bool
+):
+    import slime.utils.ppo_utils as ppo_utils
+
+    checkpoint_calls = 0
+    real_checkpoint = ppo_utils.checkpoint
+
+    def counted_checkpoint(*args, **kwargs):
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        return real_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(ppo_utils, "checkpoint", counted_checkpoint)
+    logits = _single_rank_logits().to(torch.bfloat16).requires_grad_()
+    tokens = torch.tensor([3, 0, 1], dtype=torch.long)
+
+    log_probs, entropy = calculate_log_probs_and_entropy(
+        logits,
+        tokens,
+        tp_group=None,
+        with_entropy=True,
+        with_entropy_grad=with_entropy_grad,
+        chunk_size=1,
+    )
+    (log_probs.sum() + entropy.sum()).backward()
+
+    assert checkpoint_calls == logits.size(0)
+    assert log_probs.dtype == torch.float32
+    assert entropy.dtype == torch.float32
+    assert logits.grad is not None
+    assert logits.grad.dtype == torch.bfloat16
+
+
 def _distributed_full_logits() -> torch.Tensor:
     return torch.tensor(
         [

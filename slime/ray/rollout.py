@@ -275,9 +275,9 @@ def convert_samples_to_train_data(
         train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id_list]
     if has_explicit_policy_mask:
         if prompt_equal_loss:
-            train_data["policy_rollout_mask_sums"] = prompt_equal_mask_sums(
-                args, samples, policy_loss_masks, rollout_id_list
-            )
+            # Credit-assignment masks remove gradient contributions; they must
+            # not renormalize a sparsely retained prompt back to full weight.
+            train_data["policy_rollout_mask_sums"] = list(train_data["rollout_mask_sums"])
         else:
             policy_mask_sums_per_sample = [sum(m) for m in policy_loss_masks]
             policy_rollout_total_mask: dict[int, int] = {}

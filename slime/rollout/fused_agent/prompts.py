@@ -163,7 +163,10 @@ def build_system_prompt(
     parser = tool_parser or make_tool_parser(model_name)
     schemas_str = "\n".join(json.dumps(schema, indent=0, ensure_ascii=False) for schema in schemas)
     tool_prompt = parser.get_tool_prompt(schemas_str)
-    if isinstance(parser, Gemma4ToolParser) or not inline_tool_prompt:
+    if isinstance(parser, Gemma4ToolParser):
+        contract = parser.get_tool_contract()
+        return base_prompt.strip() + ("\n\n" + contract if contract else "")
+    if not inline_tool_prompt:
         return base_prompt.strip()
     return base_prompt.strip() + "\n" + tool_prompt
 
@@ -181,6 +184,6 @@ def normalize_harness(harness: str | None) -> str:
         "deepsearch_world": "deepsearch_world",
     }
     value = aliases.get(value, value)
-    if value not in {"gem", "unified_gem", "react", "cot", "rag", "bare", "rllm_deepresearch", "cut_bill", "search_gym", "deepsearch_world"}:
+    if value not in {"gem", "unified_gem", "react", "cot", "rag", "bare", "rllm_deepresearch", "cut_bill", "search_gym", "deepsearch_world", "agentcpm_explore"}:
         raise ValueError(f"Invalid fused harness: {harness!r}")
     return value

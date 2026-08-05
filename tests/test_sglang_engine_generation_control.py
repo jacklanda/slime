@@ -66,6 +66,21 @@ def test_get_weight_version_uses_health_timeout(monkeypatch):
     assert calls == [("http://127.0.0.1:15000/model_info", 7.0)]
 
 
+def test_disk_weight_update_releases_temporary_cuda_allocator_cache():
+    calls = []
+    engine = _engine(Namespace())
+    engine._make_request = lambda endpoint, payload: calls.append((endpoint, payload))
+
+    engine.update_weights_from_disk("/tmp/weights", weight_version="7")
+
+    assert calls == [
+        (
+            "update_weights_from_disk",
+            {"model_path": "/tmp/weights", "torch_empty_cache": True, "weight_version": "7"},
+        )
+    ]
+
+
 def test_memory_occupation_transitions_are_idempotent(monkeypatch):
     calls = []
     engine = _engine(Namespace())

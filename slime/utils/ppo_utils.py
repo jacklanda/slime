@@ -2,10 +2,12 @@
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
 from argparse import Namespace
+from functools import partial
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 @torch.compile(dynamic=True)
@@ -775,14 +777,25 @@ def calculate_log_probs_and_entropy(
             for tokens_chunk, logits_chunk, mask_chunk in zip(tokens_chunks, logits_chunks, mask_chunks, strict=True):
                 if logits_scale != 1.0:
                     logits_chunk = logits_chunk * logits_scale
-                log_prob, entropy_chunk = _calculate_log_probs_and_entropy_chunk(
-                    logits_chunk,
-                    tokens_chunk,
-                    tp_group,
+                chunk_fn = partial(
+                    _calculate_log_probs_and_entropy_chunk,
+                    tp_group=tp_group,
                     with_entropy=with_entropy,
                     with_entropy_grad=with_entropy_grad,
                     log_prob_keep_mask=mask_chunk,
                 )
+                if logits_chunk.requires_grad and logits_chunk.dtype != torch.float32:
+                    # The fused op computes softmax in FP32. Checkpoint each
+                    # mixed-precision chunk so all full-vocab softmax buffers
+                    # are not retained together until policy backward.
+                    log_prob, entropy_chunk = checkpoint(
+                        chunk_fn,
+                        logits_chunk,
+                        tokens_chunk,
+                        use_reentrant=False,
+                    )
+                else:
+                    log_prob, entropy_chunk = chunk_fn(logits_chunk, tokens_chunk)
                 log_probs.append(log_prob)
                 if entropy_chunk is not None:
                     entropy_chunks.append(entropy_chunk)

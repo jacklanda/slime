@@ -34,7 +34,7 @@ Options:
   --temperature X                       Training rollout sampling temperature. Default: 1.0.
   --micro-batch-size N                   Training micro-batch size.
   --update-weights-interval N            Rollout weight update interval. Default: 1.
-  --rollout-num-gpus-per-engine N        Tensor-parallel GPUs per rollout engine. Default: 2.
+  --rollout-num-gpus-per-engine N        Tensor-parallel GPUs per rollout engine. Default: 1.
   --retrieval-backend local|serper       Set both train and eval backends (compatibility alias).
   --train-retrieval-backend local|serper Training retrieval backend. Default: local.
   --eval-retrieval-backend local|serper  Evaluation retrieval backend. Default: serper.
@@ -123,11 +123,11 @@ Options:
   --val_before_train BOOL                Run one eval before training starts. Default: true.
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
   --offload-train BOOL                   Offload trainer model between phases. Disabled by --release-train.
-  --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: false.
+  --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: true.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 128.
+  --sglang-server-concurrency N          Max concurrent trajectories per SGLang server. Default: 64.
   --sglang-router-request-timeout-secs N Router request timeout. Default: 21600.
-  --sglang-max-running-requests N        SGLang max running requests. Default: 64.
+  --sglang-max-running-requests N        SGLang max running requests. Default: 16.
   --colocate / --no-colocate             Share trainer and rollout GPUs with offload. Default: enabled.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
@@ -145,9 +145,7 @@ PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
 ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
-# Alternate training and rollout across all eight GPUs. The pinned
-# torch_memory_saver revision includes the CUDA VMM granularity fix required by
-# repeated pause/resume cycles in long-running colocated jobs.
+# Alternate training and rollout across all eight GPUs.
 COLOCATE="${COLOCATE:-true}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-false}"
@@ -191,7 +189,7 @@ HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"
 LR="${LR:-1e-6}"
 KL_COEF="${KL_COEF:-0.0}"
-USE_WANDB="${USE_WANDB:-0}"
+USE_WANDB="${USE_WANDB:-1}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
@@ -206,11 +204,11 @@ CLI_MAX_STEPS="${CLI_MAX_STEPS:-64}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-7200}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
-# Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
-# running batch so growing agent contexts do not repeatedly exhaust the KV pool.
-# Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-128}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
+# Keep enough trajectories in flight to cover retrieval/tool I/O waits. SGLang
+# separately caps the GPU batch so queued work does not consume KV capacity.
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-64}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-16}"
+SGLANG_DETERMINISTIC_INFERENCE="${SGLANG_DETERMINISTIC_INFERENCE:-false}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
@@ -239,7 +237,10 @@ EVAL_PROMPT_DATA=()
 # changes it. Release-train overrides this below because it replaces the trainer
 # actor instead of pausing it.
 OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-}}"
-RELEASE_TRAIN="${RELEASE_TRAIN:-false}"
+# torch_memory_saver.pause() can terminate the worker with cudaErrorInvalidValue
+# on the first trainer offload with this CUDA/PyTorch stack. Recreating the
+# trainer avoids that native path while preserving state through checkpoints.
+RELEASE_TRAIN="${RELEASE_TRAIN:-true}"
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
 GRM_MODEL="${GRM_MODEL:-google/gemini-3-flash-preview}"
@@ -396,11 +397,9 @@ done
 OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${COLOCATE}}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-40960}"
 
-# Colocated trainer pause/resume uses a pinned CPU copy for every tracked CUDA
-# allocation. Long runs can exhaust/fragment CUDA host registrations and make
-# cudaMallocHost fail natively inside torch_memory_saver.pause(). Release-train
-# preserves model, optimizer, and RNG through a checkpoint while avoiding that
-# native path entirely.
+# Colocated trainer pause/resume can fail natively inside
+# torch_memory_saver.pause() on this CUDA/PyTorch stack. Release-train preserves
+# model, optimizer, and RNG through a checkpoint while avoiding that path.
 if is_truthy "${RELEASE_TRAIN}"; then
    if ! is_truthy "${COLOCATE}"; then
       echo "RELEASE_TRAIN=true requires COLOCATE=true in this launcher." >&2
@@ -414,13 +413,12 @@ if is_truthy "${DISCARD_HISTORICAL_THINKING}"; then
    exit 2
 fi
 
+set +x
 if is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTOM_RM_PATH}" ]; then
    if [ -z "${OPENROUTER_API_KEY:-}" ] \
       && [ -n "${OPENAI_API_KEY:-}" ] \
       && [ -n "${GRM_BASE_URL:-${OPENAI_BASE_URL:-}}" ]; then
-      set +x
       export OPENROUTER_API_KEY="${OPENAI_API_KEY}"
-      set -x
       GRM_BASE_URL="${GRM_BASE_URL:-${OPENAI_BASE_URL}}"
    fi
    if [ -z "${OPENROUTER_API_KEY:-}" ]; then
@@ -428,6 +426,7 @@ if is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTO
       exit 2
    fi
 fi
+set -x
 
 case "${TERMINAL_LOG_STYLE}" in
    progress|rollouts|both) ;;
@@ -435,7 +434,7 @@ case "${TERMINAL_LOG_STYLE}" in
 esac
 FUSED_HARNESS="${FUSED_HARNESS:-gem}"
 
-NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+NVLINK_COUNT=$({ nvidia-smi topo -m 2>/dev/null || true; } | { grep -o 'NV[0-9][0-9]*' || true; } | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
@@ -509,16 +508,16 @@ MODEL_CONFIG="${MODEL_CONFIG:-qwen3.5-4B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
 
-# Match the trainer tensor-parallel topology to the default TP2 rollout engines
-# for the train/infer consistency baseline.
+# Keep the trainer tensor-parallel topology at TP2; the 4B rollout model uses
+# independent single-GPU replicas to avoid TP communication during decoding.
 DEFAULT_TP_SIZE=2
 
 # In colocate mode both phases use all eight GPUs in alternation. Defined here
 # before PERF_ARGS is built because bash arrays expand values at definition time.
 ACTOR_GPUS="${ACTOR_GPUS:-8}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
-ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
-CP_SIZE="${CP_SIZE:-1}"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
+CP_SIZE="${CP_SIZE:-2}"
 PP_SIZE="${PP_SIZE:-1}"
 
 if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -lt 1 ] \
@@ -528,7 +527,7 @@ if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -lt 1 ] \
 fi
 ROLLOUT_ENGINE_COUNT=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
 
-# Keep context parallelism disabled for the train/infer consistency baseline.
+# CP2 halves the per-GPU sequence/logits footprint for the 40K context default.
 # Explicit CP overrides still clamp TP to the remaining actor-GPU dimension.
 if [ "${CP_SIZE}" -lt 1 ] || [ "${PP_SIZE}" -lt 1 ]; then
    echo "CP_SIZE and PP_SIZE must be positive; got CP_SIZE=${CP_SIZE}, PP_SIZE=${PP_SIZE}" >&2
@@ -810,13 +809,13 @@ fi
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-15472}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-24576}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$(((MAX_CONTEXT_LEN + CP_SIZE - 1) / CP_SIZE))}"
-LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-${MAX_CONTEXT_LEN}}"
-LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-4096}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-20480}"
+LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-8192}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
-# Keep enough candidate groups queued to feed the default four TP2 rollout
-# engines without generating the much larger surplus created by a batch of 64.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-16}"
+# Keep enough candidate groups queued to feed the single-GPU rollout engines
+# without generating the much larger surplus created by a batch of 64.
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"  # equivalent to "parallel agent/trace num"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
@@ -966,10 +965,10 @@ ROLLOUT_ARGS=(
    --rollout-max-prompt-len "${MAX_PROMPT_LENGTH}"
    --rollout-max-response-len "${MAX_RESPONSE_LENGTH}"
    --rollout-temperature "${TEMPERATURE}"
-   --rollout-top-p "${TOP_P:-0.95}"
+   --rollout-top-p "${TOP_P:-1.0}"
    --rollout-top-k "${TOP_K:-20}"
    --rollout-min-p "${MIN_P:-0.0}"
-   --rollout-presence-penalty "${PRESENCE_PENALTY:-1.5}"
+   --rollout-presence-penalty "${PRESENCE_PENALTY:-0.0}"
    --rollout-repetition-penalty "${REPETITION_PENALTY:-1.0}"
 
    --global-batch-size "${EFFECTIVE_GLOBAL_BATCH_SIZE}"
@@ -1118,7 +1117,7 @@ GRPO_ARGS=(
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF:-0.00}"
    --eps-clip "${EPS_CLIP:-0.2}"
-   --eps-clip-high "${EPS_CLIP_HIGH:-0.6}"
+   --eps-clip-high "${EPS_CLIP_HIGH:-0.28}"
 )
 if is_truthy "${USE_KL_LOSS:-1}"; then
    GRPO_ARGS+=(--use-kl-loss)
@@ -1156,8 +1155,8 @@ OPTIMIZER_ARGS=(
 )
 
 # Colocated SGLang shares each GPU with residual trainer allocations during
-# weight synchronization. Keep the static pool at 0.6 so KV/CUDA graph resume
-# has enough headroom while trainer CUDA allocations are still being released.
+# weight synchronization and process teardown. Keep the static pool at 0.6 so
+# KV/CUDA graph resume has enough headroom on an 80 GiB A100.
 if [ -z "${SGLANG_MEM_FRACTION_STATIC:-}" ]; then
    if is_truthy "${COLOCATE}"; then
       SGLANG_MEM_FRACTION_STATIC=0.6
@@ -1173,12 +1172,14 @@ SGLANG_ARGS=(
    --sglang-router-request-timeout-secs "${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS}"
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
    --sglang-context-length "${MAX_CONTEXT_LEN}"
-   --sglang-enable-deterministic-inference
    --sglang-attention-backend triton
    --sglang-disable-custom-all-reduce
    --sglang-disable-piecewise-cuda-graph
    --router-policy "${ROUTER_POLICY}"
 )
+if is_truthy "${SGLANG_DETERMINISTIC_INFERENCE}"; then
+   SGLANG_ARGS+=(--sglang-enable-deterministic-inference)
+fi
 WANDB_ARGS=()
 if [ "${USE_WANDB}" = "1" ]; then
    WANDB_ARGS=(
@@ -1405,7 +1406,7 @@ echo "W&B enabled: ${USE_WANDB}"
 echo "Custom generate: ${CUSTOM_GENERATE_FUNCTION_PATH:-<stock slime rollout>}"
 echo "Custom reward post-process: ${CUSTOM_REWARD_POST_PROCESS_PATH:-<vanilla>}"
 echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
-echo "Actor GPUs: ${ACTOR_GPUS}, actor TP=${TP_SIZE}, CP=${CP_SIZE}, PP=${PP_SIZE}, rollout GPUs: ${ROLLOUT_GPUS}, rollout TP=${ROLLOUT_NUM_GPUS_PER_ENGINE}, rollout engines=${ROLLOUT_ENGINE_COUNT}, colocate=${COLOCATE}, offload_train=${OFFLOAD_TRAIN}, ray GPUs=${NUM_GPUS}"
+echo "Actor GPUs: ${ACTOR_GPUS}, actor TP=${TP_SIZE}, CP=${CP_SIZE}, PP=${PP_SIZE}, rollout GPUs: ${ROLLOUT_GPUS}, rollout TP=${ROLLOUT_NUM_GPUS_PER_ENGINE}, rollout engines=${ROLLOUT_ENGINE_COUNT}, colocate=${COLOCATE}, release_train=${RELEASE_TRAIN}, offload_train=${OFFLOAD_TRAIN}, ray GPUs=${NUM_GPUS}"
 echo "Training token budgets: max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}, log_probs_max_tokens_per_gpu=${LOG_PROBS_MAX_TOKENS_PER_GPU}, log_probs_chunk_size=${LOG_PROBS_CHUNK_SIZE}, max_context_len=${MAX_CONTEXT_LEN}"
 echo "YaRN: enable=${ENABLE_YARN}, factor=${YARN_FACTOR}, original_max_position_embeddings=${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
 echo "SGLang: mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}, server_concurrency=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}"
