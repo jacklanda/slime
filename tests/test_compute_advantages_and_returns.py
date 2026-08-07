@@ -31,7 +31,7 @@ def test_masked_whiten_returns_zero_when_no_policy_tokens_remain(monkeypatch):
 def test_advantage_whitening_uses_loss_specific_masks(monkeypatch, loss_type, expected_mask):
     monkeypatch.setattr(loss.mpu, "is_pipeline_last_stage", lambda: True)
     monkeypatch.setattr(loss.mpu, "get_context_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(loss.mpu, "get_data_parallel_group", lambda: None)
+    monkeypatch.setattr(loss.mpu, "get_data_parallel_group", lambda **_kwargs: None)
 
     captured = {}
 
@@ -69,6 +69,60 @@ def test_advantage_whitening_uses_loss_specific_masks(monkeypatch, loss_type, ex
     advantages = torch.cat(rollout_data["advantages"])
     torch.testing.assert_close(advantages[expected_mask.bool()].mean(), torch.tensor(0.0))
     torch.testing.assert_close(advantages[expected_mask.bool()].std(unbiased=False), torch.tensor(1.0))
+
+
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_advantage_whitening_reduces_over_the_dp_group_including_cp(monkeypatch, cp_size):
+    """The whitening population must span CP.
+
+    Ranks inside one CP group hold the same samples but disjoint token halves.
+    Reducing over DP-without-CP gives each CP rank its own mean/var, so one
+    sequence would get two different affine transforms.
+    """
+    monkeypatch.setattr(loss.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(loss.mpu, "get_context_parallel_world_size", lambda: cp_size)
+
+    captured = {}
+
+    def get_data_parallel_group(**kwargs):
+        captured["kwargs"] = kwargs
+        return None
+
+    monkeypatch.setattr(loss.mpu, "get_data_parallel_group", get_data_parallel_group)
+    # CP>1 slices each sequence by token offsets; keep the whole response local
+    # so this test isolates the process-group choice.
+    monkeypatch.setattr(
+        loss,
+        "get_logits_and_tokens_offset_with_cp",
+        lambda total_len, response_len: (None, None, None, [(total_len - response_len, total_len), (0, 0)]),
+    )
+    monkeypatch.setattr(loss, "distributed_masked_whiten", lambda values, mask, **_kwargs: values)
+
+    args = Namespace(
+        use_rollout_logprobs=False,
+        kl_coef=0,
+        kl_loss_type="k1",
+        custom_advantage_function_path=None,
+        advantage_estimator="grpo",
+        loss_type="policy_loss",
+        use_opd=False,
+        normalize_advantages=True,
+    )
+    rollout_data = {
+        "log_probs": None,
+        "rollout_log_probs": None,
+        "ref_log_probs": None,
+        "rewards": [2.0, -1.0],
+        "values": None,
+        "response_lengths": [3, 2],
+        "loss_masks": [torch.ones(3, dtype=torch.int), torch.ones(2, dtype=torch.int)],
+        "policy_loss_masks": [torch.tensor([1, 0, 0]), torch.tensor([0, 1])],
+        "total_lengths": [5, 4],
+    }
+
+    loss.compute_advantages_and_returns(args, rollout_data)
+
+    assert captured["kwargs"] == {"with_context_parallel": True}
 
 
 def test_zero_kl_uses_loss_masks_when_log_probs_and_values_are_missing(monkeypatch):

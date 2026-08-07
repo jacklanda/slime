@@ -23,6 +23,7 @@ from dataclasses import replace as dc_replace
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.bias import causal_lower_right
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
@@ -59,6 +60,11 @@ class Gemma4TransformerConfig(Gemma3TransformerConfig):
     global_kv_channels: int = 512
     global_num_query_groups: int = 4
     global_partial_rotary_factor: float = 0.25  # fraction of global head_dim that gets RoPE
+    # Width of the global half of the concatenated DualRotaryEmbedding output.
+    # Declared as a real field (not set via setattr on the shared config) so it
+    # survives the `dc_replace` clone that global layers are built against -
+    # otherwise global layers cannot find it and never slice the RoPE.
+    dual_rope_global_dim: int = 0
     attention_k_eq_v: bool = True  # global layers: V = K (no v_proj)
     enable_moe_block: bool = False  # 26B-A4B MoE variant
     hidden_size_per_layer_input: int = 0  # E2B/E4B per-layer embeddings
@@ -296,10 +302,7 @@ class Gemma4MoELayer(MoELayer):
         under activation checkpointing / recomputation.
         """
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
-            raise ValueError(
-                "During training, performance may degrade if MoE and tensor "
-                "parallelism are enabled without also enabling sequence parallelism."
-            )
+            raise ValueError("During training, performance may degrade if MoE and tensor " "parallelism are enabled without also enabling sequence parallelism.")
 
         router_in = router_input if router_input is not None else hidden_states
         experts_in = self.pre_feedforward_layernorm_2(hidden_states)
@@ -366,19 +369,12 @@ class Gemma4TransformerLayer(TransformerLayer):
         # This guard is Gemma4-only and catches callers that provide a stale
         # custom ModuleSpec instead of the canonical spec above.
         if isinstance(self.pre_mlp_layernorm, IdentityOp):
-            raise RuntimeError(
-                "Gemma4 requires an explicit pre_mlp_layernorm; received IdentityOp. "
-                "Use slime_plugins.models.gemma4:get_gemma4_spec."
-            )
+            raise RuntimeError("Gemma4 requires an explicit pre_mlp_layernorm; received IdentityOp. " "Use slime_plugins.models.gemma4:get_gemma4_spec.")
 
         self.self_attention._is_global = self._is_global
         self.self_attention._global_layer_idx = global_layer_number - 1
-        self.self_attention._kv_shared_layer_index = getattr(config, "kv_shared_layer_map", {}).get(
-            global_layer_number - 1
-        )
-        self.self_attention._store_full_length_kv = (global_layer_number - 1) in getattr(
-            config, "kv_store_layers", set()
-        )
+        self.self_attention._kv_shared_layer_index = getattr(config, "kv_shared_layer_map", {}).get(global_layer_number - 1)
+        self.self_attention._store_full_length_kv = (global_layer_number - 1) in getattr(config, "kv_store_layers", set())
 
         # Global layers require this because head_dim=512 exceeds flash attention's limit (256).
         # Local layers also use SDPA for consistency.
@@ -430,11 +426,7 @@ class Gemma4TransformerLayer(TransformerLayer):
             )
 
         self.is_kv_shared_layer = self.global_layer_idx in getattr(config, "kv_shared_layer_map", {})
-        if (
-            getattr(config, "use_double_wide_mlp", False)
-            and self.is_kv_shared_layer
-            and not getattr(config, "enable_moe_block", False)
-        ):
+        if getattr(config, "use_double_wide_mlp", False) and self.is_kv_shared_layer and not getattr(config, "enable_moe_block", False):
             wide_config = dc_replace(config, ffn_hidden_size=config.ffn_hidden_size * 2)
             self.mlp = build_module(
                 submodules.mlp,
@@ -501,10 +493,7 @@ class Gemma4TransformerLayer(TransformerLayer):
 
     def _forward_per_layer_input(self, hidden_states, per_layer_inputs):
         if per_layer_inputs is None:
-            raise RuntimeError(
-                "Gemma4 per-layer inputs are missing. E2B/E4B PLE currently requires "
-                "the Gemma4 provider hooks installed by --custom-model-provider-path."
-            )
+            raise RuntimeError("Gemma4 per-layer inputs are missing. E2B/E4B PLE currently requires " "the Gemma4 provider hooks installed by --custom-model-provider-path.")
 
         residual = hidden_states
         per_layer_input = per_layer_inputs[..., self.global_layer_idx, :]
@@ -543,18 +532,18 @@ class Gemma4TransformerLayer(TransformerLayer):
         if isinstance(attention_mask, tuple):
             attention_mask = attention_mask[1] if self.is_sliding else attention_mask[0]
 
-        # Global layers use partial RoPE (25% of head_dim=512 = 128 dims)
-        # Local layers use full RoPE (100% of head_dim=256 = 256 dims)
-        # With DualRotaryEmbedding, global RoPE is full-size (512 dims) with zero-padded
-        # non-rotated dims, so no truncation needed.
-        # With single RoPE (local only, 256 dims), truncate for global layers.
+        # Global layers use partial RoPE: only `partial_rotary_factor` of the
+        # 512-wide head is rotated. That is expressed by ZERO-PADDING inv_freq
+        # (see the provider), NOT by narrowing the tensor - the width handed to
+        # Megatron must stay the full `global_kv_channels`, because
+        # `_apply_rotary_pos_emb_bshd` slices `t[..., :rot_dim]` and pairs dim i
+        # with dim i + rot_dim/2. Narrowing to `global_head_dim * partial` (128)
+        # would pair dim i with i+64 instead of the correct i+256, rotating the
+        # wrong subspace on every full-attention layer.
         if not self.is_sliding and rotary_pos_emb is not None:
-            global_rope_dim = int(self.config.global_kv_channels * self.config.global_partial_rotary_factor)
-            if (
-                rotary_pos_emb.shape[-1] != self.config.global_kv_channels
-                and rotary_pos_emb.shape[-1] > global_rope_dim
-            ):
-                rotary_pos_emb = rotary_pos_emb[..., :global_rope_dim]
+            expected = self.config.global_kv_channels
+            if rotary_pos_emb.shape[-1] != expected:
+                raise RuntimeError(f"Gemma4 global layer expected a {expected}-wide rotary embedding " f"(partial rotation is encoded as zeroed inv_freq tails), got " f"{rotary_pos_emb.shape[-1]}. Check that `dual_rope_global_dim` is set " "on the config used to build this layer.")
 
         residual = hidden_states
 
@@ -672,9 +661,7 @@ class SDPACoreAttention(nn.Module):
     @staticmethod
     def _cp_unzigzag_permutation(cu_seqlens_list, cp_size, device):
         """Map rank-major CP-gathered K/V tokens back to packed global order."""
-        total_local_len = sum(
-            (cu_seqlens_list[i + 1] - cu_seqlens_list[i]) // cp_size for i in range(len(cu_seqlens_list) - 1)
-        )
+        total_local_len = sum((cu_seqlens_list[i + 1] - cu_seqlens_list[i]) // cp_size for i in range(len(cu_seqlens_list) - 1))
         local_prefix = 0
         perm_parts = []
         for s_idx in range(len(cu_seqlens_list) - 1):
@@ -713,7 +700,6 @@ class SDPACoreAttention(nn.Module):
 
         t_local = query.shape[0]
         np_q, hn = query.shape[1], query.shape[2]
-        nk = key.shape[1]
         scale = self._resolve_scale(hn)
 
         # Differentiable all-gather along the token dim. forward: AG,
@@ -742,16 +728,9 @@ class SDPACoreAttention(nn.Module):
             expected_t_local = 0
             for s_idx in range(len(cu_seqlens) - 1):
                 s_len = (cu_seqlens[s_idx + 1] - cu_seqlens[s_idx]).item()
-                assert s_len % (2 * cp_size) == 0, (
-                    f"sub-sequence {s_idx} global length ({s_len}) is not "
-                    f"divisible by 2*cp_size ({2 * cp_size}); `slice_with_cp` "
-                    "should pad before packing"
-                )
+                assert s_len % (2 * cp_size) == 0, f"sub-sequence {s_idx} global length ({s_len}) is not " f"divisible by 2*cp_size ({2 * cp_size}); `slice_with_cp` " "should pad before packing"
                 expected_t_local += s_len // cp_size
-            assert expected_t_local == t_local, (
-                f"packed-seq local length mismatch: sum(seq_len // cp_size) = "
-                f"{expected_t_local}, but query.shape[0] = {t_local}"
-            )
+            assert expected_t_local == t_local, f"packed-seq local length mismatch: sum(seq_len // cp_size) = " f"{expected_t_local}, but query.shape[0] = {t_local}"
 
         if cu_seqlens is None:
             t_full_total = k_full.shape[0]
@@ -779,43 +758,118 @@ class SDPACoreAttention(nn.Module):
             k_seq = k_full[seq_start : seq_start + seq_len_global]
             v_seq = v_full[seq_start : seq_start + seq_len_global]
 
-            q4 = q_seq.unsqueeze(0).transpose(1, 2)  # [1, np, local_len, hn]
-            k4 = k_seq.unsqueeze(0).transpose(1, 2)  # [1, nk, seq_len, hn]
-            v4 = v_seq.unsqueeze(0).transpose(1, 2)
-
-            # Global positions of local Q tokens. cp_size=1 degenerates to
-            # identity; use arange to preserve odd-length seqs (zigzag helper
-            # floor-divides, dropping the trailing token).
+            # Each rank owns exactly two zig-zag chunks of this sub-sequence,
+            # and both are *contiguous* in global position. A contiguous query
+            # block whose last row is global position `g_end - 1` needs no
+            # explicit mask at all: causality is "attend to K[:g_end], aligned
+            # bottom-right", and the sliding window is a fixed left offset from
+            # each row. Both are expressible as kernel-native arguments, so we
+            # never build the [local_len, seq_len_global] score/mask tensors
+            # that forced the math backend and made attention O(T^2) in memory
+            # (12+ GiB per global layer at a 40K context under CP2, which is
+            # what exhausted the 80 GiB ranks during the actor update).
             if cp_size > 1:
-                row_idx = self._zigzag_global_indices(local_len, cp_rank, cp_size, device)
+                chunk_size = local_len // 2
+                # `_zigzag_global_indices` order: [chunk cp_rank, chunk 2*cp-cp_rank-1].
+                chunk_starts = (cp_rank * chunk_size, (2 * cp_size - cp_rank - 1) * chunk_size)
+                chunk_bounds = [(i * chunk_size, chunk_size, g) for i, g in enumerate(chunk_starts)]
             else:
-                row_idx = torch.arange(local_len, device=device)
-            col_idx = torch.arange(seq_len_global, device=device)
-            forbid_future = col_idx[None, :] > row_idx[:, None]
-            if sliding_window is not None and sliding_window > 0:
-                forbid_past = col_idx[None, :] < (row_idx[:, None] - (sliding_window - 1))
-                forbid = forbid_future | forbid_past
-            else:
-                forbid = forbid_future
-            mask = torch.where(
-                forbid,
-                torch.finfo(dtype).min,
-                0.0,
-            ).to(dtype=dtype)
+                chunk_bounds = [(0, local_len, 0)]
 
-            o = F.scaled_dot_product_attention(
-                q4,
-                k4,
-                v4,
-                attn_mask=mask[None, None, :, :],
-                dropout_p=self.dropout_p if self.training else 0.0,
-                scale=scale,
-                enable_gqa=(np_q != nk),
-            )
-            out[local_offset : local_offset + local_len] = o.transpose(1, 2).reshape(local_len, -1)
+            for local_start, chunk_len, global_start in chunk_bounds:
+                if chunk_len == 0:
+                    continue
+                q_chunk = q_seq[local_start : local_start + chunk_len]
+                # Causal: nothing past this chunk's last global position.
+                k_end = global_start + chunk_len
+                self._attend_contiguous_chunk(
+                    q_chunk,
+                    k_seq,
+                    v_seq,
+                    k_end=k_end,
+                    global_start=global_start,
+                    scale=scale,
+                    sliding_window=sliding_window,
+                    out=out[local_offset + local_start : local_offset + local_start + chunk_len],
+                )
             local_offset += local_len
 
         return out
+
+    def _attend_contiguous_chunk(
+        self,
+        q_chunk,
+        k_seq,
+        v_seq,
+        *,
+        k_end,
+        global_start,
+        scale,
+        sliding_window,
+        out,
+    ):
+        """Attend one contiguous query chunk without building an explicit mask.
+
+        ``q_chunk`` holds global positions ``[global_start, k_end)`` of a packed
+        sub-sequence whose gathered K/V is ``k_seq``/``v_seq`` in global order.
+        Causality then means "keys ``[:k_end]``, aligned bottom-right", and a
+        sliding window is a constant left offset, so both constraints become
+        kernel arguments instead of an ``O(chunk_len * seq_len)`` bias tensor.
+        Writes the ``[chunk_len, np_q * hn]`` result into ``out``.
+        """
+        chunk_len, np_q, hn = q_chunk.shape
+        nk = k_seq.shape[1]
+        has_window = sliding_window is not None and sliding_window > 0
+
+        # Trim keys the window can never reach. Flash needs the trimmed start to
+        # stay aligned with the bottom-right anchor, so keep whole rows only.
+        k_start = max(0, global_start - (sliding_window - 1)) if has_window else 0
+        k_chunk = k_seq[k_start:k_end]
+        v_chunk = v_seq[k_start:k_end]
+
+        if hn <= 256:
+            # flash-attn supports GQA natively and takes the window directly.
+            from flash_attn import flash_attn_varlen_func
+
+            cu_q = torch.tensor([0, chunk_len], device=q_chunk.device, dtype=torch.int32)
+            cu_k = torch.tensor([0, k_chunk.shape[0]], device=q_chunk.device, dtype=torch.int32)
+            o = flash_attn_varlen_func(
+                q_chunk.contiguous(),
+                k_chunk.contiguous(),
+                v_chunk.contiguous(),
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=chunk_len,
+                max_seqlen_k=k_chunk.shape[0],
+                dropout_p=self.dropout_p if self.training else 0.0,
+                softmax_scale=scale,
+                causal=True,
+                window_size=(sliding_window - 1, 0) if has_window else (-1, -1),
+            )
+            out.copy_(o.reshape(chunk_len, -1))
+            return
+
+        # Global layers use head_dim=512, which flash-attn 2.x rejects, so they
+        # run on SDPA's memory-efficient kernel. That kernel has no GQA support,
+        # so broadcast K/V heads explicitly - a [seq_len, np_q, hn] copy, which
+        # is linear in sequence length rather than quadratic. Global layers are
+        # never sliding, so bottom-right causal alone is exact.
+        assert not has_window, "Gemma4 global (head_dim>256) layers must not use a sliding window"
+        k4 = k_seq[:k_end].unsqueeze(0).transpose(1, 2)  # [1, nk, k_end, hn]
+        v4 = v_seq[:k_end].unsqueeze(0).transpose(1, 2)
+        if np_q != nk:
+            repeat = np_q // nk
+            k4 = k4.unsqueeze(2).expand(1, nk, repeat, k_end, hn).reshape(1, np_q, k_end, hn)
+            v4 = v4.unsqueeze(2).expand(1, nk, repeat, k_end, hn).reshape(1, np_q, k_end, hn)
+        o = F.scaled_dot_product_attention(
+            q_chunk.unsqueeze(0).transpose(1, 2),
+            k4,
+            v4,
+            attn_mask=causal_lower_right(chunk_len, k_end),
+            dropout_p=self.dropout_p if self.training else 0.0,
+            scale=scale,
+        )
+        out.copy_(o.transpose(1, 2).reshape(chunk_len, -1))
 
     def _forward_thd_flash(self, query, key, value, cu_seqlens):
         """Sliding-window or head_dim<=256 path via flash_attn_varlen_func.
@@ -996,9 +1050,7 @@ class Gemma4SelfAttention(SelfAttention):
             query, key, value = self._split_qkv_global_k_eq_v(hidden_states)
             return self._apply_kv_sharing(query, key, value)
 
-        result = super().get_query_key_value_tensors(
-            hidden_states, key_value_states, output_gate=output_gate, split_qkv=split_qkv
-        )
+        result = super().get_query_key_value_tensors(hidden_states, key_value_states, output_gate=output_gate, split_qkv=split_qkv)
         if not split_qkv:
             return result
 
@@ -1015,10 +1067,7 @@ class Gemma4SelfAttention(SelfAttention):
     def _apply_kv_sharing(self, query, key, value):
         runtime_state = getattr(self, "_gemma4_runtime_state", None)
         if runtime_state is None:
-            raise RuntimeError(
-                "Gemma4 KV-sharing runtime state is missing. E2B/E4B requires "
-                "the Gemma4 provider hooks installed by --custom-model-provider-path."
-            )
+            raise RuntimeError("Gemma4 KV-sharing runtime state is missing. E2B/E4B requires " "the Gemma4 provider hooks installed by --custom-model-provider-path.")
         shared_states = runtime_state.shared_kv_states
 
         if self._store_full_length_kv and self._global_layer_idx is not None:
@@ -1028,11 +1077,7 @@ class Gemma4SelfAttention(SelfAttention):
             return query, key, value
 
         if self._kv_shared_layer_index not in shared_states:
-            raise RuntimeError(
-                f"Gemma4 layer {self._global_layer_idx} needs shared KV from layer "
-                f"{self._kv_shared_layer_index}, but it has not been produced. "
-                "Use pipeline-model-parallel-size=1 for E2B/E4B KV-sharing models."
-            )
+            raise RuntimeError(f"Gemma4 layer {self._global_layer_idx} needs shared KV from layer " f"{self._kv_shared_layer_index}, but it has not been produced. " "Use pipeline-model-parallel-size=1 for E2B/E4B KV-sharing models.")
         shared_key, shared_value = shared_states[self._kv_shared_layer_index]
         return query, shared_key.to(query.device), shared_value.to(query.device)
 
@@ -1192,9 +1237,7 @@ def _kv_sharing_maps(hf_text):
         return {}, set()
 
     prev_layers = list(hf_text.layer_types[:first_shared])
-    store_layers = {
-        len(prev_layers) - 1 - prev_layers[::-1].index(layer_type) for layer_type in set(prev_layers)
-    }
+    store_layers = {len(prev_layers) - 1 - prev_layers[::-1].index(layer_type) for layer_type in set(prev_layers)}
     shared_map = {}
     for layer_idx in range(first_shared, hf_text.num_hidden_layers):
         layer_type = hf_text.layer_types[layer_idx]
@@ -1234,9 +1277,7 @@ def _apply_core_config(config, hf_text):
 
     config.__class__ = Gemma4TransformerConfig
     config.global_kv_channels = hf_text.global_head_dim
-    config.global_num_query_groups = (
-        getattr(hf_text, "num_global_key_value_heads", None) or hf_text.num_key_value_heads
-    )
+    config.global_num_query_groups = getattr(hf_text, "num_global_key_value_heads", None) or hf_text.num_key_value_heads
     config.attention_k_eq_v = getattr(hf_text, "attention_k_eq_v", True)
     config.final_logit_softcapping = getattr(hf_text, "final_logit_softcapping", 30.0)
     config.sliding_window = hf_text.sliding_window
@@ -1293,6 +1334,16 @@ def _apply_rope_config(config, hf_text):
     rope_params = getattr(hf_text, "rope_parameters", {}) or {}
     config.rope_local_base_freq = get_rope_local_base_freq(hf_text)
     config.global_partial_rotary_factor = rope_params.get("full_attention", {}).get("partial_rotary_factor", 0.25)
+    # Set here, before `get_gemma4_layer_spec_te` builds the layers, because
+    # global layers are constructed against a `dc_replace` clone of this config.
+    # The provider also assigns this when it installs DualRotaryEmbedding, but
+    # that happens *after* construction and so only reaches the sliding layers,
+    # which still hold the original config object. A global layer that cannot
+    # see this width skips the RoPE slice entirely, receives the full
+    # (global + local) concatenation, and Megatron then rotates only the
+    # leading `rot_dim` columns - pairing dim i with i+64 instead of i+256 and
+    # silently applying the wrong rotation on every full-attention layer.
+    config.dual_rope_global_dim = int(hf_text.global_head_dim)
 
 
 def _guard_cp_sliding_window(args, config):
@@ -1306,11 +1357,7 @@ def _guard_cp_sliding_window(args, config):
         return
     max_tokens = getattr(args, "max_tokens_per_gpu", None)
     if max_tokens is not None and max_tokens < config.sliding_window:
-        raise ValueError(
-            f"context_parallel_size={cp_size} with max_tokens_per_gpu={max_tokens} "
-            f"< sliding_window={config.sliding_window}: per-rank CP chunk cap is "
-            "smaller than the sliding window. Reduce CP or raise max_tokens_per_gpu."
-        )
+        raise ValueError(f"context_parallel_size={cp_size} with max_tokens_per_gpu={max_tokens} " f"< sliding_window={config.sliding_window}: per-rank CP chunk cap is " "smaller than the sliding window. Reduce CP or raise max_tokens_per_gpu.")
 
 
 def get_gemma4_spec(args, config, vp_stage):

@@ -87,8 +87,10 @@ Core:
   --acebench-overwrite BOOL            Remove matching ACEBench cache before running. Default: false.
   --acebench-max-dialog-turns N        ACEBench agent turn limit. Default: 40.
   --acebench-max-tokens N              Optional per-request output limit. Default: endpoint decides.
-  --acebench-agent-backend NAME        acebench or rllm_tool_agent. Default: rllm_tool_agent.
+  --acebench-agent-backend NAME        acebench or rllm_tool_agent. Alias: --agent-backend.
+                                       Default: rllm_tool_agent.
   --acebench-protocol MODE             auto, official_acebench, or slime_fused_gem.
+                                       Alias: --protocol-mode.
                                        auto maps --harness gem to slime_fused_gem.
   --acebench-user-model NAME           Simulated user model for agent tasks.
   --acebench-user-base-url URL         Simulated user OpenAI-compatible endpoint.
@@ -439,8 +441,8 @@ while [ "$#" -gt 0 ]; do
       --acebench-overwrite) ACEBENCH_OVERWRITE="${2:?Missing value for --acebench-overwrite}"; shift 2 ;;
       --acebench-max-dialog-turns) ACEBENCH_MAX_DIALOG_TURNS="${2:?Missing value for --acebench-max-dialog-turns}"; shift 2 ;;
       --acebench-max-tokens) ACEBENCH_MAX_TOKENS="${2:?Missing value for --acebench-max-tokens}"; shift 2 ;;
-      --acebench-agent-backend) ACEBENCH_AGENT_BACKEND="${2:?Missing value for --acebench-agent-backend}"; acebench_agent_backend_explicit=true; shift 2 ;;
-      --acebench-protocol) ACEBENCH_PROTOCOL="${2:?Missing value for --acebench-protocol}"; shift 2 ;;
+      --acebench-agent-backend|--agent-backend) ACEBENCH_AGENT_BACKEND="${2:?Missing value for $1}"; acebench_agent_backend_explicit=true; shift 2 ;;
+      --acebench-protocol|--protocol-mode) ACEBENCH_PROTOCOL="${2:?Missing value for $1}"; shift 2 ;;
       --acebench-user-model) ACEBENCH_USER_MODEL="${2:?Missing value for --acebench-user-model}"; shift 2 ;;
       --acebench-user-base-url) ACEBENCH_USER_BASE_URL="${2:?Missing value for --acebench-user-base-url}"; shift 2 ;;
       --acebench-user-api-key) ACEBENCH_USER_API_KEY="${2:?Missing value for --acebench-user-api-key}"; shift 2 ;;

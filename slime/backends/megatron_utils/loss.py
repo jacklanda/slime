@@ -974,7 +974,15 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             assert (
                 all_advs.size() == all_masks.size()
             ), f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
-            dp_group = mpu.get_data_parallel_group()
+            # The whitening population is the whole rollout, and with CP each
+            # sequence is split across the CP ranks (the mask chunking above
+            # keeps only this rank's token offsets). Ranks inside one CP group
+            # hold the *same* samples but disjoint token halves, so reducing
+            # over DP-without-CP would give each CP rank its own mean/var and
+            # apply two different affine transforms to one sequence, breaking
+            # the per-sequence-constant advantage that GRPO assumes. Include CP
+            # so every token of the rollout contributes to one global statistic.
+            dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
 
             whitened_advs_flat = distributed_masked_whiten(
                 all_advs,
@@ -1418,15 +1426,12 @@ def sft_loss_function(
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()
 
-    result = (
+    return (
         loss,
         {
             "loss": loss.clone().detach(),
         },
     )
-    if os.environ.get("SLIME_GEMMA4_CLEAR_CACHE_BEFORE_BACKWARD") == "1":
-        torch.cuda.empty_cache()
-    return result
 
 
 def loss_function(
@@ -1532,6 +1537,14 @@ def loss_function(
         )
     else:
         loss = loss * mpu.get_context_parallel_world_size()
+
+    # Tiled Gemma4 projection uses large, variably sized vocabulary buffers.
+    # Release free blocks left by the preceding microbatch after this forward
+    # has finished, so the imminent backward can obtain one contiguous block.
+    # Keep this at the loss/schedule boundary: placing it in sft_loss_function
+    # never affected the policy-loss actor update.
+    if gemma4_output_layer is not None and os.environ.get("SLIME_GEMMA4_CLEAR_CACHE_BEFORE_BACKWARD") == "1":
+        torch.cuda.empty_cache()
 
     return (
         loss,

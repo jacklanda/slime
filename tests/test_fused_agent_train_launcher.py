@@ -32,7 +32,7 @@ def test_gemma4_e4b_sync_launcher_uses_e4b_model_shape():
     assert 'MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-20480}"' in launcher
     assert 'LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"' in launcher
     assert 'LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-4096}"' in launcher
-    assert 'PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"' in launcher
+    assert 'PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"' in launcher
     assert "--accumulate-allreduce-grads-in-fp32" in launcher
     assert "--grad-reduce-in-bf16" not in launcher
     assert 'export FUSED_MODEL_SERIES="gemma4"' in launcher
@@ -65,6 +65,25 @@ def test_qwen3_sync_launcher_defaults_to_colocated_trainer_offload():
     assert 'MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-20480}"' in launcher
     assert 'LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"' in launcher
     assert 'LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-8192}"' in launcher
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "launcher_name",
+    [
+        "train_qwen3_fused_agent_sync.sh",
+        "train_qwen3.5_fused_agent_sync.sh",
+    ],
+)
+def test_qwen_sync_launchers_do_not_enable_reference_model_by_default(launcher_name):
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / f"experiments/{launcher_name}").read_text(encoding="utf-8")
+
+    assert 'KL_COEF="${KL_COEF:-0.0}"' in launcher
+    assert 'KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"' in launcher
+    assert 'USE_KL_LOSS="${USE_KL_LOSS:-0}"' in launcher
+    assert 'if is_truthy "${USE_KL_LOSS}"; then' in launcher
+    assert 'USE_KL_LOSS:-1' not in launcher
 
 
 @pytest.mark.unit

@@ -81,7 +81,9 @@ Options:
   --horizon-reward-target-tool-calls X   Target tool calls for no horizon penalty. Default: target_steps - 1.
   --enable-dynamic-sampling-filter BOOL  Enable DAPO-style non-zero reward variance dynamic filtering. Default: true.
   --normalize-advantages / --no-normalize-advantages
-                                         Whiten advantages across the data-parallel batch. Default: enabled.
+                                         Whiten advantages across the data-parallel batch. Default: disabled.
+                                         Redundant under GRPO group std-normalization, and its
+                                         token-weighted re-centering injects a length-correlated bias.
   --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
   --grm-model NAME                       OpenRouter judge model. Default: google/gemini-3-flash-preview.
   --grm-base-url URL                     OpenRouter-compatible judge endpoint.
@@ -192,7 +194,15 @@ CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_ST
 CREDIT_ASSIGNMENT_MAX_TURNS="${CREDIT_ASSIGNMENT_MAX_TURNS:-True}"
 CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN:-True}"
 HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
-NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"
+# Global advantage whitening is OFF by default for GRPO: --disable-grpo-std-normalization
+# is not set, so rewards are already mean-0/std-1 *within each prompt group* on the
+# rollout side. A second, global whitening pass re-centers on a TOKEN-weighted mean
+# while group norm centered on a SEQUENCE-weighted mean. Because wrong/truncated
+# trajectories are longer, that token-weighted mean is systematically negative, so
+# whitening adds a uniform positive constant to every token -- an unconditional
+# likelihood push whose token mass sits mostly on wrong trajectories. It also breaks
+# GRPO's per-group zero-mean invariant. See tests/test_group_reward_normalization.py.
+NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
 LR="${LR:-1e-6}"
 CLIP_GRAD="${CLIP_GRAD:-1.0}"
 KL_COEF="${KL_COEF:-0.0}"
@@ -200,7 +210,7 @@ KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
 # A zero-weight reference KL neither changes advantages nor the actor loss.
 # Keep the expensive reference-model forward opt-in for this Gemma4 workload.
 USE_KL_LOSS="${USE_KL_LOSS:-0}"
-USE_WANDB="${USE_WANDB:-1}"
+USE_WANDB="${USE_WANDB:-0}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
@@ -863,7 +873,7 @@ LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-4096}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 # Keep enough candidate groups queued to feed the default four TP2 rollout
 # engines without generating the much larger surplus created by a batch of 64.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-256}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 # Gemma4 requires a top-k shortlist to avoid sampling low-probability noise from
@@ -1322,9 +1332,12 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
 export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-10000000000}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 # Dynamic sequence packing and tiled-vocabulary backward create different-sized
-# allocations across microbatches.  Expandable segments prevent the resulting
-# cached blocks from fragmenting the remaining GPU memory.
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# allocations across microbatches, but the colocated lifecycle takes precedence:
+# TorchMemorySaver must be able to track and release every SGLang allocation.
+# Colocated rollout relies on TorchMemorySaver to release SGLang allocations
+# before actor training. TorchMemorySaver cannot track expandable segments and
+# refuses to initialize when they are enabled.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
 export OPENROUTER_APP_NAME="${OPENROUTER_APP_NAME:-GRM}"
 export SLIME_FUSED_REQUIRE_WEIGHT_VERSION="${SLIME_FUSED_REQUIRE_WEIGHT_VERSION:-1}"
 
@@ -1442,7 +1455,7 @@ keys = (
     "SLIME_GEMMA4_LOGPROB_BF16",
     "SLIME_GEMMA4_TILED_POLICY_LOSS",
     "SLIME_GEMMA4_BATCH_INVARIANT",
-    "SLIME_GEMMA4_SUPPRESS_EXPECTED_TRAINING_WARNINGS",
+    "SLIME_GEMMA4_SUPPRESS_EXPECTED_TRAINING_WARNINGS", "SLIME_SGLANG_BASE_PORT",
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM",
     "RAY_WARN_BLOCKING_GET_INSIDE_ASYNC", "TOKENIZERS_PARALLELISM",
     "VLLM_ALLOW_LONG_MAX_MODEL_LEN", "VLLM_ENGINE_ITERATION_TIMEOUT_S",

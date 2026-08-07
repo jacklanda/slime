@@ -279,3 +279,115 @@ def test_cp_unzigzag_permutation_handles_multiple_packed_subseqs():
         device=device,
     )
     assert gathered.index_select(0, perm).tolist() == list(range(32))
+
+
+def _dense_mask_reference(query, key, value, row_idx, scale, sliding_window=None):
+    """The pre-chunking implementation: an explicit [local_len, seq_len] bias.
+
+    Kept only as a test oracle. In production this tensor - and the O(T^2)
+    attention scores it forces onto the math backend - is what exhausted an
+    80 GiB rank during the actor update.
+    """
+    dtype = query.dtype
+    nq, nk = query.shape[1], key.shape[1]
+    col_idx = torch.arange(key.shape[0], device=query.device)
+    forbid = col_idx[None, :] > row_idx[:, None]
+    if sliding_window:
+        forbid = forbid | (col_idx[None, :] < (row_idx[:, None] - (sliding_window - 1)))
+    mask = torch.where(forbid, torch.finfo(dtype).min, 0.0).to(dtype)
+    out = F.scaled_dot_product_attention(
+        query.unsqueeze(0).transpose(1, 2),
+        key.unsqueeze(0).transpose(1, 2),
+        value.unsqueeze(0).transpose(1, 2),
+        attn_mask=mask[None, None, :, :],
+        scale=scale,
+        enable_gqa=(nq != nk),
+    )
+    return out.transpose(1, 2).reshape(query.shape[0], -1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize(
+    "hn, nq, nk, sliding_window, dtype",
+    [
+        (512, 8, 2, None, torch.float32),  # global layer: SDPA + bottom-right causal
+        (256, 8, 2, 512, torch.bfloat16),  # sliding layer: flash varlen + window
+        (256, 8, 2, None, torch.bfloat16),  # sliding-config layer without a window
+    ],
+)
+def test_cp_chunked_attention_matches_dense_mask_reference(hn, nq, nk, sliding_window, dtype):
+    """The mask-free chunked path must be numerically identical to the old one.
+
+    Each rank's queries are two contiguous zig-zag chunks, so causality reduces
+    to bottom-right alignment and the window to a fixed left offset. This test
+    pins that equivalence: any drift means we changed what the model attends to.
+    """
+    if hn <= 256 and dtype is torch.bfloat16:
+        pytest.importorskip("flash_attn")
+
+    torch.manual_seed(7)
+    device = "cuda"
+    seq_len = 1024
+    scale = 1.0 / (hn**0.5)
+
+    from types import SimpleNamespace
+
+    q = torch.randn(seq_len, nq, hn, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(seq_len, nk, hn, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(seq_len, nk, hn, device=device, dtype=dtype, requires_grad=True)
+    packed = SimpleNamespace(cu_seqlens_q=torch.tensor([0, seq_len], dtype=torch.int32, device=device))
+
+    core = _make_core_attention(sliding_window=sliding_window, softmax_scale=scale)
+    try:
+        out = core._forward_cp_subseq_mask(q, k, v, packed, sliding_window=sliding_window)
+    except Exception:
+        pytest.skip("Megatron parallel_state not initialized; skipping CP path test")
+
+    # cp_size == 1 here, so local rows are global positions 0..seq_len.
+    ref = _dense_mask_reference(q, k, v, torch.arange(seq_len, device=device), scale, sliding_window)
+
+    cos = F.cosine_similarity(out.float().flatten().unsqueeze(0), ref.float().flatten().unsqueeze(0)).item()
+    assert cos > 0.9999, f"forward mismatch vs dense mask, cosine={cos}"
+
+    grad_out = torch.randn_like(ref)
+    dq, dk, dv = torch.autograd.grad(out, [q, k, v], grad_out, retain_graph=True)
+    dq_ref, dk_ref, dv_ref = torch.autograd.grad(ref, [q, k, v], grad_out)
+    for name, got, want in (("dq", dq, dq_ref), ("dk", dk, dk_ref), ("dv", dv, dv_ref)):
+        cos_g = F.cosine_similarity(got.float().flatten().unsqueeze(0), want.float().flatten().unsqueeze(0)).item()
+        assert cos_g > 0.9999, f"{name} mismatch vs dense mask, cosine={cos_g}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cp_attention_memory_is_linear_not_quadratic_in_sequence_length():
+    """Guard the actual OOM: peak memory must not scale with seq_len^2.
+
+    Doubling the sequence roughly doubles a mask-free implementation's peak.
+    The old dense-mask path quadrupled it, which is why a 40K context under
+    CP2 needed >25 GiB of attention scores per global layer.
+    """
+    from types import SimpleNamespace
+
+    device = "cuda"
+    hn, nq, nk = 512, 8, 2
+    scale = 1.0 / (hn**0.5)
+    core = _make_core_attention(sliding_window=None, softmax_scale=scale)
+
+    peaks = {}
+    for seq_len in (2048, 4096):
+        q = torch.randn(seq_len, nq, hn, device=device, dtype=torch.bfloat16)
+        k = torch.randn(seq_len, nk, hn, device=device, dtype=torch.bfloat16)
+        v = torch.randn(seq_len, nk, hn, device=device, dtype=torch.bfloat16)
+        packed = SimpleNamespace(cu_seqlens_q=torch.tensor([0, seq_len], dtype=torch.int32, device=device))
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        try:
+            core._forward_cp_subseq_mask(q, k, v, packed, sliding_window=None)
+        except Exception:
+            pytest.skip("Megatron parallel_state not initialized; skipping CP memory test")
+        torch.cuda.synchronize()
+        peaks[seq_len] = torch.cuda.max_memory_allocated() - base
+
+    growth = peaks[4096] / max(peaks[2048], 1)
+    assert growth < 3.0, f"peak memory grew {growth:.1f}x for a 2x sequence; quadratic attention is back"

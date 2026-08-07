@@ -2110,6 +2110,29 @@ def slime_validate_args(args):
             "require advantage normalization. Please add `--normalize-advantages` to your command."
         )
 
+    if (
+        args.advantage_estimator in ["grpo", "gspo", "cispo"]
+        and args.normalize_advantages
+        and args.rewards_normalization
+        and args.grpo_std_normalization
+    ):
+        # Group std-normalization already makes advantages mean-0/std-1 per prompt
+        # group, weighting every sequence equally. The global whitening pass in
+        # compute_advantages_and_returns then re-centers on a TOKEN-weighted mean.
+        # The two disagree whenever response length correlates with reward -- which
+        # it does, since wrong/truncated trajectories run longer -- so whitening
+        # adds a uniform positive constant to every token. That constant is an
+        # unconditional likelihood push whose token mass sits mostly on wrong
+        # trajectories, and it destroys GRPO's per-group zero-mean baseline. It is
+        # also non-stationary: it is re-estimated from whatever groups survive
+        # dynamic sampling. See tests/test_group_reward_normalization.py.
+        logger.warning(
+            "--normalize-advantages is redundant with GRPO group std-normalization and injects a "
+            "length-correlated bias: group norm centers per group (sequence-weighted) while whitening "
+            "re-centers globally (token-weighted). Prefer dropping --normalize-advantages, or add "
+            "--disable-grpo-std-normalization if global whitening is what you want."
+        )
+
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
 

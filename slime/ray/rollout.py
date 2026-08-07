@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import random
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -147,23 +148,53 @@ def _post_process_rewards(args, samples: list[Sample], custom_reward_post_proces
         args.advantage_estimator in ["grpo", "gspo", "cispo", "reinforce_plus_plus_baseline"]
         and args.rewards_normalization
     ):
-        # group norm
-        rewards = torch.tensor(raw_rewards, dtype=torch.float)
-        if rewards.shape[-1] == args.n_samples_per_prompt * args.rollout_batch_size:
-            rewards = rewards.reshape(-1, args.n_samples_per_prompt)
-        else:
-            # when samples count are not equal in each group
-            rewards = rewards.view(-1, rewards.shape[-1])
-        mean = rewards.mean(dim=-1, keepdim=True)
-        rewards = rewards - mean
-
-        if args.advantage_estimator in ["grpo", "gspo", "cispo"] and args.grpo_std_normalization:
-            std = rewards.std(dim=-1, keepdim=True)
-            rewards = rewards / (std + 1e-6)
-
-        return raw_rewards, rewards.flatten().tolist()
+        # Group norm. Group membership comes from ``group_index`` rather than
+        # position: the previous positional reshape only held when the flat
+        # sample count was exactly n_samples_per_prompt * rollout_batch_size,
+        # and its fallback (``view(-1, N)``) silently collapsed the whole batch
+        # into ONE group -- degrading group norm into batch norm with no log.
+        # Grouping explicitly is equivalent whenever the positional layout was
+        # valid (the data source emits contiguous groups, see
+        # DataSource.get_samples) and stays correct when it is not.
+        normalized = _group_normalize_rewards(args, samples, raw_rewards)
+        return raw_rewards, normalized
 
     return raw_rewards, raw_rewards
+
+
+def _group_normalize_rewards(args, samples: list[Sample], raw_rewards: list[float]) -> list[float]:
+    """Mean-center (and optionally std-normalize) rewards within each prompt group."""
+    groups: dict[Any, list[int]] = defaultdict(list)
+    for index, sample in enumerate(samples):
+        group_id = sample.group_index
+        if group_id is None:
+            # Standard data sources always set group_index; custom generate
+            # functions may not. Fall back the same way horizon reward shaping
+            # does, and warn -- a wrong group id silently changes the baseline.
+            group_id = sample.rollout_id if sample.rollout_id is not None else f"_index_{index}"
+            logger.warning(
+                f"sample at index {getattr(sample, 'index', '?')} has group_index=None; "
+                f"falling back to {group_id!r} for reward group normalization"
+            )
+        groups[group_id].append(index)
+
+    use_std = args.advantage_estimator in ["grpo", "gspo", "cispo"] and args.grpo_std_normalization
+    normalized = [0.0] * len(samples)
+    for indices in groups.values():
+        rewards = torch.tensor([raw_rewards[i] for i in indices], dtype=torch.float)
+        rewards = rewards - rewards.mean()
+        if use_std:
+            # Keep the historical unbiased (correction=1) convention of the
+            # positional path. NOTE: process_segment_rewards uses population
+            # std instead; that divergence predates this change.
+            # A singleton group is already all-zero after centering, and
+            # unbiased std over one element is NaN, so skip the division.
+            if rewards.numel() > 1:
+                rewards = rewards / (rewards.std() + 1e-6)
+        for index, reward in zip(indices, rewards.tolist(), strict=True):
+            normalized[index] = reward
+
+    return normalized
 
 
 def convert_samples_to_train_data(

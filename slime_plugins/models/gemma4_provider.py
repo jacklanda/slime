@@ -23,6 +23,9 @@ from slime_plugins.models.gemma4 import _load_hf_text_config
 
 logger = logging.getLogger(__name__)
 
+_GEMMA4_RECOMPUTE_FREE_FLOOR_BYTES = 8 * 1024**3
+_GEMMA4_RECOMPUTE_MIN_RECLAIM_BYTES = 1024**3
+
 
 @dataclass
 class _Gemma4RuntimeState:
@@ -40,6 +43,25 @@ def _is_rank_zero() -> bool:
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return True
     return torch.distributed.get_rank() == 0
+
+
+def _clear_fragmented_cache_before_gemma4_recompute(_module, _args) -> None:
+    """Reclaim large inactive blocks before a checkpointed Gemma4 layer runs."""
+    if (
+        os.environ.get("SLIME_GEMMA4_CLEAR_CACHE_BEFORE_BACKWARD") != "1"
+        or os.environ.get("SLIME_GEMMA4_ACTOR_TRAIN_ACTIVE") != "1"
+        or not torch.is_grad_enabled()
+        or not torch.cuda.is_available()
+    ):
+        return
+
+    free_bytes, _total_bytes = torch.cuda.mem_get_info()
+    reclaimable_bytes = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    if (
+        free_bytes < _GEMMA4_RECOMPUTE_FREE_FLOOR_BYTES
+        and reclaimable_bytes >= _GEMMA4_RECOMPUTE_MIN_RECLAIM_BYTES
+    ):
+        torch.cuda.empty_cache()
 
 
 def model_provider(pre_process=True, post_process=True, vp_stage=None):
@@ -201,6 +223,12 @@ def _install_runtime_state(inner) -> _Gemma4RuntimeState:
     if hasattr(inner, "decoder"):
         for layer in inner.decoder.layers:
             layer._gemma4_runtime_state = state
+            # Full activation checkpointing executes the original layer under
+            # no_grad and its backward recomputation with gradients enabled.
+            # The hook therefore runs only at the useful lifetime boundary,
+            # after the following layer released its temporary buffers and
+            # before this layer requests another multi-GiB attention buffer.
+            layer.register_forward_pre_hook(_clear_fragmented_cache_before_gemma4_recompute)
             if hasattr(layer, "self_attention"):
                 layer.self_attention._gemma4_runtime_state = state
 

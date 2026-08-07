@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -40,7 +41,7 @@ def test_eval_launcher_routes_acebench_to_isolated_official_pipeline():
     assert '--user-api-key "${ACEBENCH_USER_API_KEY}"' not in launcher
     assert 'exec "${ACEBENCH_CMD[@]}"' in launcher
     acebench_branch = launcher.split('if is_truthy "${ACEBENCH_SELECTED}"; then', 1)[1].split(
-        'case "${ROUTER_POLICY}"', 1
+        'if is_truthy "${TAU2_SELECTED}"; then', 1
     )[0]
     assert "ray stop --force" not in acebench_branch
     assert 'is_truthy "${CLEANUP}"' not in acebench_branch
@@ -52,6 +53,31 @@ def test_eval_launcher_routes_acebench_to_isolated_official_pipeline():
     assert 'endpoint_serves_expected_model' in acebench_launcher
     assert 'run_config.json' in acebench_launcher
     assert 'flock -n 9' in acebench_launcher
+
+
+@pytest.mark.unit
+def test_eval_launcher_accepts_acebench_runner_option_aliases():
+    repo_root = Path(__file__).resolve().parents[1]
+
+    result = subprocess.run(
+        [
+            "bash",
+            "experiments/evals.sh",
+            "--protocol-mode",
+            "slime_fused_gem",
+            "--agent-backend",
+            "rllm_tool_agent",
+            "--help",
+        ],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Alias: --protocol-mode" in result.stdout
+    assert "Alias: --agent-backend" in result.stdout
 
 
 if __name__ == "__main__":

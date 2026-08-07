@@ -189,6 +189,10 @@ HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"
 LR="${LR:-1e-6}"
 KL_COEF="${KL_COEF:-0.0}"
+KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
+# A zero-weight reference KL neither changes advantages nor the actor loss.
+# Keep the expensive reference-model forward opt-in for this Qwen3.5 workload.
+USE_KL_LOSS="${USE_KL_LOSS:-0}"
 USE_WANDB="${USE_WANDB:-0}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
@@ -1113,13 +1117,13 @@ fi
 GRPO_ARGS=(
    --advantage-estimator "${ADVANTAGE_ESTIMATOR:-grpo}"
    --kl-coef "${KL_COEF}"
-   --kl-loss-coef "${KL_LOSS_COEF:-0.00}"
+   --kl-loss-coef "${KL_LOSS_COEF}"
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF:-0.00}"
    --eps-clip "${EPS_CLIP:-0.2}"
    --eps-clip-high "${EPS_CLIP_HIGH:-0.28}"
 )
-if is_truthy "${USE_KL_LOSS:-1}"; then
+if is_truthy "${USE_KL_LOSS}"; then
    GRPO_ARGS+=(--use-kl-loss)
 fi
 if is_truthy "${NORMALIZE_ADVANTAGES}"; then
