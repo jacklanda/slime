@@ -16,6 +16,7 @@ from urllib3.exceptions import NewConnectionError
 
 from slime.backends.sglang_utils.external import get_server_info
 from slime.ray.ray_actor import RayActor
+from slime.utils.hf_config import register_gemma4_config_aliases
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ def _launch_server_with_suppression(server_args: ServerArgs) -> None:
     from slime.utils.logging_utils import suppress_known_training_warnings
 
     suppress_known_training_warnings()
+    register_gemma4_config_aliases()
 
     from sglang.srt.entrypoints.http_server import launch_server
 
@@ -81,21 +83,33 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
         base_url=server_args.url(),
         api_key=server_args.api_key,
         is_process_alive=lambda: p.is_alive(),
+        timeout=float(os.environ.get("SGLANG_SERVER_STARTUP_TIMEOUT", "1800")),
     )
 
     return p
 
 
-def _wait_server_healthy(base_url, api_key, is_process_alive):
+def _wait_server_healthy(base_url, api_key, is_process_alive, timeout: float = 1800.0):
+    """Wait for SGLang to finish initialization without triggering generation.
+
+    Rollout workers disable generation from health endpoints.  Polling
+    ``/health_generate`` here nevertheless submits a real one-token request,
+    which can block startup while CUDA graphs/model kernels are still settling.
+    ``/health`` reports the same server lifecycle state without consuming a
+    generation slot when that setting is disabled.
+    """
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Authorization": f"Bearer {api_key}",
     }
 
+    deadline = time.monotonic() + timeout
+    last_status = None
     with requests.Session() as session:
-        while True:
+        while time.monotonic() < deadline:
             try:
-                response = session.get(f"{base_url}/health_generate", headers=headers)
+                response = session.get(f"{base_url}/health", headers=headers, timeout=5)
+                last_status = response.status_code
                 if response.status_code == 200:
                     break
             except requests.RequestException:
@@ -105,6 +119,11 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
                 raise Exception("Server process terminated unexpectedly.")
 
             time.sleep(2)
+        else:
+            raise TimeoutError(
+                f"SGLang server at {base_url} did not become healthy within {timeout:.0f}s "
+                f"(last /health status={last_status!r})."
+            )
 
 
 def remove_worker_from_router(worker_url: str, router_ip: str | None, router_port: int | None) -> None:
@@ -125,7 +144,9 @@ def remove_worker_from_router(worker_url: str, router_ip: str | None, router_por
                     response = requests.delete(f"http://{router_ip}:{router_port}/workers/{worker['id']}")
                     break
             else:
-                logger.warning(f"Worker {worker_url} not found in router.")
+                # Recovery/shutdown can race, so removal is intentionally
+                # idempotent: another cleanup pass may have removed it first.
+                logger.debug("Worker %s was already absent from router.", worker_url)
         except Exception as e:
             logger.warning(f"Failed to fetch workers list or remove worker: {e}")
 
@@ -218,6 +239,9 @@ class SGLangEngine(RayActor):
 
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
+        # SGLang resolves the checkpoint config while constructing ServerArgs.
+        # Register transitional Gemma 4 model-type aliases before that happens.
+        register_gemma4_config_aliases()
         self.process = launch_server_process(ServerArgs(**server_args_dict))
         self._register_to_router(server_args_dict)
 

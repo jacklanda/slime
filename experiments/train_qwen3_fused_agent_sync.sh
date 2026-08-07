@@ -887,7 +887,12 @@ CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}"
    --ref-load "${REF_LOAD}"
    --save "${SAVE_DIR}"
-   --save-interval "${SAVE_INTERVAL:-10}"
+   # Release-train keeps non-boundary checkpoints only as temporary reload
+   # points. Save every rollout step by default so an interruption cannot roll
+   # back the actor/optimizer state to an earlier training step. Larger values
+   # remain available explicitly via SAVE_INTERVAL when checkpoint I/O matters
+   # more than exact interruption recovery.
+   --save-interval "${SAVE_INTERVAL:-1}"
 )
 # Resume training state (model/optimizer/rng/step + rollout data state) from an
 # existing Megatron checkpoint dir. Defaults to SAVE_DIR so a re-launch with the

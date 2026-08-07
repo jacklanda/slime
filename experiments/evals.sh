@@ -18,7 +18,7 @@ Usage:
 Core:
   --model PATH                         HF model path.
   --model-config NAME                  scripts/models/<NAME>.sh. Defaults by --model-series.
-  --model-series qwen3|qwen3.5         Default: qwen3.5.
+  --model-series qwen3|qwen3.5|gemma4  Default: qwen3.5. Gemma 4 aliases are accepted.
   --benchmarks-root PATH               Default: experiments/artifacts/benchmarks.
   --include LIST                       Comma-separated benchmark names, or all.
                                        Use bfcl-v3 or bfcl-v4 to select the BFCL version.
@@ -659,8 +659,11 @@ fi
 export MCP_ATLAS_AUTH_TOKEN
 
 case "${MODEL_SERIES}" in
-   qwen3|qwen3.5) ;;
-   *) echo "Unsupported --model-series ${MODEL_SERIES}; expected qwen3 or qwen3.5." >&2; exit 2 ;;
+   qwen3|qwen3.5|gemma4|gemma-4|gemma-4-*) ;;
+   *) echo "Unsupported --model-series ${MODEL_SERIES}; expected qwen3, qwen3.5, or gemma4." >&2; exit 2 ;;
+esac
+case "${MODEL_SERIES}" in
+   gemma-4|gemma-4-*) MODEL_SERIES="gemma4" ;;
 esac
 if [ "${MODEL_SERIES}" = "qwen3.5" ]; then
    TEMPERATURE=1.0
@@ -704,6 +707,8 @@ fi
 if [ -z "${MODEL_CONFIG}" ]; then
    if [ "${MODEL_SERIES}" = "qwen3.5" ]; then
       MODEL_CONFIG="qwen3.5-4B"
+   elif [ "${MODEL_SERIES}" = "gemma4" ]; then
+      MODEL_CONFIG="gemma4-E4B"
    else
       MODEL_CONFIG="qwen3-4B"
    fi
@@ -712,9 +717,20 @@ fi
 if [ -z "${MODEL_DIR}" ]; then
    if [ "${MODEL_SERIES}" = "qwen3.5" ]; then
       MODEL_DIR="/share/nlp/share/plm/Qwen3.5-4B"
+   elif [ "${MODEL_SERIES}" = "gemma4" ]; then
+      MODEL_DIR="/share/nlp/share/plm/gemma-4-E4B-it"
    else
       MODEL_DIR="/share/nlp/share/plm/Qwen3-4B"
    fi
+fi
+
+# Keep the user-facing Gemma naming convention compatible with the checked-in
+# model config filenames (for example, gemma-4-e4b -> gemma4-E4B).
+if [ "${MODEL_SERIES}" = "gemma4" ]; then
+   case "$(printf '%s' "${MODEL_CONFIG}" | tr '[:upper:]_' '[:lower:]-')" in
+      gemma-4-e4b|gemma4-e4b) MODEL_CONFIG="gemma4-E4B" ;;
+      gemma-4-e2b|gemma4-e2b) MODEL_CONFIG="gemma4-E2B" ;;
+   esac
 fi
 
 MODEL_CONFIG_PATH="${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
@@ -748,6 +764,8 @@ except (OSError, ValueError) as exc:
 normalized_type = model_type.lower().replace("-", "_")
 if model_series == "qwen3.5":
     matches = normalized_type == "qwen3_5" or normalized_type.startswith("qwen3_5_")
+elif model_series == "gemma4":
+    matches = normalized_type == "gemma4" or normalized_type.startswith("gemma4_")
 else:
     matches = (
         normalized_type == "qwen3" or normalized_type.startswith("qwen3_")
@@ -807,7 +825,7 @@ PY
       --yarn-original-max-position-embeddings "${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
    )
 fi
-ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}"
 if [ "${ROLLOUT_GPUS}" -lt 1 ]; then
    echo "--gpus must be >= 1" >&2
    exit 2
@@ -1528,6 +1546,14 @@ EVAL_CONFIG="${EVAL_CONFIG:-${LOG_ROOT}/eval_config.yaml}"
 EVAL_CACHE_DIR="${EVAL_CACHE_DIR:-${LOG_ROOT}/normalized_benchmarks}"
 DUMP_DETAILS="${DUMP_DETAILS:-${LOG_ROOT}/debug}"
 mkdir -p "${LOG_ROOT}" "${EVAL_CACHE_DIR}" "${DUMP_DETAILS}"
+
+# Transitional Gemma-4 checkpoints use pre-release config and processor class
+# names that current Transformers/SGLang no longer register. Build a lightweight
+# native metadata view while keeping the original weight files as symlinks.
+if [ "${MODEL_SERIES}" = "gemma4" ]; then
+   MODEL_DIR="$(PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" python3 -m slime.utils.hf_config \
+      "${MODEL_DIR}" "${LOG_ROOT}/hf_checkpoint_compat")"
+fi
 
 if is_truthy "${MCP_ATLAS_SELECTED}" && ! is_truthy "${MCP_ATLAS_SKIP_STATE_CHECK}"; then
    state_tool="${SCRIPT_DIR}/artifacts/benchmarks/mcp-atlas/ops/external_state.py"

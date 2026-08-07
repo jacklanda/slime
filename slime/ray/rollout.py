@@ -668,6 +668,19 @@ class RolloutServer:
                     ]
                 )
 
+    def restart_with_overrides(self, overrides: dict[str, Any]) -> None:
+        """Restart all local engines with a temporary SGLang profile."""
+        for group in self.server_groups:
+            if group.worker_type == "placeholder":
+                continue
+            dead_indices = [i for i, engine in enumerate(group.all_engines) if engine is not None]
+            group.remove_stale_router_workers(dead_indices)
+            for index in dead_indices:
+                group.mark_engine_group_dead(index // group.nodes_per_engine)
+            if overrides:
+                group.sglang_overrides.update(overrides)
+        self.recover()
+
     def offload(self):
         """Release memory occupation across all groups (concurrent).
 
@@ -907,9 +920,47 @@ class RolloutManager:
         if self.args.debug_train_only:
             # if debug train only, we don't generate evaluation data
             return
-        self.health_monitoring_resume()
 
-        result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
+        restarted = False
+        eval_overrides = {}
+        original_concurrency = self.args.sglang_server_concurrency
+        original_max_running = self.args.sglang_max_running_requests
+        original_group_overrides = {
+            id(server): [dict(group.sglang_overrides) for group in server.server_groups]
+            for server in self.servers.values()
+        }
+        restart_requested = getattr(self.args, "eval_restart_sglang_server", False) and not self.args.rollout_external
+        if restart_requested:
+            if self.args.eval_sglang_mem_fraction_static is not None:
+                eval_overrides["mem_fraction_static"] = self.args.eval_sglang_mem_fraction_static
+            if self.args.eval_sglang_server_concurrency is not None:
+                self.args.sglang_server_concurrency = self.args.eval_sglang_server_concurrency
+            if self.args.eval_sglang_max_running_requests is not None:
+                self.args.sglang_max_running_requests = self.args.eval_sglang_max_running_requests
+                eval_overrides["max_running_requests"] = self.args.eval_sglang_max_running_requests
+            restarted = bool(eval_overrides or original_concurrency != self.args.sglang_server_concurrency)
+
+        try:
+            if restarted:
+                # A newly-created Ray actor is visible in ``all_engines`` before
+                # ``engine.init()`` has finished. Keep the health monitor paused
+                # across that window or it can kill the actor as an unhealthy
+                # engine while recovery is still starting it.
+                self.health_monitoring_pause()
+                for server in self.servers.values():
+                    server.restart_with_overrides(eval_overrides)
+            else:
+                self.health_monitoring_resume()
+            result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
+        finally:
+            if restarted:
+                self.args.sglang_server_concurrency = original_concurrency
+                self.args.sglang_max_running_requests = original_max_running
+                for server in self.servers.values():
+                    for group, saved in zip(server.server_groups, original_group_overrides[id(server)], strict=True):
+                        group.sglang_overrides = saved
+                    server.restart_with_overrides({"mem_fraction_static": self.args.sglang_mem_fraction_static})
+                self.health_monitoring_resume()
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
@@ -950,7 +1001,13 @@ class RolloutManager:
         self.health_monitoring_pause()
         srv = self._get_updatable_server()
         if self.rollout_id == -1 or srv is None:
-            return
+            return (
+                srv.engines if srv is not None else [],
+                self.rollout_engine_lock,
+                srv.num_new_engines if srv is not None else 0,
+                srv.engine_gpu_counts if srv is not None else [],
+                srv.engine_gpu_offsets if srv is not None else [],
+            )
 
         if isinstance(srv, RolloutServer):
             srv.recover(health_check_timeout=self.args.rollout_health_check_timeout)
@@ -1391,12 +1448,17 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     router_args.log_level = "warn"
     router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
 
+    # Engine lifecycle and health are managed by Slime.  A router-side
+    # circuit breaker can blacklist every freshly restarted worker after a
+    # transient startup 503, leaving requests with no available route until
+    # its long timeout expires.
+    router_args.disable_circuit_breaker = True
+
     if has_pd_disaggregation:
         router_args.pd_disaggregation = True
-        # Disable circuit breaker to prevent RDMA transfer timeouts from
-        # marking decode workers as dead. Timeouts are transient (PCIe
-        # contention under high load) and do not indicate a dead server.
-        router_args.disable_circuit_breaker = True
+        # PD transfer timeouts are transient (for example, PCIe contention)
+        # and do not indicate a dead server; the managed-router policy above
+        # also prevents those failures from blacklisting decode workers.
 
     # We will not use the health check from router.
     router_args.disable_health_check = True

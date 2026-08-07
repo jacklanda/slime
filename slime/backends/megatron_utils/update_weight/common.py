@@ -17,7 +17,7 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     All-gather TP-sharded param to full tensor. expert_bias→param, non-TP/duplicated→param.data.
     Uses expert-TP for ".experts.", else regular-TP. linear_fc1 rechunked (GLU), linear_fc2 dim fix.
     """
-    if "expert_bias" in name:
+    if _is_direct_buffer_name(name):
         return param
 
     assert hasattr(param, "tensor_model_parallel"), f"{name} does not have tensor_model_parallel attribute"
@@ -64,7 +64,7 @@ def all_gather_params_async(
 
     for info, param in param_infos_and_params:
         # Prepare async all_gather
-        if "expert_bias" in info.name:
+        if _is_direct_buffer_name(info.name):
             gather_tasks.append((info, param, None, None, None))
             handles.append(None)
         elif not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
@@ -115,6 +115,14 @@ def all_gather_params_async(
     return gathered_params
 
 
+def _is_direct_buffer_name(name: str) -> bool:
+    """Names of persistent buffers that are already replicated and need no TP gather."""
+    # ``layer_scalar`` is emitted only for Gemma4 by the named-buffer iterator.
+    # Keep this list explicit so rotary/cache buffers from other models are never
+    # accidentally sent through the actor weight-update path.
+    return "expert_bias" in name or name.endswith(".layer_scalar")
+
+
 def named_params_and_buffers(
     args: Namespace,
     model: Sequence[torch.nn.Module],
@@ -152,9 +160,22 @@ def _named_params_and_buffers_vanilla(model: Sequence[torch.nn.Module]) -> Itera
 
         for name, buffer in model_module.named_buffers():
             # TODO shall we handle (almost) all buffers like Megatron Bridge
-            if "expert_bias" not in name:
+            if "expert_bias" not in name and not _is_gemma4_layer_scalar(model_module, name):
                 continue
             yield _compute_fqn(name), buffer
+
+
+def _is_gemma4_layer_scalar(model_module: torch.nn.Module, name: str) -> bool:
+    """Return whether ``name`` is Gemma4's persistent per-layer scalar buffer.
+
+    Gemma4 registers ``layer_scalar`` as a buffer because it is fixed model state,
+    but SGLang still needs it whenever actor weights are refreshed. Keep this
+    predicate deliberately narrow: including arbitrary buffers would transfer
+    runtime/cache state for other model families.
+    """
+    config = getattr(model_module, "config", None)
+    config_name = type(config).__name__ if config is not None else ""
+    return config_name == "Gemma4TransformerConfig" and name.endswith("layer_scalar")
 
 
 def _named_params_and_buffers_global(
@@ -221,7 +242,7 @@ def _named_params_and_buffers_global(
         # treat expert bias as normal parameters
         for name, buffer in model_module.named_buffers():
             # TODO shall we handle (almost) all buffers like Megatron Bridge
-            if "expert_bias" not in name:
+            if "expert_bias" not in name and not _is_gemma4_layer_scalar(model_module, name):
                 continue
             # for model without ddp wrap
             if not name.startswith("module.module."):

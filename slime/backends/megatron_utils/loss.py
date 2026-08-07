@@ -1,5 +1,6 @@
 from argparse import Namespace
 from collections.abc import Callable, Iterator
+import os
 from typing import Any
 
 import torch
@@ -588,6 +589,131 @@ def get_log_probs_and_entropy(
     return torch.empty((0,), device=device), res
 
 
+def get_gemma4_tiled_log_probs_and_entropy(
+    hidden_states: torch.Tensor,
+    *,
+    args: Namespace,
+    batch: RolloutBatch,
+    output_layer: torch.nn.Module,
+    output_weight: torch.Tensor | None,
+) -> dict[str, list[torch.Tensor]]:
+    """Project Gemma4 hidden states without materializing full-vocabulary logits."""
+    if mpu.get_tensor_model_parallel_world_size() != 1:
+        raise RuntimeError("Gemma4 tiled policy loss currently requires tensor-model-parallel-size=1")
+    if hidden_states.ndim != 3 or hidden_states.size(0) != 1:
+        raise RuntimeError(f"Expected Gemma4 hidden states with shape [1,T,H], got {hidden_states.shape}")
+
+    hidden_states = hidden_states.squeeze(0).contiguous()
+    total_lengths = batch["total_lengths"]
+    response_lengths = batch["response_lengths"]
+    local_token_count = hidden_states.size(0)
+    token_count = local_token_count
+    targets = _build_shifted_tokens(
+        token_count,
+        hidden_states.device,
+        batch["unconcat_tokens"],
+        total_lengths,
+        response_lengths,
+        args.allgather_cp,
+    )
+    top_p_keep_mask = None
+    top_p_kwargs = get_rollout_top_p_logprob_kwargs(args, batch)
+    if top_p_kwargs:
+        top_p_keep_mask = _build_topp_keep_mask(
+            token_count,
+            args.padded_vocab_size,
+            hidden_states.device,
+            top_p_kwargs["top_p_token_ids"],
+            top_p_kwargs["top_p_token_offsets"],
+            total_lengths,
+            response_lengths,
+            args.allgather_cp,
+        )
+
+    # Only response positions can affect policy loss. Avoid projecting prompt
+    # hidden states into the 262k vocabulary, which is pure wasted GEMM work.
+    response_index_lists, _ = _extract_per_sample(
+        torch.arange(token_count, device=hidden_states.device),
+        None,
+        total_lengths,
+        response_lengths,
+        args.allgather_cp,
+    )
+    response_indices = torch.cat(response_index_lists, dim=0)
+    hidden_states = hidden_states.index_select(0, response_indices)
+    targets = targets.index_select(0, response_indices)
+    if top_p_keep_mask is not None:
+        top_p_keep_mask = top_p_keep_mask.index_select(0, response_indices)
+    response_counts = [x.numel() for x in response_index_lists]
+    token_count = hidden_states.size(0)
+    if token_count == 0:
+        empty_log_probs = hidden_states.new_empty((0,))
+        empty_entropy = hidden_states.new_empty((0,))
+        return {
+            "log_probs": [empty_log_probs for _ in response_counts],
+            "entropy": [empty_entropy for _ in response_counts],
+        }
+    tile_size = args.log_probs_chunk_size if args.log_probs_chunk_size > 0 else token_count
+    with_entropy_grad = args.entropy_coef != 0
+    rollout_temperature = getattr(args, "rollout_temperature", 1.0)
+    log_prob_tiles = []
+    entropy_tiles = []
+
+    for start in range(0, token_count, tile_size):
+        end = min(start + tile_size, token_count)
+        keep_mask_tile = None if top_p_keep_mask is None else top_p_keep_mask[start:end]
+
+        def project_tile(
+            hidden_tile: torch.Tensor,
+            target_tile: torch.Tensor,
+            keep_mask: torch.Tensor | None = keep_mask_tile,
+        ):
+            projected = output_layer(
+                hidden_tile.unsqueeze(1),
+                weight=output_weight,
+                runtime_gather_output=None,
+            )
+            logits_tile = projected[0] if isinstance(projected, tuple) else projected
+            logits_tile = logits_tile.squeeze(1)
+            return calculate_log_probs_and_entropy(
+                logits_tile,
+                target_tile,
+                mpu.get_tensor_model_parallel_group(),
+                with_entropy=True,
+                with_entropy_grad=with_entropy_grad,
+                chunk_size=-1,
+                log_prob_keep_mask=keep_mask,
+                logits_scale=1.0 / rollout_temperature,
+            )
+
+        log_prob_tile, entropy_tile = checkpoint(
+            project_tile,
+            hidden_states[start:end],
+            targets[start:end],
+            use_reentrant=False,
+        )
+        log_prob_tiles.append(log_prob_tile)
+        entropy_tiles.append(entropy_tile)
+
+    log_prob_full = torch.cat(log_prob_tiles, dim=0).squeeze(-1)
+    entropy_full = torch.cat(entropy_tiles, dim=0)
+    log_probs, entropies = [], []
+    offset = 0
+    for count in response_counts:
+        log_probs.append(log_prob_full[offset : offset + count])
+        entropies.append(entropy_full[offset : offset + count])
+        offset += count
+    result = {"log_probs": log_probs, "entropy": entropies}
+    if args.allgather_cp:
+        _allgather_cp_redistribute(
+            result,
+            logits_local_len=local_token_count,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+        )
+    return result
+
+
 def get_values(
     logits: torch.Tensor,
     *,
@@ -918,6 +1044,7 @@ def policy_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    precomputed_log_probs_and_entropy: dict[str, list[torch.Tensor]] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO) and metrics.
 
@@ -966,15 +1093,18 @@ def policy_loss_function(
         else sum_of_sample_mean
     )
 
-    _, log_probs_and_entropy = get_log_probs_and_entropy(
-        logits,
-        args=args,
-        unconcat_tokens=batch["unconcat_tokens"],
-        total_lengths=total_lengths,
-        response_lengths=response_lengths,
-        with_entropy=True,
-        **get_rollout_top_p_logprob_kwargs(args, batch),
-    )
+    if precomputed_log_probs_and_entropy is None:
+        _, log_probs_and_entropy = get_log_probs_and_entropy(
+            logits,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            with_entropy=True,
+            **get_rollout_top_p_logprob_kwargs(args, batch),
+        )
+    else:
+        log_probs_and_entropy = precomputed_log_probs_and_entropy
 
     log_probs = log_probs_and_entropy["log_probs"]
     local_log_prob_templates = list(log_probs)
@@ -1288,12 +1418,15 @@ def sft_loss_function(
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()
 
-    return (
+    result = (
         loss,
         {
             "loss": loss.clone().detach(),
         },
     )
+    if os.environ.get("SLIME_GEMMA4_CLEAR_CACHE_BEFORE_BACKWARD") == "1":
+        torch.cuda.empty_cache()
+    return result
 
 
 def loss_function(
@@ -1302,6 +1435,8 @@ def loss_function(
     num_microbatches: int,
     step_global_batch_size: int,
     logits: torch.Tensor,
+    gemma4_output_layer: torch.nn.Module | None = None,
+    gemma4_output_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
@@ -1357,7 +1492,24 @@ def loss_function(
         case _:
             raise ValueError(f"Unknown loss type: {args.loss_type}")
 
-    if args.recompute_loss_function:
+    if gemma4_output_layer is not None:
+        if args.loss_type != "policy_loss":
+            raise RuntimeError("Gemma4 tiled output projection only supports policy_loss")
+        log_probs_and_entropy = get_gemma4_tiled_log_probs_and_entropy(
+            logits,
+            args=args,
+            batch=batch,
+            output_layer=gemma4_output_layer,
+            output_weight=gemma4_output_weight,
+        )
+        loss, log = policy_loss_function(
+            args,
+            batch,
+            logits,
+            sum_of_sample_mean,
+            precomputed_log_probs_and_entropy=log_probs_and_entropy,
+        )
+    elif args.recompute_loss_function:
         loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean, use_reentrant=False)
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)

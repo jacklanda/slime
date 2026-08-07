@@ -46,7 +46,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run tau2-bench against a local SGLang endpoint")
     parser.add_argument("--tau2-root", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--model-series", choices=("qwen3", "qwen3.5"), required=True)
+    parser.add_argument("--model-series", choices=("qwen3", "qwen3.5", "gemma4"), required=True)
     parser.add_argument("--served-model-name", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--venv-dir", type=Path, required=True)

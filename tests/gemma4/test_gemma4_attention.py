@@ -40,6 +40,10 @@ def _stub_attention(num_attention_heads, num_kv_heads, head_dim, hidden_size):
         attention_k_eq_v=True,
     )
     attn._is_global = False  # flipped per-test
+    attn._gemma4_runtime_state = SimpleNamespace(shared_kv_states={})
+    attn._store_full_length_kv = False
+    attn._global_layer_idx = None
+    attn._kv_shared_layer_index = None
     return attn, linear_qkv
 
 

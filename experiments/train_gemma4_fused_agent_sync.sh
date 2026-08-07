@@ -115,6 +115,10 @@ Options:
   --eval-initial-inflight-tasks N        Initial scheduled eval trajectories. Default: 128.
   --eval-max-inflight-tasks N            Adaptive eval hard limit. Default: 256.
   --eval-adaptive-concurrency BOOL       Adjust eval concurrency from engine metrics. Default: true.
+  --eval-restart-sglang-server BOOL      Restart local SGLang server with eval capacity profile. Default: true.
+  --eval-sglang-mem-fraction-static X    Eval-only SGLang static memory fraction. Default: 0.92.
+  --eval-sglang-server-concurrency N     Eval-only SGLang request concurrency. Default: 128.
+  --eval-sglang-max-running-requests N   Eval-only SGLang running-request limit. Default: 128.
   --eval-mix-datasets BOOL               Interleave eval benchmarks under one inflight budget. Default: true.
   --eval-termination-retry-times N       Retry non-env_done eval trajectories. Default: 4.
   --eval-trajectory-sample-rate X        Full eval trajectory dump fraction. Default: 1.
@@ -190,7 +194,12 @@ CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN:-True}"
 HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"
 LR="${LR:-1e-6}"
+CLIP_GRAD="${CLIP_GRAD:-1.0}"
 KL_COEF="${KL_COEF:-0.0}"
+KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
+# A zero-weight reference KL neither changes advantages nor the actor loss.
+# Keep the expensive reference-model forward opt-in for this Gemma4 workload.
+USE_KL_LOSS="${USE_KL_LOSS:-0}"
 USE_WANDB="${USE_WANDB:-1}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
@@ -209,12 +218,14 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-16}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-16}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-24}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-24}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
-# Gemma4's PLE tensors are not numerically correct through SGLang's current
-# batch-invariant deterministic kernels. Training determinism remains enabled.
-SGLANG_DETERMINISTIC_INFERENCE="${SGLANG_DETERMINISTIC_INFERENCE:-false}"
+# Gemma4 compounds small batch-shape-dependent kernel differences through 42
+# PLE-enhanced layers. Keep rollout batch-invariant to match deterministic
+# Megatron recomputation. The former PLE/offload incompatibility is fixed by
+# registering the PLE scale constants as model buffers in SGLang.
+SGLANG_DETERMINISTIC_INFERENCE="${SGLANG_DETERMINISTIC_INFERENCE:-true}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-}"
@@ -230,6 +241,10 @@ EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-40960}"
 EVAL_INITIAL_INFLIGHT_TASKS="${EVAL_INITIAL_INFLIGHT_TASKS:-128}"
 EVAL_MAX_INFLIGHT_TASKS="${EVAL_MAX_INFLIGHT_TASKS:-256}"
 EVAL_ADAPTIVE_CONCURRENCY="${EVAL_ADAPTIVE_CONCURRENCY:-true}"
+EVAL_RESTART_SGLANG_SERVER="${EVAL_RESTART_SGLANG_SERVER:-false}"
+EVAL_SGLANG_MEM_FRACTION_STATIC="${EVAL_SGLANG_MEM_FRACTION_STATIC:-0.8}"
+EVAL_SGLANG_SERVER_CONCURRENCY="${EVAL_SGLANG_SERVER_CONCURRENCY:-128}"
+EVAL_SGLANG_MAX_RUNNING_REQUESTS="${EVAL_SGLANG_MAX_RUNNING_REQUESTS:-128}"
 EVAL_MIX_DATASETS="${EVAL_MIX_DATASETS:-true}"
 EVAL_TERMINATION_RETRY_TIMES="${EVAL_TERMINATION_RETRY_TIMES:-4}"
 EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-1}"
@@ -366,6 +381,10 @@ while [ "$#" -gt 0 ]; do
       --eval-max-context-len) EVAL_MAX_CONTEXT_LEN="${2:?Missing value for --eval-max-context-len}"; shift 2 ;;
       --eval-initial-inflight-tasks) EVAL_INITIAL_INFLIGHT_TASKS="${2:?Missing value for --eval-initial-inflight-tasks}"; shift 2 ;;
       --eval-max-inflight-tasks) EVAL_MAX_INFLIGHT_TASKS="${2:?Missing value for --eval-max-inflight-tasks}"; shift 2 ;;
+      --eval-restart-sglang-server) EVAL_RESTART_SGLANG_SERVER="${2:?Missing value for --eval-restart-sglang-server}"; shift 2 ;;
+      --eval-sglang-mem-fraction-static) EVAL_SGLANG_MEM_FRACTION_STATIC="${2:?Missing value for --eval-sglang-mem-fraction-static}"; shift 2 ;;
+      --eval-sglang-server-concurrency) EVAL_SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --eval-sglang-server-concurrency}"; shift 2 ;;
+      --eval-sglang-max-running-requests) EVAL_SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --eval-sglang-max-running-requests}"; shift 2 ;;
       --eval-adaptive-concurrency) EVAL_ADAPTIVE_CONCURRENCY="${2:?Missing value for --eval-adaptive-concurrency}"; shift 2 ;;
       --eval-mix-datasets) EVAL_MIX_DATASETS="${2:?Missing value for --eval-mix-datasets}"; shift 2 ;;
       --eval-termination-retry-times) EVAL_TERMINATION_RETRY_TIMES="${2:?Missing value for --eval-termination-retry-times}"; shift 2 ;;
@@ -571,7 +590,21 @@ fi
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
 MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/gemma-4-E4B-it}"
-REF_LOAD="${REF_LOAD:-/share/nlp/share/plm/gemma-4-E4B-it_torch_dist}"
+# The Megatron conversion is code-dependent: reusing a torch_dist directory
+# generated before a Gemma4 parity fix silently trains against stale weights
+# while SGLang loads the current HF checkpoint. Version the default cache by
+# the conversion/model-provider implementation. An explicit REF_LOAD remains
+# an opt-in override for users managing their own conversion artifact.
+if [ -z "${REF_LOAD:-}" ]; then
+   GEMMA4_CONVERSION_REV="$({
+      sha256sum \
+         "${REPO_ROOT}/slime_plugins/models/gemma4.py" \
+         "${REPO_ROOT}/slime_plugins/models/gemma4_provider.py" \
+         "${REPO_ROOT}/slime_plugins/mbridge/gemma4.py" \
+         "${REPO_ROOT}/tools/convert_hf_to_torch_dist.py"
+   } | sha256sum | cut -c1-12)"
+   REF_LOAD="${MODEL_DIR}_torch_dist_gemma4_${GEMMA4_CONVERSION_REV}"
+fi
 RUN_ROOT="${RUN_ROOT:-${RUNS_ROOT}/${EXPERIMENT_NAME}}"
 SAVE_DIR="${SAVE_DIR:-${RUN_ROOT}/checkpoints}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
@@ -822,11 +855,15 @@ MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-24576}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-20480}"
 LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"
-LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-8192}"
+# The Gemma4 E4B output projection is TP1 over a 262k vocabulary.  The tiled
+# policy-loss checkpoint materializes a [chunk, vocab] logits tile during
+# backward, so 8192 would require roughly 4.3 GiB for one temporary tensor and
+# can exhaust an 80 GiB rank even when the forward pass fits.
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-4096}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 # Keep enough candidate groups queued to feed the default four TP2 rollout
 # engines without generating the much larger surplus created by a batch of 64.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-256}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 # Gemma4 requires a top-k shortlist to avoid sampling low-probability noise from
@@ -988,6 +1025,9 @@ ROLLOUT_ARGS=(
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
    --balance-data
 )
+if [ -n "${LOAD_DEBUG_ROLLOUT_DATA:-}" ]; then
+   ROLLOUT_ARGS+=(--load-debug-rollout-data "${LOAD_DEBUG_ROLLOUT_DATA}")
+fi
 
 if [ -n "${DYNAMIC_SAMPLING_FILTER_PATH}" ]; then
    ROLLOUT_ARGS+=(--dynamic-sampling-filter-path "${DYNAMIC_SAMPLING_FILTER_PATH}")
@@ -1082,6 +1122,14 @@ if [ -n "${EVAL_INTERVAL}" ]; then
       --eval-termination-retry-times "${EVAL_TERMINATION_RETRY_TIMES}"
       --custom-eval-rollout-log-function-path slime_plugins.evals.results_table.log_eval_results_table
    )
+   if is_truthy "${EVAL_RESTART_SGLANG_SERVER}"; then
+      EVAL_ARGS+=(
+         --eval-restart-sglang-server
+         --eval-sglang-mem-fraction-static "${EVAL_SGLANG_MEM_FRACTION_STATIC}"
+         --eval-sglang-server-concurrency "${EVAL_SGLANG_SERVER_CONCURRENCY}"
+         --eval-sglang-max-running-requests "${EVAL_SGLANG_MAX_RUNNING_REQUESTS}"
+      )
+   fi
    if is_truthy "${EVAL_ADAPTIVE_CONCURRENCY}"; then
       EVAL_ARGS+=(--eval-adaptive-concurrency)
    else
@@ -1127,13 +1175,13 @@ fi
 GRPO_ARGS=(
    --advantage-estimator "${ADVANTAGE_ESTIMATOR:-grpo}"
    --kl-coef "${KL_COEF}"
-   --kl-loss-coef "${KL_LOSS_COEF:-0.00}"
+   --kl-loss-coef "${KL_LOSS_COEF}"
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF:-0.00}"
    --eps-clip "${EPS_CLIP:-0.2}"
    --eps-clip-high "${EPS_CLIP_HIGH:-0.6}"
 )
-if is_truthy "${USE_KL_LOSS:-1}"; then
+if is_truthy "${USE_KL_LOSS}"; then
    GRPO_ARGS+=(--use-kl-loss)
 fi
 if is_truthy "${NORMALIZE_ADVANTAGES}"; then
@@ -1220,8 +1268,13 @@ if [ "${USE_WANDB}" = "1" ]; then
 fi
 
 MISC_ARGS=(
+   --train-memory-margin-bytes 268435456
+   --clip-grad "${CLIP_GRAD}"
    --attention-dropout 0.0
    --hidden-dropout 0.0
+   # Keep FP32 gradient accumulation/collective reduction.  BF16 reduction
+   # changes the norm/scaling semantics for Gemma4's credit-masked gradients
+   # and causes a multi-thousand grad-norm regression.
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
@@ -1268,7 +1321,10 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
 export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-10000000000}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
+# Dynamic sequence packing and tiled-vocabulary backward create different-sized
+# allocations across microbatches.  Expandable segments prevent the resulting
+# cached blocks from fragmenting the remaining GPU memory.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export OPENROUTER_APP_NAME="${OPENROUTER_APP_NAME:-GRM}"
 export SLIME_FUSED_REQUIRE_WEIGHT_VERSION="${SLIME_FUSED_REQUIRE_WEIGHT_VERSION:-1}"
 
@@ -1278,6 +1334,7 @@ export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
 export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-3}"
 export FUSED_WEBQA_REWARD_MATCH_MODE="normalized_target_span"
 export FUSED_MODEL_SERIES="gemma4"
+export SLIME_FUSED_STRICT_TITO=1
 # Summarize is a ~2s LLM call per search with a large retry budget; on slow
 # trajectories it stacks up and blows the 180s rollout collection timeout,
 # causing groups to be dropped. Default off and use raw retrieve docs instead.
@@ -1351,6 +1408,25 @@ if [ -n "${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS}" ]; then
 fi
 export SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER="${SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER:-4}"
 export SLIME_TENSOR_BACKUP_PIN_MEMORY="${SLIME_TENSOR_BACKUP_PIN_MEMORY:-0}"
+export SLIME_GEMMA4_CLEAR_CACHE_BEFORE_BACKWARD=1
+# SGLang exposes rollout logprobs from its FP32 logits buffer. Keep the
+# trainer's Gemma4 vocabulary reduction in FP32 as well; BF16 reduction here
+# introduces a large-vocabulary normalization mismatch (and is not needed
+# with the tiled projection).
+# SGLang's on-policy sampler computes probabilities from BF16 logits and
+# returns log(prob).  Match that path in the trainer while retaining an FP32
+# denominator for numerical stability; this avoids a second multi-GiB FP32
+# vocabulary buffer and keeps rollout/update throughput unchanged.
+export SLIME_GEMMA4_LOGPROB_BF16=1
+export SLIME_GEMMA4_TILED_POLICY_LOSS=1
+export SLIME_GEMMA4_BATCH_INVARIANT=1
+export SLIME_GEMMA4_SUPPRESS_EXPECTED_TRAINING_WARNINGS=1
+# SGLang's batch-invariant path otherwise selects DeepGEMM for large BF16
+# matrices, while Megatron's matching path uses the persistent Triton GEMM.
+# Keep Gemma4 rollout and actor forward on the same reduction kernel so the
+# on-policy log-prob comparison measures model semantics rather than backend
+# rounding drift.  This is intentionally Gemma4-launcher scoped.
+export SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0
 
 # RUNTIME_ENV_JSON contains service credentials and is passed verbatim to Ray.
 set +x
@@ -1361,7 +1437,13 @@ keys = (
     "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL", "OPENROUTER_APP_NAME",
     "SLIME_EPISODE_LOG_DIR", "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE",
     "SLIME_FUSED_EVAL_DUMP_FAILURES", "SLIME_FUSED_EVAL_USE_SGLANG_SESSION",
-    "SLIME_FUSED_REQUIRE_WEIGHT_VERSION", "SLIME_TENSOR_BACKUP_PIN_MEMORY",
+    "SLIME_FUSED_REQUIRE_WEIGHT_VERSION", "SLIME_FUSED_STRICT_TITO", "SLIME_TENSOR_BACKUP_PIN_MEMORY",
+    "SLIME_GEMMA4_CLEAR_CACHE_BEFORE_BACKWARD",
+    "SLIME_GEMMA4_LOGPROB_BF16",
+    "SLIME_GEMMA4_TILED_POLICY_LOSS",
+    "SLIME_GEMMA4_BATCH_INVARIANT",
+    "SLIME_GEMMA4_SUPPRESS_EXPECTED_TRAINING_WARNINGS",
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM",
     "RAY_WARN_BLOCKING_GET_INSIDE_ASYNC", "TOKENIZERS_PARALLELISM",
     "VLLM_ALLOW_LONG_MAX_MODEL_LEN", "VLLM_ENGINE_ITERATION_TIMEOUT_S",
     "VLLM_WORKER_MULTIPROC_METHOD", "PYTORCH_CUDA_ALLOC_CONF",

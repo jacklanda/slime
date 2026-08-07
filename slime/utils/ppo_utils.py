@@ -3,6 +3,7 @@
 
 from argparse import Namespace
 from functools import partial
+import os
 
 import torch
 import torch.distributed as dist
@@ -198,7 +199,12 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
         with_entropy_grad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with_entropy_grad = with_entropy and with_entropy_grad
-        vocab_parallel_logits = vocab_parallel_logits.float()
+        # Gemma4 E4B has a 262k vocabulary.  FP32 promotion of an 8192-row
+        # chunk allocates another ~6.6 GiB during checkpoint recomputation.
+        # The Gemma4 launcher opts into native BF16 softmax buffers; all other
+        # models retain the original FP32-stable path.
+        if os.environ.get("SLIME_GEMMA4_LOGPROB_BF16") != "1":
+            vocab_parallel_logits = vocab_parallel_logits.float()
         seq_len, vocab_parallel_size = vocab_parallel_logits.shape
         rank, _world_size = _get_vocab_parallel_rank_size(process_group)
         vocab_start_index = rank * vocab_parallel_size
@@ -231,7 +237,17 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
             # Reuse the ``normalized_logits`` storage for exp and softmax so the whole
             # softmax costs a single [seq_len, vocab] buffer instead of three.
             exp_logits = normalized_logits.exp_()
-            sum_exp_logits = exp_logits.sum(dim=-1, keepdim=True)
+            # SGLang normalizes BF16 Gemma4 logits with an FP32 reduction.
+            # Accumulate the 262k-vocabulary denominator in FP32 as well, but
+            # keep the full softmax buffer in BF16. This adds only one FP32
+            # scalar per token rather than another [tokens, vocab] allocation.
+            sum_dtype = (
+                torch.float32
+                if os.environ.get("SLIME_GEMMA4_LOGPROB_BF16") == "1"
+                and exp_logits.dtype in (torch.float16, torch.bfloat16)
+                else None
+            )
+            sum_exp_logits = exp_logits.sum(dim=-1, keepdim=True, dtype=sum_dtype)
             _maybe_all_reduce(sum_exp_logits, dist.ReduceOp.SUM, process_group)
             softmax = exp_logits.div_(sum_exp_logits)
             return predicted_logits, sum_exp_logits, softmax, logits_max

@@ -14,7 +14,9 @@ Extends the Gemma3 implementation from mbridge with Gemma4-specific features:
 """
 
 import functools
+import json
 import logging
+import os
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
 
@@ -88,6 +90,25 @@ class Gemma4TransformerLayerSubmodules(TransformerLayerSubmodules):
     # keeps the `.mlp.experts.linear_fc...` naming that mbridge's EP auto-handling
     # expects while preserving Gemma4's dense+MoE-in-parallel structure.
     dense_mlp: ModuleSpec | type = IdentityOp
+
+
+def _residual_add_rmsnorm_like_sglang(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match SGLang Gemma4's residual-add + pre-FFN RMSNorm ordering."""
+    output_dtype = hidden_states.dtype
+    residual_fp32 = hidden_states.float() + residual.float()
+    eps = getattr(norm, "eps", getattr(norm, "variance_epsilon", None))
+    if eps is None:
+        raise RuntimeError(f"Gemma4 RMSNorm module {type(norm).__name__} has no epsilon attribute")
+    weight = norm.weight.float()
+    if getattr(norm, "zero_centered_gamma", False):
+        weight = weight + 1.0
+    variance = residual_fp32.pow(2).mean(dim=-1, keepdim=True)
+    normalized = residual_fp32 * torch.rsqrt(variance + eps)
+    return (normalized * weight).to(output_dtype), residual_fp32.to(output_dtype)
 
 
 class Gemma4Router(nn.Module):
@@ -341,6 +362,15 @@ class Gemma4TransformerLayer(TransformerLayer):
             **kwargs,
         )
 
+        # Do not silently train a Gemma4 layer without its pre-FFN RMSNorm.
+        # This guard is Gemma4-only and catches callers that provide a stale
+        # custom ModuleSpec instead of the canonical spec above.
+        if isinstance(self.pre_mlp_layernorm, IdentityOp):
+            raise RuntimeError(
+                "Gemma4 requires an explicit pre_mlp_layernorm; received IdentityOp. "
+                "Use slime_plugins.models.gemma4:get_gemma4_spec."
+            )
+
         self.self_attention._is_global = self._is_global
         self.self_attention._global_layer_idx = global_layer_number - 1
         self.self_attention._kv_shared_layer_index = getattr(config, "kv_shared_layer_map", {}).get(
@@ -373,13 +403,11 @@ class Gemma4TransformerLayer(TransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
-        # Layer scalar (buffer, not learned). Kept in fp32 intentionally -
-        # HF stores this scalar in fp32 and relies on the implicit upcast of
-        # ``bf16_hidden * fp32_scalar`` at multiply time (see HF Gemma4
-        # ``Gemma4TextDecoderLayer.__init__`` at modeling_gemma4.py:1331).
-        # Don't switch to ``dtype=self.config.params_dtype``; that would
-        # silently change the arithmetic.
-        self.register_buffer("layer_scalar", torch.ones(1))
+        # The released Gemma4 checkpoints store layer_scalar in BF16, and
+        # SGLang constructs this buffer under its BF16 model-init dtype.  A
+        # float32 shape-[1] scalar would promote `hidden_states * scalar` to
+        # float32, changing every later layer and doubling residual activations.
+        self.register_buffer("layer_scalar", torch.ones(1, dtype=config.params_dtype))
 
         self.global_layer_idx = global_layer_number - 1
         self.hidden_size_per_layer_input = getattr(config, "hidden_size_per_layer_input", 0)
@@ -471,9 +499,7 @@ class Gemma4TransformerLayer(TransformerLayer):
 
         return mlp_output + moe_output
 
-    def _forward_per_layer_input(self, hidden_states):
-        runtime_state = getattr(self, "_gemma4_runtime_state", None)
-        per_layer_inputs = None if runtime_state is None else runtime_state.per_layer_inputs
+    def _forward_per_layer_input(self, hidden_states, per_layer_inputs):
         if per_layer_inputs is None:
             raise RuntimeError(
                 "Gemma4 per-layer inputs are missing. E2B/E4B PLE currently requires "
@@ -555,10 +581,11 @@ class Gemma4TransformerLayer(TransformerLayer):
         if hidden_states_bias is not None:
             hidden_states = hidden_states + hidden_states_bias
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+        pre_mlp_layernorm_output, residual = _residual_add_rmsnorm_like_sglang(
+            hidden_states,
+            residual,
+            self.pre_mlp_layernorm,
+        )
         if self.enable_moe_block:
             hidden_states = self._forward_moe_ffn(residual, pre_mlp_layernorm_output)
         else:
@@ -567,7 +594,7 @@ class Gemma4TransformerLayer(TransformerLayer):
         hidden_states = residual + hidden_states
 
         if self.hidden_size_per_layer_input:
-            hidden_states = self._forward_per_layer_input(hidden_states)
+            hidden_states = self._forward_per_layer_input(hidden_states, context)
 
         hidden_states = hidden_states * self.layer_scalar
 
@@ -1070,7 +1097,10 @@ def get_gemma4_layer_spec_te(config=None) -> ModuleSpec:
             ),
         ),
         self_attn_bda=get_bias_dropout_add,
-        pre_mlp_layernorm=IdentityOp,
+        # Gemma4 has an explicit RMSNorm before the gated MLP.  Keep this in
+        # the base spec as well as in get_gemma4_spec(); conversion and direct
+        # layer construction use this function without the later override.
+        pre_mlp_layernorm=TENorm,
         mlp=mlp_spec,
         mlp_bda=get_bias_dropout_add,
         post_attention_layernorm=TENorm,
@@ -1089,9 +1119,33 @@ def _load_hf_text_config(hf_checkpoint):
     converter) all share the same parsed object.
     """
     from transformers import AutoConfig
+    from slime.utils.hf_config import register_gemma4_config_aliases
 
-    cfg = AutoConfig.from_pretrained(hf_checkpoint, trust_remote_code=True)
-    return cfg.text_config if hasattr(cfg, "text_config") else cfg
+    register_gemma4_config_aliases()
+    try:
+        cfg = AutoConfig.from_pretrained(hf_checkpoint, trust_remote_code=True)
+    except ValueError as exc:
+        # Keep Megatron-side config loading usable with older Transformers
+        # releases that predate Gemma 4. SGLang itself still requires native
+        # Gemma 4 Transformers support and uses the alias above.
+        config_path = os.path.join(hf_checkpoint, "config.json")
+        try:
+            with open(config_path) as config_file:
+                raw_config = json.load(config_file)
+            text_config = raw_config.get("text_config")
+            if not isinstance(text_config, dict):
+                raise exc
+            from transformers import PretrainedConfig
+
+            cfg = PretrainedConfig.from_dict(text_config)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            raise exc
+    text_config = getattr(cfg, "text_config", None)
+    if isinstance(text_config, dict):
+        from transformers import PretrainedConfig
+
+        text_config = PretrainedConfig.from_dict(text_config)
+    return text_config if text_config is not None else cfg
 
 
 class _Gemma4MoELayerWarningFilter(logging.Filter):

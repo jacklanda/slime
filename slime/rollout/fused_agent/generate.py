@@ -12,6 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -624,6 +625,36 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     tito_boundary_before = True
                     context_delta_ids = list(prompt_ids)
                     tito_context_reason = "historical_thinking_discard"
+            elif tito_prefix_ids and tito_messages_snapshot is not None and _tito_model_type(model_name) == "gemma4":
+                prompt_context_start_idx = None
+                try:
+                    context_delta_ids = await asyncio.to_thread(
+                        _render_gemma4_tito_delta_ids,
+                        state.tokenizer,
+                        tito_messages_snapshot,
+                        rollout_messages,
+                        tito_prefix_ids,
+                        tools=render_tools,
+                        disable_thinking=disable_thinking,
+                    )
+                except Exception as exc:
+                    if strict_tito:
+                        raise RuntimeError("Strict Gemma4 TiTO incremental prompt construction failed") from exc
+                    logger.exception("Gemma4 incremental TITO prompt construction failed; starting a new segment.")
+                    prompt_ids = await asyncio.to_thread(
+                        _render_prompt_ids,
+                        state.tokenizer,
+                        rollout_messages,
+                        tools=render_tools,
+                        disable_thinking=disable_thinking,
+                    )
+                    tito_boundary_before = True
+                    context_delta_ids = list(prompt_ids)
+                    tito_context_reason = "tito_incremental_tokenization_failed"
+                else:
+                    prompt_ids = list(tito_prefix_ids) + context_delta_ids
+                    tito_boundary_before = False
+                    tito_context_reason = "append_delta"
             elif tito_prefix_ids and tito_messages_snapshot is not None and _tito_model_type(model_name) in {
                 "qwen3",
                 "qwen3_5",
@@ -838,6 +869,17 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             if deepsearch_world:
                 response = dsw.ensure_think_tags(response)
                 parsed_actions = await asyncio.to_thread(parser.parse, response)
+            _record_tool_parser_errors(
+                args=args,
+                base_sample=base_sample,
+                session_id=session_id,
+                rollout_step=step_idx,
+                model_name=model_name,
+                response=response,
+                parser=parser,
+                prompt_ids=prompt_ids,
+                evaluation=evaluation,
+            )
             final_response = response
             finish_reason = output["finish_reason"]
             last_finish_reason = finish_reason
@@ -1284,6 +1326,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     final_done = True
                     credit_event = "tool_parser_error"
                     credit_step_index = len(pending_turns) - 1
+                    _record_tool_parser_errors(
+                        args=args, base_sample=base_sample, session_id=session_id,
+                        rollout_step=step_idx, model_name=model_name, response=response,
+                        parser=parser, prompt_ids=prompt_ids, evaluation=evaluation,
+                        fallback_errors=["no tool call could be parsed from the model response"],
+                    )
                     await _mark_pending_turn_error_span(
                         state.tokenizer,
                         pending_turns[-1],
@@ -1324,6 +1372,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 final_done = True
                 credit_event = "tool_parser_error"
                 credit_step_index = len(pending_turns) - 1
+                _record_tool_parser_errors(
+                    args=args, base_sample=base_sample, session_id=session_id,
+                    rollout_step=step_idx, model_name=model_name, response=response,
+                    parser=parser, prompt_ids=prompt_ids, evaluation=evaluation,
+                    fallback_errors=["malformed Gemma4 tool-call marker"],
+                )
                 await _mark_pending_turn_error_span(
                     state.tokenizer,
                     pending_turns[-1],
@@ -1689,6 +1743,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             ):
                 credit_event = "tool_parser_error"
                 credit_step_index = len(pending_turns) - 1
+                _record_tool_parser_errors(
+                    args=args, base_sample=base_sample, session_id=session_id,
+                    rollout_step=step_idx, model_name=model_name, response=response,
+                    parser=parser, prompt_ids=prompt_ids, evaluation=evaluation,
+                    fallback_errors=[str(last_info.get("termination_reason"))],
+                )
             elif (
                 detect_abnormal_trajectories
                 and last_info.get("termination_reason") == "ABNORMAL_NESTED_FINISH_PAYLOAD"
@@ -1696,6 +1756,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             ):
                 credit_event = "tool_parser_error"
                 credit_step_index = len(pending_turns) - 1
+                _record_tool_parser_errors(
+                    args=args, base_sample=base_sample, session_id=session_id,
+                    rollout_step=step_idx, model_name=model_name, response=response,
+                    parser=parser, prompt_ids=prompt_ids, evaluation=evaluation,
+                    fallback_errors=["ABNORMAL_NESTED_FINISH_PAYLOAD"],
+                )
                 await _mark_pending_turn_error_span(
                     state.tokenizer,
                     pending_turns[-1],
@@ -2228,6 +2294,8 @@ def _common_token_prefix_length(left: list[int], right: list[int]) -> int:
 
 def _tito_model_type(model_name: str | None) -> str | None:
     explicit_series = os.environ.get("FUSED_MODEL_SERIES", "").strip().lower().replace("-", "_")
+    if explicit_series in {"gemma4", "gemma_4"}:
+        return "gemma4"
     if explicit_series in {"qwen3.5", "qwen3_5"}:
         return "qwen3_5"
     if explicit_series == "qwen3":
@@ -2240,6 +2308,73 @@ def _tito_model_type(model_name: str | None) -> str | None:
     if "qwen3" in normalized:
         return "qwen3"
     return None
+
+
+def _record_tool_parser_errors(
+    *,
+    args,
+    base_sample: Sample,
+    session_id: str,
+    rollout_step: int,
+    model_name: str | None,
+    response: str,
+    parser,
+    prompt_ids: list[int],
+    evaluation: bool,
+    fallback_errors: list[str] | None = None,
+) -> None:
+    """Append every parser error to the current run's post-hoc debug log.
+
+    Rollout workers are separate Ray processes, so use one O_APPEND write per
+    JSON record rather than a process-local logger or shared file handle.
+    """
+    parser_errors = list(getattr(parser, "last_schema_errors", ()) or ())
+    # Schema failures are recorded immediately after parsing.  The later
+    # abnormal-termination branches pass fallback_errors for responses where
+    # the parser had no more specific diagnosis; do not write the same schema
+    # failure a second time from those branches.
+    if fallback_errors is not None and parser_errors:
+        return
+    errors = parser_errors or list(fallback_errors or ())
+    if not errors:
+        return
+    configured_path = os.environ.get("SLIME_TOOL_PARSER_ERROR_LOG")
+    if configured_path:
+        log_path = configured_path
+    else:
+        episode_dir = os.environ.get("SLIME_EPISODE_LOG_DIR")
+        if episode_dir:
+            root = Path(episode_dir)
+            root = root.parent if root.name in {"episodes", "train", "evals"} else root
+        else:
+            root = Path(getattr(args, "dump_details", ".") or ".")
+        log_path = str(root / "tool_parser_errors.log")
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "evaluation": bool(evaluation),
+        "rollout_id": getattr(base_sample, "rollout_id", None),
+        "sample_index": getattr(base_sample, "index", None),
+        "group_index": getattr(base_sample, "group_index", None),
+        "session_id": session_id,
+        "step": int(rollout_step),
+        "model": _tito_model_type(model_name) or model_name,
+        "parser": type(parser).__name__,
+        "errors": errors,
+        "response": response,
+        "response_length": len(response),
+        "prompt_tokens": len(prompt_ids),
+    }
+    line = (json.dumps(record, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+    try:
+        path = Path(log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except OSError:
+        logger.exception("Failed to append tool parser error log at %s", log_path)
 
 
 def _declared_tool_names(tools: list[dict]) -> set[str]:
@@ -2529,9 +2664,6 @@ def _first_malformed_tool_call_span(response: str) -> tuple[int, int] | None:
         except json.JSONDecodeError:
             return match.start(), match.end()
     for match in re.finditer(r"<\|tool_call>\s*(.*?)\s*<tool_call\|>", response, flags=re.DOTALL):
-        payload = match.group(1).strip()
-        if not re.fullmatch(r"call:[A-Za-z0-9_.-]+\s*\{.*\}", payload, flags=re.DOTALL):
-            return match.start(), match.end()
         parsed = make_tool_parser("gemma4").parse(match.group(0))
         if not parsed:
             return match.start(), match.end()
@@ -2679,18 +2811,39 @@ def _credit_assignment_loss_mask(
         return apply_base([0] * output_len)
     if credit_step_index is None:
         return apply_base([0] * output_len)
-    if credit_event == "mixed_tool_and_answer":
-        return apply_base([1] * output_len if turn_index == credit_step_index else [0] * output_len)
-    if turn_index == credit_step_index and action_span is not None:
-        start, end = action_span
-        if 0 <= start < end <= output_len:
-            return apply_base([0] * start + [1] * (end - start) + [0] * (output_len - end))
-    if credit_event in {"tool_parser_error", "think_parser_error"} and turn_index == credit_step_index:
-        trained_len = max(0, min(output_len, parser_error_token_window))
-        return apply_base([0] * (output_len - trained_len) + [1] * trained_len)
-    if credit_event == "max_response_len_exceeded" and turn_index == credit_step_index:
-        trained_len = max(0, min(output_len, parser_error_token_window))
-        return apply_base([0] * (output_len - trained_len) + [1] * trained_len)
+    # Parser/length failures identify a bad action span, not a bad trajectory.
+    # Keep the original response mask for every other turn and only remove the
+    # malformed tail/span from the failing turn.  The previous implementation
+    # selected only the error window and zeroed all preceding turns, which could
+    # leave just a handful of policy tokens and produce an artificially large
+    # actor gradient norm.
+    if credit_event in {
+        "tool_parser_error",
+        "think_parser_error",
+        "max_response_len_exceeded",
+        "too_many_tool_calls",
+        "repeated_search_query",
+        "ngram_repetition",
+        "mixed_tool_and_answer",
+    }:
+        if turn_index != credit_step_index:
+            return apply_base([1] * output_len)
+        if action_span is not None:
+            start, end = action_span
+            if 0 <= start < end <= output_len:
+                mask = [1] * output_len
+                mask[start:end] = [0] * (end - start)
+                return apply_base(mask)
+        # Without a character-derived span, only parser/length failures have a
+        # meaningful tail location. Other events retain the whole turn rather
+        # than guessing and accidentally deleting valid training signal.
+        if credit_event not in {"tool_parser_error", "think_parser_error", "max_response_len_exceeded"}:
+            return apply_base([1] * output_len)
+        masked_len = max(0, min(output_len, parser_error_token_window))
+        mask = [1] * output_len
+        if masked_len:
+            mask[-masked_len:] = [0] * masked_len
+        return apply_base(mask)
     return apply_base([1] * output_len if turn_index == credit_step_index else [0] * output_len)
 
 
@@ -2937,6 +3090,73 @@ def _render_qwen3_tito_delta_ids(
     else:
         bridge_ids = [im_end_id, *newline_ids]
     return bridge_ids + encoded
+
+
+def _render_gemma4_tito_delta_ids(
+    tokenizer,
+    old_messages: list[dict[str, Any]],
+    new_messages: list[dict[str, Any]],
+    prefix_ids: list[int] | None = None,
+    *,
+    tools: list[dict] | None,
+    disable_thinking: bool,
+) -> list[int]:
+    """Render only the Gemma4 tool-result suffix after a generated action.
+
+    Gemma4 replaces the last raw assistant message with a structured assistant
+    message containing both the parsed tool call and its result. Re-rendering
+    that message would replay and possibly re-tokenize an action whose exact ids
+    are already in the TiTO prefix. Build an otherwise identical assistant turn
+    containing only the result, then take the suffix after the generation prompt.
+    """
+    if len(old_messages) != len(new_messages) or old_messages[:-1] != new_messages[:-1]:
+        raise ValueError("Gemma4 TITO requires only the last assistant message to be replaced")
+    if not old_messages or old_messages[-1].get("role") != "assistant":
+        raise ValueError("Gemma4 TITO requires a previous assistant action")
+
+    replacement = new_messages[-1]
+    if replacement.get("role") != "assistant" or not replacement.get("tool_responses"):
+        raise ValueError("Gemma4 TITO requires a structured assistant tool response")
+
+    response_only = {
+        "role": "assistant",
+        "tool_responses": copy.deepcopy(replacement["tool_responses"]),
+    }
+    base_ids = _render_prompt_ids(
+        tokenizer,
+        new_messages[:-1],
+        tools=tools,
+        disable_thinking=disable_thinking,
+    )
+    with_response_ids = _render_prompt_ids(
+        tokenizer,
+        [*new_messages[:-1], response_only],
+        tools=tools,
+        disable_thinking=disable_thinking,
+    )
+    if not _has_token_prefix(with_response_ids, base_ids):
+        raise ValueError("Gemma4 chat template did not produce an append-only tool-response suffix")
+    delta_ids = list(with_response_ids[len(base_ids) :])
+
+    # A native Gemma4 tool call normally stops after generating the opening
+    # <|tool_response> handoff token.  The response-only chat-template suffix
+    # starts with that same token.  Replaying it creates
+    # ``<|tool_response><|tool_response>...`` and the model commonly answers
+    # with one more empty handoff instead of another action.  SGLang may omit
+    # the stop token from output_ids, so remove the suffix opener only when it
+    # is already the last served token.
+    tool_response_ids = tokenizer.encode("<|tool_response>", add_special_tokens=False)
+    if hasattr(tool_response_ids, "tolist"):
+        tool_response_ids = tool_response_ids.tolist()
+    tool_response_ids = [int(token_id) for token_id in tool_response_ids]
+    if (
+        tool_response_ids
+        and prefix_ids
+        and prefix_ids[-len(tool_response_ids) :] == tool_response_ids
+        and delta_ids[: len(tool_response_ids)] == tool_response_ids
+    ):
+        delta_ids = delta_ids[len(tool_response_ids) :]
+    return delta_ids
 
 
 def _last_assistant_context_start_idx(

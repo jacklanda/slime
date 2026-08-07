@@ -12,6 +12,7 @@ from slime.backends.sglang_utils.arguments import validate_args as sglang_valida
 from slime.backends.sglang_utils.external import apply_external_engine_info_to_args
 from slime.utils.data import read_file
 from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
+from slime.utils.hf_config import register_gemma4_config_aliases
 from slime.utils.logging_utils import configure_logger
 
 logger = logging.getLogger(__name__)
@@ -945,6 +946,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=5.0,
                 help="Seconds between SGLang engine metric samples for adaptive evaluation concurrency.",
             )
+            parser.add_argument(
+                "--eval-restart-sglang-server",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help="Restart local SGLang rollout servers with eval memory/concurrency overrides around interval eval.",
+            )
+            parser.add_argument("--eval-sglang-mem-fraction-static", type=float, default=None)
+            parser.add_argument("--eval-sglang-server-concurrency", type=int, default=None)
+            parser.add_argument("--eval-sglang-max-running-requests", type=int, default=None)
 
             return parser
 
@@ -1826,6 +1836,7 @@ def _apply_yarn_sglang_override(args):
 def parse_args(add_custom_arguments=None):
     # Users may call `parse_args` very early, thus we ensure logger is configured here
     configure_logger()
+    register_gemma4_config_aliases()
 
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 

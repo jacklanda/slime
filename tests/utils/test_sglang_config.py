@@ -456,6 +456,52 @@ class TestRolloutServerRecovery:
         assert ray_get_calls == [["init-ref"]]
 
 
+class TestRolloutManagerEvalRestart:
+    def test_eval_pauses_health_monitor_during_server_restart(self, monkeypatch):
+        from slime.ray import rollout as rollout_module
+
+        events = []
+
+        class FakeServer:
+            server_groups = []
+
+            def restart_with_overrides(self, overrides):
+                events.append(("restart", dict(overrides)))
+
+        manager_cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
+        manager = object.__new__(manager_cls)
+        manager.args = Namespace(
+            debug_train_only=False,
+            eval_restart_sglang_server=True,
+            rollout_external=False,
+            eval_sglang_mem_fraction_static=0.92,
+            eval_sglang_server_concurrency=8,
+            eval_sglang_max_running_requests=8,
+            sglang_server_concurrency=2,
+            sglang_max_running_requests=2,
+            sglang_mem_fraction_static=0.8,
+        )
+        manager.servers = {"default": FakeServer()}
+        manager.data_source = object()
+        manager.eval_generate_rollout = object()
+        manager.health_monitoring_pause = lambda: events.append(("pause",))
+        manager.health_monitoring_resume = lambda: events.append(("resume",))
+        manager._save_debug_rollout_data = lambda *args, **kwargs: None
+
+        monkeypatch.setattr(rollout_module, "call_rollout_fn", lambda *args, **kwargs: events.append(("rollout",)) or Namespace(data=[], metrics={}))
+        monkeypatch.setattr(rollout_module, "_log_eval_rollout_data", lambda *args, **kwargs: None)
+
+        manager.eval(0)
+
+        assert events == [
+            ("pause",),
+            ("restart", {"mem_fraction_static": 0.92, "max_running_requests": 8}),
+            ("rollout",),
+            ("restart", {"mem_fraction_static": 0.8}),
+            ("resume",),
+        ]
+
+
 class TestGetModelUrl:
     def test_get_model_url_basic(self):
         """get_model_url should return the correct URL for a named model."""

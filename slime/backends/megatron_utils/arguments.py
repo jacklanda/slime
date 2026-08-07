@@ -7,6 +7,8 @@ from megatron.training.arguments import validate_args as _megatron_validate_args
 from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
 from transformers import AutoConfig
 
+from slime.utils.hf_config import register_gemma4_config_aliases
+
 __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
 
 logger = logging.getLogger(__name__)
@@ -193,6 +195,7 @@ def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
 
     hf_config = None
     if args.hf_checkpoint and not skip_hf_validate:
+        register_gemma4_config_aliases()
         hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
         _hf_validate_args(args, hf_config)
 

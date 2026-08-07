@@ -1,9 +1,13 @@
 from argparse import Namespace
 
-from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+import pytest
+
+from slime.backends.sglang_utils.sglang_engine import SGLangEngine, _wait_server_healthy
 
 
 class _Response:
+    status_code = 200
+
     def raise_for_status(self):
         pass
 
@@ -16,6 +20,22 @@ class _VersionResponse(_Response):
         return {"weight_version": "v9"}
 
 
+class _HealthSession:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return self.response
+
+
 def _engine(args):
     engine = SGLangEngine.__new__(SGLangEngine)
     engine.args = args
@@ -24,6 +44,34 @@ def _engine(args):
     engine.server_port = 15000
     engine._offloaded_memory_tags = set()
     return engine
+
+
+def test_wait_server_healthy_uses_non_generating_health_endpoint(monkeypatch):
+    session = _HealthSession(_Response())
+    monkeypatch.setattr("slime.backends.sglang_utils.sglang_engine.requests.Session", lambda: session)
+
+    _wait_server_healthy("http://engine", "token", lambda: True, timeout=10)
+
+    assert session.calls == [
+        (
+            "http://engine/health",
+            {
+                "headers": {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Authorization": "Bearer token",
+                },
+                "timeout": 5,
+            },
+        )
+    ]
+
+
+def test_wait_server_healthy_has_a_deadline(monkeypatch):
+    session = _HealthSession(type("Response", (), {"status_code": 503})())
+    monkeypatch.setattr("slime.backends.sglang_utils.sglang_engine.requests.Session", lambda: session)
+
+    with pytest.raises(TimeoutError, match="did not become healthy"):
+        _wait_server_healthy("http://engine", None, lambda: True, timeout=0)
 
 
 def test_pause_and_continue_generation_use_control_timeout(monkeypatch):

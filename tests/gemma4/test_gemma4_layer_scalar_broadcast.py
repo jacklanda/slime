@@ -18,6 +18,7 @@ def _worker(rank: int, world_size: int, master_port: int, ckpt_dir: str, out_dir
     try:
         try:
             import megatron.core.transformer.transformer_layer as tl
+            import megatron.training  # noqa: F401
         except ModuleNotFoundError:
             from tests.gemma4._standalone_imports import install_mbridge_stubs, install_megatron_stubs
 
@@ -32,7 +33,7 @@ def _worker(rank: int, world_size: int, master_port: int, ckpt_dir: str, out_dir
         layers = []
         for _ in range(3):
             layer = torch.nn.Module()
-            layer.register_buffer("layer_scalar", torch.ones(1))
+            layer.register_buffer("layer_scalar", torch.ones(1, dtype=torch.bfloat16))
             layers.append(layer)
         inner.decoder.layers = torch.nn.ModuleList(layers)
 
@@ -44,9 +45,10 @@ def _worker(rank: int, world_size: int, master_port: int, ckpt_dir: str, out_dir
             tl.get_transformer_layer_offset = orig_offset
 
         loaded = [layer.layer_scalar.item() for layer in inner.decoder.layers]
+        dtypes = [str(layer.layer_scalar.dtype) for layer in inner.decoder.layers]
         out_path = os.path.join(out_dir, f"rank{rank}.json")
         with open(out_path, "w") as fp:
-            json.dump({"rank": rank, "scalars": loaded}, fp)
+            json.dump({"rank": rank, "scalars": loaded, "dtypes": dtypes}, fp)
     finally:
         dist.destroy_process_group()
 
@@ -98,3 +100,5 @@ def test_layer_scalars_broadcast_to_all_ranks():
     assert r1["scalars"] == pytest.approx([0.5, 1.25, 2.0]), (
         "rank 1 did not receive the broadcast scalars; check " "_broadcast_layer_scalars"
     )
+    assert r0["dtypes"] == ["torch.bfloat16"] * 3
+    assert r1["dtypes"] == ["torch.bfloat16"] * 3

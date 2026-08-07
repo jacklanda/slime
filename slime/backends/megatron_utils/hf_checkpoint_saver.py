@@ -64,6 +64,7 @@ def save_hf_model_direct_to_path(
 
     import torch.distributed as dist
     from transformers import AutoConfig
+    from slime.utils.hf_config import register_gemma4_config_aliases
 
     from .update_weight.common import named_params_and_buffers
     from .update_weight.hf_weight_iterator_direct import HfWeightIteratorDirect
@@ -89,6 +90,7 @@ def save_hf_model_direct_to_path(
     else:
         if is_save_rank:
             try:
+                register_gemma4_config_aliases()
                 hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 payload = [
                     (

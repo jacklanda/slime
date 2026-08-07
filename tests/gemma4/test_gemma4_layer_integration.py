@@ -101,6 +101,7 @@ def test_layer_builds_and_forwards_sliding():
     spec = get_gemma4_layer_spec_te(cfg)
 
     layer = build_module(spec, config=cfg, layer_number=1)
+    assert layer.layer_scalar.dtype == cfg.params_dtype
     layer = layer.cuda().to(torch.bfloat16)
     assert layer.is_sliding is True
     assert layer._is_global is False
@@ -190,6 +191,28 @@ def test_layer_spec_builds_without_cuda():
 
     assert spec.submodules.post_attention_layernorm is not IdentityOp
     assert spec.submodules.post_feedforward_layernorm is not IdentityOp
+
+
+def test_residual_add_rmsnorm_matches_sglang_fp32_ordering():
+    from slime_plugins.models.gemma4 import _residual_add_rmsnorm_like_sglang
+
+    class Norm(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([0.75, 1.25], dtype=torch.bfloat16))
+            self.eps = 1e-6
+
+    hidden = torch.tensor([[1.0078125, 0.50390625]], dtype=torch.bfloat16)
+    residual = torch.tensor([[-0.99609375, 0.4921875]], dtype=torch.bfloat16)
+    norm = Norm()
+
+    actual, residual_out = _residual_add_rmsnorm_like_sglang(hidden, residual, norm)
+    residual_fp32 = hidden.float() + residual.float()
+    variance = residual_fp32.pow(2).mean(dim=-1, keepdim=True)
+    expected = (residual_fp32 * torch.rsqrt(variance + norm.eps) * norm.weight.float()).to(torch.bfloat16)
+
+    torch.testing.assert_close(residual_out, residual_fp32.to(torch.bfloat16), rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_layer_spec_moe_variant_includes_dense_mlp_spec():

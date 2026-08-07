@@ -583,6 +583,7 @@ class Gemma4ToolParser(QwenToolParser):
     tool_output_begin = "<|tool_response>"
     tool_output_end = "<tool_response|>"
     _CALL_PREFIX_RE = re.compile(r"\s*call:([A-Za-z0-9_.-]+)\s*", re.DOTALL)
+    _CALL_BEGIN_MARKERS = (tool_call_begin, "<|channel>")
 
     def __init__(self, valid_tools: set[str] | None = None):
         super().__init__(valid_tools=valid_tools)
@@ -673,7 +674,15 @@ class Gemma4ToolParser(QwenToolParser):
                 self.last_schema_error_spans.append((start, end))
                 continue
             try:
-                args = self._parse_object(raw_args, parameter_schema=self._tool_parameter_schemas.get(name))
+                # A complete web_search object makes a terminal query boundary
+                # unambiguous even when generation omits only its closing native
+                # quote marker. Keep mutating finish calls strict.
+                args = self._parse_object(
+                    raw_args,
+                    parameter_schema=self._tool_parameter_schemas.get(name),
+                    intrinsic_string_keys={"query"} if name == "web_search" else None,
+                    terminal_native_string_keys={"query"} if name == "web_search" else None,
+                )
             except ValueError as exc:
                 self.last_schema_errors.append(f"invalid arguments for tool {name!r}: {exc}")
                 self.last_schema_error_spans.append((start, end))
@@ -744,11 +753,16 @@ class Gemma4ToolParser(QwenToolParser):
         calls = []
         search_pos = 0
         while True:
-            start = text.find(cls.tool_call_begin, search_pos)
-            if start < 0:
+            marker_matches = [
+                (start, marker)
+                for marker in cls._CALL_BEGIN_MARKERS
+                if (start := text.find(marker, search_pos)) >= 0
+            ]
+            if not marker_matches:
                 return calls
+            start, begin_marker = min(marker_matches)
 
-            pos = start + len(cls.tool_call_begin)
+            pos = start + len(begin_marker)
             prefix = cls._CALL_PREFIX_RE.match(text, pos)
             if prefix is None:
                 search_pos = pos
@@ -769,6 +783,13 @@ class Gemma4ToolParser(QwenToolParser):
                 continue
 
             end_marker_start = cls._skip_ws(text, obj_end)
+            # Gemma4 occasionally closes the argument object correctly and then
+            # leaks one or more array/parenthesis closers before the call marker.
+            # The object boundary is already unambiguous, so ignore only this
+            # narrow class of wrapper noise and keep argument parsing/schema
+            # validation strict.
+            while end_marker_start < len(text) and text[end_marker_start] in "])":
+                end_marker_start = cls._skip_ws(text, end_marker_start + 1)
             if not text.startswith(cls.tool_call_end, end_marker_start):
                 search_pos = obj_end
                 continue
@@ -999,14 +1020,27 @@ class Gemma4ToolParser(QwenToolParser):
         return str(argument)
 
     @classmethod
-    def _parse_object(cls, text: str, *, parameter_schema: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _parse_object(
+        cls,
+        text: str,
+        *,
+        parameter_schema: dict[str, Any] | None = None,
+        intrinsic_string_keys: set[str] | None = None,
+        terminal_native_string_keys: set[str] | None = None,
+    ) -> dict[str, Any]:
         properties = (parameter_schema or {}).get("properties") or {}
         string_keys = {
             str(name)
             for name, schema in properties.items()
             if isinstance(schema, dict) and cls._value_matches_schema("", schema)
         }
-        parser = _Gemma4ArgumentParser(text, top_level_string_keys=string_keys)
+        string_keys.update(intrinsic_string_keys or ())
+        parser = _Gemma4ArgumentParser(
+            text,
+            top_level_string_keys=string_keys,
+            top_level_keys=set(map(str, properties)) | string_keys,
+            terminal_native_string_keys=terminal_native_string_keys,
+        )
         value = parser.parse_value()
         parser.skip_ws()
         if parser.pos != len(parser.text):
@@ -1017,25 +1051,36 @@ class Gemma4ToolParser(QwenToolParser):
 
 
 class _Gemma4ArgumentParser:
-    def __init__(self, text: str, *, top_level_string_keys: set[str] | None = None):
+    def __init__(
+        self,
+        text: str,
+        *,
+        top_level_string_keys: set[str] | None = None,
+        top_level_keys: set[str] | None = None,
+        terminal_native_string_keys: set[str] | None = None,
+    ):
         self.text = text.strip()
         self.pos = 0
         self.top_level_string_keys = top_level_string_keys or set()
+        self.top_level_keys = top_level_keys or set(self.top_level_string_keys)
+        self.terminal_native_string_keys = terminal_native_string_keys or set()
         self.object_depth = 0
 
-    def parse_value(self, *, schema_string: bool = False) -> Any:
+    def parse_value(self, *, schema_string: bool = False, terminal_native_string: bool = False) -> Any:
         self.skip_ws()
         if self.text.startswith('<|"|>', self.pos):
-            return self.parse_gemma_string()
+            return self.parse_gemma_string(allow_terminal_object_close=terminal_native_string)
         ch = self.peek()
         if schema_string and ch in {'"', "'"}:
-            return self.parse_schema_string()
+            return self.parse_schema_string(allow_terminal_object_close=terminal_native_string)
         if ch in {'"', "'"}:
             return self.parse_quoted_string(close_follow={",", "}", "]"})
         if ch == "{":
             return self.parse_object()
         if ch == "[":
             return self.parse_array()
+        if schema_string:
+            return self.parse_schema_bare_string()
         token = self.parse_token()
         normalized_token = token.lower()
         if normalized_token == "true":
@@ -1065,6 +1110,7 @@ class _Gemma4ArgumentParser:
             key = self.parse_key()
             self.skip_ws()
             schema_string = self.object_depth == 1 and key in self.top_level_string_keys
+            terminal_native_string = self.object_depth == 1 and key in self.terminal_native_string_keys
             if self.peek() in {":", "="}:
                 self.pos += 1
             elif not (
@@ -1072,7 +1118,10 @@ class _Gemma4ArgumentParser:
                 and (self.text.startswith('<|"|>', self.pos) or self.peek() in {'"', "'"})
             ):
                 raise ValueError(f"Expected ':' at offset {self.pos}.")
-            result[key] = self.parse_value(schema_string=schema_string)
+            result[key] = self.parse_value(
+                schema_string=schema_string,
+                terminal_native_string=terminal_native_string,
+            )
             self.skip_ws()
             ch = self.peek()
             if ch == ",":
@@ -1119,14 +1168,14 @@ class _Gemma4ArgumentParser:
             return self.parse_quoted_string(close_follow={":"})
         return self.parse_token(stop_chars={":", "=", "<", '"', "'", " ", "\n", "\t", "\r"})
 
-    def parse_schema_string(self) -> str:
+    def parse_schema_string(self, *, allow_terminal_object_close: bool = False) -> str:
         quote = self.peek()
         self.pos += 1
         start = self.pos
         marker = '<|"|>'
         while self.pos < len(self.text):
             ch = self.text[self.pos]
-            if ch == "," and self._declared_key_at(self.pos + 1) is not None:
+            if ch == "," and self._argument_key_at(self.pos + 1) is not None:
                 break
             if ch.isspace() and self._declared_key_at(self.pos) is not None:
                 break
@@ -1139,6 +1188,12 @@ class _Gemma4ArgumentParser:
             return value[: -len(quote)]
         if value.endswith(marker):
             return value[: -len(marker)]
+        if allow_terminal_object_close and self.object_depth == 1 and value:
+            # web_search.query is a read-only scalar and the enclosing object
+            # close gives us an unambiguous terminal boundary.  Recover a
+            # missing ordinary quote there just as we recover a missing native
+            # <|"|> closer; mutating and structured tools never enable this.
+            return value
         # Multiple quote characters inside the value prove that the model used
         # ordinary quotes as query punctuation and omitted only the outer close.
         # A plain one-sided quote remains an ambiguous truncation and is rejected.
@@ -1146,9 +1201,25 @@ class _Gemma4ArgumentParser:
             return value
         raise ValueError("Unterminated quoted Gemma4 string.")
 
+    def parse_schema_bare_string(self) -> str:
+        start = self.pos
+        while self.pos < len(self.text):
+            ch = self.text[self.pos]
+            if ch == "," and self._declared_key_at(self.pos + 1) is not None:
+                break
+            if ch.isspace() and self._declared_key_at(self.pos) is not None:
+                break
+            if ch == "}" and not self.text[self.pos + 1 :].strip():
+                break
+            self.pos += 1
+        value = self.text[start : self.pos].rstrip()
+        if not value:
+            raise ValueError(f"Expected string at offset {start}.")
+        return value
+
     def _declared_key_at(self, pos: int) -> str | None:
         pos = self._skip_ws_pos(pos)
-        for key in sorted(self.top_level_string_keys):
+        for key in sorted(self.top_level_keys):
             if not self.text.startswith(key, pos):
                 continue
             end = self._skip_ws_pos(pos + len(key))
@@ -1156,17 +1227,34 @@ class _Gemma4ArgumentParser:
                 self.text[end] in {":", "="} or self.text.startswith('<|"|>', end)
             ):
                 return key
-        # Non-string siblings such as max_results are valid implicit-comma
-        # boundaries too; identify their key lexically and let normal parsing
-        # and schema validation decide whether they are declared and well typed.
+        return None
+
+    def _argument_key_at(self, pos: int) -> str | None:
+        """Return any syntactic argument key after an explicit comma."""
+        pos = self._skip_ws_pos(pos)
+        quoted_match = re.match(r"([\"'])([A-Za-z_][A-Za-z0-9_.-]*)\1\s*[:=]", self.text[pos:])
+        if quoted_match:
+            return quoted_match.group(2)
         match = re.match(r"[A-Za-z_][A-Za-z0-9_.-]*\s*[:=]", self.text[pos:])
         return match.group(0).rstrip(":=").strip() if match else None
 
-    def parse_gemma_string(self) -> str:
+    def parse_gemma_string(self, *, allow_terminal_object_close: bool = False) -> str:
         marker = '<|"|>'
         self.pos += len(marker)
         end = self.text.find(marker, self.pos)
         if end < 0:
+            if allow_terminal_object_close and self.object_depth == 1:
+                end = len(self.text) - 1
+                value = self.text[self.pos : end]
+                if (
+                    self.text[end:] == "}"
+                    and value
+                    and not any(char in value for char in "{}[]")
+                    and '"""' not in value
+                    and "'''" not in value
+                ):
+                    self.pos = end
+                    return value
             raise ValueError("Unterminated Gemma4 string.")
         value = self.text[self.pos : end]
         self.pos = end + len(marker)

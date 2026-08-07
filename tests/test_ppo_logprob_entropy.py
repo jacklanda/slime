@@ -206,6 +206,25 @@ def _weighted_loss(
     return loss
 
 
+def test_gemma4_bf16_logprob_uses_fp32_vocab_reduction(monkeypatch):
+    """Gemma4's memory-saving path must retain SGLang's logsumexp accuracy."""
+    monkeypatch.setenv("SLIME_GEMMA4_LOGPROB_BF16", "1")
+    torch.manual_seed(7)
+    logits_fp32 = torch.randn(8, 262_144)
+    logits = logits_fp32.bfloat16().requires_grad_()
+    tokens = torch.randint(logits.size(-1), (logits.size(0),))
+
+    log_probs, _ = calculate_log_probs_and_entropy(
+        logits,
+        tokens,
+        tp_group=None,
+        with_entropy=False,
+    )
+    expected = torch.log_softmax(logits.float(), dim=-1)[torch.arange(logits.size(0)), tokens]
+
+    torch.testing.assert_close(log_probs.squeeze(-1), expected, rtol=0.0, atol=1e-2)
+
+
 @pytest.mark.parametrize("chunk_size", [-1, 1, 2, 8])
 @pytest.mark.parametrize("with_mask", [False, True])
 @pytest.mark.parametrize("with_entropy", [False, True])

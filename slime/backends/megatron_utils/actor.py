@@ -8,9 +8,11 @@ import ray
 import torch
 import torch.distributed as dist
 
-from slime.utils.logging_utils import suppress_known_training_warnings
+from slime.utils.logging_utils import suppress_gemma4_expected_training_warnings, suppress_known_training_warnings
+from slime.utils.hf_config import register_gemma4_config_aliases
 
 suppress_known_training_warnings()
+suppress_gemma4_expected_training_warnings()
 
 from megatron.core import mpu
 from torch_memory_saver import torch_memory_saver
@@ -74,6 +76,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):
             if i == dist.get_rank() % args.num_gpus_per_node:
+                register_gemma4_config_aliases()
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
@@ -528,17 +531,24 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
-                train(
-                    rollout_id,
-                    self.model,
-                    self.optimizer,
-                    self.opt_param_scheduler,
-                    data_iterator,
-                    num_microbatches,
-                    global_batch_sizes,
-                    rollout_data=rollout_data,
-                    train_metrics_table_extra=rollout_metrics,
-                )
+                tiled_gemma4_loss = os.environ.get("SLIME_GEMMA4_TILED_POLICY_LOSS") == "1"
+                if tiled_gemma4_loss:
+                    os.environ["SLIME_GEMMA4_ACTOR_TRAIN_ACTIVE"] = "1"
+                try:
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                        global_batch_sizes,
+                        rollout_data=rollout_data,
+                        train_metrics_table_extra=rollout_metrics,
+                    )
+                finally:
+                    if tiled_gemma4_loss:
+                        os.environ.pop("SLIME_GEMMA4_ACTOR_TRAIN_ACTIVE", None)
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -663,6 +673,16 @@ class MegatronTrainRayActor(TrainRayActor):
             destroy_process_groups()
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
+        # Reference/teacher/old-actor weights are auxiliary model snapshots. They
+        # are loaded in finetune mode with optimizer and RNG restoration disabled;
+        # any Megatron TP/PP compatibility warning below therefore applies only to
+        # this auxiliary load, never to the resumable actor checkpoint.
+        logger.info(
+            "Loading auxiliary %s checkpoint from %s with optimizer and RNG "
+            "restore disabled (TP/PP mismatch warnings are expected here).",
+            model_tag,
+            path,
+        )
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
         self.args.load = path
         self.args.no_load_optim = True

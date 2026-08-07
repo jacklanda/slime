@@ -71,6 +71,12 @@ def get_args():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     args.global_batch_size = int(os.environ.get("WORLD_SIZE", "1"))
 
+    if args.num_layers is None:
+        raise ValueError(
+            "--num-layers is required for conversion. Provide the model arguments "
+            "(for example, source scripts/models/gemma4-12B.sh) or pass --num-layers explicitly."
+        )
+
     assert world_size <= args.num_layers, (
         f"World size {world_size} must be less than or equal to number of layers {args.num_layers}. "
         "You are using too many GPUs for this conversion."

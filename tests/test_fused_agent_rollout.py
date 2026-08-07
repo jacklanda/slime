@@ -23,6 +23,7 @@ from slime.rollout.fused_agent.generate import (
     _format_tool_observation,
     _initial_messages,
     _last_assistant_context_start_idx,
+    _render_gemma4_tito_delta_ids,
     _render_qwen3_tito_delta_ids,
     _render_prompt_ids,
     _default_response_loss_mask,
@@ -864,7 +865,7 @@ def test_qwen35_schema_violation_terminates_current_turn_as_tool_parser_error():
         "malformed parameter name '\"query'",
         "unknown parameter 'include_full_text' for tool 'web_search'",
     ]
-    assert _policy_masked_text(sample) == bad
+    assert _policy_masked_text(sample) == ""
 
 
 def test_qwen35_invalid_typed_parameter_is_a_schema_error():
@@ -1265,6 +1266,94 @@ def test_gemma4_tool_parser_accepts_logged_string_syntax_variants(arguments, exp
     assert parser.last_schema_errors == []
 
 
+def test_gemma4_web_search_accepts_terminal_native_query_without_close_marker():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+    response = (
+        '<|tool_call>call:web_search{query:<|"|>Virú Valley Gallinazo style stylized fish adobe motif '
+        'PIC 2016 5590 1982 pages 337-338**}<tool_call|>'
+    )
+
+    calls = parser.parse(response)
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {
+        "query": "Virú Valley Gallinazo style stylized fish adobe motif PIC 2016 5590 1982 pages 337-338**"
+    }
+    assert parser.last_schema_errors == []
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_query", "expected_max_results"),
+    [
+        (
+            '{max_results:3,query:"bacteria ethylbenzene growth inhibition continuous bioreactor" '
+            '"merouani" phd}',
+            'bacteria ethylbenzene growth inhibition continuous bioreactor" "merouani" phd',
+            3,
+        ),
+        (
+            '{query: "Emerg. Infect. Dis. 17:2099" genomic island recA ctxAB IncC}',
+            'Emerg. Infect. Dis. 17:2099" genomic island recA ctxAB IncC',
+            None,
+        ),
+        (
+            '{query:"""Nigunim" "New Music Buff" "The WholeNote" "Volume 27 Issue 6" 2017 violin<|"|>}',
+            '""Nigunim" "New Music Buff" "The WholeNote" "Volume 27 Issue 6" 2017 violin',
+            None,
+        ),
+        (
+            '{query:<|"|>New Music Buff "Nigunim" violin 2017 WholeNote review<|"|>]}',
+            'New Music Buff "Nigunim" violin 2017 WholeNote review',
+            None,
+        ),
+        (
+            '{query:\\"bioprinting\\" "Bingham plastic" gelatin "direct extrusion" '
+            '"version 2.0" 2025 throughput}',
+            '\\"bioprinting\\" "Bingham plastic" gelatin "direct extrusion" "version 2.0" 2025 throughput',
+            None,
+        ),
+        (
+            '{query:"The Database of Religious History" 2023 lecture series '
+            '"Open Scholarship in Practice" October 2019}',
+            'The Database of Religious History" 2023 lecture series "Open Scholarship in Practice" October 2019',
+            None,
+        ),
+        (
+            '{query:<|"|>"Tom Butcher" "optical joint transform correlation" '
+            "Austronesian root 'deflate'</strong>}",
+            '"Tom Butcher" "optical joint transform correlation" Austronesian root \'deflate\'</strong>',
+            None,
+        ),
+    ],
+)
+def test_gemma4_web_search_logged_queries_do_not_require_cached_schema(
+    arguments, expected_query, expected_max_results
+):
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+
+    calls = parser.parse(f"<|tool_call>call:web_search{arguments}<tool_call|>")
+
+    assert len(calls) == 1
+    assert calls[0].arguments["query"] == expected_query
+    if expected_max_results is not None:
+        assert calls[0].arguments["max_results"] == expected_max_results
+    assert parser.last_schema_errors == []
+
+
+def test_gemma4_schema_string_preserves_bare_brackets():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    parser.get_tool_prompt(json.dumps(finish_schema(), ensure_ascii=False))
+
+    calls = parser.parse(
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:JSONArray[]}<tool_call|>'
+    )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"command": "submit", "result": "JSONArray[]"}
+    assert parser.last_schema_errors == []
+
+
 def test_gemma4_tool_parser_still_rejects_unclosed_native_finish_result():
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
     parser.get_tool_prompt(json.dumps(finish_schema(), ensure_ascii=False))
@@ -1319,10 +1408,10 @@ def test_gemma4_tool_parser_accepts_braces_inside_json_like_quoted_strings():
 
 
 def test_gemma4_tool_parser_logs_malformed_arguments_without_traceback(caplog):
-    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
 
     with caplog.at_level("WARNING", logger="slime.rollout.fused_agent.parser"):
-        calls = parser.parse('<|tool_call>call:web_search{query:"unterminated}<tool_call|>')
+        calls = parser.parse('<|tool_call>call:finish{command:"submit",result:"unterminated}<tool_call|>')
 
     assert calls == []
     assert "Failed to parse Gemma4 tool-call arguments" in caplog.text
@@ -1361,11 +1450,11 @@ def test_gemma4_parser_error_credit_assignment_masks_only_bad_native_action():
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
     assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
-    assert _policy_masked_text(sample) == bad
+    assert _policy_masked_text(sample) == ""
 
 
 def test_gemma4_malformed_closed_tool_call_terminates_as_parser_error():
-    bad = '<|tool_call>call:web_search{query:"unterminated}<tool_call|>'
+    bad = '<|tool_call>call:finish{command:"submit",result:"unterminated}<tool_call|>'
 
     result = _run_generate_with_fake_sglang(
         Sample(prompt="placeholder", label={"answer": "answer"}, metadata={"question": "Use web_search before submit"}),
@@ -1383,7 +1472,56 @@ def test_gemma4_malformed_closed_tool_call_terminates_as_parser_error():
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
     assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
-    assert _policy_masked_text(sample) == bad
+    assert _policy_masked_text(sample) == ""
+
+
+def test_gemma4_web_search_recovers_terminal_missing_ordinary_quote():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+
+    calls = parser.parse(
+        '<|tool_call>call:web_search{query:"research paper optical correlation}<tool_call|><|tool_response>'
+    )
+
+    assert len(calls) == 1
+    assert calls[0].arguments["query"] == "research paper optical correlation"
+    assert parser.last_schema_errors == []
+
+
+def test_gemma4_tool_parser_accepts_logged_channel_call_wrapper():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+
+    calls = parser.parse(
+        '<|channel>call:web_search{query:<|"|>Cheirolepidiaceae cone phyllotaxy<|"|>}'
+        '<tool_call|><|tool_response>'
+    )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "Cheirolepidiaceae cone phyllotaxy"}
+    assert parser.last_schema_errors == []
+    assert fused_generate._response_has_malformed_tool_call(
+        '<|channel>call:web_search{query:<|"|>Cheirolepidiaceae cone phyllotaxy<|"|>}'
+        '<tool_call|><|tool_response>'
+    ) is False
+
+
+def test_gemma4_tool_parser_ignores_extra_wrapper_closer_after_argument_object():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+
+    calls = parser.parse(
+        '<|tool_call>call:web_search{query:<|"|>ethylbenzene degradation bacteria<|"|>}]'
+        '<tool_call|><|tool_response>'
+    )
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "ethylbenzene degradation bacteria"}
+    assert parser.last_schema_errors == []
+    assert fused_generate._response_has_malformed_tool_call(
+        '<|tool_call>call:web_search{query:<|"|>ethylbenzene degradation bacteria<|"|>}]'
+        '<tool_call|><|tool_response>'
+    ) is False
 
 
 def test_gemma4_valid_call_then_unclosed_native_marker_terminates_as_parser_error(tmp_path: Path):
@@ -1407,7 +1545,7 @@ def test_gemma4_valid_call_then_unclosed_native_marker_terminates_as_parser_erro
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
     assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
-    assert _policy_masked_text(sample) == malformed
+    assert _policy_masked_text(sample) == valid
     assert "before-error" not in sample.metadata["rllm_episode"]["trajectories"][0]["steps"][0]["observation"]
 
 
@@ -1432,7 +1570,7 @@ def test_gemma4_valid_call_then_malformed_closed_native_marker_terminates_as_par
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
     assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
-    assert _policy_masked_text(sample) == malformed
+    assert _policy_masked_text(sample) == valid
     assert "before-error" not in sample.metadata["rllm_episode"]["trajectories"][0]["steps"][0]["observation"]
 
 
@@ -1440,6 +1578,69 @@ def test_tito_model_type_detects_gemma4_without_changing_qwen_detection():
     assert fused_generate._tito_model_type("/share/nlp/share/plm/gemma-4-E2B-it") == "gemma4"
     assert fused_generate._tito_model_type("/models/Qwen3.5-4B") == "qwen3_5"
     assert fused_generate._tito_model_type("/models/Qwen3-4B") == "qwen3"
+
+
+def test_gemma4_tito_delta_does_not_duplicate_generated_tool_response_handoff():
+    tokenizer = FakeGemma4Tokenizer()
+    tools = [web_search_schema(), finish_schema()]
+    action = '<|tool_call>call:web_search{query:<|"|>evidence<|"|>}<tool_call|><|tool_response>'
+    old_messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": action},
+    ]
+    new_messages = [
+        old_messages[0],
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "web_search", "arguments": {"query": "evidence"}}}],
+            "tool_responses": [{"name": "web_search", "response": {"value": "result"}}],
+        },
+    ]
+    prefix_ids = tokenizer.encode(action, add_special_tokens=False)
+
+    delta_ids = fused_generate._render_gemma4_tito_delta_ids(
+        tokenizer,
+        old_messages,
+        new_messages,
+        prefix_ids,
+        tools=tools,
+        disable_thinking=True,
+    )
+    continuation = tokenizer.decode(delta_ids, skip_special_tokens=False)
+
+    assert continuation.startswith('response:web_search{value:<|"|>result<|"|>}<tool_response|>')
+    assert not continuation.startswith("<|tool_response>")
+
+
+def test_gemma4_tito_delta_keeps_tool_response_handoff_when_generation_omits_it():
+    tokenizer = FakeGemma4Tokenizer()
+    tools = [web_search_schema(), finish_schema()]
+    action = '<|tool_call>call:web_search{query:<|"|>evidence<|"|>}<tool_call|>'
+    old_messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": action},
+    ]
+    new_messages = [
+        old_messages[0],
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "web_search", "arguments": {"query": "evidence"}}}],
+            "tool_responses": [{"name": "web_search", "response": {"value": "result"}}],
+        },
+    ]
+    prefix_ids = tokenizer.encode(action, add_special_tokens=False)
+
+    delta_ids = fused_generate._render_gemma4_tito_delta_ids(
+        tokenizer,
+        old_messages,
+        new_messages,
+        prefix_ids,
+        tools=tools,
+        disable_thinking=True,
+    )
+    continuation = tokenizer.decode(delta_ids, skip_special_tokens=False)
+
+    assert continuation.startswith('<|tool_response>response:web_search{value:<|"|>result<|"|>}<tool_response|>')
 
 
 def test_build_system_prompt_switches_tool_format_by_model():
@@ -2117,6 +2318,62 @@ def test_qwen3_tito_delta_rejects_history_rewrite():
             [1, 2, 3],
             disable_thinking=False,
         )
+
+
+def test_gemma4_tito_delta_appends_only_tool_response_after_raw_action():
+    tokenizer = FakeGemma4Tokenizer()
+    history = [{"role": "user", "content": "find evidence"}]
+    old_messages = [*history, {"role": "assistant", "content": "raw non-canonical action"}]
+    new_messages = [
+        *history,
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "echo", "arguments": {"value": "alpha"}}}],
+            "tool_responses": [{"name": "echo", "response": {"echo": "alpha"}}],
+        },
+    ]
+
+    delta = _render_gemma4_tito_delta_ids(
+        tokenizer,
+        old_messages,
+        new_messages,
+        tools=None,
+        disable_thinking=True,
+    )
+    rendered_delta = tokenizer.decode(delta)
+
+    assert rendered_delta.startswith("<|tool_response>")
+    assert "response:echo" in rendered_delta
+    assert "<|tool_call>" not in rendered_delta
+    assert rendered_delta.endswith("<turn|>\n<|turn>model\n")
+
+
+def test_gemma4_strict_tito_avoids_structured_assistant_replay_segments(tmp_path: Path):
+    first = _gemma4_echo_call("alpha")
+    finish = _gemma4_finish_call('{"done":true}')
+    prompt_ids_seen: list[list[int]] = []
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Use echo before finish"),
+        [{"text": first}, {"text": finish}],
+        {
+            "FUSED_DISABLE_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+            "SLIME_FUSED_STRICT_TITO": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+        prompt_ids_seen=prompt_ids_seen,
+    )
+
+    assert len(result) == 1
+    assert result[0].metadata["segment_count"] == 1
+    assert result[0].metadata["fused_tito_boundary_count"] == 0
+    assert result[0].metadata["fused_tito_incremental_turns"] == 1
+    assert result[0].metadata["fused_tito_prompt_prefix_mismatch_turns"] == 0
+    assert prompt_ids_seen[1][: len(prompt_ids_seen[0]) + len(first)] == [
+        *prompt_ids_seen[0],
+        *[ord(character) for character in first],
+    ]
 
 
 def test_context_span_rendering_uses_same_thinking_control():
@@ -5735,7 +5992,7 @@ def test_mixed_tool_and_answer_credit_assignment_masks_only_error_turn():
             credit_event="mixed_tool_and_answer",
             credit_step_index=1,
         )
-        == [0] * 5
+        == [1] * 5
     )
     assert (
         fused_generate._credit_assignment_loss_mask(
@@ -5769,7 +6026,7 @@ def test_credit_assignment_policy_mask_never_unmasks_base_loss_mask_tokens():
         credit_step_index=0,
         parser_error_token_window=5,
         base_loss_mask=base_loss_mask,
-    ) == [0, 0, 1, 1, 0, 1, 0]
+    ) == [0, 0, 0, 0, 0, 0, 0]
 
     assert fused_generate._credit_assignment_loss_mask(
         output_len=len(base_loss_mask),
@@ -5982,9 +6239,48 @@ def test_parser_error_credit_assignment_masks_only_error_turn_after_history(tmp_
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
     assert bad in _masked_text(sample)
-    assert _policy_masked_text(sample) == bad
-    assert good in _policy_unmasked_text(sample)
-    assert "<tool_response>" in _policy_unmasked_text(sample)
+    assert good in _policy_masked_text(sample)
+    assert bad in _policy_unmasked_text(sample)
+
+
+@pytest.mark.parametrize(
+    ("tokenizer", "bad_response", "expected_model"),
+    [
+        (FakeChatTemplateTokenizer(), "I cannot produce a tool call here.", None),
+        (
+            FakeGemma4Tokenizer(),
+            '<|tool_call>call:echo{value:<|"|>unterminated<tool_call|>',
+            "gemma4",
+        ),
+    ],
+)
+def test_tool_parser_errors_are_appended_to_run_log(
+    monkeypatch, tmp_path: Path, tokenizer, bad_response: str, expected_model: str | None
+):
+    episode_dir = tmp_path / "run" / "logs" / "episodes"
+    monkeypatch.setenv("SLIME_EPISODE_LOG_DIR", str(episode_dir))
+
+    _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Persist the parser failure"),
+        [{"text": bad_response}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR": "True",
+        },
+        tokenizer=tokenizer,
+    )
+
+    log_path = episode_dir.parent / "tool_parser_errors.log"
+    records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    record = records[0]
+    assert record["session_id"]
+    assert record["step"] == 0
+    assert record["response"] == bad_response
+    assert record["response_length"] == len(bad_response)
+    assert record["errors"]
+    assert record["parser"]
+    assert record["model"] == expected_model
 
 
 def test_parser_error_credit_assignment_masks_only_error_tail(tmp_path: Path):
@@ -6007,10 +6303,8 @@ def test_parser_error_credit_assignment_masks_only_error_tail(tmp_path: Path):
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
     assert malformed_action in _masked_text(sample)
-    assert _policy_masked_text(sample) == malformed_action
-    assert good in _policy_unmasked_text(sample)
-    assert bad[: -len(malformed_action)] in _policy_unmasked_text(sample)
-    assert "<tool_response>" in _policy_unmasked_text(sample)
+    assert good in _policy_masked_text(sample)
+    assert bad[-len(malformed_action) :] in _policy_unmasked_text(sample)
 
 
 def test_tool_burst_credit_assignment_masks_only_burst_turn_after_history(tmp_path: Path):
@@ -6033,9 +6327,9 @@ def test_tool_burst_credit_assignment_masks_only_burst_turn_after_history(tmp_pa
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "too_many_tool_calls"
     assert burst in _masked_text(sample)
-    assert _policy_masked_text(sample) == burst
+    assert good in _policy_masked_text(sample)
+    assert burst in _policy_unmasked_text(sample)
     assert reasoning in _policy_unmasked_text(sample)
-    assert good in _policy_unmasked_text(sample)
     assert "<tool_response>" in _policy_unmasked_text(sample)
 
 
@@ -6128,7 +6422,7 @@ def test_max_response_len_credit_assignment_masks_only_error_tail():
         credit_event="max_response_len_exceeded",
         credit_step_index=0,
         parser_error_token_window=4,
-    ) == [0, 0, 0, 0, 0, 0, 1, 1, 1, 1]
+    ) == [1, 1, 1, 1, 1, 1, 0, 0, 0, 0]
 
 
 def test_search_bypass_credit_assignment_keeps_full_action_mask():

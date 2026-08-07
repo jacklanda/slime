@@ -26,13 +26,26 @@ def test_gemma4_e4b_sync_launcher_uses_e4b_model_shape():
     assert 'TOP_K="${TOP_K:-64}"' in launcher
     assert '--rollout-top-p "${TOP_P}"' in launcher
     assert '--rollout-top-k "${TOP_K}"' in launcher
-    assert 'SGLANG_DETERMINISTIC_INFERENCE="${SGLANG_DETERMINISTIC_INFERENCE:-false}"' in launcher
+    assert 'SGLANG_DETERMINISTIC_INFERENCE="${SGLANG_DETERMINISTIC_INFERENCE:-true}"' in launcher
     assert 'if is_truthy "${SGLANG_DETERMINISTIC_INFERENCE}"; then' in launcher
     assert 'CP_SIZE="${CP_SIZE:-2}"' in launcher
     assert 'MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-20480}"' in launcher
     assert 'LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"' in launcher
-    assert 'LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-8192}"' in launcher
+    assert 'LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-4096}"' in launcher
+    assert 'PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"' in launcher
+    assert "--accumulate-allreduce-grads-in-fp32" in launcher
+    assert "--grad-reduce-in-bf16" not in launcher
     assert 'export FUSED_MODEL_SERIES="gemma4"' in launcher
+    assert "export SLIME_FUSED_STRICT_TITO=1" in launcher
+    # Gemma4 rollout uses SGLang batch-invariant kernels under deterministic
+    # inference; the trainer receives the matching Gemma4-only runtime flag.
+    assert "export SLIME_GEMMA4_BATCH_INVARIANT=1" in launcher
+    assert '"SLIME_GEMMA4_BATCH_INVARIANT"' in launcher
+    assert "export SLIME_GEMMA4_LOGPROB_BF16=1" in launcher
+    # Keep SGLang's Gemma4 batch-invariant GEMM on the same persistent Triton
+    # implementation used by Megatron; DeepGEMM has a different reduction path.
+    assert "export SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0" in launcher
+    assert '"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM"' in launcher
     assert 'export FUSED_WEBQA_REWARD_MATCH_MODE="normalized_target_span"' in launcher
 
 

@@ -11,7 +11,7 @@ from slime_plugins.models.gemma4 import get_rope_local_base_freq as _rope_local_
 _gelu_tanh = functools.partial(F.gelu, approximate="tanh")
 
 
-@register_model(["gemma4", "gemma4_text", "gemma4_unified_text"])
+@register_model(["gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"])
 class Gemma4Bridge(Gemma3Bridge):
     """
     Bridge for Gemma4 text dense and MoE variants.

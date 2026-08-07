@@ -22,7 +22,9 @@ def _get_config(args):
     checkpoint = args.hf_checkpoint
     if checkpoint not in _config_cache:
         from transformers import AutoConfig
+        from slime.utils.hf_config import register_gemma4_config_aliases
 
+        register_gemma4_config_aliases()
         hf_config = AutoConfig.from_pretrained(checkpoint, trust_remote_code=True)
         hf_text = hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
         _config_cache[checkpoint] = {

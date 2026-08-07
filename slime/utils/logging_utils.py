@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import sys
 import warnings
@@ -143,6 +144,30 @@ def suppress_known_training_warnings():
         category=UserWarning,
         module=r"torch\.distributed\.c10d_logger",
     )
+
+
+def suppress_gemma4_expected_training_warnings():
+    """Suppress warnings caused by Gemma4's intentional trainer configuration."""
+    if os.environ.get("SLIME_GEMMA4_SUPPRESS_EXPECTED_TRAINING_WARNINGS") != "1":
+        return
+
+    # The Gemma4 launcher deliberately disables compiler caches. Dynamo reports
+    # that this also disables PGO, which is expected and does not affect results.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"dynamo_pgo force disabled by torch\.compiler\.config\.force_disable_caches",
+        category=UserWarning,
+        module=r"torch\._dynamo\.pgo",
+    )
+
+    # Megatron DDP keeps AccumulateGrad nodes alive to host its per-parameter
+    # hooks. Gemma4 does not use trainer CUDA graphs or overlapped grad-reduce,
+    # so a node surviving from the initialization stream is intentional here.
+    import torch
+
+    setter = getattr(torch.autograd.graph, "set_warn_on_accumulate_grad_stream_mismatch", None)
+    if setter is not None:
+        setter(False)
 
 
 # ref: SGLang

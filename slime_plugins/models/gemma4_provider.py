@@ -13,7 +13,6 @@ import os
 from dataclasses import dataclass, field
 from types import MethodType
 
-import torch.nn.functional as F
 import torch
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.spec_utils import import_module
@@ -46,6 +45,20 @@ def _is_rank_zero() -> bool:
 def model_provider(pre_process=True, post_process=True, vp_stage=None):
     args = get_args()
     config = core_transformer_config_from_args(args)
+
+    # SGLang's deterministic-inference mode uses batch-invariant GEMM and
+    # RMSNorm kernels.  Match that reduction order in the Gemma4 trainer before
+    # constructing TE modules; --deterministic-mode alone only configures
+    # PyTorch determinism and does not install Megatron's kernel patches.
+    if os.environ.get("SLIME_GEMMA4_BATCH_INVARIANT") == "1":
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            enable_batch_invariant_mode,
+        )
+
+        config.batch_invariant_mode = True
+        enable_batch_invariant_mode()
+        if _is_rank_zero():
+            logger.info("Gemma4 trainer batch-invariant GEMM/RMSNorm enabled")
 
     transformer_layer_spec = import_module(args.spec)
     if callable(transformer_layer_spec):
@@ -111,12 +124,15 @@ class _Gemma4LogitSoftcap(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
         (softcapped,) = ctx.saved_tensors
         scale = ctx.scale
-        grad_logits = softcapped / scale
-        grad_logits.pow_(2)
-        grad_logits.neg_()
-        grad_logits.add_(1.0)
-        grad_logits.mul_(grad_output)
-        return grad_logits, None
+        # The logits tensor is several GiB for Gemma4's 262k vocabulary. Its
+        # downstream users have completed when this backward runs, so reuse the
+        # saved output buffer instead of allocating another full-size tensor.
+        softcapped.div_(scale)
+        softcapped.pow_(2)
+        softcapped.neg_()
+        softcapped.add_(1.0)
+        softcapped.mul_(grad_output)
+        return softcapped, None
 
 
 def _logit_softcapping(logits: torch.Tensor, scale: float) -> torch.Tensor:
@@ -132,7 +148,16 @@ class _Gemma4RMSNorm(torch.nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.rms_norm(x, (self.weight.shape[0],), self.weight, self.eps)
+        # Match the HF/SGLang Gemma4RMSNorm equation exactly.  In particular,
+        # Gemma4 uses ``pow(mean(x**2) + eps, -0.5)`` rather than delegating to
+        # a backend RMSNorm kernel whose accumulation/rounding can differ
+        # across trainer and rollout runtimes.  This module is PLE-only;
+        # ordinary Gemma4 norms keep their Transformer Engine implementation.
+        x_float = x.float()
+        mean_squared = x_float.pow(2).mean(-1, keepdim=True) + self.eps
+        output = x_float * torch.pow(mean_squared, -0.5)
+        output = output * self.weight.float()
+        return output.to(dtype=x.dtype)
 
 
 def _install_per_layer_input_modules(inner, args, config, hf_text):
@@ -186,6 +211,37 @@ def _install_runtime_state(inner) -> _Gemma4RuntimeState:
         return orig_forward(*f_args, **f_kwargs)
 
     inner.forward = MethodType(_forward_with_gemma4_state, inner)
+
+    if hasattr(inner, "_postprocess"):
+        orig_postprocess = inner._postprocess
+
+        def _postprocess_with_tiled_actor_logits(self, *p_args, **p_kwargs):
+            if (
+                os.environ.get("SLIME_GEMMA4_TILED_POLICY_LOSS") == "1"
+                and os.environ.get("SLIME_GEMMA4_ACTOR_TRAIN_ACTIVE") == "1"
+            ):
+                hidden_states = p_kwargs.get("hidden_states", p_args[0] if p_args else None)
+                labels = p_kwargs.get("labels", p_args[3] if len(p_args) > 3 else None)
+                if hidden_states is None or labels is not None:
+                    raise RuntimeError("Gemma4 tiled policy loss requires hidden states and labels=None")
+                # Match GPTModel's normal [s,b,v] -> [b,s,v] output layout.
+                # The policy loss owns the output projection tile-by-tile.
+                return hidden_states.transpose(0, 1).contiguous()
+            return orig_postprocess(*p_args, **p_kwargs)
+
+        inner._postprocess = MethodType(_postprocess_with_tiled_actor_logits, inner)
+
+    if hasattr(inner, "decoder"):
+        def _pass_per_layer_inputs_through_checkpoint(module, args, kwargs):
+            if kwargs.get("context") is None and state.per_layer_inputs is not None:
+                kwargs["context"] = state.per_layer_inputs
+            return args, kwargs
+
+        inner.decoder.register_forward_pre_hook(
+            _pass_per_layer_inputs_through_checkpoint,
+            with_kwargs=True,
+        )
+
     return state
 
 
@@ -211,6 +267,27 @@ def _install_hooks(model, args, config, pre_process, post_process):
     _install_per_layer_input_modules(inner, args, config, hf_text)
     runtime_state = _install_runtime_state(inner)
 
+    if hasattr(inner, "decoder") and _is_rank_zero() and inner.decoder.layers:
+        # Keep the constructed graph auditable: a stale custom spec that drops
+        # this norm is a hard Gemma4 parity failure, not a harmless variant.
+        first_layer = inner.decoder.layers[0]
+        scalar_dtypes = {layer.layer_scalar.dtype for layer in inner.decoder.layers}
+        expected_scalar_dtype = config.params_dtype
+        if scalar_dtypes != {expected_scalar_dtype}:
+            raise RuntimeError(
+                "Gemma4 layer_scalar dtype mismatch: "
+                f"expected {expected_scalar_dtype}, got {sorted(map(str, scalar_dtypes))}. "
+                "A float32 shape-[1] scalar promotes the residual stream to float32."
+            )
+        logger.info(
+            "Gemma4 runtime layer contract: pre_mlp_layernorm=%s, post_attention_layernorm=%s, "
+            "post_feedforward_layernorm=%s, layer_scalar_dtype=%s",
+            type(getattr(first_layer, "pre_mlp_layernorm", None)).__name__,
+            type(getattr(first_layer, "post_attention_layernorm", None)).__name__,
+            type(getattr(first_layer, "post_feedforward_layernorm", None)).__name__,
+            expected_scalar_dtype,
+        )
+
     # Embedding scaling - HF applies this inside the embedding module.
     # See ``Gemma4TextScaledWordEmbedding``: the scale is stored as an fp32
     # tensor and cast to the embedding weight's dtype at forward time, so
@@ -230,6 +307,12 @@ def _install_hooks(model, args, config, pre_process, post_process):
             if input_ids is None:
                 raise ValueError("Gemma4 per-layer embeddings require input_ids in embedding forward inputs")
             token_ple = module.per_layer_embeddings(input_ids)
+            # SGLang/HF Gemma4 uses a scaled per-layer embedding with
+            # embed_scale=sqrt(hidden_size_per_layer_input).  Megatron's
+            # VocabParallelEmbedding does not apply that model-specific scale
+            # itself, so restore it before combining the token and projected
+            # PLE branches.
+            token_ple = token_ple * (inner._gemma4_ple_dim**0.5)
             token_ple = token_ple.transpose(0, 1).contiguous()
             if token_ple.shape[0] != scaled.shape[0]:
                 from megatron.core import tensor_parallel
