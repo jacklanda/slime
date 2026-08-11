@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 _MISSING_PARAMETER = object()
 _INVALID_PARAMETER = object()
+_NO_SCHEMA_COERCION = object()
 # A typed parameter the model opened but left empty (``<parameter=n></parameter>``).
 # Distinct from _INVALID_PARAMETER: the value is absent rather than malformed, so
 # the argument is dropped without recording a schema error.
@@ -46,6 +48,17 @@ class ToolCall:
     arguments: dict[str, Any]
     start: int | None = None
     end: int | None = None
+
+
+@dataclass(frozen=True)
+class _Gemma4NativeCall:
+    raw_name: str
+    raw_args: str
+    start: int
+    end: int
+    name_span: tuple[int, int]
+    args_start: int
+    repairs: tuple[str, ...] = ()
 
 
 class QwenToolParser:
@@ -588,7 +601,10 @@ class Gemma4ToolParser(QwenToolParser):
     def __init__(self, valid_tools: set[str] | None = None):
         super().__init__(valid_tools=valid_tools)
         self.last_schema_errors: list[str] = []
-        self.last_schema_error_spans: list[tuple[int, int]] = []
+        self.last_schema_error_spans: list[tuple[int, int] | None] = []
+        self.last_schema_error_kinds: list[str] = []
+        self.last_syntax_repairs: list[str] = []
+        self.last_schema_coercions: list[str] = []
         self._tool_parameter_schemas: dict[str, dict[str, Any]] = {}
 
     def _normalize_name(self, name: str) -> str:
@@ -621,7 +637,8 @@ class Gemma4ToolParser(QwenToolParser):
             f"{tool_name}.{parameter_name}"
             for tool_name, parameters in self._tool_parameter_schemas.items()
             for parameter_name, schema in (parameters.get("properties") or {}).items()
-            if isinstance(schema, dict) and str(schema.get("type", "")).lower() in {"object", "array"}
+            if isinstance(schema, dict)
+            and self._schema_value_types(schema) & {"object", "array"}
         )
         contract = [
             "Gemma4 native tool-call contract:",
@@ -634,12 +651,39 @@ class Gemma4ToolParser(QwenToolParser):
             "- Never emit <|channel>call:, finish.result:, XML tool syntax, bare JSON, or plain final-answer prose.",
         ]
         if "finish" in tool_names:
+            finish_parameters = self._tool_parameter_schemas["finish"]
+            finish_result_schema = (finish_parameters.get("properties") or {}).get("result") or {}
+            finish_result_types = self._schema_value_types(finish_result_schema)
+            if "object" in finish_result_types:
+                result_example = "{...}"
+            elif "array" in finish_result_types:
+                result_example = "[...]"
+            else:
+                result_example = '<|"|>CONCISE_FINAL_ANSWER<|"|>'
             contract.append(
-                '- To finish, emit exactly: <|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>CONCISE_FINAL_ANSWER<|"|>}<tool_call|>'
+                "- To finish, emit exactly: "
+                f'<|tool_call>call:finish{{command:<|"|>submit<|"|>,result:{result_example}}}<tool_call|>'
             )
         if structured_parameters:
             contract.append("- These parameters require unquoted structured values: " + ", ".join(structured_parameters))
         return "\n".join(contract)
+
+    @classmethod
+    def _schema_value_types(cls, schema: dict[str, Any]) -> set[str]:
+        schema_type = schema.get("type")
+        if isinstance(schema_type, str):
+            types = {schema_type.lower()}
+        elif isinstance(schema_type, (list, tuple)):
+            types = {str(item).lower() for item in schema_type}
+        else:
+            types = set()
+        for key in ("anyOf", "oneOf"):
+            variants = schema.get(key)
+            if isinstance(variants, list):
+                for variant in variants:
+                    if isinstance(variant, dict):
+                        types.update(cls._schema_value_types(variant))
+        return types
 
     def format_action(self, action: ToolCall) -> str:
         return f"<|tool_call>call:{action.name}{self._format_argument(action.arguments or {}, escape_keys=False)}<tool_call|>"
@@ -666,63 +710,198 @@ class Gemma4ToolParser(QwenToolParser):
         text = model_response or ""
         self.last_schema_errors = []
         self.last_schema_error_spans = []
+        self.last_schema_error_kinds = []
+        self.last_syntax_repairs = []
+        self.last_schema_coercions = []
         calls: list[ToolCall] = []
-        for raw_name, raw_args, start, end in self._iter_native_tool_calls(text):
-            name = self._normalize_name(raw_name)
+        for native_call in self._iter_native_tool_calls(text):
+            name = self._normalize_name(native_call.raw_name)
             if not name:
-                self.last_schema_errors.append(f"unknown tool name {raw_name!r}")
-                self.last_schema_error_spans.append((start, end))
+                self.last_schema_errors.append(f"unknown tool name {native_call.raw_name!r}")
+                self.last_schema_error_spans.append(native_call.name_span)
+                self.last_schema_error_kinds.append("unknown_tool")
                 continue
             try:
                 # A complete web_search object makes a terminal query boundary
                 # unambiguous even when generation omits only its closing native
                 # quote marker. Keep mutating finish calls strict.
-                args = self._parse_object(
-                    raw_args,
+                args, field_spans = self._parse_object(
+                    native_call.raw_args,
                     parameter_schema=self._tool_parameter_schemas.get(name),
                     intrinsic_string_keys={"query"} if name == "web_search" else None,
                     terminal_native_string_keys={"query"} if name == "web_search" else None,
                 )
             except ValueError as exc:
                 self.last_schema_errors.append(f"invalid arguments for tool {name!r}: {exc}")
-                self.last_schema_error_spans.append((start, end))
+                self.last_schema_error_spans.append(self._syntax_error_span(native_call, exc))
+                self.last_schema_error_kinds.append("invalid_syntax")
                 logger.warning(
                     "Failed to parse Gemma4 tool-call arguments for tool '%s': %s. raw_args=%r",
-                    raw_name,
+                    native_call.raw_name,
                     exc,
-                    raw_args[:512],
+                    native_call.raw_args[:512],
                 )
                 logger.debug("Gemma4 tool-call argument parse failure.", exc_info=True)
                 continue
-            schema_errors = self._validate_arguments(name, args)
+            self.last_syntax_repairs.extend(native_call.repairs)
+            # Some generated MCP schemas historically declared structured
+            # submit results as strings. Accept a JSON-encoded object/array so
+            # old assets and newly generated native calls share one contract.
+            if name.startswith("submit_result_") and isinstance(args.get("result"), str):
+                try:
+                    decoded_result = json.loads(args["result"])
+                except (TypeError, json.JSONDecodeError):
+                    pass
+                else:
+                    if isinstance(decoded_result, (dict, list)):
+                        args["result"] = decoded_result
+            args = self._coerce_arguments(name, args)
+            schema_errors = self._validate_arguments(
+                name,
+                args,
+                field_spans=field_spans,
+                args_start=native_call.args_start,
+            )
             if schema_errors:
-                self.last_schema_errors.extend(schema_errors)
-                self.last_schema_error_spans.append((start, end))
-                continue
-            calls.append(ToolCall(name=name, arguments=args if isinstance(args, dict) else {}, start=start, end=end))
+                for error, span, kind in schema_errors:
+                    self.last_schema_errors.append(error)
+                    self.last_schema_error_spans.append(span)
+                    self.last_schema_error_kinds.append(kind)
+                if any(kind != "unknown_parameter" for _, _, kind in schema_errors):
+                    continue
+                # Unknown optional fields should not discard an otherwise
+                # executable call. Keep the diagnostics/spans for credit
+                # assignment, but pass only declared arguments to the tool.
+                properties = (self._tool_parameter_schemas.get(name) or {}).get("properties") or {}
+                args = {key: value for key, value in args.items() if key in properties}
+            calls.append(
+                ToolCall(
+                    name=name,
+                    arguments=args if isinstance(args, dict) else {},
+                    start=native_call.start,
+                    end=native_call.end,
+                )
+            )
         return calls
 
-    def _validate_arguments(self, tool_name: str, arguments: dict[str, Any]) -> list[str]:
+    @staticmethod
+    def _syntax_error_span(native_call: _Gemma4NativeCall, exc: ValueError) -> tuple[int, int] | None:
+        match = re.search(r"\boffset (\d+)\b", str(exc))
+        if match is None or not native_call.raw_args:
+            return None
+        offset = min(int(match.group(1)), len(native_call.raw_args) - 1)
+        position = native_call.args_start + offset
+        return position, position + 1
+
+    def _coerce_arguments(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        parameter_schema = self._tool_parameter_schemas.get(tool_name)
+        if not isinstance(parameter_schema, dict):
+            return arguments
+        properties = parameter_schema.get("properties") or {}
+        if not isinstance(properties, dict):
+            return arguments
+        required = set(parameter_schema.get("required") or ())
+        coerced_arguments = dict(arguments)
+        for name, value in arguments.items():
+            schema = properties.get(name)
+            if not isinstance(schema, dict) or self._value_matches_schema(value, schema):
+                continue
+            if value is None and name not in required:
+                coerced_arguments.pop(name, None)
+                self.last_schema_coercions.append(f"{tool_name}.{name}: dropped optional null")
+                continue
+            coerced = self._coerce_value_to_schema(value, schema)
+            if coerced is _NO_SCHEMA_COERCION:
+                continue
+            coerced_arguments[name] = coerced
+            self.last_schema_coercions.append(
+                f"{tool_name}.{name}: {type(value).__name__} -> {type(coerced).__name__}"
+            )
+        return coerced_arguments
+
+    @classmethod
+    def _coerce_value_to_schema(cls, value: Any, schema: dict[str, Any]) -> Any:
+        variants = schema.get("anyOf") or schema.get("oneOf")
+        if isinstance(variants, list):
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    continue
+                coerced = cls._coerce_value_to_schema(value, variant)
+                if coerced is not _NO_SCHEMA_COERCION and cls._value_matches_schema(coerced, variant):
+                    return coerced
+            return _NO_SCHEMA_COERCION
+        expected = schema.get("type")
+        if isinstance(expected, list):
+            for item in expected:
+                variant = {**schema, "type": item}
+                coerced = cls._coerce_value_to_schema(value, variant)
+                if coerced is not _NO_SCHEMA_COERCION and cls._value_matches_schema(coerced, variant):
+                    return coerced
+            return _NO_SCHEMA_COERCION
+        if not isinstance(value, str) or expected is None:
+            return _NO_SCHEMA_COERCION
+        expected = str(expected).lower()
+        stripped = value.strip()
+        if expected in {"array", "object"}:
+            try:
+                decoded = json.loads(stripped)
+            except json.JSONDecodeError:
+                return _NO_SCHEMA_COERCION
+            return decoded if cls._value_matches_schema(decoded, schema) else _NO_SCHEMA_COERCION
+        if expected == "integer" and re.fullmatch(r"[+-]?\d+", stripped):
+            return int(stripped)
+        if expected == "number" and re.fullmatch(
+            r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?",
+            stripped,
+        ):
+            number = float(stripped) if any(char in stripped.lower() for char in (".", "e")) else int(stripped)
+            return number if math.isfinite(float(number)) else _NO_SCHEMA_COERCION
+        if expected == "boolean" and stripped.lower() in {"true", "false"}:
+            return stripped.lower() == "true"
+        if expected == "null" and stripped.lower() in {"null", "none"}:
+            return None
+        return _NO_SCHEMA_COERCION
+
+    def _validate_arguments(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        field_spans: dict[str, tuple[int, int, int, int]],
+        args_start: int,
+    ) -> list[tuple[str, tuple[int, int] | None, str]]:
         parameter_schema = self._tool_parameter_schemas.get(tool_name)
         if parameter_schema is None:
             return []
         properties = parameter_schema.get("properties") or {}
         if not isinstance(properties, dict):
             properties = {}
-        errors = [
-            f"missing required parameter {name!r} for tool {tool_name!r}"
+        errors: list[tuple[str, tuple[int, int] | None, str]] = [
+            (f"missing required parameter {name!r} for tool {tool_name!r}", None, "missing_parameter")
             for name in parameter_schema.get("required") or []
             if name not in arguments
         ]
         for name, value in arguments.items():
             schema = properties.get(name)
             if not isinstance(schema, dict):
-                errors.append(f"unknown parameter {name!r} for tool {tool_name!r}")
+                field_span = field_spans.get(name)
+                key_span = None if field_span is None else (args_start + field_span[0], args_start + field_span[1])
+                errors.append((f"unknown parameter {name!r} for tool {tool_name!r}", key_span, "unknown_parameter"))
+                continue
+            if tool_name.startswith("submit_result_") and name == "result" and isinstance(value, (dict, list)):
+                # Older MCP assets exposed ``result`` as string even though
+                # the callable requires a structured value.
                 continue
             if not self._value_matches_schema(value, schema):
+                field_span = field_spans.get(name)
+                value_span = None if field_span is None else (args_start + field_span[2], args_start + field_span[3])
                 errors.append(
-                    f"invalid type for parameter {name!r} of tool {tool_name!r}: "
-                    f"expected {schema.get('type')!r}, got {type(value).__name__}"
+                    (
+                        f"invalid type for parameter {name!r} of tool {tool_name!r}: "
+                        f"expected {schema.get('type')!r}, got {type(value).__name__}",
+                        value_span,
+                        "invalid_parameter_type",
+                    )
                 )
         return errors
 
@@ -749,8 +928,8 @@ class Gemma4ToolParser(QwenToolParser):
         return checks.get(expected, lambda: True)()
 
     @classmethod
-    def _iter_native_tool_calls(cls, text: str) -> list[tuple[str, str, int, int]]:
-        calls = []
+    def _iter_native_tool_calls(cls, text: str) -> list[_Gemma4NativeCall]:
+        calls: list[_Gemma4NativeCall] = []
         search_pos = 0
         while True:
             marker_matches = [
@@ -770,13 +949,30 @@ class Gemma4ToolParser(QwenToolParser):
 
             raw_name = prefix.group(1)
             obj_start = prefix.end()
+            name_span = (prefix.start(1), prefix.end(1))
             try:
                 obj_end = cls._find_argument_object_end(text, obj_start)
             except ValueError:
                 end_marker_start = text.find(cls.tool_call_end, obj_start)
                 if end_marker_start >= 0:
                     end = end_marker_start + len(cls.tool_call_end)
-                    calls.append((raw_name, text[obj_start:end_marker_start], start, end))
+                    raw_args = text[obj_start:end_marker_start]
+                    repairs: tuple[str, ...] = ()
+                    if cls._syntax_repair_allowed(raw_name):
+                        repaired = cls._repair_incomplete_native_arguments(raw_args)
+                        if repaired is not None:
+                            raw_args, repairs = repaired
+                    calls.append(
+                        _Gemma4NativeCall(
+                            raw_name=raw_name,
+                            raw_args=raw_args,
+                            start=start,
+                            end=end,
+                            name_span=name_span,
+                            args_start=obj_start,
+                            repairs=repairs,
+                        )
+                    )
                     search_pos = end
                     continue
                 search_pos = pos
@@ -791,12 +987,113 @@ class Gemma4ToolParser(QwenToolParser):
             while end_marker_start < len(text) and text[end_marker_start] in "])":
                 end_marker_start = cls._skip_ws(text, end_marker_start + 1)
             if not text.startswith(cls.tool_call_end, end_marker_start):
+                if cls._syntax_repair_allowed(raw_name) and cls._is_missing_call_end_boundary(
+                    text, end_marker_start
+                ):
+                    calls.append(
+                        _Gemma4NativeCall(
+                            raw_name=raw_name,
+                            raw_args=text[obj_start:obj_end],
+                            start=start,
+                            end=obj_end,
+                            name_span=name_span,
+                            args_start=obj_start,
+                            repairs=("missing_tool_call_end",),
+                        )
+                    )
+                    search_pos = max(obj_end, end_marker_start)
+                    continue
                 search_pos = obj_end
                 continue
 
             end = end_marker_start + len(cls.tool_call_end)
-            calls.append((raw_name, text[obj_start:obj_end], start, end))
+            calls.append(
+                _Gemma4NativeCall(
+                    raw_name=raw_name,
+                    raw_args=text[obj_start:obj_end],
+                    start=start,
+                    end=end,
+                    name_span=name_span,
+                    args_start=obj_start,
+                )
+            )
             search_pos = end
+
+    @staticmethod
+    def _syntax_repair_allowed(tool_name: str) -> bool:
+        return tool_name not in {"finish", "submit"} and not tool_name.startswith("submit_result_")
+
+    @classmethod
+    def _repair_incomplete_native_arguments(cls, raw_args: str) -> tuple[str, tuple[str, ...]] | None:
+        if not raw_args.lstrip().startswith("{"):
+            return None
+        repaired = raw_args.rstrip()
+        repairs: list[str] = []
+        marker = '<|"|>'
+        if repaired.count(marker) % 2:
+            marker_start = repaired.rfind(marker)
+            value_start = marker_start + len(marker)
+            value = repaired[value_start:]
+            if '"""' in value or "'''" in value:
+                return None
+            if repaired.endswith("}") and not any(char in value[:-1] for char in "{}[]"):
+                repaired = repaired[:-1] + marker + "}"
+            elif not any(char in value for char in "{}[]"):
+                repaired += marker
+            else:
+                return None
+            repairs.append("missing_native_string_end")
+        elif match := re.search(
+            r'(?:^|[,{])\s*[A-Za-z_][A-Za-z0-9_.-]*\s*[:=]\s*"([^"{}\[\]]*)(})?$',
+            repaired,
+        ):
+            value_end = match.end(1)
+            repaired = repaired[:value_end] + '"' + repaired[value_end:]
+            repairs.append("missing_quoted_string_end")
+
+        missing_closers = cls._missing_argument_closers(repaired)
+        if missing_closers is None or len(missing_closers) > 1:
+            return None
+        if missing_closers:
+            if missing_closers != "}":
+                return None
+            repaired += missing_closers
+            repairs.append("missing_argument_object_end")
+        return (repaired, tuple(repairs)) if repairs else None
+
+    @classmethod
+    def _missing_argument_closers(cls, text: str) -> str | None:
+        marker = '<|"|>'
+        stack: list[str] = []
+        pos = 0
+        while pos < len(text):
+            if text.startswith(marker, pos):
+                end = text.find(marker, pos + len(marker))
+                if end < 0:
+                    return None
+                pos = end + len(marker)
+                continue
+            ch = text[pos]
+            if ch in {'"', "'"}:
+                try:
+                    pos = cls._find_quoted_string_end(text, pos, close_follow={":", ",", "}", "]"})
+                except ValueError:
+                    return None
+                continue
+            if ch == "{":
+                stack.append("}")
+            elif ch == "[":
+                stack.append("]")
+            elif ch in "}]":
+                if not stack or stack.pop() != ch:
+                    return None
+            pos += 1
+        return "".join(reversed(stack))
+
+    @classmethod
+    def _is_missing_call_end_boundary(cls, text: str, pos: int) -> bool:
+        suffix = text[pos:]
+        return not suffix or suffix.startswith(cls.tool_output_begin) or suffix.startswith("<eos>")
 
     @staticmethod
     def _skip_ws(text: str, pos: int) -> int:
@@ -1027,7 +1324,7 @@ class Gemma4ToolParser(QwenToolParser):
         parameter_schema: dict[str, Any] | None = None,
         intrinsic_string_keys: set[str] | None = None,
         terminal_native_string_keys: set[str] | None = None,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, tuple[int, int, int, int]]]:
         properties = (parameter_schema or {}).get("properties") or {}
         string_keys = {
             str(name)
@@ -1047,7 +1344,7 @@ class Gemma4ToolParser(QwenToolParser):
             raise ValueError(f"Unexpected trailing Gemma4 argument text at offset {parser.pos}.")
         if not isinstance(value, dict):
             raise ValueError("Gemma4 tool-call arguments must be an object.")
-        return value
+        return value, parser.top_level_field_spans
 
 
 class _Gemma4ArgumentParser:
@@ -1059,12 +1356,13 @@ class _Gemma4ArgumentParser:
         top_level_keys: set[str] | None = None,
         terminal_native_string_keys: set[str] | None = None,
     ):
-        self.text = text.strip()
+        self.text = text
         self.pos = 0
         self.top_level_string_keys = top_level_string_keys or set()
         self.top_level_keys = top_level_keys or set(self.top_level_string_keys)
         self.terminal_native_string_keys = terminal_native_string_keys or set()
         self.object_depth = 0
+        self.top_level_field_spans: dict[str, tuple[int, int, int, int]] = {}
 
     def parse_value(self, *, schema_string: bool = False, terminal_native_string: bool = False) -> Any:
         self.skip_ws()
@@ -1107,7 +1405,10 @@ class _Gemma4ArgumentParser:
             self.object_depth -= 1
             return result
         while True:
+            self.skip_ws()
+            key_start = self.pos
             key = self.parse_key()
+            key_end = self.pos
             self.skip_ws()
             schema_string = self.object_depth == 1 and key in self.top_level_string_keys
             terminal_native_string = self.object_depth == 1 and key in self.terminal_native_string_keys
@@ -1118,10 +1419,13 @@ class _Gemma4ArgumentParser:
                 and (self.text.startswith('<|"|>', self.pos) or self.peek() in {'"', "'"})
             ):
                 raise ValueError(f"Expected ':' at offset {self.pos}.")
+            value_start = self._skip_ws_pos(self.pos)
             result[key] = self.parse_value(
                 schema_string=schema_string,
                 terminal_native_string=terminal_native_string,
             )
+            if self.object_depth == 1:
+                self.top_level_field_spans[key] = (key_start, key_end, value_start, self.pos)
             self.skip_ws()
             ch = self.peek()
             if ch == ",":

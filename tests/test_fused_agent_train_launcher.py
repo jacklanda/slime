@@ -1,9 +1,22 @@
+import argparse
 from pathlib import Path
 
 import pytest
 
+from slime.backends.sglang_utils.arguments import add_sglang_arguments
+
 
 NUM_GPUS = 0
+
+
+@pytest.mark.unit
+def test_sglang_accepts_megatron_on_policy_target():
+    parser = argparse.ArgumentParser()
+    add_sglang_arguments(parser)
+
+    args = parser.parse_args(["--sglang-rl-on-policy-target", "megatron"])
+
+    assert args.sglang_rl_on_policy_target == "megatron"
 
 
 @pytest.mark.unit
@@ -46,7 +59,60 @@ def test_gemma4_e4b_sync_launcher_uses_e4b_model_shape():
     # implementation used by Megatron; DeepGEMM has a different reduction path.
     assert "export SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0" in launcher
     assert '"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM"' in launcher
+    assert "export SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT=0" in launcher
+    assert '"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT"' in launcher
+    assert "--sglang-rl-on-policy-target megatron" in launcher
     assert 'export FUSED_WEBQA_REWARD_MATCH_MODE="normalized_target_span"' in launcher
+
+
+@pytest.mark.unit
+def test_gemma4_launcher_uses_trajectory_mean_grpo_by_default():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_gemma4_fused_agent_sync.sh").read_text(encoding="utf-8")
+
+    # Token-sum reduction makes a sequence-level GRPO advantage proportional to
+    # response length. Gemma4 must opt into that legacy behavior explicitly.
+    assert 'CALCULATE_PER_TOKEN_LOSS="${CALCULATE_PER_TOKEN_LOSS:-false}"' in launcher
+    perf_start = launcher.index("PERF_ARGS=(")
+    perf_end = launcher.index("if [ \"${USE_DYNAMIC_BATCH_SIZE:-1}\"", perf_start)
+    perf_args = launcher[perf_start:perf_end]
+    assert "\n   --calculate-per-token-loss\n" not in perf_args
+    assert 'if is_truthy "${CALCULATE_PER_TOKEN_LOSS}"; then' in launcher
+    assert "PERF_ARGS+=(--calculate-per-token-loss)" in launcher
+    assert "default false = trajectory/sample mean" in launcher
+
+
+@pytest.mark.unit
+def test_gemma4_launcher_defaults_to_even_mcp_webqa_groups():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_gemma4_fused_agent_sync.sh").read_text(encoding="utf-8")
+
+    assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"' in launcher
+    assert 'ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-mcp=0.5,webqa=0.5}"' in launcher
+    assert 'ROLLOUT_ARGS+=(--rollout-task-family-quotas "${ROLLOUT_TASK_FAMILY_QUOTAS}")' in launcher
+
+
+@pytest.mark.unit
+def test_gemma4_launcher_starts_a_new_wandb_run_for_each_attempt_by_default():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_gemma4_fused_agent_sync.sh").read_text(encoding="utf-8")
+
+    assert 'WANDB_RESUME_SAME_RUN="${WANDB_RESUME_SAME_RUN:-0}"' in launcher
+    assert '[ -n "${WANDB_RUN_ID:-}" ] && is_truthy "${WANDB_RESUME_SAME_RUN}"' in launcher
+    assert "unset WANDB_RUN_ID" in launcher
+
+
+@pytest.mark.unit
+def test_gemma4_launcher_avoids_train_memory_saver_by_default():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_gemma4_fused_agent_sync.sh").read_text(encoding="utf-8")
+
+    assert 'COLOCATE="${COLOCATE:-true}"' in launcher
+    assert 'RELEASE_TRAIN="${RELEASE_TRAIN:-true}"' in launcher
+    assert 'OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${COLOCATE}}"' in launcher
+    assert "OFFLOAD_TRAIN=false" in launcher
+    assert "--update-weight-mode full" in launcher
+    assert "--update-weight-transport disk" in launcher
 
 
 @pytest.mark.unit
@@ -84,6 +150,8 @@ def test_qwen_sync_launchers_do_not_enable_reference_model_by_default(launcher_n
     assert 'USE_KL_LOSS="${USE_KL_LOSS:-0}"' in launcher
     assert 'if is_truthy "${USE_KL_LOSS}"; then' in launcher
     assert 'USE_KL_LOSS:-1' not in launcher
+    assert "--sglang-rl-on-policy-target megatron" not in launcher
+    assert "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT" not in launcher
 
 
 @pytest.mark.unit

@@ -52,6 +52,23 @@ def test_credit_assignment_masks_only_valid_action_span():
     assert mask == [0, 0, 0, 1, 1, 0]
 
 
+@pytest.mark.parametrize("attribution", ["unattributable", "localized"])
+def test_parser_error_without_reliable_span_penalizes_bounded_tail(attribution):
+    config = CreditAssignmentConfig(enable=True, tool_parser_error=True)
+    mask, event = build_policy_loss_mask(
+        metadata={
+            "tool_call_parse_error": True,
+            "credit_assignment_error_attribution": attribution,
+        },
+        loss_mask=[1, 0, 1, 1],
+        config=config,
+        parser_error_token_window=2,
+    )
+
+    assert event == "tool_parser_error"
+    assert mask == [0, 0, 1, 1]
+
+
 def test_credit_assignment_invalid_span_masks_all_policy_tokens():
     config = CreditAssignmentConfig(enable=True, repeated_search_query=True)
     mask, event = build_policy_loss_mask(
@@ -1313,6 +1330,45 @@ def test_zero_std_filter_judges_prompt_equal_batches_on_trajectory_level_rewards
         ),
     ]
     assert check_reward_nonzero_std(args, distinct_terminal).keep is True
+
+
+@pytest.mark.parametrize("segment", [False, True])
+def test_zero_std_filter_uses_the_clean_credit_assignment_baseline(segment):
+    from slime.rollout.filter_hub.dynamic_sampling_filters import check_reward_nonzero_std
+
+    samples = []
+    for index, reward in enumerate([0.0] * 30 + [1.0, 1.0]):
+        metadata = {"credit_assignment_event": "tool_parser_error"} if index < 30 else {}
+        if segment:
+            metadata.update(
+                prompt_equal_loss=True,
+                parent_traj_id=f"t{index}",
+                instance_id="prompt-a",
+                segment_index=0,
+                segment_count=1,
+            )
+        samples.append(Sample(index=index, rollout_id=index, reward=reward, metadata=metadata))
+
+    result = check_reward_nonzero_std(_args(), samples)
+
+    assert result.keep is False
+    assert result.reason == "zero_std_1.0"
+
+
+def test_zero_std_filter_keeps_nonzero_variance_among_clean_samples():
+    from slime.rollout.filter_hub.dynamic_sampling_filters import check_reward_nonzero_std
+
+    samples = [
+        Sample(
+            index=index,
+            rollout_id=index,
+            reward=reward,
+            metadata={"credit_assignment_event": "tool_parser_error"} if index < 30 else {},
+        )
+        for index, reward in enumerate([0.0] * 30 + [0.0, 1.0])
+    ]
+
+    assert check_reward_nonzero_std(_args(), samples).keep is True
 
 
 def test_segment_reward_anchor_broadcast_wraps_horizon_reward_shaping(monkeypatch):

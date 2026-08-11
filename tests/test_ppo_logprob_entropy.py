@@ -225,6 +225,30 @@ def test_gemma4_bf16_logprob_uses_fp32_vocab_reduction(monkeypatch):
     torch.testing.assert_close(log_probs.squeeze(-1), expected, rtol=0.0, atol=1e-2)
 
 
+def test_gemma4_batch_invariant_logprob_uses_log_softmax_semantics(monkeypatch):
+    monkeypatch.setenv("SLIME_GEMMA4_LOGPROB_BF16", "1")
+    monkeypatch.setenv("SLIME_GEMMA4_BATCH_INVARIANT", "1")
+    torch.manual_seed(11)
+    logits = torch.randn(5, 64).bfloat16().requires_grad_()
+    tokens = torch.tensor([3, 17, 29, 41, 63])
+
+    log_probs, _ = calculate_log_probs_and_entropy(
+        logits,
+        tokens,
+        tp_group=None,
+        with_entropy=False,
+    )
+    expected_logits = logits.detach().clone().requires_grad_()
+    expected = torch.log_softmax(expected_logits, dim=-1)[torch.arange(tokens.numel()), tokens]
+
+    torch.testing.assert_close(log_probs.squeeze(-1), expected, rtol=0.0, atol=0.0)
+
+    weights = torch.tensor([0.25, -0.5, 1.5, 0.75, -0.125], dtype=torch.bfloat16)
+    (log_probs.squeeze(-1) * weights).sum().backward()
+    (expected * weights).sum().backward()
+    torch.testing.assert_close(logits.grad, expected_logits.grad, rtol=0.0, atol=2e-3)
+
+
 @pytest.mark.parametrize("chunk_size", [-1, 1, 2, 8])
 @pytest.mark.parametrize("with_mask", [False, True])
 @pytest.mark.parametrize("with_entropy", [False, True])

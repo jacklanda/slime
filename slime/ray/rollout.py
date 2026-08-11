@@ -20,7 +20,11 @@ from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupCo
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine, remove_worker_from_router
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
-from slime.utils.credit_assignment import CreditAssignmentConfig, build_policy_loss_mask
+from slime.utils.credit_assignment import (
+    CreditAssignmentConfig,
+    build_policy_loss_mask,
+    excluded_from_reward_baseline,
+)
 from slime.utils.data import get_source
 from slime.utils.dp_schedule import build_dp_schedule
 from slime.utils.episode_dump import save_rllm_episode_batch
@@ -179,18 +183,36 @@ def _group_normalize_rewards(args, samples: list[Sample], raw_rewards: list[floa
         groups[group_id].append(index)
 
     use_std = args.advantage_estimator in ["grpo", "gspo", "cispo"] and args.grpo_std_normalization
+    credit_config = CreditAssignmentConfig.from_args(args)
     normalized = [0.0] * len(samples)
     for indices in groups.values():
         rewards = torch.tensor([raw_rewards[i] for i in indices], dtype=torch.float)
-        rewards = rewards - rewards.mean()
+        # Credit-assignment penalties carry a synthetic 0.0 reward, so they must
+        # not define the baseline they are then scored against. They keep their
+        # (masked) policy loss and are still centered on the clean mean -- they
+        # just lose their vote in computing it. A group with no clean sample has
+        # no definable baseline, so fall back to the full group.
+        baseline = rewards
+        if credit_config.enable:
+            keep = torch.tensor(
+                [not excluded_from_reward_baseline(samples[i].metadata, credit_config) for i in indices],
+                dtype=torch.bool,
+            )
+            if bool(keep.any()):
+                baseline = rewards[keep]
+        rewards = rewards - baseline.mean()
         if use_std:
             # Keep the historical unbiased (correction=1) convention of the
             # positional path. NOTE: process_segment_rewards uses population
             # std instead; that divergence predates this change.
-            # A singleton group is already all-zero after centering, and
-            # unbiased std over one element is NaN, so skip the division.
-            if rewards.numel() > 1:
-                rewards = rewards / (rewards.std() + 1e-6)
+            # Scale by the spread of the same population that set the mean.
+            if baseline.numel() > 1:
+                spread = (baseline - baseline.mean()).std()
+                # Constant (or numerically constant) baselines have no
+                # evidence for a scale. Dividing by epsilon would turn a
+                # normal penalty into an O(1e6) advantage.
+                if bool(torch.isfinite(spread)) and bool(spread > 1e-6):
+                    rewards = rewards / (spread + 1e-6)
         for index, reward in zip(indices, rewards.tolist(), strict=True):
             normalized[index] = reward
 
@@ -264,6 +286,9 @@ def convert_samples_to_train_data(
                 metadata=sample.metadata or {},
                 loss_mask=loss_mask,
                 config=credit_assignment_config,
+                parser_error_token_window=int(
+                    os.environ.get("CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR_TOKEN_WINDOW", "256")
+                ),
             )
             if policy_mask is not None:
                 has_explicit_policy_mask = True
@@ -1969,8 +1994,10 @@ def compute_episode_metrics_from_samples(args, samples):
     if fused_stats is None:
         return {}
 
+    raw_rewards = [reward for rewards in fused_stats["group_rewards"].values() for reward in rewards]
     metrics: dict[str, float] = {
         "episode/num": len(fused_stats["group_rewards"]),
+        "episode/reward": float(np.mean(raw_rewards)) if raw_rewards else 0.0,
     }
 
     for source, rewards in fused_stats["episode_rewards_by_source"].items():
@@ -1987,7 +2014,11 @@ def compute_episode_metrics_from_samples(args, samples):
         warning_count = sum(count for reason, count in termination_counts.items() if _is_warning_termination(reason))
         metrics["episode/termination_warning/abnormal_or_limit"] = warning_count / total
 
-    for key, values in fused_stats["workflow_values"].items():
+    workflow_values = dict(fused_stats["workflow_values"])
+    completed_rewards = workflow_values.pop("reward", [])
+    if completed_rewards:
+        metrics["episode/reward/completed_mean"] = float(np.mean(completed_rewards))
+    for key, values in workflow_values.items():
         metrics[f"episode/{key}"] = float(np.mean(values))
     for key, values in fused_stats["episode_turn_values"].items():
         metrics[f"episode/{key}"] = float(np.mean(values))

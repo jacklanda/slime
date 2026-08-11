@@ -13,6 +13,7 @@ Extends the Gemma3 implementation from mbridge with Gemma4-specific features:
   come from Megatron's MoELayer + TEGroupedMLP.
 """
 
+import copy
 import functools
 import json
 import logging
@@ -48,6 +49,7 @@ except ImportError:
     HAVE_TE = False
 
 from mbridge.models.gemma3.transformer_config import Gemma3TransformerConfig
+from slime_plugins.models.gemma4_activation import Gemma4GeluAndMul
 
 # Gemma uses GeGLU, not SwiGLU.
 _gelu_tanh = functools.partial(F.gelu, approximate="tanh")
@@ -79,8 +81,13 @@ class VNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.dim = dim
+        self.register_buffer("weight", torch.ones(dim), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if os.environ.get("SLIME_GEMMA4_BATCH_INVARIANT") == "1" and x.is_cuda:
+            from megatron.core.transformer.custom_layers.batch_invariant_kernels import BatchInvariantRMSNormFn
+
+            return BatchInvariantRMSNormFn.apply(x, self.weight, self.eps, False)
         dtype = x.dtype
         x = x.float()
         return (x * torch.pow(x.pow(2).mean(-1, keepdim=True) + self.eps, -0.5)).to(dtype)
@@ -460,6 +467,15 @@ class Gemma4TransformerLayer(TransformerLayer):
                 hidden_size=config.hidden_size,
                 eps=config.layernorm_epsilon,
             )
+
+        # Keep the spec as Megatron's native MLP so TP-group plumbing and
+        # checkpoint keys remain unchanged. Only the selected Gemma-4 dense
+        # branch receives a module-local activation dispatch override; the
+        # shared config and MoE experts retain their original behavior.
+        dense_mlp = self.dense_mlp if self.enable_moe_block else self.mlp
+        dense_mlp.config = copy.copy(dense_mlp.config)
+        dense_mlp.config.use_te_activation_func = True
+        dense_mlp.activation_func = Gemma4GeluAndMul()
 
     def _forward_dense_ffn(self, pre_mlp_ln):
         """Run the dense MLP. ``self.mlp`` is the dense MLP directly for the

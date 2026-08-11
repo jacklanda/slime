@@ -23,7 +23,15 @@ from tqdm import tqdm
 
 from slime.backends.sglang_utils.server_control import abort_servers_until_idle
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
-from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from slime.rollout.filter_hub.base_types import DynamicFilterOutput, MetricGatherer, call_dynamic_filter
+from slime.rollout.filter_hub.dynamic_sampling_filters import is_infra_failure
+from slime.rollout.task_family import (
+    has_task_family_quota_candidates,
+    parse_task_family_quotas,
+    sample_group_task_family,
+    select_task_family_quota_groups,
+    task_family_quota_counts,
+)
 from slime.utils.async_utils import run
 from slime.utils import http_utils
 from slime.utils.data import Dataset
@@ -805,6 +813,8 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
 
     # target_data_size is the total number of valid samples to get
     target_data_size = args.rollout_batch_size
+    quota_spec = getattr(args, "rollout_task_family_quotas", None)
+    task_family_quotas = parse_task_family_quotas(quota_spec)
 
     data = []
     all_data = [] if args.rollout_all_samples_process_path is not None else None
@@ -818,7 +828,10 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
     started = time.time()
     last_log = started
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Trace collection")
-    while len(data) < target_data_size:
+    while len(data) < target_data_size or (
+        task_family_quotas
+        and not has_task_family_quota_candidates(data, target_data_size, task_family_quotas)
+    ):
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
@@ -875,13 +888,22 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
             if all_data is not None:
                 all_data.append(group)
             completed_groups += 1
-            dynamic_filter_output = call_dynamic_filter(
-                dynamic_filter,
-                args,
-                _flatten_samples(group),
-                rollout_id=rollout_id,
+            flat_group = _flatten_samples(group)
+            if any(is_infra_failure(sample) for sample in flat_group):
+                dynamic_filter_output = DynamicFilterOutput(keep=False, reason="infra_failure")
+            else:
+                dynamic_filter_output = call_dynamic_filter(
+                    dynamic_filter,
+                    args,
+                    flat_group,
+                    rollout_id=rollout_id,
+                )
+            relax_filter = (
+                dynamic_filter_output.reason != "infra_failure"
+                and filter_relax_after > 0
+                and completed_groups >= filter_relax_after
+                and _group_has_trainable_response(group)
             )
-            relax_filter = filter_relax_after > 0 and completed_groups >= filter_relax_after and _group_has_trainable_response(group)
             if not dynamic_filter_output.keep and not relax_filter:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 drop_reasons[str(dynamic_filter_output.reason or "unspecified")] += 1
@@ -902,14 +924,24 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
 
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
-            if len(data) < target_data_size:
+            if len(data) < target_data_size or task_family_quotas:
                 # Rich-rendering a full episode (up to 128 step panels plus
                 # per-token mask views) is seconds of pure-Python work; keep it
                 # off the event loop so it cannot stall request dispatch for
                 # every in-flight trajectory.
                 await asyncio.to_thread(maybe_print_rollout_group, args, group, group_id=len(data))
                 data.append(group)
-                pbar.update(args.n_samples_per_prompt)
+                if pbar.n < pbar.total:
+                    pbar.update(args.n_samples_per_prompt)
+        if (
+            task_family_quotas
+            and not state.pendings
+            and not has_task_family_quota_candidates(data, target_data_size, task_family_quotas)
+        ):
+            # Accepted candidates count toward remaining_batch_size in the
+            # stock collector. Once a complete wave lacks a required family,
+            # release that count so the next wave can be submitted.
+            state.remaining_batch_size = 0
         now = time.time()
         if now - last_log > 30.0:
             # logger.info(
@@ -943,6 +975,24 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
             last_log = now
 
     pbar.close()
+    candidate_family_counts = Counter(sample_group_task_family(group) for group in data)
+    if task_family_quotas:
+        data = select_task_family_quota_groups(data, target_data_size, quota_spec)
+        required_family_counts = task_family_quota_counts(target_data_size, task_family_quotas)
+        selected_family_counts = Counter(sample_group_task_family(group) for group in data)
+        missing = {
+            family: count - selected_family_counts[family]
+            for family, count in required_family_counts.items()
+            if selected_family_counts[family] < count
+        }
+        if missing:
+            raise RuntimeError(
+                "Synchronous rollout could not satisfy task family quotas: "
+                f"missing={missing}, candidates={dict(candidate_family_counts)}"
+            )
+    else:
+        data = data[:target_data_size]
+        selected_family_counts = candidate_family_counts
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
         f"Finish group collection: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
@@ -974,6 +1024,10 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
     metrics["rollout/dynamic_filter/completed_groups"] = completed_groups
     metrics["rollout/dynamic_filter/dropped_groups"] = dropped_groups
     metrics["rollout/dynamic_filter/kept_groups"] = len(data)
+    for family, count in candidate_family_counts.items():
+        metrics[f"rollout/task_family_candidates/{family}"] = count
+    for family, count in selected_family_counts.items():
+        metrics[f"rollout/task_family_selected/{family}"] = count
     return RolloutFnTrainOutput(samples=data, metrics=metrics), aborted_samples
 
 

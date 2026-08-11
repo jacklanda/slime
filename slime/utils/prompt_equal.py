@@ -5,6 +5,8 @@ from typing import Any
 
 import torch
 
+from slime.utils.credit_assignment import CreditAssignmentConfig, excluded_from_reward_baseline
+
 
 PROMPT_EQUAL_LOSS_ESTIMATORS = {"grpo", "reinforce_plus_plus_baseline"}
 _SEGMENT_REWARD_NORMALIZATION_ESTIMATORS = {
@@ -35,16 +37,16 @@ def _is_segment_marked(metadata: dict[str, Any]) -> bool:
     return metadata.get("parent_traj_id") is not None and int(metadata.get("segment_count", 1) or 1) > 1
 
 
-def trajectory_level_rewards(args: Any, samples: list[Any]) -> list[float]:
-    """Collapse per-segment rewards to one value per trajectory.
+def trajectory_level_samples(samples: list[Any]) -> list[Any]:
+    """Select the reward-carrying anchor sample from each trajectory.
 
     The anchor segment (max segment_index) carries the trajectory's terminal
     reward. Current fused rollouts keep sibling rewards sparse, while legacy or
     external TiTO producers may duplicate the terminal reward on every segment;
-    taking the anchor's value is correct for both. Samples without a
-    parent_traj_id each count as their own trajectory.
+    selecting the anchor is correct for both. Samples without a parent_traj_id
+    each count as their own trajectory.
     """
-    anchor_rewards: dict[str, float] = {}
+    anchors: dict[str, Any] = {}
     anchor_segment_indices: dict[str, int] = {}
     order: list[str] = []
     for position, sample in enumerate(samples):
@@ -52,14 +54,14 @@ def trajectory_level_rewards(args: Any, samples: list[Any]) -> list[float]:
         parent_traj_id = metadata.get("parent_traj_id")
         key = str(parent_traj_id) if parent_traj_id is not None else f"__no_parent_{position}"
         segment_index = int(metadata.get("segment_index", 0) or 0)
-        if key not in anchor_rewards:
+        if key not in anchors:
             order.append(key)
-            anchor_rewards[key] = float(sample.get_reward_value(args))
+            anchors[key] = sample
             anchor_segment_indices[key] = segment_index
         elif segment_index >= anchor_segment_indices[key]:
-            anchor_rewards[key] = float(sample.get_reward_value(args))
+            anchors[key] = sample
             anchor_segment_indices[key] = segment_index
-    return [anchor_rewards[key] for key in order]
+    return [anchors[key] for key in order]
 
 
 def prompt_equal_mask_sums(
@@ -166,14 +168,38 @@ def process_segment_rewards(
             assert group_index is not None or bool(getattr(samples[representative], "remove_sample", False)), f"live reward representative at index {getattr(samples[representative], 'index', '?')} has group_index=None"
             prompt_groups[group_index].append(representative)
 
+        credit_config = CreditAssignmentConfig.from_args(args)
         for representative_indices in prompt_groups.values():
             values = torch.tensor([shaped_rewards[index] for index in representative_indices], dtype=torch.float32)
-            normalized = values - values.mean()
+            # Credit-assignment penalties carry a synthetic 0.0 reward, so they
+            # must not define the baseline they are then scored against. They
+            # keep their (masked) policy loss and are still centered on the
+            # clean mean -- they just lose their vote in computing it.
+            baseline_values = values
+            if credit_config.enable:
+                keep = torch.tensor(
+                    [
+                        not excluded_from_reward_baseline(
+                            getattr(samples[index], "metadata", None),
+                            credit_config,
+                        )
+                        for index in representative_indices
+                    ],
+                    dtype=torch.bool,
+                )
+                # A group with no clean sample has no definable baseline; fall
+                # back to the full group rather than dropping it.
+                if bool(keep.any()):
+                    baseline_values = values[keep]
+            normalized = values - baseline_values.mean()
             # Match the Dressage reference implementation's population std.
-            # A singleton group has zero advantage after mean-centering, so skip
-            # the std division rather than relying on epsilon alone.
-            if values.numel() > 1 and estimator in {"grpo", "gspo", "cispo"} and bool(getattr(args, "grpo_std_normalization", False)):
-                normalized = normalized / (normalized.std(correction=0) + 1e-6)
+            if baseline_values.numel() > 1 and estimator in {"grpo", "gspo", "cispo"} and bool(getattr(args, "grpo_std_normalization", False)):
+                # Scale by the spread of the same population that set the mean.
+                spread = (baseline_values - baseline_values.mean()).std(correction=0)
+                # A constant baseline has no evidence for a scale. Dividing by
+                # epsilon would turn parser-error penalties into O(1e6).
+                if bool(torch.isfinite(spread)) and bool(spread > 1e-6):
+                    normalized = normalized / (spread + 1e-6)
             for index, value in zip(representative_indices, normalized.tolist(), strict=True):
                 processed[index] = value
 

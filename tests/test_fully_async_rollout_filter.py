@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import slime.rollout.fully_async_rollout as fully_async
 from slime.rollout.base_types import RolloutFnTrainOutput
+from slime.rollout.filter_hub.dynamic_sampling_filters import is_infra_failure
 from slime.utils.types import Sample
 
 
@@ -72,6 +73,39 @@ def test_fully_async_dynamic_filter_keeps_nonzero_variance_groups(monkeypatch):
     assert output.metrics["rollout/dynamic_filter/drop_zero_std_0.0"] == 1
     assert worker.resumed is True
     assert worker.paused is True
+
+
+def test_fully_async_dynamic_filter_excludes_infra_failure_from_zero_reward(monkeypatch):
+    failed = _sample(0, 0.0)
+    failed.status = Sample.Status.FAILED
+    failed.metadata.update({"fused_error": "rollout_group_timeout"})
+    groups = [
+        [failed, _sample(1, 0.0)],
+        [_sample(2, 0.0), _sample(3, 1.0)],
+    ]
+    worker = FakeWorker(groups)
+
+    monkeypatch.setattr(fully_async, "_get_global_worker", lambda args, data_buffer: worker)
+
+    args = SimpleNamespace(
+        rollout_global_dataset=True,
+        rollout_batch_size=1,
+        dynamic_sampling_filter_path="slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std",
+        reward_key=None,
+    )
+
+    output = asyncio.run(fully_async._generate_rollout_async(args, rollout_id=0, data_buffer=None))
+
+    assert output.samples == [groups[1]]
+    assert output.metrics["rollout/dynamic_filter/drop_infra_failure"] == 1
+
+
+def test_verifier_exception_is_classified_as_infra_failure():
+    sample = _sample(0, 0.0)
+    sample.status = Sample.Status.COMPLETED
+    sample.metadata["fused_reward_debug"] = {"reward": 0.0, "verifier_error": "RuntimeError: unavailable"}
+
+    assert is_infra_failure(sample) is True
 
 
 def test_fully_async_omits_candidate_and_selected_fused_distributions(monkeypatch):
@@ -150,6 +184,20 @@ def test_task_family_quota_selection_prefers_requested_mix():
     assert families.count("webqa") == 1
     assert families.count("mcp") == 2
     assert families.count("cli") == 1
+
+
+def test_task_family_quota_selection_splits_eight_groups_evenly():
+    groups = [
+        *[[_sample(index, 1.0, "mcp")] for index in range(6)],
+        *[[_sample(index, 1.0, "web_search")] for index in range(6, 12)],
+    ]
+    args = SimpleNamespace(rollout_task_family_quotas="mcp=0.5,webqa=0.5")
+
+    selected = fully_async._select_task_family_quota_groups(groups, target=8, args=args)
+
+    families = [fully_async._sample_group_task_family(group) for group in selected]
+    assert families.count("mcp") == 4
+    assert families.count("webqa") == 4
 
 
 def test_task_family_quota_selection_fills_missing_family_from_remaining():

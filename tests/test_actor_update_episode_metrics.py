@@ -108,6 +108,7 @@ def test_actor_update_episode_metrics_logs_zero_when_no_valid_episode(monkeypatc
     )
 
     assert metrics["episode/num"] == 0.0
+    assert metrics["episode/reward"] == 0.0
     assert metrics["episode/training_reward/mean"] == 0.0
     assert "episode/reward/mean" not in metrics
     assert "episode/pass@1" not in metrics
@@ -185,11 +186,47 @@ def test_actor_update_episode_metrics_deduplicates_multi_segment_trajectories(mo
     )
 
     assert metrics["episode/num"] == 2.0
+    assert metrics["episode/reward"] == 0.5
     assert metrics["episode/training_reward/mean"] == 0.5
     assert metrics["episode/reward/webqa/mean"] == 0.5
     assert metrics["episode/termination_reason/env_done"] == 0.5
     assert metrics["episode/termination_reason/abnormal_parse_error"] == 0.5
     assert metrics["episode/tool_calls"] == 1.0
+
+
+def test_actor_update_episode_reward_counts_abnormal_trajectories(monkeypatch):
+    metrics_fn = _episode_metrics_for_actor_update(monkeypatch)
+
+    metrics = metrics_fn(
+        {
+            "episode_metrics_data": {
+                "raw_rewards": [1.0, 0.0],
+                "metadata": [
+                    {
+                        "fused_task_type": "webqa",
+                        "fused_termination": "env_done",
+                        "rllm_episode": {"metrics": {"reward": 1.0}},
+                    },
+                    {
+                        "fused_task_type": "webqa",
+                        "fused_termination": "ABNORMAL_PARSE_ERROR",
+                    },
+                ],
+                "group_indices": [1, 2],
+                "remove_sample": [False, False],
+                "loss_mask_sums": [3, 3],
+                "prompt_lengths": [2, 2],
+                "response_lengths": [4, 4],
+                "statuses": ["completed", "completed"],
+            }
+        }
+    )
+
+    assert metrics["episode/reward"] == 0.5
+    assert metrics["episode/training_reward/mean"] == 0.5
+    assert metrics["episode/reward/completed_mean"] == 1.0
+    assert metrics["episode/termination_reason/env_done"] == 0.5
+    assert metrics["episode/termination_reason/abnormal_parse_error"] == 0.5
 
 
 def test_actor_update_episode_metrics_logs_fused_abnormal_termination_details(monkeypatch):

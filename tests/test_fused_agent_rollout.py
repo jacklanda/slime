@@ -865,7 +865,7 @@ def test_qwen35_schema_violation_terminates_current_turn_as_tool_parser_error():
         "malformed parameter name '\"query'",
         "unknown parameter 'include_full_text' for tool 'web_search'",
     ]
-    assert _policy_masked_text(sample) == ""
+    assert _policy_masked_text(sample) == bad
 
 
 def test_qwen35_invalid_typed_parameter_is_a_schema_error():
@@ -954,6 +954,17 @@ def test_gemma4_tool_prompt_uses_native_declarations():
     assert 'finish{command:<|"|>submit<|"|>,result:<|"|>CONCISE_FINAL_ANSWER<|"|>}' in prompt
 
 
+def test_gemma4_tool_prompt_uses_structured_finish_contract_for_union_schema():
+    schema = finish_schema(structured_result=True)
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    prompt = parser.get_tool_prompt(json.dumps(schema, ensure_ascii=False))
+
+    assert 'finish{command:<|"|>submit<|"|>,result:{...}}' in prompt
+    assert "finish.result" in prompt
+    assert 'result:<|"|>CONCISE_FINAL_ANSWER<|"|>' not in prompt
+
+
 def test_gemma4_tool_parser_strictly_validates_declared_tool_names_and_argument_types():
     schema = tool_schema(
         "submit_result_difficulty_3",
@@ -965,10 +976,18 @@ def test_gemma4_tool_parser_strictly_validates_declared_tool_names_and_argument_
     prompt = parser.get_tool_prompt(json.dumps(schema))
 
     assert "submit_result_difficulty_3.result" in prompt
-    invalid = '<|tool_call>call:submit_result_difficulty_3{result:<|"|>{"framework_analysis": []}<|"|>}<tool_call|>'
+    legacy_string = '<|tool_call>call:submit_result_difficulty_3{result:<|"|>{"framework_analysis": []}<|"|>}<tool_call|>'
+    calls = parser.parse(legacy_string)
+    assert calls[0].arguments == {"result": {"framework_analysis": []}}
+    assert parser.last_schema_errors == []
+
+    invalid = '<|tool_call>call:submit_result_difficulty_3{result:<|"|>not-json<|"|>}<tool_call|>'
     assert parser.parse(invalid) == []
     assert "invalid type for parameter 'result'" in parser.last_schema_errors[0]
-    assert parser.last_schema_error_spans == [(0, len(invalid))]
+    invalid_value = '<|"|>not-json<|"|>'
+    value_start = invalid.index(invalid_value)
+    assert parser.last_schema_error_spans == [(value_start, value_start + len(invalid_value))]
+    assert parser.last_schema_error_kinds == ["invalid_parameter_type"]
 
     calls = parser.parse(
         '<|tool_call>call:submit_result_difficulty_3{result:{framework_analysis:[]}}<tool_call|>'
@@ -979,6 +998,103 @@ def test_gemma4_tool_parser_strictly_validates_declared_tool_names_and_argument_
 
     assert parser.parse('<|tool_call>call:submit_result_difficulty3{result:{}}<tool_call|>') == []
     assert parser.last_schema_errors == ["unknown tool name 'submit_result_difficulty3'"]
+    assert parser.last_schema_error_kinds == ["unknown_tool"]
+
+
+def test_gemma4_tool_parser_safely_coerces_schema_typed_arguments():
+    schema = tool_schema(
+        "typed_tool",
+        "Typed arguments.",
+        {
+            "count": {"type": "integer"},
+            "ratio": {"type": "number"},
+            "enabled": {"type": "boolean"},
+            "items": {"type": "array"},
+            "payload": {"type": "object"},
+            "optional_count": {"type": "integer"},
+        },
+        ["count", "ratio", "enabled", "items", "payload"],
+    )
+    parser = make_tool_parser("gemma4", valid_tools={"typed_tool"})
+    parser.get_tool_prompt(json.dumps(schema))
+
+    calls = parser.parse(
+        '<|tool_call>call:typed_tool{count:<|"|>3<|"|>,ratio:<|"|>1.25e2<|"|>,'
+        'enabled:<|"|>true<|"|>,items:<|"|>["a","b"]<|"|>,'
+        'payload:<|"|>{"answer":42}<|"|>,optional_count:null}<tool_call|>'
+    )
+
+    assert calls[0].arguments == {
+        "count": 3,
+        "ratio": 125.0,
+        "enabled": True,
+        "items": ["a", "b"],
+        "payload": {"answer": 42},
+    }
+    assert len(parser.last_schema_coercions) == 6
+    assert parser.last_schema_errors == []
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{count:<|"|>3.5<|"|>,label:<|"|>ok<|"|>}',
+        '{count:3,label:[<|"|>not<|"|>,<|"|>scalar<|"|>]}',
+        '{count:null,label:<|"|>ok<|"|>}',
+    ],
+)
+def test_gemma4_tool_parser_keeps_ambiguous_type_mismatches_fatal(arguments):
+    schema = tool_schema(
+        "typed_tool",
+        "Typed arguments.",
+        {"count": {"type": "integer"}, "label": {"type": "string"}},
+        ["count", "label"],
+    )
+    parser = make_tool_parser("gemma4", valid_tools={"typed_tool"})
+    parser.get_tool_prompt(json.dumps(schema))
+
+    assert parser.parse(f"<|tool_call>call:typed_tool{arguments}<tool_call|>") == []
+    assert parser.last_schema_error_kinds == ["invalid_parameter_type"]
+
+
+def test_gemma4_tool_parser_localizes_emitted_schema_errors_but_not_omissions():
+    schema = tool_schema(
+        "finish",
+        "Finish.",
+        {"command": {"type": "string"}, "result": {"type": "object"}},
+        ["command", "result"],
+    )
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    parser.get_tool_prompt(json.dumps(schema))
+
+    unknown_parameter = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+        'extra:1,result:{answer:<|"|>42<|"|>}}<tool_call|>'
+    )
+    calls = parser.parse(unknown_parameter)
+    assert calls[0].arguments == {"command": "submit", "result": {"answer": "42"}}
+    extra_start = unknown_parameter.index("extra")
+    assert parser.last_schema_error_spans == [(extra_start, extra_start + len("extra"))]
+    assert parser.last_schema_error_kinds == ["unknown_parameter"]
+
+    missing_parameter = '<|tool_call>call:finish{command:<|"|>submit<|"|>}<tool_call|>'
+    assert parser.parse(missing_parameter) == []
+    assert parser.last_schema_error_spans == [None]
+    assert parser.last_schema_error_kinds == ["missing_parameter"]
+
+
+def test_gemma4_tool_parser_localizes_structured_result_syntax_error():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    parser.get_tool_prompt(json.dumps(finish_schema(structured_result=True)))
+    malformed = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+        'result:{items:[{value:1}{value:2}]}}<tool_call|>'
+    )
+
+    assert parser.parse(malformed) == []
+    assert parser.last_schema_error_kinds == ["invalid_syntax"]
+    start, end = parser.last_schema_error_spans[0]
+    assert malformed[start:end] == "{"
 
 
 def test_gemma4_tool_prompt_formats_complex_json_schema_without_python_repr():
@@ -1284,6 +1400,55 @@ def test_gemma4_web_search_accepts_terminal_native_query_without_close_marker():
 
 
 @pytest.mark.parametrize(
+    ("response", "repairs"),
+    [
+        (
+            '<|tool_call>call:web_search{query:<|"|>deterministic query<tool_call|>',
+            ["missing_native_string_end", "missing_argument_object_end"],
+        ),
+        (
+            '<|tool_call>call:web_search{query:<|"|>deterministic query<|"|><tool_call|>',
+            ["missing_argument_object_end"],
+        ),
+        (
+            '<|tool_call>call:web_search{query:"deterministic query<tool_call|>',
+            ["missing_quoted_string_end", "missing_argument_object_end"],
+        ),
+        (
+            '<|tool_call>call:web_search{query:<|"|>deterministic query<|"|>}<|tool_response>',
+            ["missing_tool_call_end"],
+        ),
+    ],
+)
+def test_gemma4_tool_parser_repairs_only_deterministic_call_closures(response, repairs):
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+
+    calls = parser.parse(response)
+
+    assert calls[0].arguments == {"query": "deterministic query"}
+    assert parser.last_syntax_repairs == repairs
+    assert parser.last_schema_errors == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        '<|tool_call>call:web_search{query:<|"|>truncated without a boundary',
+        '<|tool_call>call:web_search{query:<|"|>ambiguous """ query}<tool_call|>',
+        '<|tool_call>call:web_search{query:<|"|>query<|"|>,payload:{items:[1,2]<tool_call|>',
+        '<|tool_call>call:web_search{query:<|"|>query<|"|>} trailing prose',
+    ],
+)
+def test_gemma4_tool_parser_does_not_repair_ambiguous_truncation(response):
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+
+    assert parser.parse(response) == []
+    assert parser.last_syntax_repairs == []
+
+
+@pytest.mark.parametrize(
     ("arguments", "expected_query", "expected_max_results"),
     [
         (
@@ -1450,7 +1615,8 @@ def test_gemma4_parser_error_credit_assignment_masks_only_bad_native_action():
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
     assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
-    assert _policy_masked_text(sample) == ""
+    assert sample.metadata["credit_assignment_error_attribution"] == "localized"
+    assert _policy_masked_text(sample) == bad
 
 
 def test_gemma4_malformed_closed_tool_call_terminates_as_parser_error():
@@ -1472,7 +1638,108 @@ def test_gemma4_malformed_closed_tool_call_terminates_as_parser_error():
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
     assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
-    assert _policy_masked_text(sample) == ""
+    assert sample.metadata["credit_assignment_error_attribution"] == "localized"
+    assert _policy_masked_text(sample) == bad
+
+
+@pytest.mark.parametrize(
+    ("bad", "penalized_text", "error_kind"),
+    [
+        (
+            '<|tool_call>call:unknown_tool{value:<|"|>bad<|"|>}<tool_call|>',
+            "unknown_tool",
+            "unknown_tool",
+        ),
+        (
+            '<|tool_call>call:echo{value:{bad:true}}<tool_call|>',
+            "{bad:true}",
+            "invalid_parameter_type",
+        ),
+    ],
+)
+def test_gemma4_parser_error_credit_assignment_penalizes_only_localized_schema_token(
+    tmp_path: Path,
+    bad: str,
+    penalized_text: str,
+    error_kind: str,
+):
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Trigger a localized schema error"),
+        [{"text": bad}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["credit_assignment_error_attribution"] == "localized"
+    assert sample.metadata["tool_parser_error_kinds"] == [error_kind]
+    assert _policy_masked_text(sample) == penalized_text
+
+
+def test_gemma4_missing_required_parameter_penalizes_terminal_action(tmp_path: Path):
+    bad = '<|tool_call>call:echo{}<tool_call|>'
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Trigger a missing parameter"),
+        [{"text": bad}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["credit_assignment_error_attribution"] == "localized"
+    assert sample.metadata["tool_parser_error_kinds"] == ["missing_parameter"]
+    assert _policy_masked_text(sample) == bad
+
+
+def test_gemma4_unknown_optional_parameter_executes_declared_subset(tmp_path: Path):
+    unknown = '<|tool_call>call:echo{value:<|"|>good<|"|>,unknown_parameter:<|"|>bad<|"|>}<tool_call|>'
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Recover from an optional parameter"),
+        [{"text": unknown}, {"text": _gemma4_finish_call()}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0]
+    assert sample.reward == 1.0
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["tool_parser_error_recoverable"] is True
+    assert sample.metadata["tool_parser_error_kinds"] == ["unknown_parameter"]
+
+
+def test_gemma4_deterministic_syntax_repair_continues_rollout(tmp_path: Path):
+    missing_call_end = '<|tool_call>call:echo{value:<|"|>good<|"|>}<|tool_response>'
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Recover a deterministic call boundary"),
+        [{"text": missing_call_end}, {"text": _gemma4_finish_call()}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0]
+    assert sample.reward == 1.0
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["tool_parser_syntax_repairs"] == ["missing_tool_call_end"]
+    assert sample.metadata["credit_assignment_event"] is None
 
 
 def test_gemma4_web_search_recovers_terminal_missing_ordinary_quote():
@@ -1545,13 +1812,14 @@ def test_gemma4_valid_call_then_unclosed_native_marker_terminates_as_parser_erro
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
     assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
-    assert _policy_masked_text(sample) == valid
+    assert sample.metadata["credit_assignment_error_attribution"] == "localized"
+    assert _policy_masked_text(sample) == malformed
     assert "before-error" not in sample.metadata["rllm_episode"]["trajectories"][0]["steps"][0]["observation"]
 
 
-def test_gemma4_valid_call_then_malformed_closed_native_marker_terminates_as_parser_error(tmp_path: Path):
+def test_gemma4_valid_call_then_ambiguous_nested_truncation_terminates_as_parser_error(tmp_path: Path):
     valid = _gemma4_echo_call("before-error")
-    malformed = '<|tool_call>call:echo{value:"unterminated}<tool_call|>'
+    malformed = '<|tool_call>call:echo{value:{nested:[1,2}<tool_call|>'
     response = valid + malformed
 
     result = _run_generate_with_fake_sglang(
@@ -1570,7 +1838,9 @@ def test_gemma4_valid_call_then_malformed_closed_native_marker_terminates_as_par
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
     assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
-    assert _policy_masked_text(sample) == valid
+    assert sample.metadata["credit_assignment_error_attribution"] == "localized"
+    assert _policy_masked_text(sample)
+    assert _policy_masked_text(sample) in malformed
     assert "before-error" not in sample.metadata["rllm_episode"]["trajectories"][0]["steps"][0]["observation"]
 
 
@@ -1924,6 +2194,41 @@ def submit_result(result: dict) -> dict:
     assert caplog.text.count("keeping the registered tools") == 1
 
 
+def test_local_mcp_uses_single_finish_tool_with_submission_result_schema(tmp_path: Path):
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    (asset / "tools.py").write_text(
+        """
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("Tools")
+
+@mcp.tool(description="Submit structured result")
+def submit_result_difficulty_3(result: dict) -> dict:
+    if not isinstance(result, dict):
+        raise ValueError(f"result must be a dict, got {type(result).__name__}")
+    return result
+
+@mcp.tool(description="Submit list result")
+def submit_result_difficulty_1(result: list) -> list:
+    return result
+""",
+        encoding="utf-8",
+    )
+    env = FusedEnvironment({"question": "Submit answer", "difficulty": 3, "tools_py": str(asset / "tools.py")})
+    tool_names = {schema["function"]["name"] for schema in env.tools()}
+    finish = next(schema for schema in env.tools() if schema["function"]["name"] == "finish")
+
+    assert tool_names == {"finish"}
+    assert finish["function"]["parameters"]["properties"]["result"]["type"] == "object"
+
+    _observation, _reward, done, _info = asyncio.run(
+        env.step(ToolCall("finish", {"command": "submit", "result": {"done": True}}))
+    )
+    assert done is True
+    assert env.answer == '{"done":true}'
+    assert json.loads(env.answer) == {"done": True}
+
+
 def test_mcp_verifier_reward_requires_a_tool_call(tmp_path: Path):
     sample = _local_mcp_sample(tmp_path, question="Submit without retrieving")
     env = FusedEnvironment(sample.metadata)
@@ -1937,6 +2242,128 @@ def test_mcp_verifier_reward_requires_a_tool_call(tmp_path: Path):
     assert env.compute_final_reward() == 1.0
 
 
+def test_mcp_empty_retrieval_retries_with_default_filters(tmp_path: Path):
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    (asset / "tools.py").write_text(
+        """
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("Tools")
+
+@mcp.tool(description="Retrieve matching records")
+def get_records(query: str = "", min_items: int = 0) -> list[dict]:
+    if query or min_items:
+        return []
+    return [{"title": "Broad evidence"}]
+""",
+        encoding="utf-8",
+    )
+    env = FusedEnvironment({"question": "Find evidence", "tools_py": str(asset / "tools.py")})
+
+    observation, reward, done, info = asyncio.run(
+        env.step(ToolCall("get_records", {"query": "overly specific", "min_items": 3}))
+    )
+
+    assert json.loads(observation) == {
+        "_slime_query_fallback": "The original filters returned no results; this result uses the tool defaults.",
+        "result": [{"title": "Broad evidence"}],
+    }
+    assert reward == 0.0
+    assert done is False
+    assert info["tools/mcp_empty_result"] == 0
+    assert info["tools/mcp_query_fallback_attempted"] == 1
+    assert info["tools/mcp_query_fallback_used"] == 1
+    assert env.mcp_empty_tool_results == 0
+    assert env.mcp_nonempty_tool_results == 1
+
+
+def test_mcp_verifier_tool_calls_ignore_unknown_generated_filters_without_relaxing_evidence_query(tmp_path: Path):
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    (asset / "tools.py").write_text(
+        """
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("Tools")
+
+@mcp.tool(description="Retrieve matching records")
+def get_records(query: str = "") -> list[dict]:
+    return [] if query else [{"title": "Evidence"}]
+""",
+        encoding="utf-8",
+    )
+    task = {
+        "question": "Find evidence",
+        "tools_py": str(asset / "tools.py"),
+        "verifier": {
+            "verification_code": """
+def verify(tools, answer):
+    records = tools['get_records'](query='', generated_unknown_filter=True)
+    return {'passed': bool(records), 'message': 'verified from records'}
+"""
+        },
+    }
+    env = FusedEnvironment(task)
+    env.answer = json.dumps({"title": "Evidence"})
+    env.tool_calls = 1
+
+    assert env.compute_final_reward() == 1.0
+    assert env.reward_debug["verifier_passed"] is True
+
+    env.task["verifier"]["verification_code"] = """
+def verify(tools, answer):
+    records = tools['get_records'](query='too narrow', generated_unknown_filter=True)
+    return {'passed': bool(records), 'message': 'verified from records'}
+"""
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["verifier_passed"] is False
+
+
+def test_mcp_verifier_rejects_empty_answer_even_when_verifier_passes(tmp_path: Path):
+    sample = _local_mcp_sample(tmp_path, question="Extract evidence")
+    sample.metadata["verifier"]["verification_code"] = """
+def verify(tools, answer):
+    return {'passed': True, 'message': 'No requirements found in documents'}
+"""
+    env = FusedEnvironment(sample.metadata)
+    env.answer = "[]"
+    env.tool_calls = 1
+
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["verifier_skipped"] == "empty_answer"
+
+
+def test_mcp_verifier_rejects_degenerate_success_message(tmp_path: Path):
+    sample = _local_mcp_sample(tmp_path, question="Extract evidence")
+    sample.metadata["verifier"]["verification_code"] = """
+def verify(tools, answer):
+    return {'passed': True, 'message': 'No requirements found in documents'}
+"""
+    env = FusedEnvironment(sample.metadata)
+    env.answer = json.dumps([{"requirement": "nonempty but unsupported"}])
+    env.tool_calls = 1
+
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["verifier_passed"] is False
+    assert env.reward_debug["verifier"]["rejected_degenerate_success"] is True
+
+
+def test_mcp_verifier_allows_explicitly_valid_empty_answer(tmp_path: Path):
+    sample = _local_mcp_sample(tmp_path, question="Confirm that there are no matching records")
+    sample.metadata["verifier"] = {
+        "allow_empty_answer": True,
+        "verification_code": """
+def verify(tools, answer):
+    return {'passed': answer == [], 'message': 'No requirements found in documents'}
+""",
+    }
+    env = FusedEnvironment(sample.metadata)
+    env.answer = "[]"
+    env.tool_calls = 1
+
+    assert env.compute_final_reward() == 1.0
+    assert env.reward_debug["verifier_passed"] is True
+
+
 def test_mcp_tool_load_error_is_nonfatal(tmp_path: Path):
     asset = tmp_path / "asset"
     asset.mkdir()
@@ -1948,6 +2375,8 @@ def test_mcp_tool_load_error_is_nonfatal(tmp_path: Path):
     assert info["task_type"] == "mcp"
     assert "env_error" in info
     assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["infra_failure"] is True
+    assert env.reward_debug["infra_failure_reasons"] == ["mcp_tools_load_error"]
 
 
 def test_mcp_tool_elapsed_time_is_reported(tmp_path: Path, monkeypatch):
@@ -1997,6 +2426,15 @@ def test_mcp_atlas_task_filters_schemas_and_calls_http_tool(monkeypatch):
                 "description": "Read a file",
                 "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}},
             },
+            {
+                "name": "submit_result_difficulty_2",
+                "description": "Submit result",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"result": {"type": "object"}},
+                    "required": ["result"],
+                },
+            },
         ],
     )
 
@@ -2028,7 +2466,7 @@ def test_mcp_atlas_task_filters_schemas_and_calls_http_tool(monkeypatch):
         "data_source": "mcp_atlas",
         "mcp_transport": "atlas",
         "mcp_sandbox_url": "http://atlas.test:1984",
-        "enabled_tools": ["calculator_add"],
+        "enabled_tools": ["calculator_add", "submit_result_difficulty_2"],
     }
     env = FusedEnvironment(task)
 
@@ -2038,7 +2476,9 @@ def test_mcp_atlas_task_filters_schemas_and_calls_http_tool(monkeypatch):
     assert resolve_task_mode(task) == "mcp"
     assert observation == "Add two numbers"
     assert info["task_type"] == "mcp"
-    assert _valid_tool_names(env.tools()) == {"calculator_add", "finish", "submit"}
+    assert _valid_tool_names(env.tools()) == {"calculator_add", "finish"}
+    finish = next(schema for schema in env.tools() if schema["function"]["name"] == "finish")
+    assert finish["function"]["parameters"]["properties"]["result"]["type"] == "object"
     assert result == '{"result":5}'
     assert reward == 0.0
     assert done is False
@@ -2137,7 +2577,7 @@ def test_mcp_atlas_read_only_hides_and_blocks_mutating_tools(monkeypatch):
         }
     )
 
-    assert _valid_tool_names(env.tools()) == {"slack_channels_list", "finish", "submit"}
+    assert _valid_tool_names(env.tools()) == {"slack_channels_list", "finish"}
     observation, reward, done, _metrics = asyncio.run(env.step(ToolCall("slack_conversations_add_message", {"channel_id": "C1", "text": "test"})))
 
     assert observation == "Error: MCP-Atlas read-only evaluation blocks mutating tool slack_conversations_add_message"
@@ -2158,7 +2598,7 @@ def test_mcp_atlas_reports_tools_missing_from_sandbox(monkeypatch):
     _observation, info = env.reset()
 
     assert "anili_get_anime" in info["env_warning"]
-    assert _valid_tool_names(env.tools()) == {"finish", "submit"}
+    assert _valid_tool_names(env.tools()) == {"finish"}
 
 
 def test_mcp_atlas_accepts_parquet_ndarray_enabled_tools(monkeypatch):
@@ -2184,7 +2624,7 @@ def test_mcp_atlas_accepts_parquet_ndarray_enabled_tools(monkeypatch):
     _observation, info = env.reset()
 
     assert "env_warning" not in info
-    assert _valid_tool_names(env.tools()) == {"wikipedia_search_wikipedia", "finish", "submit"}
+    assert _valid_tool_names(env.tools()) == {"wikipedia_search_wikipedia", "finish"}
 
 
 def test_mcp_atlas_caps_large_tool_output(monkeypatch):
@@ -3685,6 +4125,26 @@ def test_web_search_summary_failure_falls_back_to_documents(monkeypatch):
     assert reward == 0.0
     assert done is False
     assert len([url for url, _ in FakeSession.calls if url.endswith("/summarize")]) == 3
+
+
+def test_web_search_retrieval_failure_is_not_an_ordinary_zero_reward(monkeypatch):
+    async def fail_retrieve(*_args, **_kwargs):
+        raise asyncio.TimeoutError("retrieval unavailable")
+
+    monkeypatch.setattr(fused_env, "_retrieve_json_cached", fail_retrieve)
+    monkeypatch.setenv("FUSED_WEBQA_MIN_UNIQUE_SEARCHES", "1")
+    env = FusedEnvironment({"question": "Find evidence", "ground_truth": "answer"})
+
+    observation, reward, done, info = asyncio.run(env.step(ToolCall("web_search", {"query": "q"})))
+    env.answer = "wrong"
+
+    assert observation.startswith("Search failed: TimeoutError")
+    assert reward == 0.0
+    assert done is False
+    assert info["infra_failure"] is True
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["infra_failure"] is True
+    assert env.reward_debug["infra_failure_reasons"] == ["search_retrieval_TimeoutError"]
 
 
 def test_web_search_summary_failure_does_not_disable_future_summary_attempts(monkeypatch):
@@ -5300,7 +5760,7 @@ def test_trailing_im_end_is_not_replayed_twice_in_next_prompt():
 
 def test_long_horizon_credit_assignment_masks_prior_assistant_generations_intentionally():
     prior_turns = [_search_call(f"unique query {i:02d}") for i in range(18)]
-    repeated = _search_call("unique query 07")
+    repeated = _search_call("unique query 17")
     tokenizer = FakeChatTemplateTokenizer()
 
     result = _run_generate_with_fake_sglang(
@@ -5329,7 +5789,11 @@ def test_long_horizon_credit_assignment_masks_prior_assistant_generations_intent
     visual_unmasked = _visualized_text_by_styles(
         sample,
         tokenizer,
-        {rollout_visualization._UNMASKED_TOKEN_STYLE, rollout_visualization._REWARD_NEG_STYLE},
+        {
+            rollout_visualization._UNMASKED_TOKEN_STYLE,
+            rollout_visualization._UNMASKED_TOOL_CALL_STYLE,
+            rollout_visualization._REWARD_NEG_STYLE,
+        },
     )
     visual_masked = _visualized_text_by_style(sample, tokenizer, rollout_visualization._MASKED_TOKEN_STYLE)
     assert repeated in visual_unmasked
@@ -5428,6 +5892,58 @@ def test_disable_thinking_visualization_keeps_thinking_empty_for_action_only_res
     assert step["thought"] == ""
     assert step["info"]["disable_thinking"] is True
     assert rollout_visualization._step_thinking_and_response(step) == ("", action)
+
+
+def test_gemma4_visualization_separates_native_thought_channel_from_action():
+    action = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+        'result:<|"|>Austrocallerya megasperma<|"|>}<tool_call|><eos>'
+    )
+    response = (
+        "<|channel>thought\n"
+        "The evidence supports the modern accepted name.\n"
+        "I will submit the scientific name.\n"
+        f"<channel|>{action}"
+    )
+    step = {
+        "model_response": response,
+        "thought": "<|channel>thought\nstale fallback<channel|>",
+    }
+
+    assert rollout_visualization._step_thinking_and_response(step) == (
+        "The evidence supports the modern accepted name.\nI will submit the scientific name.",
+        action,
+    )
+    assert rollout_visualization._step_thinking_and_response(
+        {
+            "model_response": f"<|channel>thought\n<channel|>{action}",
+            "thought": "stale fallback",
+        }
+    ) == ("", action)
+
+
+def test_step_visualization_separates_thinking_panel_with_blank_line():
+    from rich.console import Console
+
+    console = Console(width=80, force_terminal=False, color_system=None, record=True)
+    rollout_visualization._print_step(
+        console,
+        {
+            "thought": "internal plan",
+            "response": "tool call",
+            "observation": "tool result",
+            "reward": 0.0,
+            "done": False,
+        },
+        0,
+        1,
+        max_chars=200,
+    )
+
+    lines = console.export_text().splitlines()
+    thinking_line = next(index for index, line in enumerate(lines) if "Thinking" in line)
+    assert thinking_line > 0
+    assert lines[thinking_line - 1].strip("│ ") == ""
 
 
 def test_legacy_function_tool_action_executes_and_trains(tmp_path: Path):
@@ -5992,7 +6508,7 @@ def test_mixed_tool_and_answer_credit_assignment_masks_only_error_turn():
             credit_event="mixed_tool_and_answer",
             credit_step_index=1,
         )
-        == [1] * 5
+        == [0] * 5
     )
     assert (
         fused_generate._credit_assignment_loss_mask(
@@ -6026,7 +6542,16 @@ def test_credit_assignment_policy_mask_never_unmasks_base_loss_mask_tokens():
         credit_step_index=0,
         parser_error_token_window=5,
         base_loss_mask=base_loss_mask,
-    ) == [0, 0, 0, 0, 0, 0, 0]
+    ) == [0, 0, 1, 1, 0, 1, 0]
+
+    assert fused_generate._credit_assignment_loss_mask(
+        output_len=len(base_loss_mask),
+        turn_index=0,
+        credit_event="tool_parser_error",
+        credit_step_index=0,
+        error_attribution="unattributable",
+        base_loss_mask=base_loss_mask,
+    ) == base_loss_mask
 
     assert fused_generate._credit_assignment_loss_mask(
         output_len=len(base_loss_mask),
@@ -6238,9 +6763,10 @@ def test_parser_error_credit_assignment_masks_only_error_turn_after_history(tmp_
     sample = result[0]
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
+    assert sample.metadata["credit_assignment_error_attribution"] == "localized"
     assert bad in _masked_text(sample)
-    assert good in _policy_masked_text(sample)
-    assert bad in _policy_unmasked_text(sample)
+    assert good not in _policy_masked_text(sample)
+    assert _policy_masked_text(sample) == bad
 
 
 @pytest.mark.parametrize(
@@ -6249,7 +6775,7 @@ def test_parser_error_credit_assignment_masks_only_error_turn_after_history(tmp_
         (FakeChatTemplateTokenizer(), "I cannot produce a tool call here.", None),
         (
             FakeGemma4Tokenizer(),
-            '<|tool_call>call:echo{value:<|"|>unterminated<tool_call|>',
+            '<|tool_call>call:echo{value:{nested:[1,2}<tool_call|>',
             "gemma4",
         ),
     ],
@@ -6279,11 +6805,13 @@ def test_tool_parser_errors_are_appended_to_run_log(
     assert record["response"] == bad_response
     assert record["response_length"] == len(bad_response)
     assert record["errors"]
+    assert "error_kinds" in record
+    assert "error_spans" in record
     assert record["parser"]
     assert record["model"] == expected_model
 
 
-def test_parser_error_credit_assignment_masks_only_error_tail(tmp_path: Path):
+def test_structurally_incomplete_tool_call_penalizes_only_malformed_action(tmp_path: Path):
     good = _echo_call("before-error-tail")
     bad = "<think>" + ("reasoning " * 20) + '<tool_call>{"name":"echo"'
     malformed_action = '<tool_call>{"name":"echo"'
@@ -6302,9 +6830,9 @@ def test_parser_error_credit_assignment_masks_only_error_tail(tmp_path: Path):
     sample = result[0]
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
+    assert sample.metadata["credit_assignment_error_attribution"] == "localized"
     assert malformed_action in _masked_text(sample)
-    assert good in _policy_masked_text(sample)
-    assert bad[-len(malformed_action) :] in _policy_unmasked_text(sample)
+    assert _policy_masked_text(sample) == malformed_action
 
 
 def test_tool_burst_credit_assignment_masks_only_burst_turn_after_history(tmp_path: Path):
@@ -6327,8 +6855,8 @@ def test_tool_burst_credit_assignment_masks_only_burst_turn_after_history(tmp_pa
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "too_many_tool_calls"
     assert burst in _masked_text(sample)
-    assert good in _policy_masked_text(sample)
-    assert burst in _policy_unmasked_text(sample)
+    assert _policy_masked_text(sample) == burst
+    assert good in _policy_unmasked_text(sample)
     assert reasoning in _policy_unmasked_text(sample)
     assert "<tool_response>" in _policy_unmasked_text(sample)
 

@@ -204,6 +204,7 @@ def _trajectory_table(trajectory: dict[str, Any], num_steps: int):
 def _print_step(console, step: dict[str, Any], step_idx: int, num_steps: int, *, max_chars: int) -> None:
     from rich.console import Group
     from rich.panel import Panel
+    from rich.padding import Padding
     from rich.table import Table
 
     summary = Table.grid(padding=(0, 2))
@@ -221,7 +222,10 @@ def _print_step(console, step: dict[str, Any], step_idx: int, num_steps: int, *,
 
     contents = [summary]
     if thought or disable_thinking:
-        contents.append(_text_panel("Thinking", _strip_think_tags(thought), "yellow", max_chars=min(max_chars, 2000)))
+        thinking_panel = _text_panel(
+            "Thinking", _strip_think_tags(thought), "yellow", max_chars=min(max_chars, 2000)
+        )
+        contents.append(Padding(thinking_panel, (1, 0, 0, 0)))
     if response:
         contents.append(_text_panel("Actions", response, "magenta", max_chars=min(max_chars, 2000)))
     if observation:
@@ -738,6 +742,7 @@ def _plain_rllm_episode(
                 [
                     "",
                     f"Step {step_idx + 1}/{len(steps)} | reward={_format_reward_value(step.get('reward'))} | done={bool(step.get('done'))}",
+                    "",
                     "Thinking:",
                     _clip_text(_strip_think_tags(thought), max_chars),
                     "Actions:",
@@ -753,7 +758,7 @@ def _plain_rllm_episode(
 def _step_thinking_and_response(step: dict[str, Any]) -> tuple[str, str]:
     model_response = str(step.get("model_response") or "")
     thought, response = _extract_thinking_and_response(model_response)
-    if thought or "<think>" in model_response:
+    if thought or "<think>" in model_response or "<|channel>thought" in model_response:
         return thought, response
     if _step_disables_thinking(step):
         return "", response
@@ -769,9 +774,14 @@ def _extract_thinking_and_response(model_response: str) -> tuple[str, str]:
     if not model_response:
         return "", ""
     match = re.search(r"<think>(.*?)</think>", model_response, re.DOTALL)
-    if not match:
-        return "", model_response.strip()
-    return match.group(1).strip(), model_response.split("</think>", 1)[-1].strip()
+    if match:
+        return match.group(1).strip(), model_response[match.end() :].strip()
+
+    match = re.search(r"<\|channel>thought(?:\r?\n)?(.*?)<channel\|>", model_response, re.DOTALL)
+    if match:
+        return match.group(1).strip(), model_response[match.end() :].strip()
+
+    return "", model_response.strip()
 
 
 def _strip_think_tags(text: str) -> str:

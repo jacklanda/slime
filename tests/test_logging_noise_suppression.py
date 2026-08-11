@@ -137,6 +137,8 @@ def test_log_drops_untracked_metric_namespaces(monkeypatch):
             "episode/correct": 1.0,
             "episode/pass@1": 1.0,
             "episode/reward/mean": 1.0,
+            "episode/reward": 0.5,
+            "episode/reward/completed_mean": 1.0,
             "episode/training_reward/mean": 0.5,
         },
         step_key="rollout/step",
@@ -146,6 +148,8 @@ def test_log_drops_untracked_metric_namespaces(monkeypatch):
     assert sys.modules["wandb"].logged == [
         {
             "rollout/step": 3,
+            "episode/reward": 0.5,
+            "episode/reward/completed_mean": 1.0,
             "episode/training_reward/mean": 0.5,
             "train/step": 6,
         }

@@ -46,10 +46,11 @@ FUSED_MCP_SYSTEM_PROMPT = """You are a tool agent. You are given a task to compl
 CRITICAL RULES:
 1. Use available non-finish tools when they are relevant to the task. If none apply, do not call an unrelated tool.
 2. Plan your approach, then call tools step by step to collect evidence.
-3. Be precise in tool arguments and respect parameter types.
-4. Emit tool calls exactly in the format shown in the Tools section below.
-5. Submit your final answer as a JSON value via the finish tool: a JSON array directly when the task asks for multiple items, not wrapped in another object.
-6. The finish result must be a pure JSON string/value; never embed another tool call inside it.
+3. Start retrieval broadly. If a tool returns an empty result, retry with fewer filters or use a listing tool before narrowing the query.
+4. Be precise in tool arguments and respect parameter types.
+5. Emit tool calls exactly in the format shown in the Tools section below.
+6. Submit your final answer as a JSON value via the finish tool: a JSON array directly when the task asks for multiple items, not wrapped in another object.
+7. Never submit an empty answer when the task asks you to extract or analyze evidence. The finish result must be pure JSON and must not contain another tool call.
 """
 
 FUSED_MCP_USER_PROMPT = """Solve the following task using the available tools.
@@ -103,8 +104,9 @@ GENERAL RULES:
 4. Submit only when the available evidence supports the final answer or final filesystem state.
 
 TASK-SPECIFIC RULES:
-- MCP: use non-finish tools to retrieve the required data before submitting a JSON value.
+- MCP: start with broad/listing queries; after an empty result, remove filters and retrieve evidence before submitting a JSON value.
 - MCP: the finish result must be pure JSON, never an embedded tool call.
+- MCP: do not submit an empty result for an extraction or evidence-analysis task.
 - CLI/SWE: explore the repository, make minimal edits, verify syntax, and run relevant tests before submitting.
 - Endless Terminal: inspect the filesystem, make the requested final-state changes, verify them, then submit.
 - Web Search QA: search until every claim is grounded, then submit a concise final answer.
@@ -128,13 +130,30 @@ RAG_USER_PROMPT = """Answer the question using the retrieved context below. Reas
 </context>"""
 
 
-def finish_schema() -> dict:
+def finish_schema(
+    *,
+    structured_result: bool = False,
+    result_schema: dict | None = None,
+) -> dict:
+    if result_schema is not None:
+        result_schema = dict(result_schema)
+        result_schema.setdefault("description", "Final answer or JSON value.")
+    elif structured_result:
+        result_schema = {
+            "type": ["string", "object", "array", "number", "boolean", "null"],
+            "description": "Final answer or JSON value.",
+        }
+    else:
+        result_schema = {
+            "type": "string",
+            "description": "Final answer or JSON value.",
+        }
     return tool_schema(
         "finish",
         "Finish the task and submit the final result.",
         {
             "command": {"type": "string", "description": "Use submit."},
-            "result": {"type": "string", "description": "Final answer or JSON value."},
+            "result": result_schema,
         },
         ["command", "result"],
     )

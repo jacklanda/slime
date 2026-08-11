@@ -445,9 +445,16 @@ class _SampleBuilder:
 
 
 class TrajectoryManager:
-    def __init__(self, *, fork_threshold_tokens: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fork_threshold_tokens: int | None = None,
+        strict_append_only: bool = False,
+    ) -> None:
         self._fork_threshold: int = 1024 if fork_threshold_tokens is None else fork_threshold_tokens
+        self._strict_append_only = strict_append_only
         self._trees: dict[str, MessageNode] = {}
+        self._append_only_tails: dict[str, MessageNode] = {}
         self._turn_count: dict[str, int] = {}
         self._weight_versions: dict[str, str] = {}
 
@@ -529,6 +536,16 @@ class TrajectoryManager:
 
         root = self._trees.setdefault(sid, MessageNode())
 
+        if self._strict_append_only:
+            if turn.context_delta_ids is None:
+                raise ValueError("strict append-only trajectories require context_delta_ids on every turn")
+            if turn.tito_boundary_before:
+                raise ValueError("strict append-only trajectories cannot contain a TiTO boundary")
+            node = self._append_only_tails.get(sid, root)
+            self._attach_assistant_leaf(sid, node, turn=turn, response_message=response_message, metadata=metadata)
+            self._append_only_tails[sid] = node.children[-1]
+            return
+
         node, depth = self._find_mount_point(root, prompt_messages)
         node, depth = self._try_merge_assistant_rewrite(sid, node, prompt_messages, depth, incoming_turn=turn)
         node = self._mount_prompt_messages(node, prompt_messages[depth:])
@@ -575,12 +592,14 @@ class TrajectoryManager:
             s.reward = per_sample_reward
 
         self._trees.pop(sid, None)
+        self._append_only_tails.pop(sid, None)
         self._turn_count.pop(sid, None)
         self._weight_versions.pop(sid, None)
         return samples
 
     def drop_session(self, sid: str) -> None:
         self._trees.pop(sid, None)
+        self._append_only_tails.pop(sid, None)
         self._turn_count.pop(sid, None)
         self._weight_versions.pop(sid, None)
 

@@ -71,6 +71,72 @@ def test_generate_group_timeout_returns_failed_tail_sample(monkeypatch):
     assert out[1].metadata["fused_error"] == "rollout_group_timeout"
 
 
+def test_sync_rollout_enforces_task_family_quota(monkeypatch):
+    groups = []
+    for index, family in enumerate(
+        ["mcp", "mcp", "mcp", "web_search", "mcp", "web_search", "web_search", "web_search"]
+    ):
+        sample = Sample(
+            index=index,
+            prompt=f"q{index}",
+            response="answer",
+            response_length=1,
+            reward=1.0,
+            status=Sample.Status.COMPLETED,
+            metadata={"fused_task_type": family},
+        )
+        groups.append([sample])
+
+    class QuotaGenerateState:
+        def __init__(self, _args):
+            self.reset()
+
+        def reset(self):
+            self.remaining_batch_size = 0
+            self.pendings = set()
+            self.pending_groups = {}
+            self.aborted = False
+
+        def submit_generate_tasks(self, submitted_groups):
+            async def complete(group):
+                return group
+
+            for group in submitted_groups:
+                task = asyncio.create_task(complete(group))
+                self.pendings.add(task)
+                self.pending_groups[task] = group
+            self.remaining_batch_size += len(submitted_groups)
+
+    source_batches = [groups[:4], groups[4:]]
+
+    def data_source(_num_samples):
+        return source_batches.pop(0)
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", QuotaGenerateState)
+    monkeypatch.setattr(sglang_rollout, "maybe_print_rollout_group", lambda *_args, **_kwargs: None)
+    args = Namespace(
+        rollout_global_dataset=True,
+        dynamic_sampling_filter_path=None,
+        rollout_batch_size=4,
+        rollout_task_family_quotas="mcp=0.5,webqa=0.5",
+        rollout_all_samples_process_path=None,
+        fully_async_filter_relax_after_groups=0,
+        n_samples_per_prompt=1,
+        over_sampling_batch_size=4,
+        rollout_sample_filter_path=None,
+    )
+
+    output, aborted = asyncio.run(sglang_rollout.generate_rollout_async(args, 0, data_source))
+
+    families = [group[0].metadata["fused_task_type"] for group in output.samples]
+    assert families.count("mcp") == 2
+    assert families.count("web_search") == 2
+    assert output.metrics["rollout/task_family_selected/mcp"] == 2
+    assert output.metrics["rollout/task_family_selected/webqa"] == 2
+    assert aborted == []
+    assert source_batches == []
+
+
 def test_generate_group_isolates_sample_exception(monkeypatch, caplog):
     monkeypatch.setattr(sglang_rollout, "GenerateState", _FakeGenerateState)
     monkeypatch.setattr(sglang_rollout, "generate_and_rm", _fake_generate_and_rm_with_one_error)
@@ -130,13 +196,34 @@ class _FakeCompletedRolloutGenerateState(_FakeRolloutGenerateState):
         self.remaining_batch_size += len(samples)
 
 
-def test_rollout_collection_timeout_returns_failed_group(monkeypatch):
-    monkeypatch.setenv("SLIME_ROLLOUT_GROUP_TIMEOUT", "1")
-    monkeypatch.setattr(sglang_rollout, "GenerateState", _FakeRolloutGenerateState)
+class _FakeTimeoutThenCompletedRolloutGenerateState(_FakeRolloutGenerateState):
+    def submit_generate_tasks(self, samples):
+        for group in samples:
+            if group[0].index < 2:
+                task = sglang_rollout.asyncio.create_task(sglang_rollout.asyncio.sleep(10))
+            else:
+                for sample in group:
+                    sample.status = Sample.Status.COMPLETED
+                    sample.reward = 1.0
+                    sample.response = "ok"
+                    sample.response_length = 1
+                task = sglang_rollout.asyncio.create_task(sglang_rollout.asyncio.sleep(0, result=group))
+            self.pendings.add(task)
+            self.pending_groups[task] = group
+        self.remaining_batch_size += len(samples)
 
-    source_group = [
+
+def test_rollout_collection_excludes_timeout_group_from_training(monkeypatch):
+    monkeypatch.setenv("SLIME_ROLLOUT_GROUP_TIMEOUT", "1")
+    monkeypatch.setattr(sglang_rollout, "GenerateState", _FakeTimeoutThenCompletedRolloutGenerateState)
+
+    source_groups = [
         [Sample(index=0, prompt="a", reward=None), Sample(index=1, prompt="b", reward=None)],
+        [Sample(index=2, prompt="c", reward=None), Sample(index=3, prompt="d", reward=None)],
     ]
+
+    def data_source(_batch_size):
+        return [source_groups.pop(0)]
 
     out, aborted = sglang_rollout.asyncio.run(
         sglang_rollout.generate_rollout_async(
@@ -151,16 +238,16 @@ def test_rollout_collection_timeout_returns_failed_group(monkeypatch):
                 partial_rollout=False,
             ),
             rollout_id=0,
-            data_source=lambda _batch_size: source_group,
+            data_source=data_source,
         )
     )
 
     assert aborted == []
     group = out.samples[0]
     assert len(group) == 2
-    assert group[0].status == Sample.Status.FAILED
-    assert group[0].reward == 0.0
-    assert group[0].metadata["fused_error"] == "rollout_group_timeout"
+    assert [sample.index for sample in group] == [2, 3]
+    assert all(sample.status == Sample.Status.COMPLETED for sample in group)
+    assert out.metrics["rollout/dynamic_filter/drop_infra_failure"] == 1
 
 
 def test_sync_rollout_relaxes_dynamic_filter_after_configured_groups(monkeypatch):

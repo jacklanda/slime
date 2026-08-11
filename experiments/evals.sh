@@ -69,14 +69,14 @@ Core:
   --bfcl-model-key NAME                BFCL handler key. Inferred from --model-config for supported Qwen sizes.
   --bfcl-python-bin PATH               Base Python used to create an isolated BFCL venv.
   --bfcl-venv-dir PATH                 BFCL dependency venv. Default: Gorilla/.venv-slime-evals.
-  --bfcl-num-threads N|auto            BFCL request concurrency. Default: 8 per DP replica.
+  --bfcl-num-threads N|auto            BFCL trajectory concurrency. Default: 16 per DP replica.
   --bfcl-sticky-engine-routing BOOL    Launch one single-GPU SGLang server per DP replica and
                                        route each trajectory to one server. Default: true.
   --bfcl-agent-mode MODE               auto, bfcl, or slime_fused_gem. Default: auto.
                                        auto maps --harness gem to slime_fused_gem.
   --bfcl-use-fc-interface BOOL         Select BFCL's Qwen FC transport. Default: true.
   --bfcl-overwrite BOOL                Recompute generation and scores. Default: false.
-  --bfcl-max-tokens N                  Optional per-request output limit.
+  --bfcl-max-tokens N                  Per-request output limit. Default: eval-max-response-len.
   --bfcl-seed N|none                   Deterministic generation seed. Default: --rollout-seed.
   --bfcl-discard-historical-thinking BOOL
                                        Drop prior CoT from BFCL requests. Defaults to
@@ -114,7 +114,7 @@ Generation/eval:
                                        Effective only when --disable-thinking is false. Default: false.
   --max-steps N                        Default: 128.
   --mcp-max-steps N                    Default: max-steps.
-  --web-search-max-steps N             Default: max-steps.
+  --web-search-max-steps N             Default: 64; BFCL uses 16 unless this is explicitly set.
   --cli-max-steps N                    Default: max-steps.
   --trajectory-timeout N               Default: 7200.
   --eval-trajectory-timeout N          Default: trajectory-timeout.
@@ -234,6 +234,7 @@ DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
 MAX_STEPS="${MAX_STEPS:-64}"
 MCP_MAX_STEPS="${MCP_MAX_STEPS:-${MAX_STEPS}}"
 WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-64}"
+web_search_max_steps_explicit=false
 CLI_MAX_STEPS="${CLI_MAX_STEPS:-${MAX_STEPS}}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-${TRAJECTORY_TIMEOUT}}"
@@ -330,6 +331,7 @@ BFCL_AGENT_MODE="${BFCL_AGENT_MODE:-auto}"
 BFCL_USE_FC_INTERFACE="${BFCL_USE_FC_INTERFACE:-true}"
 BFCL_OVERWRITE="${BFCL_OVERWRITE:-false}"
 BFCL_MAX_TOKENS="${BFCL_MAX_TOKENS:-}"
+BFCL_WEB_SEARCH_MAX_STEPS="${BFCL_WEB_SEARCH_MAX_STEPS:-}"
 BFCL_SEED="${BFCL_SEED:-${ROLLOUT_SEED}}"
 BFCL_DISCARD_HISTORICAL_THINKING="${BFCL_DISCARD_HISTORICAL_THINKING:-}"
 BFCL_V3_COMMIT="${BFCL_V3_COMMIT:-cd9429ccf3d4d04156affe883c495b3b047e6b64}"
@@ -460,7 +462,7 @@ while [ "$#" -gt 0 ]; do
       --discard-historical-thinking) DISCARD_HISTORICAL_THINKING="${2:?Missing value for --discard-historical-thinking}"; shift 2 ;;
       --max-steps) MAX_STEPS="${2:?Missing value for --max-steps}"; DEEPSEARCH_WORLD_MAX_STEPS="${MAX_STEPS}"; shift 2 ;;
       --mcp-max-steps) MCP_MAX_STEPS="${2:?Missing value for --mcp-max-steps}"; shift 2 ;;
-      --web-search-max-steps) WEB_SEARCH_MAX_STEPS="${2:?Missing value for --web-search-max-steps}"; shift 2 ;;
+      --web-search-max-steps) WEB_SEARCH_MAX_STEPS="${2:?Missing value for --web-search-max-steps}"; web_search_max_steps_explicit=true; shift 2 ;;
       --cli-max-steps) CLI_MAX_STEPS="${2:?Missing value for --cli-max-steps}"; shift 2 ;;
       --trajectory-timeout) TRAJECTORY_TIMEOUT="${2:?Missing value for --trajectory-timeout}"; shift 2 ;;
       --eval-trajectory-timeout) EVAL_TRAJECTORY_TIMEOUT="${2:?Missing value for --eval-trajectory-timeout}"; shift 2 ;;
@@ -563,10 +565,11 @@ if is_truthy "${BFCL_SELECTED}"; then
       case "${normalized_model_config}" in
          *qwen3.5-4b*) BFCL_MODEL_KEY="Qwen/Qwen3.5-4B" ;;
          *qwen3-4b*) BFCL_MODEL_KEY="Qwen/Qwen3-4B-Thinking-2507" ;;
+         *qwen3-8b*) BFCL_MODEL_KEY="Qwen/Qwen3-8B" ;;
          *qwen3-32b*) BFCL_MODEL_KEY="Qwen/Qwen3-32B" ;;
          *)
             echo "Cannot infer a BFCL handler key from --model-config ${MODEL_CONFIG@Q}." >&2
-            echo "Pass --bfcl-model-key explicitly; supported slime-gem defaults currently cover Qwen3.5 4B and Qwen3 4B/32B." >&2
+            echo "Pass --bfcl-model-key explicitly; supported slime-gem defaults currently cover Qwen3.5 4B and Qwen3 4B/8B/32B." >&2
             exit 2
             ;;
       esac
@@ -705,6 +708,51 @@ if [ "${RETRIEVAL_BACKEND}" = "serper" ] && ! is_truthy "${retrieval_url_explici
    export SERPER_PROXY_TOKEN
    export SERPER_SEARCH_URL
 fi
+export RETRIEVAL_SERVER_URL
+
+cleanup_managed_serper() {
+   local exit_status=$?
+   if [ -n "${SERPER_SERVICE_PID}" ]; then
+      kill "${SERPER_SERVICE_PID}" 2>/dev/null || true
+      wait "${SERPER_SERVICE_PID}" 2>/dev/null || true
+      SERPER_SERVICE_PID=""
+   fi
+   return "${exit_status}"
+}
+
+start_managed_serper() {
+   local log_path="$1"
+   if [ "${RETRIEVAL_BACKEND}" != "serper" ] || is_truthy "${retrieval_url_explicit}"; then
+      return
+   fi
+
+   trap cleanup_managed_serper EXIT
+   python3 "${REPO_ROOT}/examples/search-r1/serper_search_server.py" \
+      --host "${SERPER_SERVER_HOST}" \
+      --port "${SERPER_SERVER_PORT}" \
+      >"${log_path}" 2>&1 &
+   SERPER_SERVICE_PID=$!
+   python3 - "${RETRIEVAL_SERVER_URL}" "${SERPER_SERVICE_PID}" <<'PY' || exit 2
+import json
+import os
+import sys
+import time
+import urllib.request
+
+url = sys.argv[1].rstrip("/") + "/health"
+pid = int(sys.argv[2])
+for _ in range(50):
+    if not os.path.exists(f"/proc/{pid}"):
+        break
+    try:
+        with urllib.request.urlopen(url, timeout=1) as response:
+            if json.load(response).get("status") == "ok":
+                raise SystemExit(0)
+    except Exception:
+        time.sleep(0.1)
+raise SystemExit(f"Managed Serper service failed to start at {url}")
+PY
+}
 
 if [ -z "${MODEL_CONFIG}" ]; then
    if [ "${MODEL_SERIES}" = "qwen3.5" ]; then
@@ -821,6 +869,9 @@ if target_context > int(factor * original_context):
         f"{int(factor * original_context)}"
     )
 PY
+   export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+   BFCL_SGLANG_JSON_MODEL_OVERRIDE_ARGS="{\"max_position_embeddings\":${EVAL_MAX_CONTEXT_LEN},\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":${YARN_FACTOR},\"original_max_position_embeddings\":${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}}}"
+   export BFCL_SGLANG_JSON_MODEL_OVERRIDE_ARGS
    MODEL_ARGS+=(
       --use-yarn-rope
       --yarn-rope-scaling-factor "${YARN_FACTOR}"
@@ -928,7 +979,29 @@ if is_truthy "${BFCL_SELECTED}"; then
       fi
    fi
    if [ "${BFCL_NUM_THREADS}" = "auto" ]; then
-      BFCL_NUM_THREADS=$((BFCL_DP_SIZE * 8))
+      BFCL_NUM_THREADS=$((BFCL_DP_SIZE * 16))
+   fi
+   # BFCL runs before the generic fused-agent defaults are resolved. Keep its
+   # per-request budget aligned with the user-facing evaluation response limit
+   # unless an explicit BFCL override was supplied.
+   if [ -z "${BFCL_MAX_TOKENS}" ]; then
+      BFCL_MAX_TOKENS="${EVAL_MAX_RESPONSE_LEN}"
+   fi
+   if [ -z "${BFCL_WEB_SEARCH_MAX_STEPS}" ]; then
+      if [ "${web_search_max_steps_explicit}" = "true" ]; then
+         BFCL_WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS}"
+      else
+         BFCL_WEB_SEARCH_MAX_STEPS=16
+      fi
+   fi
+   if ! [[ "${BFCL_WEB_SEARCH_MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "BFCL web-search max steps must be a positive integer." >&2
+      exit 2
+   fi
+   BFCL_SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
+   if ! [[ "${BFCL_SGLANG_MAX_RUNNING_REQUESTS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "--sglang-max-running-requests must be a positive integer for BFCL." >&2
+      exit 2
    fi
    BFCL_CUDA_DEVICES=""
    for ((gpu_index = 0; gpu_index < ROLLOUT_GPUS; gpu_index++)); do
@@ -945,13 +1018,10 @@ if is_truthy "${BFCL_SELECTED}"; then
    BFCL_RESULT_DIR="${BFCL_LOG_ROOT}/bfcl_results"
    BFCL_SCORE_DIR="${BFCL_LOG_ROOT}/bfcl_scores"
    export BFCL_VERSION_PREFIX="BFCL_${BFCL_BENCH_VERSION}"
-   if [ "${BFCL_BENCH_VERSION}" = v4 ] && [ -z "${SERPAPI_API_KEY:-}" ]; then
-      BFCL_DOTENV="${BFCL_ROOT}/.env"
-      if [ ! -f "${BFCL_DOTENV}" ] || ! rg -q '^[[:space:]]*SERPAPI_API_KEY=..+' "${BFCL_DOTENV}"; then
-         echo "BFCL-v4 all_scoring requires SERPAPI_API_KEY for its web-search categories." >&2
-         echo "Set it in the shell or ${BFCL_DOTENV}; BFCL-v3 does not require it." >&2
-         exit 2
-      fi
+   if [ "${BFCL_BENCH_VERSION}" = v4 ] && [ -z "${RETRIEVAL_SERVER_URL:-}" ]; then
+      echo "BFCL-v4 all_scoring requires RETRIEVAL_SERVER_URL for its web-search categories." >&2
+      echo "Use the default managed Serper backend or set RETRIEVAL_SERVER_URL explicitly." >&2
+      exit 2
    fi
    mkdir -p "${BFCL_RESULT_DIR}" "${BFCL_SCORE_DIR}"
    BFCL_CMD=(
@@ -972,6 +1042,7 @@ if is_truthy "${BFCL_SELECTED}"; then
       --dp-size "${BFCL_DP_SIZE}"
       --context-length "${EVAL_MAX_CONTEXT_LEN}"
       --gpu-memory-utilization "${SGLANG_MEM_FRACTION_STATIC}"
+      --max-running-requests "${BFCL_SGLANG_MAX_RUNNING_REQUESTS}"
       --num-threads "${BFCL_NUM_THREADS}"
       --result-dir "${BFCL_RESULT_DIR}"
       --temperature "${TEMPERATURE}"
@@ -1026,6 +1097,7 @@ if is_truthy "${BFCL_SELECTED}"; then
       echo "BFCL-${BFCL_BENCH_VERSION} preflight complete. Results will be written under ${BFCL_LOG_ROOT}."
       exit 0
    fi
+   start_managed_serper "${BFCL_LOG_ROOT}/serper_search_server.log"
    if [ ! -x "${BFCL_VENV_DIR}/bin/bfcl" ] || ! "${BFCL_VENV_DIR}/bin/python" -c \
       'import bfcl_eval, boto3, cohere, datamodel_code_generator, google.genai, mistralai, openai, overrides, qwen_agent, tenacity, tree_sitter, tree_sitter_java, tree_sitter_javascript, writerai' >/dev/null 2>&1; then
       echo "Preparing isolated BFCL environment under ${BFCL_VENV_DIR}"
@@ -1055,6 +1127,7 @@ if is_truthy "${BFCL_SELECTED}"; then
    export PATH="${BFCL_VENV_DIR}/bin:${PATH}"
    export BFCL_PROJECT_ROOT="${BFCL_ROOT}"
    export BFCL_DISCARD_HISTORICAL_THINKING="${BFCL_DISCARD_HISTORICAL_THINKING}"
+   export BFCL_WEB_SEARCH_MAX_STEPS="${BFCL_WEB_SEARCH_MAX_STEPS}"
    export BFCL_SLIME_TOOL_PARSER_PATH="${REPO_ROOT}/slime/rollout/fused_agent/parser.py"
    export FUSED_MODEL_SERIES="${MODEL_SERIES}"
    export FUSED_MAX_STEPS="${MAX_STEPS}"
@@ -1071,6 +1144,7 @@ if is_truthy "${BFCL_SELECTED}"; then
       --result-dir "${BFCL_RESULT_DIR}" \
       --score-dir "${BFCL_SCORE_DIR}" \
       --artifact-name "${EXPERIMENT_NAME}"
+   cleanup_managed_serper
    exec "${BFCL_VENV_DIR}/bin/bfcl" scores --score-dir "${BFCL_SCORE_DIR}"
 fi
 
@@ -1737,43 +1811,7 @@ else
    ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${ROLLOUT_GPUS}" --num-cpus "${RAY_NUM_CPUS}" --disable-usage-stats
 fi
 
-cleanup_managed_serper() {
-   local exit_status=$?
-   if [ -n "${SERPER_SERVICE_PID}" ]; then
-      kill "${SERPER_SERVICE_PID}" 2>/dev/null || true
-      wait "${SERPER_SERVICE_PID}" 2>/dev/null || true
-   fi
-   return "${exit_status}"
-}
-
-if [ "${RETRIEVAL_BACKEND}" = "serper" ] && ! is_truthy "${retrieval_url_explicit}"; then
-   trap cleanup_managed_serper EXIT
-   python3 "${REPO_ROOT}/examples/search-r1/serper_search_server.py" \
-      --host "${SERPER_SERVER_HOST}" \
-      --port "${SERPER_SERVER_PORT}" \
-      >"${LOG_ROOT}/serper_search_server.log" 2>&1 &
-   SERPER_SERVICE_PID=$!
-   python3 - "${RETRIEVAL_SERVER_URL}" "${SERPER_SERVICE_PID}" <<'PY' || exit 2
-import json
-import os
-import sys
-import time
-import urllib.request
-
-url = sys.argv[1].rstrip("/") + "/health"
-pid = int(sys.argv[2])
-for _ in range(50):
-    if not os.path.exists(f"/proc/{pid}"):
-        break
-    try:
-        with urllib.request.urlopen(url, timeout=1) as response:
-            if json.load(response).get("status") == "ok":
-                raise SystemExit(0)
-    except Exception:
-        time.sleep(0.1)
-raise SystemExit(f"Managed Serper service failed to start at {url}")
-PY
-fi
+start_managed_serper "${LOG_ROOT}/serper_search_server.log"
 
 export SCRIPT_DIR REPO_ROOT
 export CUDA_HOME="/cm/shared/apps/cuda12.9"

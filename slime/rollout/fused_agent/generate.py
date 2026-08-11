@@ -531,7 +531,10 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     manager = (
         None
         if evaluation
-        else TrajectoryManager(fork_threshold_tokens=int(os.environ.get("SLIME_FUSED_FORK_THRESHOLD_TOKENS", "1024")))
+        else TrajectoryManager(
+            fork_threshold_tokens=int(os.environ.get("SLIME_FUSED_FORK_THRESHOLD_TOKENS", "1024")),
+            strict_append_only=strict_tito and _tito_model_type(model_name) == "gemma4",
+        )
     )
     session_id = base_sample.session_id or uuid.uuid4().hex
     base_sample.session_id = session_id
@@ -571,6 +574,10 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     total_completion_tokens = 0
     credit_event: str | None = None
     credit_step_index: int | None = None
+    recoverable_tool_parser_errors: list[str] = []
+    recoverable_tool_parser_error_spans: list[tuple[int, int] | None] = []
+    tool_parser_syntax_repairs: list[str] = []
+    tool_parser_schema_coercions: list[str] = []
     eval_response_anomaly_info: dict[str, Any] = {}
     deepsearch_phase = "plan"
     deepsearch_state = dict(dsw.EMPTY_STATE)
@@ -880,6 +887,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 prompt_ids=prompt_ids,
                 evaluation=evaluation,
             )
+            if _has_recoverable_tool_schema_errors(parser, parsed_actions):
+                recoverable_tool_parser_errors.extend(parser.last_schema_errors)
+                recoverable_tool_parser_error_spans.extend(parser.last_schema_error_spans)
+            tool_parser_syntax_repairs.extend(getattr(parser, "last_syntax_repairs", ()) or ())
+            tool_parser_schema_coercions.extend(getattr(parser, "last_schema_coercions", ()) or ())
             final_response = response
             finish_reason = output["finish_reason"]
             last_finish_reason = finish_reason
@@ -1253,32 +1265,43 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 )
                 break
 
+            recoverable_tool_schema_errors = _has_recoverable_tool_schema_errors(parser, parsed_actions)
             if (
                 detect_abnormal_trajectories
                 and credit_assignment_tool_parser_error
                 and getattr(parser, "last_schema_errors", ())
+                and not recoverable_tool_schema_errors
             ):
                 final_reward = 0.0
                 final_done = True
                 credit_event = "tool_parser_error"
                 credit_step_index = len(pending_turns) - 1
                 if isinstance(parser, Gemma4ToolParser):
-                    error_span = next(iter(parser.last_schema_error_spans), None) or _parser_error_action_span(response)
+                    error_span = next((span for span in parser.last_schema_error_spans if span is not None), None)
+                    if error_span is None:
+                        error_span = _parser_error_action_span(response)
+                    error_attribution = "localized" if error_span is not None else "unattributable"
                 else:
-                    error_span = _actions_span(actions) or _parser_error_action_span(response)
+                    # XML/Qwen parser diagnostics currently do not expose a
+                    # token-precise span; do not blame the whole parsed call.
+                    error_span = None
+                    error_attribution = "unattributable"
                 await _mark_pending_turn_error_span(
                     state.tokenizer,
                     pending_turns[-1],
                     response,
                     error_span,
                     output_len=len(output_ids),
+                    attribution=error_attribution,
                 )
                 last_info = {
                     "termination_reason": "ABNORMAL_PARSE_ERROR",
                     "credit_assignment_event": credit_event,
                     "credit_assignment_error_step_index": credit_step_index,
+                    "credit_assignment_error_attribution": error_attribution,
                     "tool_parser_error_count": 1,
                     "tool_parser_errors": list(parser.last_schema_errors),
+                    "tool_parser_error_kinds": list(getattr(parser, "last_schema_error_kinds", ())),
                 }
                 trajectory_steps.append(
                     _episode_step(
@@ -1332,17 +1355,21 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         parser=parser, prompt_ids=prompt_ids, evaluation=evaluation,
                         fallback_errors=["no tool call could be parsed from the model response"],
                     )
+                    error_span = _parser_error_action_span(response)
+                    error_attribution = "localized" if error_span is not None else "unattributable"
                     await _mark_pending_turn_error_span(
                         state.tokenizer,
                         pending_turns[-1],
                         response,
-                        _parser_error_action_span(response),
+                        error_span,
                         output_len=len(output_ids),
+                        attribution=error_attribution,
                     )
                     last_info = {
                         "termination_reason": "ABNORMAL_PARSE_ERROR",
                         "credit_assignment_event": credit_event,
                         "credit_assignment_error_step_index": credit_step_index,
+                        "credit_assignment_error_attribution": error_attribution,
                         "tool_parser_error_count": 1,
                     }
                     trajectory_steps.append(
@@ -1367,6 +1394,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 and detect_abnormal_trajectories
                 and credit_assignment_tool_parser_error
                 and _response_has_malformed_tool_call(response)
+                and not getattr(parser, "last_syntax_repairs", ())
             ):
                 final_reward = 0.0
                 final_done = True
@@ -1378,17 +1406,21 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     parser=parser, prompt_ids=prompt_ids, evaluation=evaluation,
                     fallback_errors=["malformed Gemma4 tool-call marker"],
                 )
+                error_span = _parser_error_action_span(response)
+                error_attribution = "localized" if error_span is not None else "unattributable"
                 await _mark_pending_turn_error_span(
                     state.tokenizer,
                     pending_turns[-1],
                     response,
-                    _parser_error_action_span(response),
+                    error_span,
                     output_len=len(output_ids),
+                    attribution=error_attribution,
                 )
                 last_info = {
                     "termination_reason": "ABNORMAL_PARSE_ERROR",
                     "credit_assignment_event": credit_event,
                     "credit_assignment_error_step_index": credit_step_index,
+                    "credit_assignment_error_attribution": error_attribution,
                     "tool_parser_error_count": 1,
                 }
                 trajectory_steps.append(
@@ -1678,6 +1710,14 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 final_reward = batch_reward
                 final_done = batch_done
                 last_info = _merge_tool_infos(env_infos)
+                if recoverable_tool_schema_errors:
+                    last_info.update(
+                        {
+                            "tool_parser_errors": list(parser.last_schema_errors),
+                            "tool_parser_error_kinds": list(parser.last_schema_error_kinds),
+                            "tool_parser_error_recoverable": True,
+                        }
+                    )
                 trajectory_steps.append(
                     _episode_step(
                         observation=formatted_obs,
@@ -1719,6 +1759,14 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             final_reward = float(reward)
             final_done = bool(done)
             last_info = dict(env_info or {})
+            if recoverable_tool_schema_errors:
+                last_info.update(
+                    {
+                        "tool_parser_errors": list(parser.last_schema_errors),
+                        "tool_parser_error_kinds": list(parser.last_schema_error_kinds),
+                        "tool_parser_error_recoverable": True,
+                    }
+                )
             if detect_abnormal_trajectories and last_info.get("credit_assignment") == "reasoning_step_only":
                 final_reward = 0.0
                 if last_info.get("termination_reason") == "ABNORMAL_SEARCH_BYPASS" and credit_assignment_search_bypass:
@@ -1906,6 +1954,19 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         "fused_tito_prompt_prefix_mismatch_turns": tito_reasons.count("prompt_prefix_mismatch"),
         "fused_tito_incremental_tokenization_failed_turns": tito_reasons.count("tito_incremental_tokenization_failed"),
     }
+    if recoverable_tool_parser_errors:
+        common_metadata.update(
+            {
+                "tool_parser_error_recoverable": True,
+                "tool_parser_errors": recoverable_tool_parser_errors,
+                "tool_parser_error_kinds": ["unknown_parameter"] * len(recoverable_tool_parser_errors),
+                "tool_parser_error_spans": recoverable_tool_parser_error_spans,
+            }
+        )
+    if tool_parser_syntax_repairs:
+        common_metadata["tool_parser_syntax_repairs"] = tool_parser_syntax_repairs
+    if tool_parser_schema_coercions:
+        common_metadata["tool_parser_schema_coercions"] = tool_parser_schema_coercions
     if prompt_equal_loss:
         instance_id = (base_sample.metadata or {}).get("instance_id")
         if instance_id is None:
@@ -2271,7 +2332,7 @@ def _valid_tool_names(tools: list[dict]) -> set[str]:
         if name:
             names.add(name)
             names.add(str(name).replace("-", "_"))
-    names.update({"finish", "submit"})
+    names.add("finish")
     return names
 
 
@@ -2360,6 +2421,8 @@ def _record_tool_parser_errors(
         "model": _tito_model_type(model_name) or model_name,
         "parser": type(parser).__name__,
         "errors": errors,
+        "error_kinds": list(getattr(parser, "last_schema_error_kinds", ()) or ()),
+        "error_spans": list(getattr(parser, "last_schema_error_spans", ()) or ()),
         "response": response,
         "response_length": len(response),
         "prompt_tokens": len(prompt_ids),
@@ -2386,6 +2449,14 @@ def _declared_tool_names(tools: list[dict]) -> set[str]:
             normalized = str(name).strip().replace("-", "_")
             names.add(normalized)
     return names
+
+
+def _has_recoverable_tool_schema_errors(parser, actions: list[ToolCall]) -> bool:
+    """Return true when unknown optional fields were filtered from a valid call."""
+    if not isinstance(parser, Gemma4ToolParser) or not actions:
+        return False
+    kinds = list(getattr(parser, "last_schema_error_kinds", ()) or ())
+    return bool(kinds) and all(kind == "unknown_parameter" for kind in kinds)
 
 
 def _actions_span(actions: list[ToolCall]) -> tuple[int, int] | None:
@@ -2677,7 +2748,11 @@ async def _mark_pending_turn_error_span(
     char_span: tuple[int, int] | None,
     *,
     output_len: int,
+    attribution: str = "localized",
 ) -> None:
+    item["credit_assignment_error_attribution"] = attribution
+    if attribution == "unattributable":
+        return
     # The char->token span conversion may re-encode the response twice; run it
     # off the event loop since abnormal terminations cluster in waves.
     span = await asyncio.to_thread(
@@ -2750,12 +2825,15 @@ def _record_pending_turns(
             credit_step_index=credit_step_index,
             parser_error_token_window=parser_error_token_window,
             action_span=item.get("credit_assignment_action_span"),
+            error_attribution=item.get("credit_assignment_error_attribution"),
             base_loss_mask=turn.loss_mask,
         )
         metadata = dict(item["metadata"])
         if credit_event is not None:
             metadata["credit_assignment_event"] = credit_event
             metadata["credit_assignment_error_step_index"] = credit_step_index
+            if idx == credit_step_index and item.get("credit_assignment_error_attribution") is not None:
+                metadata["credit_assignment_error_attribution"] = item["credit_assignment_error_attribution"]
             if idx == credit_step_index and item.get("credit_assignment_action_span") is not None:
                 start, end = item["credit_assignment_action_span"]
                 metadata["credit_assignment_action_start"] = start
@@ -2767,15 +2845,20 @@ def _record_pending_turns(
                 output_ids=turn.output_ids,
                 finish_reason=turn.finish_reason,
                 output_log_probs=turn.output_log_probs,
+                weight_version=turn.weight_version,
+                require_rollout_logprobs=turn.require_rollout_logprobs,
+                require_weight_version=turn.require_weight_version,
                 context_delta_ids=turn.context_delta_ids,
                 tito_boundary_before=turn.tito_boundary_before,
                 tito_model_type=turn.tito_model_type,
+                tito_context_reason=turn.tito_context_reason,
                 disable_thinking=turn.disable_thinking,
                 loss_mask=turn.loss_mask,
                 policy_loss_mask=policy_loss_mask,
                 prompt_context_start_idx=turn.prompt_context_start_idx,
                 rollout_top_p_token_ids=turn.rollout_top_p_token_ids,
                 rollout_top_p_token_offsets=turn.rollout_top_p_token_offsets,
+                ill_formed=turn.ill_formed,
             ),
             prompt_messages=item["prompt_messages"],
             response_message=item["response_message"],
@@ -2791,6 +2874,7 @@ def _credit_assignment_loss_mask(
     credit_step_index: int | None,
     parser_error_token_window: int = 256,
     action_span: tuple[int, int] | None = None,
+    error_attribution: str | None = None,
     base_loss_mask: list[int] | None = None,
 ) -> list[int] | None:
     def apply_base(mask: list[int]) -> list[int]:
@@ -2811,29 +2895,36 @@ def _credit_assignment_loss_mask(
         return apply_base([0] * output_len)
     if credit_step_index is None:
         return apply_base([0] * output_len)
-    # Parser/length failures identify a bad action span, not a bad trajectory.
-    # Keep the original response mask for every other turn and only remove the
-    # malformed tail/span from the failing turn.  The previous implementation
-    # selected only the error window and zeroed all preceding turns, which could
-    # leave just a handful of policy tokens and produce an artificially large
-    # actor gradient norm.
+    if credit_event == "tool_parser_error":
+        if turn_index != credit_step_index:
+            return apply_base([0] * output_len)
+        if action_span is not None:
+            start, end = action_span
+            if 0 <= start < end <= output_len:
+                return apply_base([0] * start + [1] * (end - start) + [0] * (output_len - end))
+        # Missing delimiters and truncated calls do not always expose a precise
+        # span. Penalize a bounded suffix of the failing turn so format errors
+        # retain a learning signal without blaming prior tool/reasoning turns.
+        penalized_len = max(0, min(output_len, parser_error_token_window))
+        return apply_base([0] * (output_len - penalized_len) + [1] * penalized_len)
+    # Other credit events keep their event-specific action-span behavior. Parser
+    # failures are handled above because their negative signal additionally
+    # depends on whether the emitted error can be localized reliably.
     if credit_event in {
-        "tool_parser_error",
         "think_parser_error",
         "max_response_len_exceeded",
+        "max_turns_exceeded",
         "too_many_tool_calls",
         "repeated_search_query",
         "ngram_repetition",
         "mixed_tool_and_answer",
     }:
         if turn_index != credit_step_index:
-            return apply_base([1] * output_len)
+            return apply_base([0] * output_len)
         if action_span is not None:
             start, end = action_span
             if 0 <= start < end <= output_len:
-                mask = [1] * output_len
-                mask[start:end] = [0] * (end - start)
-                return apply_base(mask)
+                return apply_base([0] * start + [1] * (end - start) + [0] * (output_len - end))
         # Without a character-derived span, only parser/length failures have a
         # meaningful tail location. Other events retain the whole turn rather
         # than guessing and accidentally deleting valid training signal.

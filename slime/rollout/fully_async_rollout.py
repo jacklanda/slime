@@ -29,7 +29,6 @@ import asyncio
 import atexit
 import logging
 import queue
-import math
 import os
 import threading
 import time
@@ -37,7 +36,14 @@ from collections import Counter
 
 from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
 from slime.rollout.base_types import RolloutFnTrainOutput
-from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from slime.rollout.filter_hub.base_types import DynamicFilterOutput, MetricGatherer, call_dynamic_filter
+from slime.rollout.filter_hub.dynamic_sampling_filters import is_infra_failure
+from slime.rollout.task_family import (
+    has_task_family_quota_candidates as _has_task_family_quota_candidates,
+    parse_task_family_quotas as _parse_task_family_quotas,
+    sample_group_task_family as _sample_group_task_family,
+    select_task_family_quota_groups,
+)
 from slime.utils.async_utils import run
 from slime.utils.http_utils import get_rollout_num_engines
 from slime.utils.misc import load_function
@@ -235,8 +241,16 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
         drained = 0
         for gid, group in worker.get_completed_groups():
             completed_groups += 1
-            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, _flatten_samples(group), rollout_id=rollout_id)
-            relax_filter = filter_relax_after > 0 and completed_groups >= filter_relax_after
+            flat_group = _flatten_samples(group)
+            if any(is_infra_failure(sample) for sample in flat_group):
+                dynamic_filter_output = DynamicFilterOutput(keep=False, reason="infra_failure")
+            else:
+                dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, flat_group, rollout_id=rollout_id)
+            relax_filter = (
+                dynamic_filter_output.reason != "infra_failure"
+                and filter_relax_after > 0
+                and completed_groups >= filter_relax_after
+            )
             if not dynamic_filter_output.keep and not relax_filter:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 dropped_groups += 1
@@ -314,127 +328,11 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
 
 
 def _select_task_family_quota_groups(groups: list[list[Sample]], target: int, args) -> list[list[Sample]]:
-    quota_spec = getattr(args, "rollout_task_family_quotas", None)
-    if not quota_spec:
-        return groups[:target]
-    quotas = _parse_task_family_quotas(quota_spec)
-    if not quotas:
-        return groups[:target]
-
-    selected: list[list[Sample]] = []
-    selected_ids: set[int] = set()
-    counts = {family: math.floor(target * fraction) for family, fraction in quotas.items()}
-    remaining = target - sum(counts.values())
-    for family, _fraction in sorted(quotas.items(), key=lambda item: item[1], reverse=True):
-        if remaining <= 0:
-            break
-        counts[family] += 1
-        remaining -= 1
-
-    for family, count in counts.items():
-        if count <= 0:
-            continue
-        taken = 0
-        for idx, group in enumerate(groups):
-            if idx in selected_ids or _sample_group_task_family(group) != family:
-                continue
-            selected.append(group)
-            selected_ids.add(idx)
-            taken += 1
-            if taken >= count:
-                break
-
-    missing_families = [family for family, count in counts.items() if count > 0 and not any(_sample_group_task_family(group) == family for group in selected)]
-    for family in missing_families:
-        for idx, group in enumerate(groups):
-            if idx in selected_ids or _sample_group_task_family(group) != family:
-                continue
-            selected.append(group)
-            selected_ids.add(idx)
-            break
-
-    for idx, group in enumerate(groups):
-        if len(selected) >= target:
-            break
-        if idx not in selected_ids:
-            selected.append(group)
-
-    return selected[:target]
-
-
-def _has_task_family_quota_candidates(groups, target: int, quotas: dict[str, float]) -> bool:
-    counts = _task_family_quota_counts(target, quotas)
-    available = Counter(_sample_group_task_family(group) for group in groups)
-    return all(available[family] >= count for family, count in counts.items() if count > 0)
-
-
-def _parse_task_family_quotas(spec: str | dict[str, float]) -> dict[str, float]:
-    if isinstance(spec, dict):
-        items = spec.items()
-    else:
-        items = []
-        for part in str(spec).split(","):
-            if not part.strip() or "=" not in part:
-                continue
-            name, value = part.split("=", 1)
-            items.append((name, value))
-    quotas: dict[str, float] = {}
-    for name, value in items:
-        family = _normalize_task_family(name)
-        try:
-            fraction = float(value)
-        except (TypeError, ValueError):
-            continue
-        if family and fraction > 0:
-            quotas[family] = fraction
-    total = sum(quotas.values())
-    if total <= 0:
-        return {}
-    return {family: fraction / total for family, fraction in quotas.items()}
-
-
-def _task_family_quota_counts(target: int, quotas: dict[str, float]) -> dict[str, int]:
-    counts = {family: math.floor(target * fraction) for family, fraction in quotas.items()}
-    remaining = target - sum(counts.values())
-    for family, _fraction in sorted(quotas.items(), key=lambda item: item[1], reverse=True):
-        if remaining <= 0:
-            break
-        counts[family] += 1
-        remaining -= 1
-    return counts
-
-
-def _sample_group_task_family(group: list[Sample]) -> str:
-    samples = _flatten_samples(group)
-    families = [_sample_task_family(sample) for sample in samples]
-    counts = Counter(family for family in families if family)
-    if not counts:
-        return "unknown"
-    return counts.most_common(1)[0][0]
-
-
-def _sample_task_family(sample: Sample) -> str:
-    metadata = getattr(sample, "metadata", {}) or {}
-    for key in ("fused_task_type", "task_type", "data_source"):
-        value = metadata.get(key)
-        if value:
-            return _normalize_task_family(value)
-    if metadata.get("tools_py") or metadata.get("environment"):
-        return "mcp"
-    if metadata.get("docker_image"):
-        return "cli"
-    return "webqa"
-
-
-def _normalize_task_family(value: str) -> str:
-    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if normalized in {"web_search", "search", "webqa"}:
-        return "webqa"
-    if normalized in {"mcp", "tool", "tools"}:
-        return "mcp"
-    if normalized in {"cli", "swe", "et", "endless_terminal", "endless_terminals"}:
-        return "cli"
-    return normalized
+    return select_task_family_quota_groups(
+        groups,
+        target,
+        getattr(args, "rollout_task_family_quotas", None),
+    )
 
 
 def _int_env(name: str, default: int) -> int:

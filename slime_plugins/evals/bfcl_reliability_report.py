@@ -34,6 +34,17 @@ def _strings(value: Any) -> Iterable[str]:
             yield from _strings(item)
 
 
+def _numbers(value: Any) -> Iterable[float]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _numbers(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _numbers(item)
+
+
 def _score_category(path: Path, rows: list[dict[str, Any]]) -> str:
     for row in rows:
         if row.get("test_category"):
@@ -52,6 +63,8 @@ def build_report(result_dir: Path, score_dir: Path, artifact_name: str) -> dict[
     parallel_total = 0
     parallel_protocol_mismatches = 0
     force_terminated = 0
+    failed_ids: set[str] = set()
+    scoring_total = 0
     for path in sorted(score_root.rglob("*_score.json")):
         rows = _read_jsonl(path)
         summary = next((row for row in rows if "accuracy" in row and "total_count" in row), None)
@@ -60,6 +73,7 @@ def build_report(result_dir: Path, score_dir: Path, artifact_name: str) -> dict[
         category = _score_category(path, rows)
         correct = int(summary["correct_count"])
         total = int(summary["total_count"])
+        scoring_total += total
         low, high = wilson_interval(correct, total)
         categories.append(
             {
@@ -73,6 +87,7 @@ def build_report(result_dir: Path, score_dir: Path, artifact_name: str) -> dict[
         )
 
         failures = [row for row in rows if row.get("valid") is False]
+        failed_ids.update(str(row["id"]) for row in failures if row.get("id"))
         if "parallel" in category:
             parallel_total += total
             parallel_protocol_mismatches += sum(1 for row in failures if str(row.get("error_type", "")).endswith("wrong_count") and len(row.get("model_result_decoded") or []) == 1 and len(row.get("possible_answer") or []) > 1)
@@ -94,6 +109,32 @@ def build_report(result_dir: Path, score_dir: Path, artifact_name: str) -> dict[
             if any(f"forced to quit after {max_steps} total steps" in message or f"Finish action detected at the {max_steps}-step limit" in message for message in messages):
                 step_limit_reached += 1
 
+    agentic_total = 0
+    agentic_context_exhausted = 0
+    failed_generation_token_cap = 0
+    max_tokens_raw = str(manifest.get("max_tokens", ""))
+    max_tokens = int(max_tokens_raw) if max_tokens_raw.isdigit() else None
+    for path in sorted(result_root.rglob("*_result.json")):
+        if "_prereq_result" in path.name:
+            continue
+        rows = _read_jsonl(path)
+        if "agentic" in path.parts:
+            agentic_total += len(rows)
+        for row in rows:
+            result = row.get("result")
+            if (
+                "agentic" in path.parts
+                and isinstance(result, str)
+                and "No generation budget remains within the model context window" in result
+            ):
+                agentic_context_exhausted += 1
+            if (
+                max_tokens is not None
+                and str(row.get("id", "")) in failed_ids
+                and any(value >= max_tokens for value in _numbers(row.get("output_token_count")))
+            ):
+                failed_generation_token_cap += 1
+
     def diagnostic(count: int, total: int) -> dict[str, Any]:
         return {"count": count, "total": total, "rate": count / total if total else 0.0}
 
@@ -106,6 +147,10 @@ def build_report(result_dir: Path, score_dir: Path, artifact_name: str) -> dict[
         warnings.append("Parallel categories require batched calls, while the fused runtime executes parsed actions sequentially; interpret official parallel accuracy separately.")
     if context_exhausted:
         warnings.append("Some multi-turn samples exhausted the configured model context window.")
+    if agentic_context_exhausted:
+        warnings.append("Some agentic samples exhausted the configured model context window.")
+    if failed_generation_token_cap:
+        warnings.append("Some failed samples reached the configured per-request generation token cap.")
     if step_limit_reached:
         warnings.append("Some multi-turn samples reached the configured agent step limit.")
 
@@ -115,12 +160,18 @@ def build_report(result_dir: Path, score_dir: Path, artifact_name: str) -> dict[
             "seed": manifest.get("seed", ""),
             "temperature": manifest.get("temperature", ""),
             "context_length": manifest.get("context_length", ""),
+            "max_tokens": manifest.get("max_tokens", ""),
             "max_agent_steps": manifest.get("max_agent_steps", ""),
+            "web_search_max_agent_steps": manifest.get("web_search_max_agent_steps", ""),
             "discard_historical_thinking": manifest.get("discard_historical_thinking", ""),
         },
         "diagnostics": {
             "parallel_protocol_mismatch": diagnostic(parallel_protocol_mismatches, parallel_total),
             "multi_turn_context_exhaustion": diagnostic(context_exhausted, multi_turn_total),
+            "agentic_context_exhaustion": diagnostic(agentic_context_exhausted, agentic_total),
+            "failed_generation_token_cap_reached": diagnostic(
+                failed_generation_token_cap, scoring_total
+            ),
             "multi_turn_step_limit_reached": diagnostic(step_limit_reached, multi_turn_total),
             "multi_turn_force_terminated": diagnostic(force_terminated, multi_turn_total),
         },

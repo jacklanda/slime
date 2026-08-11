@@ -1,8 +1,14 @@
 import argparse
 
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, add_rl_on_policy_target_choices
 from sglang_router.launch_router import RouterArgs
 from slime.utils.http_utils import _wrap_ipv6
+
+
+# SGLang's on-policy mode accepts backend-specific targets.  Register the
+# Megatron target here so Gemma4 can select the shared deterministic kernels
+# without taking the FSDP-specific RMSNorm branch.
+add_rl_on_policy_target_choices(["megatron"])
 
 
 # TODO: use all sglang router arguments with `--sglang-router` prefix

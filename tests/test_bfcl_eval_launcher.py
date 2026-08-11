@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -14,6 +15,7 @@ NUM_GPUS = 0
 def test_eval_launcher_routes_bfcl_v3_to_gorilla_pipeline():
     repo_root = Path(__file__).resolve().parents[1]
     launcher = (repo_root / "experiments/evals.sh").read_text(encoding="utf-8")
+    bfcl_launcher = (repo_root / "experiments/artifacts/benchmarks/gorilla/berkeley-function-call-leaderboard" / "run_eval.sh").read_text(encoding="utf-8")
     model_config = (repo_root / "experiments/artifacts/benchmarks/gorilla/berkeley-function-call-leaderboard" / "bfcl_eval/constants/model_config.py").read_text(encoding="utf-8")
 
     assert "BFCL_BENCH_VERSION=v3" in launcher
@@ -24,6 +26,8 @@ def test_eval_launcher_routes_bfcl_v3_to_gorilla_pipeline():
     assert '--tp-size "${ROLLOUT_NUM_GPUS_PER_ENGINE}"' in launcher
     assert '--dp-size "${BFCL_DP_SIZE}"' in launcher
     assert 'BFCL_STICKY_ENGINE_ROUTING="${BFCL_STICKY_ENGINE_ROUTING:-true}"' in launcher
+    assert "BFCL_NUM_THREADS=$((BFCL_DP_SIZE * 16))" in launcher
+    assert '--max-running-requests "${BFCL_SGLANG_MAX_RUNNING_REQUESTS}"' in launcher
     assert "BFCL_CMD+=(--sticky-engine-routing)" in launcher
     assert '--agent-mode "${BFCL_AGENT_MODE}"' in launcher
     assert "BFCL_AGENT_MODE=slime_fused_gem" in launcher
@@ -32,6 +36,13 @@ def test_eval_launcher_routes_bfcl_v3_to_gorilla_pipeline():
     assert '"${BFCL_PYTHON_BIN}" -m venv --clear --system-site-packages' in launcher
     assert '"${BFCL_VENV_DIR}/bin/python" -m pip install --no-deps -e "${BFCL_ROOT}"' in launcher
     assert 'if [ "${BFCL_BENCH_VERSION}" = v4 ]' in launcher
+    assert 'start_managed_serper "${BFCL_LOG_ROOT}/serper_search_server.log"' in launcher
+    assert "SERPAPI_API_KEY" not in launcher
+    assert "SERPAPI_API_KEY" not in bfcl_launcher
+    assert "RETRIEVAL_SERVER_URL is required" in bfcl_launcher
+    assert 'web_search_max_agent_steps=${BFCL_WEB_SEARCH_MAX_STEPS:-16}' in bfcl_launcher
+    assert 'model_handler_utils=${PROJECT_ROOT}/bfcl_eval/model_handler/utils.py' in bfcl_launcher
+    assert 'default_prompts=${PROJECT_ROOT}/bfcl_eval/constants/default_prompts.py' in bfcl_launcher
     assert "'sentence-transformers==3.4.1'" in launcher
     assert '"${BFCL_VENV_DIR}/bin/python" -m pip install --no-deps' in launcher
     assert '--sglang-python-bin "${BFCL_SGLANG_PYTHON_BIN}"' in launcher
@@ -44,18 +55,28 @@ def test_eval_launcher_routes_bfcl_v3_to_gorilla_pipeline():
     assert '--bfcl-data-dir "${BFCL_DATA_DIR}"' in launcher
     assert "unset BFCL_DATA_DIR || true" in launcher
     assert '*qwen3.5-4b*) BFCL_MODEL_KEY="Qwen/Qwen3.5-4B"' in launcher
+    assert '*qwen3-8b*) BFCL_MODEL_KEY="Qwen/Qwen3-8B"' in launcher
     assert "export BFCL_SLIME_TOOL_PARSER_PATH=" in launcher
     assert 'export FUSED_MODEL_SERIES="${MODEL_SERIES}"' in launcher
     assert 'export FUSED_MAX_STEPS="${MAX_STEPS}"' in launcher
     assert 'export FUSED_MCP_MAX_STEPS="${MCP_MAX_STEPS}"' in launcher
     assert 'BFCL_SEED="${BFCL_SEED:-${ROLLOUT_SEED}}"' in launcher
+    assert 'BFCL_MAX_TOKENS="${EVAL_MAX_RESPONSE_LEN}"' in launcher
+    assert 'export BFCL_WEB_SEARCH_MAX_STEPS="${BFCL_WEB_SEARCH_MAX_STEPS}"' in launcher
+    assert "BFCL_WEB_SEARCH_MAX_STEPS=16" in launcher
     assert 'BFCL_DISCARD_HISTORICAL_THINKING="${BFCL_DISCARD_HISTORICAL_THINKING:-}"' in launcher
     assert 'BFCL_DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING}"' in launcher
     assert 'bfcl_discard_historical_thinking_explicit=true' in launcher
     assert 'BFCL_CMD+=(--seed "${BFCL_SEED}")' in launcher
+    assert "export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1" in launcher
+    assert "BFCL_SGLANG_JSON_MODEL_OVERRIDE_ARGS=" in launcher
     assert "slime_plugins.evals.bfcl_reliability_report" in launcher
+    assert '"Qwen/Qwen3-4B-FC"' in model_config
+    assert '"Qwen/Qwen3-4B-FC-RLLM-ToolAgent"' in model_config
+    assert '"Qwen/Qwen3-4B"' in model_config
     assert '"Qwen/Qwen3-4B-Thinking-2507-FC-RLLM-ToolAgent"' in model_config
     assert '"Qwen/Qwen3.5-4B-FC-RLLM-ToolAgent"' in model_config
+    assert '"Qwen/Qwen3-8B-FC-RLLM-ToolAgent"' in model_config
 
 
 @pytest.mark.unit
@@ -78,6 +99,32 @@ def test_bfcl_tool_agent_discards_only_historical_reasoning(monkeypatch):
     request_messages = agent.chat_completions
     assert "reasoning_content" not in request_messages[1]
     assert agent.messages[1]["reasoning_content"] == "old think"
+
+    monkeypatch.setenv("BFCL_DISCARD_HISTORICAL_THINKING", "false")
+    agent.discard_historical_thinking = True
+    request_messages = agent.chat_completions
+    assert "reasoning_content" not in request_messages[1]
+    assert agent.messages[1]["reasoning_content"] == "old think"
+
+
+@pytest.mark.unit
+def test_bfcl_memory_prompts_require_retention_and_retrieval():
+    repo_root = Path(__file__).resolve().parents[1]
+    prompt_source = (
+        repo_root
+        / "experiments/artifacts/benchmarks/gorilla/berkeley-function-call-leaderboard"
+        / "bfcl_eval/constants/default_prompts.py"
+    ).read_text(encoding="utf-8")
+    utils_source = (
+        repo_root
+        / "experiments/artifacts/benchmarks/gorilla/berkeley-function-call-leaderboard"
+        / "bfcl_eval/model_handler/utils.py"
+    ).read_text(encoding="utf-8")
+
+    assert "store every concrete fact that may be asked about later" in prompt_source
+    assert "Use archival memory for overflow" in prompt_source
+    assert "Before saying that information is unknown" in prompt_source
+    assert 'if "prereq" in test_category:' in utils_source
 
 
 @pytest.mark.unit
@@ -108,27 +155,53 @@ def test_bfcl_tool_agent_uses_slime_gem_prompt_and_finish_schema():
 
 
 @pytest.mark.unit
-def test_bfcl_tool_agent_executes_all_actions_before_finish():
+def test_bfcl_tool_agent_preserves_final_response_after_actions():
     repo_root = Path(__file__).resolve().parents[1]
     gorilla_root = repo_root / "experiments/artifacts/benchmarks/gorilla/berkeley-function-call-leaderboard"
     compat_path = gorilla_root / "bfcl_eval/model_handler/tool_agent_compat.py"
     handler_path = gorilla_root / "bfcl_eval/model_handler/local_inference/rllm_qwen_tool_agent.py"
+    checker_path = gorilla_root / "bfcl_eval/eval_checker/agentic_eval/agentic_checker.py"
     spec = importlib.util.spec_from_file_location("bfcl_tool_agent_actions_test", compat_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
+    checker_spec = importlib.util.spec_from_file_location(
+        "bfcl_agentic_checker_test", checker_path
+    )
+    checker = importlib.util.module_from_spec(checker_spec)
+    assert checker_spec.loader is not None
+    checker_spec.loader.exec_module(checker)
 
     actions = [
         {"function": {"name": "lookup", "arguments": {"id": 1}}},
         {"function": {"name": "update", "arguments": {"id": 1}}},
-        {"function": {"name": "finish", "arguments": {"command": "submit"}}},
+        {
+            "function": {
+                "name": "finish",
+                "arguments": json.dumps(
+                    {"command": "submit", "result": ["final answer"]}
+                ),
+            }
+        },
         {"function": {"name": "ignored", "arguments": {}}},
     ]
-    executable, finish_requested = module.actions_before_finish(actions)
+    executable, final_response = module.split_actions_and_final_response(actions)
 
     assert [action["function"]["name"] for action in executable] == ["lookup", "update"]
-    assert finish_requested is True
+    assert final_response == '["final answer"]'
+    assert checker.agentic_checker(final_response, ["final answer"])["valid"] is True
+
+    agent = module.MCPToolAgentCompat()
+    plain_response = '{"answer": "Michael", "context": "Stored in memory."}'
+    action = agent.update_from_model(plain_response)
+    executable, final_response = module.split_actions_and_final_response(action.action)
+
+    assert executable == []
+    assert final_response == plain_response
+    assert checker.agentic_checker(final_response, ["Michael"])["valid"] is True
+
     handler_source = handler_path.read_text(encoding="utf-8")
+    assert "current_turn_response.append(final_response)" in handler_source
     assert handler_source.count("return convert_to_function_call(self._decode_ast_calls(calls))") == 2
     assert "execute_multi_turn_func_call(\n                    convert_to_function_call(executable_tool_call_maps)" in handler_source
     assert "Executed only the first parsed action" not in handler_source
@@ -304,7 +377,7 @@ def test_bfcl_run_eval_forwards_disabled_top_k():
 
 
 @pytest.mark.unit
-def test_bfcl_sticky_engine_routing_is_stable_and_thread_local():
+def test_bfcl_sticky_engine_routing_is_balanced_and_thread_local():
     repo_root = Path(__file__).resolve().parents[1]
     module_path = (
         repo_root
@@ -316,29 +389,27 @@ def test_bfcl_sticky_engine_routing_is_stable_and_thread_local():
     assert spec.loader is not None
     spec.loader.exec_module(module)
 
-    assert module.stable_engine_index("multi_turn_base_0", 8) == 0
-    assert module.stable_engine_index("trajectory-e", 8) == 1
-    assert module.stable_engine_index("trajectory-f", 8) == 2
-    assert module.stable_engine_index("trajectory-e", 8) == 1
-
     router = module.TrajectoryEngineRouter()
     router.clients = [object() for _ in range(8)]
     default_client = object()
+    bound = threading.Barrier(16)
+    checked = threading.Barrier(16)
 
     def route_trajectory(trajectory_id):
         selected_index = router.bind(trajectory_id)
+        bound.wait()
         selected_clients = [router.current_client(default_client) for _ in range(20)]
+        checked.wait()
         router.unbind()
         return selected_index, selected_clients, router.current_client(default_client)
 
-    trajectory_ids = ["trajectory-e", "trajectory-f"] * 16
+    trajectory_ids = [f"trajectory-{index}" for index in range(16)]
     with ThreadPoolExecutor(max_workers=16) as executor:
         routed = list(executor.map(route_trajectory, trajectory_ids))
 
-    for trajectory_id, (engine_index, selected_clients, unbound_client) in zip(
-        trajectory_ids, routed
-    ):
-        assert engine_index == module.stable_engine_index(trajectory_id, 8)
+    engine_indices = [engine_index for engine_index, _, _ in routed]
+    assert [engine_indices.count(index) for index in range(8)] == [2] * 8
+    for engine_index, selected_clients, unbound_client in routed:
         assert all(client is router.clients[engine_index] for client in selected_clients)
         assert unbound_client is default_client
 
@@ -354,6 +425,10 @@ def test_bfcl_sticky_engine_startup_contract():
         gorilla_root
         / "bfcl_eval/model_handler/local_inference/base_oss_handler.py"
     ).read_text(encoding="utf-8")
+    tool_agent_handler = (
+        gorilla_root
+        / "bfcl_eval/model_handler/local_inference/rllm_qwen_tool_agent.py"
+    ).read_text(encoding="utf-8")
     cli = (gorilla_root / "bfcl_eval/__main__.py").read_text(encoding="utf-8")
     generation = (gorilla_root / "bfcl_eval/_llm_response_generation.py").read_text(
         encoding="utf-8"
@@ -365,6 +440,14 @@ def test_bfcl_sticky_engine_startup_contract():
     assert '"--dp-size",\n                        "1"' in handler
     assert "for engine_index, port in enumerate(ports):" in handler
     assert "self._engine_router.bind(test_entry[\"id\"])" in handler
+    assert "self._engine_router.bind(test_entry[\"id\"])" in tool_agent_handler
+    assert "self._rllm_agent" not in tool_agent_handler
+    assert 'common_cmd += ["--max-running-requests", str(max_running_requests)]' in handler
+    assert 'sglang_cmd += ["--max-running-requests", str(max_running_requests)]' in handler
+    assert handler.count('"--json-model-override-args"') == 2
+    assert 'sglang_model_override_args=${BFCL_SGLANG_JSON_MODEL_OVERRIDE_ARGS:-}' in (
+        gorilla_root / "run_eval.sh"
+    ).read_text(encoding="utf-8")
     assert '"--sticky-engine-routing"' in cli
     assert "sticky_engine_routing=sticky_engine_routing" in cli
     assert "sticky_engine_routing=args.sticky_engine_routing" in generation
@@ -390,15 +473,19 @@ def test_bfcl_reliability_report_flags_protocol_and_runtime_limits(tmp_path):
     result_root = tmp_path / "results" / artifact
     score_root = tmp_path / "scores" / artifact
     (result_root / "multi_turn").mkdir(parents=True)
+    (result_root / "agentic").mkdir(parents=True)
     (score_root / "non_live").mkdir(parents=True)
     (score_root / "multi_turn").mkdir(parents=True)
+    (score_root / "agentic").mkdir(parents=True)
     (result_root / "run_manifest.json").write_text(
         json.dumps(
             {
                 "seed": "42",
                 "temperature": "0.6",
                 "context_length": "40960",
+                "max_tokens": "4096",
                 "max_agent_steps": "128",
+                "web_search_max_agent_steps": "16",
                 "discard_historical_thinking": "true",
             }
         ),
@@ -448,6 +535,33 @@ def test_bfcl_reliability_report_flags_protocol_and_runtime_limits(tmp_path):
         + "\n",
         encoding="utf-8",
     )
+    (score_root / "agentic/BFCL_v4_web_search_base_score.json").write_text(
+        "\n".join(
+            [
+                json.dumps({"accuracy": 0.0, "correct_count": 0, "total_count": 1}),
+                json.dumps(
+                    {
+                        "id": "web_search_base_0",
+                        "test_category": "web_search_base",
+                        "valid": False,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (result_root / "agentic/BFCL_v4_web_search_base_result.json").write_text(
+        json.dumps(
+            {
+                "id": "web_search_base_0",
+                "result": "Error during inference: No generation budget remains within the model context window.",
+                "output_token_count": [[4096]],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     report = build_report(tmp_path / "results", tmp_path / "scores", artifact)
     write_report(report, tmp_path / "scores")
@@ -456,6 +570,14 @@ def test_bfcl_reliability_report_flags_protocol_and_runtime_limits(tmp_path):
     assert report["diagnostics"]["multi_turn_context_exhaustion"] == {"count": 1, "total": 2, "rate": 0.5}
     assert report["diagnostics"]["multi_turn_step_limit_reached"] == {"count": 1, "total": 2, "rate": 0.5}
     assert report["diagnostics"]["multi_turn_force_terminated"] == {"count": 1, "total": 2, "rate": 0.5}
+    assert report["diagnostics"]["agentic_context_exhaustion"] == {"count": 1, "total": 1, "rate": 1.0}
+    assert report["diagnostics"]["failed_generation_token_cap_reached"] == {
+        "count": 1,
+        "total": 5,
+        "rate": 0.2,
+    }
+    assert report["configuration"]["max_tokens"] == "4096"
+    assert report["configuration"]["web_search_max_agent_steps"] == "16"
     assert report["category_uncertainty"][0]["wilson_95_low"] < 0.5
     assert (tmp_path / "scores/reliability_report.json").is_file()
     assert (tmp_path / "scores/data_category_uncertainty.csv").is_file()

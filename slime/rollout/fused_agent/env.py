@@ -395,6 +395,28 @@ def _load_atlas_tool_schemas(base_url: str) -> list[dict[str, Any]]:
         return payload
 
 
+def _is_mcp_submission_tool(name: str) -> bool:
+    return name == "submit_result" or name.startswith("submit_result_")
+
+
+def _mcp_finish_result_schema(
+    task: dict[str, Any],
+    candidates: dict[str, dict[str, Any]],
+) -> dict | None:
+    difficulty = task.get("difficulty")
+    preferred_names = []
+    if difficulty not in (None, ""):
+        preferred_names.append(f"submit_result_difficulty_{difficulty}")
+    preferred_names.append("submit_result")
+    for name in preferred_names:
+        if name in candidates:
+            return candidates[name]
+    if len(candidates) == 1:
+        return next(iter(candidates.values()))
+    unique_candidates = {json.dumps(schema, sort_keys=True) for schema in candidates.values()}
+    return next(iter(candidates.values())) if len(unique_candidates) == 1 else None
+
+
 class AtlasMCPToolset:
     def __init__(self, task: dict[str, Any]):
         self.task = task
@@ -408,6 +430,7 @@ class AtlasMCPToolset:
         self._dirty_servers: set[str] = set()
         self.load_error = ""
         self.load_warning = ""
+        self.last_infra_failure = ""
         try:
             all_tools = _load_atlas_tool_schemas(self.base_url)
             by_name = {str(tool.get("name")): tool for tool in all_tools if tool.get("name")}
@@ -435,9 +458,30 @@ class AtlasMCPToolset:
             self.load_error = f"{type(exc).__name__}: {exc}"
 
     def schemas(self) -> list[dict[str, Any]]:
-        return [self._schemas[name] for name in self.enabled_tools if name in self._schemas] + [finish_schema()]
+        schemas = []
+        submission_schemas = {}
+        for name in self.enabled_tools:
+            schema = self._schemas.get(name)
+            if schema is None:
+                continue
+            if _is_mcp_submission_tool(name):
+                function = schema.get("function") or {}
+                parameters = function.get("parameters") or {}
+                candidate = (parameters.get("properties") or {}).get("result")
+                if isinstance(candidate, dict):
+                    submission_schemas[name] = candidate
+                continue
+            schemas.append(schema)
+        schemas.append(
+            finish_schema(
+                structured_result=True,
+                result_schema=_mcp_finish_result_schema(self.task, submission_schemas),
+            )
+        )
+        return schemas
 
     async def call(self, name: str, arguments: dict[str, Any]) -> str:
+        self.last_infra_failure = ""
         if _atlas_read_only() and name in _ATLAS_MUTATING_TOOLS:
             return f"Error: MCP-Atlas read-only evaluation blocks mutating tool {name}"
         if name not in self._schemas:
@@ -457,6 +501,8 @@ class AtlasMCPToolset:
             ) as response:
                 body = await response.text()
                 if response.status >= 400:
+                    if response.status == 429 or response.status >= 500:
+                        self.last_infra_failure = f"atlas_http_{response.status}"
                     return f"Error calling {name}: HTTP {response.status}: {body[:1000]}"
                 try:
                     payload = json.loads(body)
@@ -464,6 +510,7 @@ class AtlasMCPToolset:
                     return _cap_atlas_tool_result(body)
                 return _cap_atlas_tool_result(_format_atlas_tool_result(payload))
         except Exception as exc:
+            self.last_infra_failure = f"atlas_{type(exc).__name__}"
             return f"Error calling {name}: {type(exc).__name__}: {exc}"
 
 
@@ -498,6 +545,7 @@ class LocalMCPToolset:
         self.descriptions: dict[str, str] = {}
         self.load_error = ""
         self.load_warning = ""
+        self.last_call_info: dict[str, Any] = {}
         if self.tools_py:
             try:
                 self._load_tools(self.tools_py)
@@ -621,6 +669,7 @@ class LocalMCPToolset:
 
     def schemas(self) -> list[dict]:
         schemas = []
+        submission_schemas = {}
         for name, fn in sorted(self.tools.items()):
             sig = inspect.signature(fn)
             properties = {}
@@ -635,41 +684,79 @@ class LocalMCPToolset:
                     typ = "number"
                 elif ann in (bool, "bool"):
                     typ = "boolean"
-                elif getattr(ann, "__origin__", None) is list or ann in (list, "list"):
+                elif get_origin(ann) is list or ann in (list, "list"):
                     typ = "array"
+                elif get_origin(ann) is dict or ann in (dict, "dict"):
+                    typ = "object"
                 properties[param_name] = {"type": typ, "description": ""}
                 if inspect.isclass(ann) and issubclass(ann, enum.Enum):
                     properties[param_name]["enum"] = [member.value for member in ann]
                 if default is inspect._empty:
                     required.append(param_name)
+            if _is_mcp_submission_tool(name):
+                candidate = properties.get("result")
+                if isinstance(candidate, dict):
+                    submission_schemas[name] = candidate
+                continue
             schemas.append(tool_schema(name, self.descriptions.get(name, ""), properties, required))
-        schemas.append(finish_schema())
+        schemas.append(
+            finish_schema(
+                structured_result=True,
+                result_schema=_mcp_finish_result_schema(self.task, submission_schemas),
+            )
+        )
         return schemas
 
     def __contains__(self, name: str) -> bool:
         return name in self.tools
 
     def __getitem__(self, name: str) -> Callable[..., Any]:
-        return self.tools[name]
+        return self._verifier_callable(name)
 
     def __getattr__(self, name: str) -> Any:
         if name in self.tools:
-            return self.tools[name]
+            return self._verifier_callable(name)
         raise AttributeError(name)
 
+    def _verifier_callable(self, name: str) -> Callable[..., Any]:
+        fn = self.tools[name]
+
+        @functools.wraps(fn)
+        def call(*args, **kwargs):
+            bound = inspect.signature(fn).bind_partial(*args)
+            return self.call_raw(name, {**bound.arguments, **kwargs}, relax_empty=False)
+
+        return call
+
     def call(self, name: str, arguments: dict[str, Any]) -> str:
-        result = self.call_raw(name, arguments)
+        result = self.call_raw(name, arguments, relax_empty=True)
         if isinstance(result, str) and result.startswith("Error:"):
             return result
+        if self.last_call_info.get("fallback_used"):
+            result = {
+                "_slime_query_fallback": "The original filters returned no results; this result uses the tool defaults.",
+                "result": result,
+            }
         return json.dumps(result, ensure_ascii=False, default=str)
 
-    def call_raw(self, name: str, arguments: dict[str, Any]) -> Any:
+    def call_raw(self, name: str, arguments: dict[str, Any], *, relax_empty: bool = True) -> Any:
+        self.last_call_info = {"empty_result": False, "fallback_attempted": False, "fallback_used": False}
         fn = self.tools.get(name)
         if fn is None:
             return f"Error: unknown tool {name}"
         try:
             kwargs = _coerce_kwargs(fn, arguments)
-            return fn(**kwargs)
+            result = fn(**kwargs)
+            if relax_empty and _is_empty_mcp_result(result):
+                relaxed_kwargs = _relax_optional_tool_arguments(fn, kwargs)
+                if relaxed_kwargs != kwargs:
+                    self.last_call_info["fallback_attempted"] = True
+                    relaxed_result = fn(**relaxed_kwargs)
+                    if not _is_empty_mcp_result(relaxed_result):
+                        result = relaxed_result
+                        self.last_call_info["fallback_used"] = True
+            self.last_call_info["empty_result"] = _is_empty_mcp_result(result)
+            return result
         except Exception as e:
             return f"Error calling {name}: {type(e).__name__}: {e}"
 
@@ -689,6 +776,10 @@ def _coerce_kwargs(fn: Callable[..., Any], arguments: dict[str, Any]) -> dict[st
                 value = float(value)
             elif ann in (bool, "bool") and isinstance(value, str):
                 value = value.lower() in {"1", "true", "yes", "y", "on"}
+            elif (get_origin(ann) is dict or ann in (dict, "dict")) and isinstance(value, str):
+                value = json.loads(value)
+            elif (get_origin(ann) is list or ann in (list, "list")) and isinstance(value, str):
+                value = json.loads(value)
             elif inspect.isclass(ann) and issubclass(ann, enum.Enum) and not isinstance(value, ann):
                 try:
                     value = ann(value)
@@ -698,6 +789,47 @@ def _coerce_kwargs(fn: Callable[..., Any], arguments: dict[str, Any]) -> dict[st
             pass
         kwargs[name] = value
     return kwargs
+
+
+def _relax_optional_tool_arguments(fn: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+    relaxed = dict(kwargs)
+    for name, param in inspect.signature(fn).parameters.items():
+        if name in relaxed and param.default is not inspect._empty and relaxed[name] != param.default:
+            relaxed[name] = param.default
+    return relaxed
+
+
+def _is_empty_mcp_result(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return True
+        try:
+            return _is_empty_mcp_result(json.loads(stripped))
+        except (TypeError, ValueError):
+            return False
+    if isinstance(value, (list, tuple, set)):
+        return not value
+    if isinstance(value, dict):
+        if not value:
+            return True
+        payload_keys = {
+            "data",
+            "documents",
+            "entries",
+            "features",
+            "items",
+            "records",
+            "requirements",
+            "result",
+            "results",
+            "sections",
+        }
+        payloads = [item for key, item in value.items() if key.lower() in payload_keys]
+        return bool(payloads) and all(_is_empty_mcp_result(item) for item in payloads)
+    return False
 
 
 def _parameter_annotation(fn: Callable[..., Any], name: str, fallback: Any) -> Any:
@@ -738,12 +870,18 @@ class FusedEnvironment:
         self.rag = rag
         self.answer = ""
         self.tool_calls = 0
+        self.mcp_empty_tool_results = 0
+        self.mcp_nonempty_tool_results = 0
+        self.mcp_tool_fallbacks = 0
         self.web_search_queries: set[str] = set()
         self.web_search_cache: dict[str, Any] = {}
         self.deepsearch_page_cache: dict[str, str] = {}
+        self.infra_failure_reasons: list[str] = []
         self.reward_debug: dict[str, Any] = {}
         if enable_tools and self.mode == "mcp":
             self.mcp_tools = AtlasMCPToolset(self.task) if _is_atlas_mcp_task(self.task) else LocalMCPToolset(self.task)
+            if self.mcp_tools.load_error:
+                self.infra_failure_reasons.append("mcp_tools_load_error")
         else:
             self.mcp_tools = None
         self.docker_env = DockerTaskEnvironment(self.task, mode=self.mode) if enable_tools and self.mode in {"cli", "et"} else None
@@ -810,7 +948,8 @@ class FusedEnvironment:
         name = action.name
         args = action.arguments or {}
         if name in {"finish", "submit"}:
-            self.answer = str(args.get("result") or args.get("answer") or "")
+            result = args["result"] if "result" in args else args.get("answer", "")
+            self.answer = _serialize_answer_payload(result)
             if self.mode == "mcp" and _contains_nested_tool_call(self.answer):
                 self.reward_debug = {
                     "type": self.mode,
@@ -846,14 +985,33 @@ class FusedEnvironment:
                 result = await self.mcp_tools.call(name, args)
             else:
                 result = self.mcp_tools.call(name, args)
+            call_info = getattr(self.mcp_tools, "last_call_info", {}) or {}
+            empty_result = bool(call_info.get("empty_result", _is_empty_mcp_result(result)))
+            if empty_result:
+                self.mcp_empty_tool_results += 1
+            else:
+                self.mcp_nonempty_tool_results += 1
+            if call_info.get("fallback_used"):
+                self.mcp_tool_fallbacks += 1
+            infra_failure = getattr(self.mcp_tools, "last_infra_failure", "")
+            if infra_failure:
+                self.infra_failure_reasons.append(infra_failure)
+            info = {
+                "tools/calls": self.tool_calls,
+                "tools/mcp_tool_elapsed_s": _now_monotonic() - started_at,
+                "tools/mcp_empty_result": int(empty_result),
+                "tools/mcp_empty_results_total": self.mcp_empty_tool_results,
+                "tools/mcp_nonempty_results_total": self.mcp_nonempty_tool_results,
+                "tools/mcp_query_fallback_attempted": int(bool(call_info.get("fallback_attempted"))),
+                "tools/mcp_query_fallback_used": int(bool(call_info.get("fallback_used"))),
+            }
+            if infra_failure:
+                info.update({"infra_failure": True, "infra_failure_reason": infra_failure})
             return (
                 result,
                 0.0,
                 False,
-                {
-                    "tools/calls": self.tool_calls,
-                    "tools/mcp_tool_elapsed_s": _now_monotonic() - started_at,
-                },
+                info,
             )
         if self.mode in {"cli", "et"} and self.docker_env is not None:
             return self.docker_env.step(name, args)
@@ -961,6 +1119,9 @@ class FusedEnvironment:
         except Exception as e:
             metrics["tools/search_failed"] = 1
             metrics["tools/search_retrieve_failures"] = 1
+            reason = f"search_retrieval_{type(e).__name__}"
+            self.infra_failure_reasons.append(reason)
+            metrics.update({"infra_failure": True, "infra_failure_reason": reason})
             return f"Search failed: {type(e).__name__}: {e}", 0.0, False, metrics
         finally:
             metrics["tools/search_retrieve_elapsed_s"] = _now_monotonic() - retrieve_started_at
@@ -1024,6 +1185,16 @@ class FusedEnvironment:
         return _limit_words(content, max_words=word_budget), 0.0, False, metrics
 
     def compute_final_reward(self, *, require_tool_evidence: bool = True) -> float:
+        reward = self._compute_final_reward(require_tool_evidence=require_tool_evidence)
+        if reward <= 0.0 and self.infra_failure_reasons:
+            self.reward_debug = {
+                **self.reward_debug,
+                "infra_failure": True,
+                "infra_failure_reasons": list(dict.fromkeys(self.infra_failure_reasons)),
+            }
+        return reward
+
+    def _compute_final_reward(self, *, require_tool_evidence: bool = True) -> float:
         verifier_reward = self._compute_verifier_reward(require_tool_evidence=require_tool_evidence)
         if verifier_reward is not None:
             return verifier_reward
@@ -1095,6 +1266,17 @@ class FusedEnvironment:
             }
             return 0.0
         answer = _parse_answer_payload(self.answer)
+        allow_empty_answer = bool(self.task.get("allow_empty_answer") or verifier.get("allow_empty_answer"))
+        if _is_empty_mcp_result(answer) and not allow_empty_answer:
+            self.reward_debug = {
+                "type": self.mode,
+                "reward": 0.0,
+                "verifier_skipped": "empty_answer",
+                "tool_calls": self.tool_calls,
+                "empty_tool_results": self.mcp_empty_tool_results,
+                "query_fallbacks": self.mcp_tool_fallbacks,
+            }
+            return 0.0
         namespace: dict[str, Any] = {}
         try:
             exec(str(verifier["verification_code"]), namespace)
@@ -1104,6 +1286,9 @@ class FusedEnvironment:
             result = verify(self.mcp_tools, answer)
             if isinstance(result, dict):
                 passed = bool(result.get("passed") or result.get("success"))
+                if passed and not allow_empty_answer and _verifier_reports_missing_evidence(result):
+                    passed = False
+                    result = {**result, "passed": False, "rejected_degenerate_success": True}
                 score = float(result.get("score", 1.0 if passed else 0.0))
                 reward = score if passed else 0.0
                 self.reward_debug = {
@@ -1112,6 +1297,9 @@ class FusedEnvironment:
                     "verifier_passed": passed,
                     "verifier": result,
                     "tool_calls": self.tool_calls,
+                    "empty_tool_results": self.mcp_empty_tool_results,
+                    "nonempty_tool_results": self.mcp_nonempty_tool_results,
+                    "query_fallbacks": self.mcp_tool_fallbacks,
                 }
                 return reward
             reward = float(result)
@@ -1129,6 +1317,20 @@ class FusedEnvironment:
     def close(self) -> None:
         if self.docker_env is not None:
             self.docker_env.close()
+
+
+def _verifier_reports_missing_evidence(result: dict[str, Any]) -> bool:
+    message = str(result.get("message") or result.get("reason") or "").strip().lower()
+    return any(
+        phrase in message
+        for phrase in (
+            "no requirements found in documents",
+            "no evidence found",
+            "no supporting evidence",
+            "nothing could be verified",
+            "no content could be verified",
+        )
+    )
 
 
 def _extract_ground_truth(label: Any) -> Any:
@@ -1190,6 +1392,13 @@ def _parse_answer_payload(text: str) -> Any:
         return json.loads(stripped)
     except Exception:
         return stripped
+
+
+def _serialize_answer_payload(value: Any) -> str:
+    """Keep verifier input JSON-compatible when a parser returns structured data."""
+    if value is None or isinstance(value, (dict, list, bool, int, float)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
 
 
 def _format_retrieval(data: Any) -> str:

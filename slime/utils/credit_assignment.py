@@ -160,11 +160,40 @@ def mask_only_action_span(mask: list[int], start: int, end: int) -> list[int]:
     return [0] * start + list(mask[start:end]) + [0] * (len(mask) - end)
 
 
+def excluded_from_reward_baseline(
+    metadata: dict[str, Any] | None,
+    config: CreditAssignmentConfig,
+) -> bool:
+    """True when a sample's reward is a credit-assignment penalty, not a score.
+
+    These samples are terminated by a format/behaviour guard and assigned a
+    synthetic reward of 0.0, indistinguishable from a trajectory that ran to
+    completion and answered wrong. Leaving them in the group mean makes the
+    baseline track the model's *formatting* failure rate rather than its task
+    success rate, which biases every sibling's advantage in both directions at
+    once: it lowers the baseline, so correct trajectories are over-credited, and
+    it shrinks the gap to 0.0, so the penalty itself is weakened.
+
+    Measured on odyssey-gemma4-e4b-think-dev38 (19.9% of samples penalized, all
+    with reward exactly 0.0), excluding them from the baseline moves the mean
+    winner advantage 0.407 -> 0.282 (-31%) and the mean penalty -0.323 -> -0.565
+    (75% stronger).
+
+    Attributable failures are still trained on: they keep a localized policy
+    loss and are scored *against* the clean baseline, so the penalty survives.
+    Omission/truncation failures may intentionally carry an all-zero policy mask
+    because no emitted token can be blamed reliably. Both lose their vote in
+    computing the baseline.
+    """
+    return enabled_credit_assignment_event(metadata, config) is not None
+
+
 def build_policy_loss_mask(
     *,
     metadata: dict[str, Any] | None,
     loss_mask: list[int],
     config: CreditAssignmentConfig,
+    parser_error_token_window: int = 256,
 ) -> tuple[list[int] | None, str | None]:
     event = enabled_credit_assignment_event(metadata, config)
     if event is None:
@@ -188,6 +217,13 @@ def build_policy_loss_mask(
         "error_action_end",
         "abnormal_action_end",
     )
+    if event == "tool_parser_error":
+        if start is not None and end is not None and 0 <= start < end <= len(loss_mask):
+            return mask_only_action_span(loss_mask, start, end), event
+        penalized_len = max(0, min(len(loss_mask), parser_error_token_window))
+        if penalized_len == 0:
+            return [0] * len(loss_mask), event
+        return [0] * (len(loss_mask) - penalized_len) + list(loss_mask[-penalized_len:]), event
     if start is None or end is None:
         return list(loss_mask), event
     return mask_only_action_span(loss_mask, start, end), event

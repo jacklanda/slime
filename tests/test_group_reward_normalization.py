@@ -12,6 +12,8 @@ import pytest
 import torch
 
 from slime.ray.rollout import _group_normalize_rewards, _post_process_rewards
+from slime.utils.credit_assignment import CreditAssignmentConfig, excluded_from_reward_baseline
+from slime.utils.prompt_equal import process_segment_rewards
 from slime.utils.types import Sample
 
 
@@ -288,6 +290,324 @@ def test_launcher_disables_normalize_advantages_by_default():
 
     assert 'NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"' in text
     assert 'NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"' not in text
+
+
+# ---------------------------------------------------------------------------
+# Dr.GRPO mean-only advantages.
+#
+# Dividing by the group std scales each group by the inverse of its own
+# evidence. DAPO's zero-variance filter drops all-wrong groups, so what survives
+# is dominated by near-degenerate ones -- exactly where the division blows up.
+# ---------------------------------------------------------------------------
+
+
+def _binary_group_advantage(k, n, use_std, path):
+    """Winner advantage for a group with ``k`` of ``n`` correct, on either path."""
+    rewards = [1.0] * k + [0.0] * (n - k)
+    args = _args(n_samples_per_prompt=n, rollout_batch_size=1, grpo_std_normalization=use_std)
+    if path == "group":
+        samples = _samples([0] * n, rewards)
+        return max(_group_normalize_rewards(args, samples, rewards))
+    # The fused-agent rollout marks every sample prompt_equal_loss, which routes
+    # _post_process_rewards through process_segment_rewards instead.
+    samples = [
+        Sample(
+            group_index=0,
+            index=i,
+            rollout_id=i,
+            reward=reward,
+            metadata={"prompt_equal_loss": True, "parent_traj_id": f"t{i}", "segment_index": 0, "segment_count": 1},
+        )
+        for i, reward in enumerate(rewards)
+    ]
+    return max(process_segment_rewards(args, samples, rewards, rewards))
+
+
+@pytest.mark.parametrize("path", ["group", "segment"])
+def test_std_normalization_amplifies_the_least_certain_groups(path):
+    """Documents the behaviour being switched off, on both reward paths.
+
+    A lone winner in 32 samples gets ~5.6x the pull of a winner in a balanced
+    group -- the group carrying the least evidence moves the weights the most.
+    """
+    lone = _binary_group_advantage(1, 32, use_std=True, path=path)
+    balanced = _binary_group_advantage(16, 32, use_std=True, path=path)
+
+    assert lone > 5.0
+    # ~1.0, but not exactly: the two paths disagree on the std convention
+    # (_group_normalize_rewards uses unbiased, process_segment_rewards
+    # population), which is a pre-existing divergence this change makes moot.
+    assert balanced == pytest.approx(1.0, abs=0.02)
+    assert lone / balanced > 5.0
+
+
+@pytest.mark.parametrize("path", ["group", "segment"])
+def test_mean_only_bounds_every_group_advantage_by_one(path):
+    """Mean-only centering caps |advantage| at (n-1)/n regardless of sparsity."""
+    for k in (1, 2, 8, 16, 31):
+        advantage = _binary_group_advantage(k, 32, use_std=False, path=path)
+        assert advantage <= 31 / 32 + 1e-6, (k, advantage)
+
+    assert _binary_group_advantage(1, 32, use_std=False, path=path) == pytest.approx(31 / 32)
+
+
+@pytest.mark.parametrize("path", ["group", "segment"])
+def test_mean_only_preserves_the_sign_and_ordering_of_advantages(path):
+    """Only the per-group scale changes; the gradient direction does not.
+
+    Winners stay positive, losers negative, and the group stays zero-mean --
+    so this is a variance-reduction change, not a change of objective.
+    """
+    rewards = [1.0] * 6 + [0.0] * 26
+    args_std = _args(n_samples_per_prompt=32, rollout_batch_size=1, grpo_std_normalization=True)
+    args_mean = _args(n_samples_per_prompt=32, rollout_batch_size=1, grpo_std_normalization=False)
+    samples = _samples([0] * 32, rewards)
+
+    with_std = _group_normalize_rewards(args_std, samples, rewards)
+    mean_only = _group_normalize_rewards(args_mean, samples, rewards)
+
+    for reward, a, b in zip(rewards, with_std, mean_only, strict=True):
+        assert (a > 0) == (b > 0) == (reward > 0.5)
+    # Same vector up to a single positive scale factor.
+    scale = with_std[0] / mean_only[0]
+    assert scale > 1
+    torch.testing.assert_close(torch.tensor(with_std), torch.tensor(mean_only) * scale, atol=1e-5, rtol=0)
+    torch.testing.assert_close(torch.tensor(mean_only).mean(), torch.tensor(0.0), atol=1e-6, rtol=0)
+
+
+def test_mean_only_flattens_the_advantage_mass_held_by_sparse_groups():
+    """The batch-level effect: sparse groups stop dominating the update.
+
+    Group shapes are taken from odyssey-gemma4-e4b-think-dev38 step 40, whose
+    surviving groups were [1, 1, 2, 2, 5, 11, 12, 18] correct out of 32.
+    """
+    observed_group_sizes = [1, 1, 2, 2, 5, 11, 12, 18]
+
+    def sparse_mass_share(use_std):
+        per_group = []
+        for k in observed_group_sizes:
+            rewards = [1.0] * k + [0.0] * (32 - k)
+            args = _args(n_samples_per_prompt=32, rollout_batch_size=1, grpo_std_normalization=use_std)
+            normalized = _group_normalize_rewards(args, _samples([0] * 32, rewards), rewards)
+            per_group.append(sum(abs(x) for x in normalized))
+        total = sum(per_group)
+        return sum(m for k, m in zip(observed_group_sizes, per_group, strict=True) if k <= 2) / total
+
+    with_std = sparse_mass_share(use_std=True)
+    mean_only = sparse_mass_share(use_std=False)
+
+    # Two groups out of eight held 31% of the update; mean-only takes them to
+    # 17.5%, just under their 2/8 = 25% share of the sequences.
+    assert with_std == pytest.approx(0.314, abs=0.01)
+    assert mean_only == pytest.approx(0.175, abs=0.01)
+    assert mean_only < 2 / len(observed_group_sizes) < with_std
+
+
+def test_gemma4_launcher_uses_dr_grpo_mean_only_advantages_by_default():
+    """Sparse binary groups must not receive an inverse-evidence amplification."""
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments" / "train_gemma4_fused_agent_sync.sh").read_text()
+
+    assert 'GRPO_STD_NORMALIZATION="${GRPO_STD_NORMALIZATION:-false}"' in launcher
+    assert 'FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS="${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS:-0}"' in launcher
+    # The flag has to actually reach the trainer, not just be declared.
+    assert 'if ! is_truthy "${GRPO_STD_NORMALIZATION}"; then' in launcher
+    assert "GRPO_ARGS+=(--disable-grpo-std-normalization)" in launcher
+
+    # The stabilization is intentionally launcher-scoped to Gemma4: other model
+    # families have not been measured and keep upstream GRPO defaults.
+    for name in ("train_qwen3_fused_agent_sync.sh", "train_qwen3.5_fused_agent_sync.sh"):
+        other = repo_root / "experiments" / name
+        if other.exists():
+            assert "GRPO_STD_NORMALIZATION" not in other.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Credit-assignment penalties must not define the baseline they are scored
+# against. Covered on both reward paths, since the fused-agent rollout marks
+# every sample prompt_equal_loss and therefore uses the segment path.
+# ---------------------------------------------------------------------------
+
+
+def _credit_args(enable=True, **overrides):
+    values = dict(
+        credit_assignment_enable=enable,
+        credit_assignment_tool_parser_error=True,
+        credit_assignment_repeated_search_query=True,
+        credit_assignment_too_many_tool_calls=True,
+        credit_assignment_search_bypass=True,
+        credit_assignment_mixed_tool_and_answer=True,
+        credit_assignment_ngram_repetition=True,
+    )
+    values.update(overrides)
+    return _args(**values)
+
+
+def _penalized_samples(rewards, events, *, segment):
+    """Build a one-group batch where ``events[i]`` marks sample i as penalized."""
+    samples = []
+    for i, (reward, event) in enumerate(zip(rewards, events, strict=True)):
+        metadata = {}
+        if segment:
+            metadata = {
+                "prompt_equal_loss": True,
+                "parent_traj_id": f"t{i}",
+                "segment_index": 0,
+                "segment_count": 1,
+            }
+        if event:
+            metadata["credit_assignment_event"] = event
+        samples.append(Sample(group_index=0, index=i, rollout_id=i, reward=reward, metadata=metadata))
+    return samples
+
+
+def _normalize(args, rewards, events, *, segment):
+    samples = _penalized_samples(rewards, events, segment=segment)
+    if segment:
+        return process_segment_rewards(args, samples, rewards, rewards)
+    return _group_normalize_rewards(args, samples, rewards)
+
+
+@pytest.mark.parametrize("segment", [False, True])
+def test_penalized_samples_are_excluded_from_the_group_baseline(segment):
+    """The baseline is the mean over clean samples only."""
+    rewards = [1.0, 1.0, 0.0, 0.0]
+    events = [None, None, None, "tool_parser_error"]
+
+    result = _normalize(_credit_args(), rewards, events, segment=segment)
+
+    # Clean mean is 2/3, not the all-sample mean of 1/2.
+    torch.testing.assert_close(
+        torch.tensor(result),
+        torch.tensor([1 / 3, 1 / 3, -2 / 3, -2 / 3]),
+        atol=1e-6,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("segment", [False, True])
+def test_penalty_survives_and_strengthens_while_winners_are_less_over_credited(segment):
+    """The directional claim: dilution was happening on both sides at once."""
+    rewards = [1.0] * 4 + [0.0] * 2 + [0.0] * 4
+    events = [None] * 6 + ["tool_parser_error"] * 4
+
+    before = _normalize(_credit_args(enable=False), rewards, events, segment=segment)
+    after = _normalize(_credit_args(), rewards, events, segment=segment)
+
+    winner_before, winner_after = before[0], after[0]
+    penalty_before, penalty_after = before[-1], after[-1]
+
+    assert winner_after < winner_before  # less over-credited
+    assert penalty_after < penalty_before  # more strongly penalized
+    assert penalty_after < 0  # still a penalty, not a reward
+
+
+@pytest.mark.parametrize("segment", [False, True])
+def test_penalized_samples_keep_a_nonzero_advantage_rather_than_being_dropped(segment):
+    """Excluded from the baseline is not the same as excluded from training."""
+    rewards = [1.0, 0.0, 0.0]
+    events = [None, None, "tool_parser_error"]
+
+    result = _normalize(_credit_args(), rewards, events, segment=segment)
+
+    assert result[-1] != 0.0
+    torch.testing.assert_close(torch.tensor(result[-1]), torch.tensor(-0.5), atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("segment", [False, True])
+def test_all_penalized_group_falls_back_to_the_full_group(segment):
+    """A baseline over an empty set is undefined; degrade, do not crash."""
+    rewards = [1.0, 0.0, 0.0, 0.0]
+    events = ["tool_parser_error"] * 4
+
+    result = _normalize(_credit_args(), rewards, events, segment=segment)
+
+    # Identical to the old all-sample behaviour: centered on 0.25.
+    torch.testing.assert_close(
+        torch.tensor(result),
+        torch.tensor([0.75, -0.25, -0.25, -0.25]),
+        atol=1e-6,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("segment", [False, True])
+def test_disabled_credit_assignment_leaves_normalization_untouched(segment):
+    """No behaviour change for runs that do not opt into credit assignment."""
+    rewards = [1.0, 1.0, 0.0, 0.0]
+    events = [None, None, None, "tool_parser_error"]
+
+    result = _normalize(_credit_args(enable=False), rewards, events, segment=segment)
+
+    torch.testing.assert_close(
+        torch.tensor(result),
+        torch.tensor([0.5, 0.5, -0.5, -0.5]),
+        atol=1e-6,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("segment", [False, True])
+def test_std_normalization_uses_the_same_population_as_the_mean(segment):
+    """Mean and scale must come from one population, or advantages are skewed."""
+    rewards = [1.0, 1.0, 0.0, 0.0, 0.0]
+    events = [None, None, None, None, "tool_parser_error"]
+    args = _credit_args(grpo_std_normalization=True)
+
+    result = _normalize(args, rewards, events, segment=segment)
+
+    clean = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    centered = clean - clean.mean()
+    expected_scale = centered.std(correction=0 if segment else 1) + 1e-6
+    torch.testing.assert_close(
+        torch.tensor(result[0]),
+        torch.tensor(((1.0 - clean.mean()) / expected_scale).item()),
+        atol=1e-5,
+        rtol=0,
+    )
+    # The clean samples remain zero-mean after scaling.
+    torch.testing.assert_close(torch.tensor(result[:4]).mean(), torch.tensor(0.0), atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("segment", [False, True])
+def test_constant_clean_baseline_does_not_amplify_credit_penalties(segment):
+    """A mostly parser-error group must stay finite when std normalization is on."""
+    rewards = [0.0] * 30 + [1.0, 1.0]
+    events = ["tool_parser_error"] * 30 + [None, None]
+
+    result = _normalize(_credit_args(grpo_std_normalization=True), rewards, events, segment=segment)
+
+    assert all(torch.isfinite(torch.tensor(result)))
+    torch.testing.assert_close(torch.tensor(result[:30]), torch.full((30,), -1.0), atol=1e-6, rtol=0)
+    torch.testing.assert_close(torch.tensor(result[30:]), torch.zeros(2), atol=1e-6, rtol=0)
+
+
+def test_every_credit_assignment_event_is_excluded_from_the_baseline():
+    """All guard events assign a synthetic 0.0, so all must be excluded."""
+    events = [
+        "tool_parser_error",
+        "direct_submit_without_tool",
+        "ngram_repetition",
+        "mixed_tool_and_answer",
+        "max_response_len_exceeded",
+        "max_turns_exceeded",
+        "repeated_search_query",
+        "too_many_tool_calls",
+        "tail_guard_early_stop",
+        "search_bypass",
+    ]
+    config = CreditAssignmentConfig.from_args(_credit_args())
+
+    for event in events:
+        assert excluded_from_reward_baseline({"credit_assignment_event": event}, config), event
+    assert not excluded_from_reward_baseline({}, config)
+    assert not excluded_from_reward_baseline(None, config)
+
+
+def test_nothing_is_excluded_when_credit_assignment_is_disabled():
+    config = CreditAssignmentConfig.from_args(_credit_args(enable=False))
+
+    assert not excluded_from_reward_baseline({"credit_assignment_event": "tool_parser_error"}, config)
 
 
 if __name__ == "__main__":

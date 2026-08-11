@@ -206,7 +206,7 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
         if os.environ.get("SLIME_GEMMA4_LOGPROB_BF16") != "1":
             vocab_parallel_logits = vocab_parallel_logits.float()
         seq_len, vocab_parallel_size = vocab_parallel_logits.shape
-        rank, _world_size = _get_vocab_parallel_rank_size(process_group)
+        rank, world_size = _get_vocab_parallel_rank_size(process_group)
         vocab_start_index = rank * vocab_parallel_size
         vocab_end_index = vocab_start_index + vocab_parallel_size
 
@@ -262,7 +262,40 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
                 return torch.einsum("ij,ij->i", softmax, logits).unsqueeze(-1)
             return (softmax * logits).sum(dim=-1, keepdim=True)
 
-        if log_prob_keep_mask is None:
+        use_gemma4_sglang_log_softmax = (
+            os.environ.get("SLIME_GEMMA4_LOGPROB_BF16") == "1"
+            and os.environ.get("SLIME_GEMMA4_BATCH_INVARIANT") == "1"
+            and world_size == 1
+            and log_prob_keep_mask is None
+            and vocab_parallel_logits.dtype == torch.bfloat16
+        )
+        if use_gemma4_sglang_log_softmax:
+            # Use the exact kernel that produced rollout log-probs. Reuse its
+            # full-vocabulary output as the backward softmax buffer, so this is
+            # both lower-kernel-count and no larger than the previous BF16 path.
+            if vocab_parallel_logits.is_cuda:
+                from sglang.srt.batch_invariant_ops import log_softmax as sglang_batch_invariant_log_softmax
+
+                log_prob_matrix = sglang_batch_invariant_log_softmax(vocab_parallel_logits)
+            else:
+                log_prob_matrix = torch.log_softmax(vocab_parallel_logits, dim=-1)
+            log_prob = torch.gather(
+                log_prob_matrix,
+                dim=-1,
+                index=masked_target_1d.reshape(-1, 1),
+            )
+            predicted_logits = torch.gather(
+                vocab_parallel_logits,
+                dim=-1,
+                index=masked_target_1d.reshape(-1, 1),
+            )
+            log_prob_softmax = log_prob_matrix.exp_()
+            if with_entropy:
+                entropy_softmax = log_prob_softmax
+                sum_softmax_times_logits = sum_softmax_logits(entropy_softmax, vocab_parallel_logits)
+                log_normalizer = predicted_logits.float() - log_prob.float()
+                entropy = (log_normalizer - sum_softmax_times_logits.float()).squeeze(dim=-1)
+        elif log_prob_keep_mask is None:
             predicted_logits, log_prob_sum_exp_logits, log_prob_softmax, log_prob_logits_max = vocab_parallel_softmax(
                 vocab_parallel_logits
             )
@@ -294,9 +327,10 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
                 log_prob_logits, inplace=True
             )
 
-        predicted_logits = predicted_logits.masked_fill_(target_mask, 0.0).unsqueeze(-1)
-        _maybe_all_reduce(predicted_logits, dist.ReduceOp.SUM, process_group)
-        log_prob = predicted_logits - log_prob_sum_exp_logits.log()
+        if not use_gemma4_sglang_log_softmax:
+            predicted_logits = predicted_logits.masked_fill_(target_mask, 0.0).unsqueeze(-1)
+            _maybe_all_reduce(predicted_logits, dist.ReduceOp.SUM, process_group)
+            log_prob = predicted_logits - log_prob_sum_exp_logits.log()
 
         if not with_entropy_grad:
             ctx.mark_non_differentiable(entropy)
@@ -801,9 +835,8 @@ def calculate_log_probs_and_entropy(
                     log_prob_keep_mask=mask_chunk,
                 )
                 if logits_chunk.requires_grad and logits_chunk.dtype != torch.float32:
-                    # The fused op computes softmax in FP32. Checkpoint each
-                    # mixed-precision chunk so all full-vocab softmax buffers
-                    # are not retained together until policy backward.
+                    # Checkpoint each mixed-precision chunk so all full-vocab
+                    # softmax buffers are not retained until policy backward.
                     log_prob, entropy_chunk = checkpoint(
                         chunk_fn,
                         logits_chunk,

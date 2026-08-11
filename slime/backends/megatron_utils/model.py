@@ -144,6 +144,7 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
     metrics.update(
         {
             "episode/num": 0.0,
+            "episode/reward": 0.0,
             "episode/training_reward/mean": 0.0,
         }
     )
@@ -254,14 +255,20 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
             episode_turn_values.setdefault(f"turn/tool_call_turn/{suffix}", []).append(tool_call_turns)
 
     num_groups = len(group_rewards)
+    training_reward_mean = float(sample_reward_sum / sample_count)
     metrics.update(
         {
             "episode/num": float(num_groups),
+            # Keep the public episode reward on the same all-trajectory
+            # denominator as the reward used by the actor update. Workflow
+            # metrics are absent on abnormal terminations and therefore cannot
+            # define this aggregate without silently dropping failed episodes.
+            "episode/reward": training_reward_mean,
             # Sample-equal-weight mean: average over every individual sample's
             # reward (flattened across groups), NOT the per-group max. The
             # per-group-max variant saturates to ~1.0 under large
             # n_samples_per_prompt because it effectively measures pass@n.
-            "episode/training_reward/mean": float(sample_reward_sum / sample_count),
+            "episode/training_reward/mean": training_reward_mean,
             "episode/prompt_tokens": float(prompt_token_sum / num_groups),
             "episode/response_tokens": float(response_token_sum / num_groups),
         }
@@ -276,6 +283,9 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
         metrics[f"episode/termination_reason/{termination}"] = count / total_terminations
     termination_warning_count = sum(count for reason, count in termination_counts.items() if _is_warning_termination(reason))
     metrics["episode/termination_warning/abnormal_or_limit"] = termination_warning_count / total_terminations
+    completed_rewards = workflow_values.pop("reward", [])
+    if completed_rewards:
+        metrics["episode/reward/completed_mean"] = float(sum(completed_rewards) / len(completed_rewards))
     for key, values in workflow_values.items():
         mean_value = float(sum(values) / len(values))
         metrics[f"episode/{key}"] = mean_value

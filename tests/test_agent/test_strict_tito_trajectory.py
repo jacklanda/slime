@@ -694,5 +694,78 @@ def test_strict_weight_version_rejects_missing_and_mixed_turns():
         )
 
 
+def test_strict_append_only_ignores_message_replay_forks_and_emits_one_sample():
+    manager = TrajectoryManager(strict_append_only=True)
+    sid = "strict-linear"
+    manager.record_turn(
+        sid,
+        turn=TurnRecord(
+            prompt_ids=[1, 2],
+            output_ids=[3, 4],
+            finish_reason="tool_calls",
+            output_log_probs=[-0.3, -0.4],
+            context_delta_ids=[1, 2],
+            tito_context_reason="initial",
+        ),
+        prompt_messages=[{"role": "user", "content": "question"}],
+        response_message={"role": "assistant", "content": "raw action"},
+    )
+    manager.record_turn(
+        sid,
+        turn=TurnRecord(
+            prompt_ids=[1, 2, 3, 4, 5],
+            output_ids=[6],
+            finish_reason="stop",
+            output_log_probs=[-0.6],
+            context_delta_ids=[5],
+            tito_context_reason="append_delta",
+        ),
+        prompt_messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "unrelated structured replay"},
+        ],
+        response_message={"role": "assistant", "content": "answer"},
+    )
+
+    samples = manager.get_trajectory(sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+
+    assert len(samples) == 1
+    assert samples[0].tokens == [1, 2, 3, 4, 5, 6]
+    assert samples[0].loss_mask == [1, 1, 0, 1]
+    assert samples[0].rollout_log_probs == [-0.3, -0.4, 0.0, -0.6]
+    assert samples[0].metadata["tito_context_reasons"] == ["initial", "append_delta"]
+
+
+@pytest.mark.parametrize(
+    "turn, message",
+    [
+        (
+            TurnRecord(prompt_ids=[1], output_ids=[2], finish_reason="stop"),
+            "context_delta_ids",
+        ),
+        (
+            TurnRecord(
+                prompt_ids=[1],
+                output_ids=[2],
+                finish_reason="stop",
+                context_delta_ids=[1],
+                tito_boundary_before=True,
+            ),
+            "boundary",
+        ),
+    ],
+)
+def test_strict_append_only_rejects_unproven_context(turn, message):
+    manager = TrajectoryManager(strict_append_only=True)
+
+    with pytest.raises(ValueError, match=message):
+        manager.record_turn(
+            "strict-invalid",
+            turn=turn,
+            prompt_messages=[{"role": "user", "content": "question"}],
+            response_message={"role": "assistant", "content": "answer"},
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

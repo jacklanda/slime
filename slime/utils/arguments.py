@@ -500,8 +500,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "Optional comma-separated task family quotas for rollout batches, "
-                    "for example `webqa=0.4,mcp=0.4,cli=0.2`. Currently applied by "
-                    "the fully-async rollout collector after dynamic filtering."
+                    "for example `webqa=0.4,mcp=0.4,cli=0.2`. Applied after dynamic "
+                    "filtering by both synchronous and fully-async rollout collectors."
                 ),
             )
 

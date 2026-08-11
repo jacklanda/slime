@@ -3,23 +3,78 @@ import os
 import torch
 
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput
-from slime.utils.prompt_equal import has_multi_segment_trajectories, trajectory_level_rewards, uses_prompt_equal_loss
+from slime.utils.credit_assignment import CreditAssignmentConfig, excluded_from_reward_baseline
+from slime.utils.prompt_equal import has_multi_segment_trajectories, trajectory_level_samples, uses_prompt_equal_loss
 from slime.utils.types import Sample
 
 __all__ = [
     "check_reward_nonzero_std",
     "check_reward_nonzero_std_and_fused_steps",
+    "is_infra_failure",
 ]
 
 
+_INFRA_TERMINATIONS = {
+    "error",
+    "env_init_error",
+    "infra_failure",
+    "rollout_group_timeout",
+    "rollout_task_exception",
+    "timeout",
+}
+
+
+def is_infra_failure(sample: Sample) -> bool:
+    """Return whether a sample failed outside the policy's task decision.
+
+    Infrastructure failures must not be treated as ordinary zero-reward model
+    outcomes: doing so creates artificial negative advantages and can collapse
+    a prompt group's reward variance.
+    """
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    status = getattr(sample, "status", None)
+    if status == Sample.Status.FAILED or getattr(status, "value", status) == Sample.Status.FAILED.value:
+        return True
+    if metadata.get("infra_failure") or metadata.get("fused_infra_failure"):
+        return True
+    termination = str(metadata.get("fused_termination") or metadata.get("termination_reason") or "").lower()
+    if termination in _INFRA_TERMINATIONS:
+        return True
+    for key in ("fused_reward_debug", "reward_debug"):
+        reward_debug = metadata.get(key)
+        if isinstance(reward_debug, dict) and (
+            reward_debug.get("infra_failure")
+            or reward_debug.get("tools_load_error")
+            or reward_debug.get("verifier_error")
+        ):
+            return True
+    return False
+
+
 def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
+    if any(is_infra_failure(sample) for sample in _iter_samples(samples)):
+        return DynamicFilterOutput(keep=False, reason="infra_failure")
     if uses_prompt_equal_loss(samples) or has_multi_segment_trajectories(samples):
         # Judge variance on trajectory-level rewards so sparse placeholders or
         # legacy duplicated segment rewards cannot fake or dilute the std.
-        rewards = trajectory_level_rewards(args, samples)
+        reward_samples = trajectory_level_samples(samples)
     else:
-        rewards = [sample.get_reward_value(args) for sample in samples]
-    keep = bool(torch.tensor(rewards, dtype=torch.float64).std() > 1e-6)
+        reward_samples = samples
+
+    credit_config = CreditAssignmentConfig.from_args(args)
+    if credit_config.enable:
+        clean_samples = [
+            sample
+            for sample in reward_samples
+            if not excluded_from_reward_baseline(sample.metadata, credit_config)
+        ]
+        if clean_samples:
+            reward_samples = clean_samples
+
+    rewards = [sample.get_reward_value(args) for sample in reward_samples]
+    reward_values = torch.tensor(rewards, dtype=torch.float64)
+    spread = reward_values.std() if reward_values.numel() > 1 else torch.tensor(0.0, dtype=reward_values.dtype)
+    keep = bool(torch.isfinite(spread)) and bool(spread > 1e-6)
     return DynamicFilterOutput(
         keep=keep,
         reason=None if keep else f"zero_std_{round(rewards[0], 1)}",

@@ -136,9 +136,17 @@ class _Gemma4LogitSoftcap(torch.autograd.Function):
     def forward(ctx, logits: torch.Tensor, scale: float) -> torch.Tensor:
         ctx.scale = scale
         ctx.mark_dirty(logits)
-        logits.div_(scale)
-        logits.tanh_()
-        logits.mul_(scale)
+        if os.environ.get("SLIME_GEMMA4_BATCH_INVARIANT") == "1" and logits.is_cuda:
+            from sglang.srt.layers.logits_processor import fused_softcap
+
+            # Match rollout's Triton/libdevice tanh exactly. PyTorch's BF16
+            # tanh rounds differently before log-softmax, which directly
+            # appears as train/rollout log-prob drift over the 262k vocab.
+            fused_softcap(logits, scale)
+        else:
+            logits.div_(scale)
+            logits.tanh_()
+            logits.mul_(scale)
         ctx.save_for_backward(logits)
         return logits
 
@@ -170,10 +178,18 @@ class _Gemma4RMSNorm(torch.nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if os.environ.get("SLIME_GEMMA4_BATCH_INVARIANT") == "1" and x.is_cuda:
+            from megatron.core.transformer.custom_layers.batch_invariant_kernels import BatchInvariantRMSNormFn
+
+            # SGLang routes the PLE projection norm through its deterministic
+            # Triton RMSNorm when rl_on_policy_target is enabled.  Use the
+            # trainer-side bitwise-equivalent kernel before PLE is injected
+            # into every decoder layer.
+            return BatchInvariantRMSNormFn.apply(x, self.weight, self.eps, False)
+
         # Match the HF/SGLang Gemma4RMSNorm equation exactly.  In particular,
-        # Gemma4 uses ``pow(mean(x**2) + eps, -0.5)`` rather than delegating to
-        # a backend RMSNorm kernel whose accumulation/rounding can differ
-        # across trainer and rollout runtimes.  This module is PLE-only;
+        # this fallback preserves the reference ``pow(..., -0.5)`` equation
+        # outside the deterministic CUDA training path. This module is PLE-only;
         # ordinary Gemma4 norms keep their Transformer Engine implementation.
         x_float = x.float()
         mean_squared = x_float.pow(2).mean(-1, keepdim=True) + self.eps

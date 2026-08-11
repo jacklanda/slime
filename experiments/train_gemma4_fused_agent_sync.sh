@@ -84,6 +84,8 @@ Options:
                                          Whiten advantages across the data-parallel batch. Default: disabled.
                                          Redundant under GRPO group std-normalization, and its
                                          token-weighted re-centering injects a length-correlated bias.
+  --grpo-std-normalization                Keep GRPO's per-group std normalization. Default: disabled.
+  --disable-grpo-std-normalization        Use mean-only GRPO advantages (default).
   --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
   --grm-model NAME                       OpenRouter judge model. Default: google/gemini-3-flash-preview.
   --grm-base-url URL                     OpenRouter-compatible judge endpoint.
@@ -155,8 +157,8 @@ SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 # torch_memory_saver revision includes the CUDA VMM granularity fix required by
 # repeated pause/resume cycles in long-running colocated jobs.
 COLOCATE="${COLOCATE:-true}"
-UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
-DISABLE_THINKING="${DISABLE_THINKING:-true}"
+UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-false}"
+DISABLE_THINKING="${DISABLE_THINKING:-false}"
 ENABLE_YARN="${ENABLE_YARN:-false}"
 YARN_FACTOR="${YARN_FACTOR:-1.0}"
 YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS:-32768}"
@@ -194,15 +196,16 @@ CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_ST
 CREDIT_ASSIGNMENT_MAX_TURNS="${CREDIT_ASSIGNMENT_MAX_TURNS:-True}"
 CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN:-True}"
 HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
-# Global advantage whitening is OFF by default for GRPO: --disable-grpo-std-normalization
-# is not set, so rewards are already mean-0/std-1 *within each prompt group* on the
-# rollout side. A second, global whitening pass re-centers on a TOKEN-weighted mean
+# Global advantage whitening is OFF by default for GRPO, and group std-normalization
+# is also disabled by default: rewards are mean-centered *within each prompt group*
+# on the rollout side. A second, global whitening pass re-centers on a TOKEN-weighted mean
 # while group norm centered on a SEQUENCE-weighted mean. Because wrong/truncated
 # trajectories are longer, that token-weighted mean is systematically negative, so
 # whitening adds a uniform positive constant to every token -- an unconditional
 # likelihood push whose token mass sits mostly on wrong trajectories. It also breaks
 # GRPO's per-group zero-mean invariant. See tests/test_group_reward_normalization.py.
 NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
+GRPO_STD_NORMALIZATION="${GRPO_STD_NORMALIZATION:-true}"
 LR="${LR:-1e-6}"
 CLIP_GRAD="${CLIP_GRAD:-1.0}"
 KL_COEF="${KL_COEF:-0.0}"
@@ -210,7 +213,12 @@ KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
 # A zero-weight reference KL neither changes advantages nor the actor loss.
 # Keep the expensive reference-model forward opt-in for this Gemma4 workload.
 USE_KL_LOSS="${USE_KL_LOSS:-0}"
-USE_WANDB="${USE_WANDB:-0}"
+USE_WANDB="${USE_WANDB:-1}"
+# A checkpoint restart is a distinct sampling/training attempt. Start a fresh
+# W&B run by default so replayed rollout ids do not mix with the previous
+# attempt's curves. Set this explicitly only when the process is continuing
+# without replaying already-logged steps.
+WANDB_RESUME_SAME_RUN="${WANDB_RESUME_SAME_RUN:-0}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
@@ -236,7 +244,7 @@ SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}
 # Megatron recomputation. The former PLE/offload incompatibility is fixed by
 # registering the PLE scale constants as model buffers in SGLang.
 SGLANG_DETERMINISTIC_INFERENCE="${SGLANG_DETERMINISTIC_INFERENCE:-true}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-20}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-}"
 EVAL_INCLUDE_BENCHMARKS="${EVAL_INCLUDE_BENCHMARKS:-asearcher}"
@@ -266,8 +274,8 @@ EVAL_PROMPT_DATA=()
 # Resolve the offload default after CLI parsing so --colocate/--no-colocate also
 # changes it. Release-train overrides this below because it replaces the trainer
 # actor instead of pausing it.
-OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-}}"
-RELEASE_TRAIN="${RELEASE_TRAIN:-false}"
+OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-false}}"
+RELEASE_TRAIN="${RELEASE_TRAIN:-true}"
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
 GRM_MODEL="${GRM_MODEL:-google/gemini-3-flash-preview}"
@@ -349,6 +357,8 @@ while [ "$#" -gt 0 ]; do
       --enable-dynamic-sampling-filter) ENABLE_DYNAMIC_SAMPLING_FILTER="${2:?Missing value for --enable-dynamic-sampling-filter}"; shift 2 ;;
       --normalize-advantages) NORMALIZE_ADVANTAGES=true; shift ;;
       --no-normalize-advantages) NORMALIZE_ADVANTAGES=false; shift ;;
+      --grpo-std-normalization) GRPO_STD_NORMALIZATION=true; shift ;;
+      --disable-grpo-std-normalization) GRPO_STD_NORMALIZATION=false; shift ;;
       --enable_use_grm_evals|--enable-use-grm-evals) ENABLE_USE_GRM_EVALS="${2:?Missing value for --enable_use_grm_evals}"; shift 2 ;;
       --grm-model) GRM_MODEL="${2:?Missing value for --grm-model}"; shift 2 ;;
       --grm-base-url) GRM_BASE_URL="${2:?Missing value for --grm-base-url}"; shift 2 ;;
@@ -492,7 +502,7 @@ RUNS_ROOT="${RUNS_ROOT:-/share/nlp/share/gem/runs}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 
 default_experiment_name() {
-   local prefix="odyssey-gemma4-e4b-think-dev"
+   local prefix="odyssey-g4-8b-it-dev"
    #local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
    #local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
    #local prefix="fused-dapo-q3-4b-dht-gem-sync-dev"  # w/o rft warmup
@@ -609,6 +619,7 @@ if [ -z "${REF_LOAD:-}" ]; then
    GEMMA4_CONVERSION_REV="$({
       sha256sum \
          "${REPO_ROOT}/slime_plugins/models/gemma4.py" \
+         "${REPO_ROOT}/slime_plugins/models/gemma4_activation.py" \
          "${REPO_ROOT}/slime_plugins/models/gemma4_provider.py" \
          "${REPO_ROOT}/slime_plugins/mbridge/gemma4.py" \
          "${REPO_ROOT}/tools/convert_hf_to_torch_dist.py"
@@ -871,9 +882,12 @@ LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"
 # can exhaust an 80 GiB rank even when the forward pass fits.
 LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-4096}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
+# The fully-async collector counts prompt groups, so the default batch of eight
+# groups is selected as four MCP groups and four WebQA groups.
+ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-mcp=0.5,webqa=0.5}"
 # Keep enough candidate groups queued to feed the default four TP2 rollout
 # engines without generating the much larger surplus created by a batch of 64.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-256}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 # Gemma4 requires a top-k shortlist to avoid sampling low-probability noise from
@@ -886,7 +900,8 @@ NUM_ROLLOUT="${NUM_ROLLOUT:-200}"
 EFFECTIVE_GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT / NUM_STEPS_PER_ROLLOUT))}"
 ENABLE_DYNAMIC_SAMPLING_FILTER="${ENABLE_DYNAMIC_SAMPLING_FILTER:-true}"
 DYNAMIC_SAMPLING_FILTER_PATH="${DYNAMIC_SAMPLING_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
-FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS="${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS:-65536}"
+# A zero-variance group must never reach the policy-gradient update.
+FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS="${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS:-0}"
 if ! is_truthy "${ENABLE_DYNAMIC_SAMPLING_FILTER}"; then
    DYNAMIC_SAMPLING_FILTER_PATH=""
 fi
@@ -1167,6 +1182,8 @@ PERF_ARGS=(
    --expert-model-parallel-size "${EP_SIZE:-1}"
    --expert-tensor-parallel-size "${ETP_SIZE:-1}"
 
+   # Selective recomputation retains too many 20k-token layer activations for
+   # this 42-layer TP1 model and exhausts an 80 GiB rank during the forward.
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
@@ -1189,13 +1206,16 @@ GRPO_ARGS=(
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF:-0.00}"
    --eps-clip "${EPS_CLIP:-0.2}"
-   --eps-clip-high "${EPS_CLIP_HIGH:-0.6}"
+   --eps-clip-high "${EPS_CLIP_HIGH:-0.28}"
 )
 if is_truthy "${USE_KL_LOSS}"; then
    GRPO_ARGS+=(--use-kl-loss)
 fi
 if is_truthy "${NORMALIZE_ADVANTAGES}"; then
    GRPO_ARGS+=(--normalize-advantages)
+fi
+if ! is_truthy "${GRPO_STD_NORMALIZATION}"; then
+   GRPO_ARGS+=(--disable-grpo-std-normalization)
 fi
 
 # Rollout correction defaults:
@@ -1238,7 +1258,7 @@ OPTIMIZER_ARGS=(
 # has enough headroom while trainer CUDA allocations are still being released.
 if [ -z "${SGLANG_MEM_FRACTION_STATIC:-}" ]; then
    if is_truthy "${COLOCATE}"; then
-      SGLANG_MEM_FRACTION_STATIC=0.6
+      SGLANG_MEM_FRACTION_STATIC=0.8
    else
       SGLANG_MEM_FRACTION_STATIC="${GPU_MEMORY_UTILIZATION:-0.9}"
    fi
@@ -1268,12 +1288,15 @@ if [ "${USE_WANDB}" = "1" ]; then
       --wandb-group "${WANDB_GROUP:-${EXPERIMENT_NAME}}"
       --disable-wandb-random-suffix
    )
-   # Resume an existing wandb run (same curves) instead of creating a new one.
-   if [ -n "${WANDB_RUN_ID:-}" ]; then
+   if [ -n "${WANDB_RUN_ID:-}" ] && is_truthy "${WANDB_RESUME_SAME_RUN}"; then
       WANDB_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")
       if is_truthy "${WANDB_SKIP_RESUME_FIRST_STEP:-1}"; then
          WANDB_ARGS+=(--wandb-skip-resume-first-step)
       fi
+   elif [ -n "${WANDB_RUN_ID:-}" ]; then
+      # wandb.init also consumes WANDB_RUN_ID directly from the environment.
+      # Remove a stale id so the SDK creates a new run for this attempt.
+      unset WANDB_RUN_ID
    fi
 fi
 
@@ -1315,6 +1338,7 @@ export SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE}"
 export SLIME_FUSED_EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES}"
 export SLIME_FUSED_EVAL_USE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+export SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT=0
 
 if is_truthy "${COLOCATE}"; then
    export NUM_GPUS="${NUM_GPUS:-${ACTOR_GPUS}}"
@@ -1522,7 +1546,7 @@ echo "Save dir: ${SAVE_DIR}"
 echo "Log root: ${LOG_ROOT}"
 echo "Episode dump root: ${EPISODE_LOG_DIR} (train/ and evals/)"
 echo "Dump details dir: ${DUMP_DETAILS:-<disabled>}"
-echo "W&B enabled: ${USE_WANDB}"
+echo "W&B enabled: ${USE_WANDB}; resume_same_run=${WANDB_RESUME_SAME_RUN}"
 echo "Custom generate: ${CUSTOM_GENERATE_FUNCTION_PATH:-<stock slime rollout>}"
 echo "Custom reward post-process: ${CUSTOM_REWARD_POST_PROCESS_PATH:-<vanilla>}"
 echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
@@ -1537,7 +1561,7 @@ echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_S
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, benchmarks=${EVAL_INCLUDE_BENCHMARKS}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, temperature=${EVAL_TEMPERATURE}, top_p=${EVAL_TOP_P}, top_k=${EVAL_TOP_K}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}"
 echo "Eval scheduling: inflight=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS}, adaptive=${EVAL_ADAPTIVE_CONCURRENCY}, mix_datasets=${EVAL_MIX_DATASETS}, termination_retries=${EVAL_TERMINATION_RETRY_TIMES}, trajectory_sample_rate=${EVAL_TRAJECTORY_SAMPLE_RATE}, dump_failures=${EVAL_DUMP_FAILURES}, native_session=${NATIVE_SGLANG_SESSION}"
 echo "OpenRouter GRM evals: enable=${ENABLE_USE_GRM_EVALS}, model=${GRM_MODEL}, mode=${GRM_MODE}, concurrency=${GRM_CONCURRENCY}, max_connections=${GRM_MAX_CONNECTIONS}, timeout=${GRM_TIMEOUT}, retries=${GRM_MAX_RETRIES}, max_input_tokens=${GRM_MAX_INPUT_TOKENS}, max_new_tokens=${GRM_MAX_NEW_TOKENS}, custom_rm=${GRM_CUSTOM_RM_PATH}"
-echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, normalize_advantages=${NORMALIZE_ADVANTAGES}, kl_coef=${KL_COEF}, lr=${LR}, eps_clip=${EPS_CLIP:-0.2}, eps_clip_high=${EPS_CLIP_HIGH:-0.28}"
+echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, std_normalization=${GRPO_STD_NORMALIZATION}, normalize_advantages=${NORMALIZE_ADVANTAGES}, kl_coef=${KL_COEF}, lr=${LR}, eps_clip=${EPS_CLIP:-0.2}, eps_clip_high=${EPS_CLIP_HIGH:-0.28}"
 echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING:-0}, path=${BUFFER_FILTER_PATH:-${ENABLE_QUOTA_BUCKET_SAMPLING:+slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps}}"
 echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}"
 echo "Horizon reward shaping: enable=${HORIZON_REWARD_SHAPING}, min_multiplier=${FUSED_HORIZON_REWARD_MIN_MULTIPLIER}, gamma=${FUSED_HORIZON_REWARD_GAMMA}, step_weight=${FUSED_HORIZON_REWARD_STEP_WEIGHT}, tool_call_weight=${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT}, target_steps=${FUSED_HORIZON_REWARD_TARGET_STEPS}, target_tool_calls=${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-target_steps-1}"
