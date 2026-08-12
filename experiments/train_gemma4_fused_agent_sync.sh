@@ -705,7 +705,7 @@ else
    # TRAIN_FILES as the source of truth; only build a prepared parquet when
    # multiple source files need to be merged.
    TRAIN_FILES=(
-      "${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
+      "${SCRIPT_DIR}/artifacts/mcp_data_final/train.parquet"
       "${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
       #"${SCRIPT_DIR}/artifacts/asearcher.parquet"
    )
@@ -884,7 +884,8 @@ LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-4096}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 # The fully-async collector counts prompt groups, so the default batch of eight
 # groups is selected as four MCP groups and four WebQA groups.
-ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-mcp=0.5,webqa=0.5}"
+#ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-mcp=0.5,webqa=0.5}"
+ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-}"
 # Keep enough candidate groups queued to feed the default four TP2 rollout
 # engines without generating the much larger surplus created by a batch of 64.
 OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-256}"

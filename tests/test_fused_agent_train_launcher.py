@@ -134,6 +134,22 @@ def test_qwen3_sync_launcher_defaults_to_colocated_trainer_offload():
 
 
 @pytest.mark.unit
+def test_odyssey_launcher_enforces_strict_dynamic_sampling():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
+
+    assert (
+        'DYNAMIC_SAMPLING_FILTER_PATH="${DYNAMIC_SAMPLING_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"'
+        in launcher
+    )
+    assert "FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS=0" in launcher
+    assert launcher.count("--fully-async-filter-relax-after-groups") == 1
+    assert "--fully-async-filter-relax-after-groups 0" in launcher
+    assert "This launcher requires strict dynamic sampling" in launcher
+    assert '--dynamic-sampling-filter-path "${DYNAMIC_SAMPLING_FILTER_PATH}"' in launcher
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "launcher_name",
     [

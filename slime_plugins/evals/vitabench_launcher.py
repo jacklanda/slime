@@ -410,6 +410,7 @@ vllm.LLM = vllm.SamplingParams = lambda *args, **kwargs: (_ for _ in ()).throw(
 )
 sys.modules["vllm"] = vllm
 
+import slime.rollout.fused_agent.parser as fused_parser
 import vita.utils.llm_utils as llm_utils
 import vita.environment.environment as environment_module
 import vita.evaluator.evaluator_traj as evaluator_traj
@@ -476,6 +477,37 @@ def tolerant_evaluator_extracter(content):
     return normalized
 
 evaluator_traj.evaluator_extracter = tolerant_evaluator_extracter
+
+# The fused-agent parser only keeps a <tool_call> whose name is a declared tool,
+# because an RL rollout must never execute a hallucinated action. VitaBench has
+# the opposite contract: its environment answers an unknown tool name with an
+# error ToolMessage the agent can recover from. Dropping the call instead leaves
+# the raw <tool_call> XML as the assistant's visible turn, so the user simulator
+# replies to XML, the step is charged without any tool running, and the judge
+# scores a trajectory in which the agent never acted.
+original_make_tool_parser = fused_parser.make_tool_parser
+
+
+def make_tool_parser_reporting_unknown_tools(model_name, valid_tools=None):
+    parser = original_make_tool_parser(model_name, valid_tools=valid_tools)
+    if not valid_tools:
+        return parser
+    unfiltered_parser = original_make_tool_parser(model_name)
+    original_parse = parser.parse
+
+    def parse_including_unknown_tool_names(model_response):
+        actions = original_parse(model_response)
+        # Only re-parse the explicit tool-call syntax: the unfiltered parser also
+        # accepts a bare {"name": ...} object, which appears in ordinary agent prose.
+        if actions or parser.tool_call_begin not in (model_response or ""):
+            return actions
+        return unfiltered_parser.parse(model_response)
+
+    parser.parse = parse_including_unknown_tool_names
+    return parser
+
+
+fused_parser.make_tool_parser = make_tool_parser_reporting_unknown_tools
 
 # Qwen can occasionally finish a turn after producing reasoning but before
 # producing visible content or a tool call. Vita retries that invalid message

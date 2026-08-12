@@ -644,7 +644,7 @@ else
    # TRAIN_FILES as the source of truth; only build a prepared parquet when
    # multiple source files need to be merged.
    TRAIN_FILES=(
-      "${SCRIPT_DIR}/artifacts/mcp_data_20260518/train.parquet"
+      "${SCRIPT_DIR}/artifacts/mcp_data_final/train.parquet"
       "${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
       #"${SCRIPT_DIR}/artifacts/asearcher.parquet"
    )

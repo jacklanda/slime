@@ -557,7 +557,11 @@ run_domain(TextRunConfig(**payload["settings"]))
             actual_runs = [(str(item["task_id"]), int(item["trial"])) for item in simulations]
             infra_errors = [item for item in simulations if item.get("termination_reason") == "infrastructure_error"]
             user_errors = [item for item in simulations if item.get("termination_reason") == "user_error"]
-            rewards = [item["reward_info"]["reward"] for item in simulations]
+            rewards = [
+                reward_info.get("reward") if isinstance(reward_info := item.get("reward_info"), dict) else None
+                for item in simulations
+            ]
+            missing_rewards = sum(value is None for value in rewards)
             protocol_missing = 0
             session_missing = 0
             session_fallbacks = 0
@@ -602,6 +606,7 @@ run_domain(TextRunConfig(**payload["settings"]))
                 f"duplicates={len(actual_runs) - len(actual_set)}, missing={len(expected_runs - actual_set)}, "
                 f"unexpected={len(actual_set - expected_runs)}, infrastructure_errors={len(infra_errors)}, "
                 f"user_errors={len(user_errors)}, "
+                f"missing_rewards={missing_rewards}, "
                 f"protocol_missing={protocol_missing}, session_missing={session_missing}",
                 file=sys.stderr,
             )

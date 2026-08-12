@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
+import types
 from pathlib import Path
 
 import pytest
 
+import slime.rollout.fused_agent.parser as fused_parser
 from slime_plugins.evals import vitabench_launcher
 
 
@@ -261,6 +264,71 @@ def test_vitabench_overwrite_removes_all_old_outputs_and_bootstrap_compiles(tmp_
     python_path = captured["kwargs"]["env"]["PYTHONPATH"].split(":")
     assert str(args.vitabench_root / "src") in python_path
     assert str(Path(vitabench_launcher.__file__).resolve().parents[2]) in python_path
+
+
+def _run_bootstrap_against_stub_vita(bootstrap: str, monkeypatch) -> None:
+    """Execute the launcher bootstrap with the ``vita`` artifact replaced by stubs."""
+    llm_utils = types.ModuleType("vita.utils.llm_utils")
+    llm_utils.SLIME_FUSED_GEM_PROTOCOL_VERSION = 2
+    llm_utils._post_json = lambda url, data, headers, **kwargs: None
+    llm_utils.requests = types.SimpleNamespace(Session=lambda: None)
+    llm_utils._HTTP_SESSION_LOCAL = threading.local()
+    llm_utils._SGLANG_SESSIONS = {}
+    llm_utils._common_prefix_length = lambda left, right: 0
+    llm_utils.format_messages = lambda messages: messages
+    llm_utils.generate = lambda model, *args, **kwargs: None
+    llm_utils.models = {}
+    modules = {
+        "vita": types.ModuleType("vita"),
+        "vita.utils": types.ModuleType("vita.utils"),
+        "vita.utils.llm_utils": llm_utils,
+        "vita.environment": types.ModuleType("vita.environment"),
+        "vita.environment.environment": types.ModuleType("vita.environment.environment"),
+        "vita.evaluator": types.ModuleType("vita.evaluator"),
+        "vita.evaluator.evaluator_traj": types.ModuleType("vita.evaluator.evaluator_traj"),
+        "vita.cli": types.ModuleType("vita.cli"),
+        "vllm": types.ModuleType("vllm"),
+    }
+    modules["vita.evaluator.evaluator_traj"].evaluator_extracter = lambda content: []
+    modules["vita.cli"].main = lambda: None
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+        parent, _, attribute = name.rpartition(".")
+        if parent:
+            setattr(modules[parent], attribute, module)
+    monkeypatch.setattr(fused_parser, "make_tool_parser", fused_parser.make_tool_parser)
+
+    exec(compile(bootstrap, "<vitabench-bootstrap>", "exec"), {"__name__": "__vitabench_bootstrap__"})
+
+
+def test_vitabench_bootstrap_sends_unknown_tool_names_to_the_environment(tmp_path: Path, monkeypatch):
+    args = _args(tmp_path)
+    args.output_dir.mkdir()
+    captured = {}
+
+    def run(command, **kwargs):
+        captured["bootstrap"] = command[2]
+        (args.output_dir / "simulations.json").write_text(
+            '{"tasks": [{"id": 1}], "simulations": ' '[{"task_id": 1, "trial": 0, "reward_info": {"reward": 1.0}}]}',
+            encoding="utf-8",
+        )
+        (args.output_dir / "metrics.csv").write_text("avg_reward\n1.0\n", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(vitabench_launcher.subprocess, "run", run)
+    assert vitabench_launcher.run_vitabench(args, Path(sys.executable), tmp_path / "models.yaml") == 0
+
+    _run_bootstrap_against_stub_vita(captured["bootstrap"], monkeypatch)
+    parser = fused_parser.make_tool_parser("Qwen3-8B", valid_tools={"instore_product_search_recommend"})
+
+    # A hallucinated tool name reaches the environment, which answers with an
+    # error ToolMessage instead of leaking raw XML into the assistant's turn.
+    hallucinated = parser.parse('<tool_call>{"name": "get_instore_product_info", "arguments": {"shop_id": "S1"}}</tool_call>')
+    assert [(call.name, call.arguments) for call in hallucinated] == [("get_instore_product_info", {"shop_id": "S1"})]
+    declared = parser.parse('<tool_call>{"name": "instore_product_search_recommend", "arguments": {"keywords": ["饭团"]}}</tool_call>')
+    assert [call.name for call in declared] == ["instore_product_search_recommend"]
+    # Prose that merely contains a JSON object is not a tool call.
+    assert parser.parse('推荐 {"name": "鸡柳紫米饭团", "price": 12}') == []
 
 
 def test_vitabench_retries_an_incomplete_result_without_overwrite(tmp_path: Path, monkeypatch):

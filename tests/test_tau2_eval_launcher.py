@@ -143,7 +143,7 @@ def test_tau2_run_uses_public_api_and_validates_results(tmp_path: Path, monkeypa
     ],
 )
 def test_tau2_result_validation_rejects_invalid_runs(
-    tmp_path: Path, monkeypatch, termination_reason: str, raw_data: dict
+    tmp_path: Path, monkeypatch, capsys, termination_reason: str, raw_data: dict
 ):
     args = _args(tmp_path)
     args.output_dir.mkdir()
@@ -159,7 +159,7 @@ def test_tau2_result_validation_rejects_invalid_runs(
                     "task_id": "1",
                     "trial": 0,
                     "termination_reason": termination_reason,
-                    "reward_info": {"reward": 1.0},
+                    "reward_info": None if termination_reason == "infrastructure_error" else {"reward": 1.0},
                     "messages": [{"role": "assistant", "raw_data": raw_data}],
                 }
             ],
@@ -169,6 +169,11 @@ def test_tau2_result_validation_rejects_invalid_runs(
 
     monkeypatch.setattr(tau2_launcher.subprocess, "run", run)
     assert tau2_launcher.run_tau2(args, Path(sys.executable)) == 1
+    if termination_reason == "infrastructure_error":
+        stderr = capsys.readouterr().err
+        assert "tau2 result validation failed" in stderr
+        assert "infrastructure_errors=1" in stderr
+        assert "missing_rewards=1" in stderr
 
 
 def test_tau2_result_validation_rejects_empty_benchmark(tmp_path: Path, monkeypatch):
