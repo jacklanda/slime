@@ -1,0 +1,303 @@
+"""Bounded, crash-recovering process isolation for local MCP tool calls."""
+
+from __future__ import annotations
+
+import concurrent.futures
+import atexit
+import json
+import multiprocessing
+import os
+import threading
+from collections import deque
+from pathlib import Path
+from typing import Any
+
+
+_worker_toolsets: dict[str, Any] = {}
+_process_context: multiprocessing.context.BaseContext | None = None
+_process_context_lock = threading.Lock()
+
+
+def _worker_toolset(task: dict[str, Any]):
+    os.environ["SLIME_LOCAL_MCP_PROCESS_WORKER"] = "1"
+    from .env import LocalMCPToolset
+
+    key = str(task.get("tools_py") or task.get("data_root"))
+    toolset = _worker_toolsets.get(key)
+    if toolset is None:
+        toolset = LocalMCPToolset(task)
+        _worker_toolsets[key] = toolset
+    return toolset
+
+
+def _worker_call(task: dict[str, Any], name: str, arguments: dict[str, Any], relax_empty: bool) -> dict[str, Any]:
+    toolset = _worker_toolset(task)
+    result = toolset.call_raw(name, arguments, relax_empty=relax_empty)
+    # Keep the IPC contract stable even when generated tools return local
+    # enums, dataclasses, or other objects that multiprocessing cannot pickle.
+    result = json.loads(json.dumps(result, ensure_ascii=False, default=str))
+    return {"result": result, "call_info": dict(toolset.last_call_info)}
+
+
+def _worker_describe(task: dict[str, Any]) -> dict[str, Any]:
+    toolset = _worker_toolset(task)
+    return {
+        "schemas": toolset.schemas(),
+        "load_error": toolset.load_error,
+        "load_warning": toolset.load_warning,
+        "tool_aliases": dict(toolset.tool_aliases),
+        "tool_names": list(toolset.tools),
+    }
+
+
+def _worker_verify(task: dict[str, Any], verification_code: str, answer: Any) -> dict[str, Any]:
+    toolset = _worker_toolset(task)
+    workspace = Path(str(task.get("data_root") or task.get("tools_py"))).resolve()
+    if workspace.is_file():
+        workspace = workspace.parent
+    previous_cwd = Path.cwd()
+    previous_base_dir = os.environ.get("MCP_SERVER_BASE_DIR")
+    try:
+        os.chdir(workspace)
+        os.environ["MCP_SERVER_BASE_DIR"] = str(workspace)
+        namespace: dict[str, Any] = {}
+        exec(verification_code, namespace)
+        verify = namespace.get("verify")
+        if not callable(verify):
+            return {"has_verifier": False, "result": None}
+        result = verify(toolset, answer)
+    finally:
+        if previous_base_dir is None:
+            os.environ.pop("MCP_SERVER_BASE_DIR", None)
+        else:
+            os.environ["MCP_SERVER_BASE_DIR"] = previous_base_dir
+        os.chdir(previous_cwd)
+    result = json.loads(json.dumps(result, ensure_ascii=False, default=str))
+    return {"has_verifier": True, "result": result}
+
+
+def _worker_ping() -> int:
+    from .env import LocalMCPToolset  # noqa: F401
+
+    return os.getpid()
+
+
+def _default_workers() -> int:
+    try:
+        available = len(os.sched_getaffinity(0))
+    except AttributeError:
+        available = os.cpu_count() or 1
+    return max(1, min(32, max(1, available // 2)))
+
+
+def _get_process_context() -> multiprocessing.context.BaseContext:
+    global _process_context
+    with _process_context_lock:
+        if _process_context is None:
+            method = os.environ.get(
+                "SLIME_LOCAL_MCP_PROCESS_START_METHOD",
+                "forkserver" if "forkserver" in multiprocessing.get_all_start_methods() else "spawn",
+            )
+            context = multiprocessing.get_context(method)
+            if method == "forkserver":
+                # The fork server is a clean, single-threaded template. Preload
+                # the heavy MCP runtime once, then fork a fresh process for
+                # every trajectory without inheriting the rollout/Ray process.
+                context.set_forkserver_preload(["slime.rollout.fused_agent.env"])
+            _process_context = context
+        return _process_context
+
+
+class _ProcessShard:
+    def __init__(self, index: int):
+        self.index = index
+        self.lock = threading.Lock()
+        self.executor: concurrent.futures.ProcessPoolExecutor | None = None
+
+    def _start(self) -> concurrent.futures.ProcessPoolExecutor:
+        if self.executor is None:
+            self.executor = concurrent.futures.ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=_get_process_context(),
+            )
+        return self.executor
+
+    def call(
+        self,
+        task: dict[str, Any],
+        name: str,
+        arguments: dict[str, Any],
+        relax_empty: bool,
+        timeout: float,
+    ) -> dict[str, Any]:
+        with self.lock:
+            executor = self._start()
+            future = executor.submit(_worker_call, task, name, arguments, relax_empty)
+            try:
+                return future.result(timeout=timeout)
+            except BaseException:
+                self._terminate_locked()
+                raise
+
+    def submit(self, fn, *args) -> concurrent.futures.Future:
+        with self.lock:
+            return self._start().submit(fn, *args)
+
+    def _terminate_locked(self) -> None:
+        executor, self.executor = self.executor, None
+        if executor is None:
+            return
+        # Python 3.12 has no public terminate_workers API. Terminate only this
+        # one failed shard before non-blocking shutdown; healthy shards remain.
+        for process in list(getattr(executor, "_processes", {}).values()):
+            if process.is_alive():
+                process.terminate()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    def terminate(self) -> None:
+        with self.lock:
+            self._terminate_locked()
+
+    def close(self) -> None:
+        with self.lock:
+            self._terminate_locked()
+
+
+class LocalMCPProcessPool:
+    def __init__(self, workers: int | None = None):
+        configured_value = os.environ.get("SLIME_LOCAL_MCP_PROCESS_WORKERS", "").strip()
+        configured = workers if workers is not None else (int(configured_value) if configured_value else _default_workers())
+        self.workers = max(1, configured)
+        self.shards = [_ProcessShard(index) for index in range(self.workers)]
+        self._condition = threading.Condition()
+        self._leases: dict[str, int] = {}
+        self._free = deque(range(self.workers))
+        self._closed = False
+
+    @staticmethod
+    def task_key(task: dict[str, Any]) -> str:
+        return str(Path(str(task.get("tools_py") or task.get("data_root"))).resolve())
+
+    def _lease(self, task: dict[str, Any]) -> int:
+        key = self.task_key(task)
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("Local MCP process pool is closed")
+            existing = self._leases.get(key)
+            if existing is not None:
+                return existing
+            while not self._free and not self._closed:
+                self._condition.wait()
+            if self._closed:
+                raise RuntimeError("Local MCP process pool is closed")
+            index = self._free.popleft()
+            self._leases[key] = index
+            return index
+
+    def try_lease(self, task: dict[str, Any]) -> bool:
+        key = self.task_key(task)
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("Local MCP process pool is closed")
+            if key in self._leases:
+                return True
+            if not self._free:
+                return False
+            self._leases[key] = self._free.popleft()
+            return True
+
+    def warm(self) -> list[int]:
+        futures = [shard.submit(_worker_ping) for shard in self.shards]
+        timeout = max(1.0, float(os.environ.get("SLIME_LOCAL_MCP_PROCESS_WARM_TIMEOUT", "60")))
+        pids = []
+        for shard, future in zip(self.shards, futures, strict=True):
+            try:
+                pids.append(future.result(timeout=timeout))
+            except BaseException:
+                shard.terminate()
+                raise
+        return pids
+
+    def call(
+        self,
+        task: dict[str, Any],
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        relax_empty: bool,
+    ) -> dict[str, Any]:
+        shard_index = self._lease(task)
+        timeout = max(1.0, float(os.environ.get("SLIME_LOCAL_MCP_PROCESS_TIMEOUT", "120")))
+        return self.shards[shard_index].call(task, name, arguments, relax_empty, timeout)
+
+    def describe(self, task: dict[str, Any]) -> dict[str, Any]:
+        shard_index = self._lease(task)
+        timeout = max(1.0, float(os.environ.get("SLIME_LOCAL_MCP_PROCESS_TIMEOUT", "120")))
+        try:
+            return self.shards[shard_index].submit(_worker_describe, task).result(timeout=timeout)
+        except BaseException:
+            self.shards[shard_index].terminate()
+            self.release(task)
+            raise
+
+    def verify(self, task: dict[str, Any], verification_code: str, answer: Any) -> dict[str, Any]:
+        shard_index = self._lease(task)
+        timeout = max(1.0, float(os.environ.get("SLIME_LOCAL_MCP_PROCESS_TIMEOUT", "120")))
+        try:
+            return self.shards[shard_index].submit(
+                _worker_verify,
+                task,
+                verification_code,
+                answer,
+            ).result(timeout=timeout)
+        except BaseException:
+            self.shards[shard_index].terminate()
+            raise
+
+    def release(self, task: dict[str, Any]) -> None:
+        key = self.task_key(task)
+        with self._condition:
+            index = self._leases.pop(key, None)
+        if index is None:
+            return
+        try:
+            # Never reuse a Python process across trajectories: generated MCP
+            # modules and verifiers may mutate arbitrary process-global state.
+            self.shards[index].terminate()
+        finally:
+            with self._condition:
+                if not self._closed:
+                    self._free.append(index)
+                self._condition.notify_all()
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._leases.clear()
+            self._free.clear()
+            self._condition.notify_all()
+        for shard in self.shards:
+            shard.close()
+
+
+_pool: LocalMCPProcessPool | None = None
+_pool_lock = threading.Lock()
+
+
+def get_local_mcp_process_pool() -> LocalMCPProcessPool:
+    global _pool
+    with _pool_lock:
+        if _pool is None:
+            _pool = LocalMCPProcessPool()
+        return _pool
+
+
+def close_local_mcp_process_pool() -> None:
+    global _pool
+    with _pool_lock:
+        pool, _pool = _pool, None
+    if pool is not None:
+        pool.close()
+
+
+atexit.register(close_local_mcp_process_pool)

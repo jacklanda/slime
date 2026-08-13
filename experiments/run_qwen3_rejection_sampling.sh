@@ -3,7 +3,7 @@
 #
 # This launcher intentionally reuses the same custom generate hook, harness,
 # prompts, tool schemas, tool parser, and runtime env knobs as
-# experiments/train_fused_agent_sync.sh, but runs slime with
+# experiments/train_qwen3_fused_agent_sync.sh, but runs slime with
 # --debug-rollout-only so no actor update is performed.
 
 set -euo pipefail
@@ -13,7 +13,7 @@ export PYTHONUNBUFFERED=1
 usage() {
    cat <<'EOF'
 Usage:
-  bash experiments/run_rejection_sampling.sh [options]
+  bash experiments/run_qwen3_rejection_sampling.sh [options]
 
 Core rejection-sampling options:
   --sample-n N                       Trajectories sampled per prompt. Default: 32
@@ -22,9 +22,13 @@ Core rejection-sampling options:
   --reward-threshold X               Minimum reward accepted. Default: 0.6
   --min-steps N                      Minimum fused trajectory steps accepted. Default: 2
   --certainty-filter BOOL            Drop groups with pass_rate 0 or 1. Default: False
+  --valid-groups-per-shard N         Finish a shard after collecting N non-zero-variance groups.
+                                     Default: 8
+  --max-candidate-groups-per-shard N Maximum prompt groups attempted to reach the valid target.
+                                     Default: 16x valid-groups-per-shard
 
 Data/output options:
-  --train-files LIST                 Comma-separated parquet files.
+  --train-files LIST                 Comma-separated parquet files. Defaults to the final Search and MCP train sets.
   --prompt-data PATH                 Prepared prompt parquet. Default: OUTPUT_DIR/fused_train.parquet
   --output-dir DIR                   Output directory. Default: experiments/rejection_sampling/NAME
   --experiment-name NAME             Run name.
@@ -33,35 +37,54 @@ Data/output options:
   --checkpointing BOOL               Save RS checkpoint after each completed batch. Default: True
   --checkpoint-path PATH             Checkpoint JSON path. Default: OUTPUT_DIR/latest_checkpoint.json
   --resume BOOL                      Resume from checkpoint/shards. Default: True
+  --results-mode MODE               full, manifest, or auto. Large runs use manifest. Default: auto
 
-Fused-agent options, aligned with train_fused_agent_sync.sh:
+Fused-agent options, aligned with train_qwen3_fused_agent_sync.sh:
   --harness NAME                     Fused prompt harness: bare, cot, react, gem, unified_gem.
   --unified-system-prompt            Select unified_gem harness unless --harness is set later.
   --no-unified-system-prompt         Select gem harness unless --harness is set later.
   --model PATH                       HF model path.
-  --disable-thinking BOOL            FUSED_DISABLE_THINKING. Default: true
+  --enable-yarn BOOL                 Enable static YaRN for long contexts. Default: false
+  --yarn-factor X                    YaRN scale factor. Default: 1.0
+  --yarn-original-max-position-embeddings N
+                                     Qwen3 native context used by YaRN. Default: 32768
+  --disable-thinking BOOL            FUSED_DISABLE_THINKING. Default: false
   --discard-historical-thinking BOOL Remove prior assistant <think> blocks before each new rollout step.
                                      Effective only when --disable-thinking is false. Default: false
-  --max-steps N                      Fused agent max steps. Default: 128
-  --mcp-max-steps N                  MCP max steps. Default: 128
-  --web-search-max-steps N           Web-search max steps. Default: 128
-  --cli-max-steps N                  CLI max steps. Default: 128
-  --trajectory-timeout N             Fused trajectory timeout. Default: 3600
-  --per-step-max-tokens N            Max tokens per model turn. Default: 2048
+  --mcp-disable-step-penalty BOOL    MCP verifier step-penalty env. Default: True
+  --max-steps N                      Fused agent max steps. Default: 64
+  --mcp-max-steps N                  MCP max steps. Default: 64
+  --mcp-max-tool-calls-per-turn N    Maximum MCP calls per assistant turn. Default: 1
+  --web-search-max-steps N           Web-search max steps. Default: 64
+  --cli-max-steps N                  CLI max steps. Default: 64
+  --trajectory-timeout N             Fused rollout-group timeout. Default: 300
+  --per-step-max-tokens N            Max tokens per model turn. Default: 8192
   --max-tool-output-length N         Fused max tool output length. Default: 4096
   --terminal-log-style STYLE         progress, rollouts, or both. Default: both
+  --show-rollout-progress-logs BOOL  Show periodic fused rollout progress logs. Default: false
 
 Rollout/system options:
-  --model-config NAME                scripts/models config. Default: qwen3-4B
-  --rollout-batch-size N             Prompt groups per rollout batch. Default: 16
-  --max-prompt-length N              Max prompt tokens. Default: 38000
-  --max-response-length N            Max response tokens. Default: 2048
+  --model-config NAME                scripts/models config. Default: qwen3-8B
+  --rollout-batch-size N             Task groups per persisted shard. Default: 2048
+  --max-prompt-length N              Max prompt tokens. Default: 15472
+  --max-response-length N            Max response tokens. Default: 24576
   --rollout-gpus N                   Rollout GPUs. Default: 8
-  --rollout-num-gpus-per-engine N    GPUs per SGLang engine. Default: 1
-  --gpu-memory-utilization X         SGLang memory fraction. Default: 0.9
-  --sglang-server-concurrency N      SGLang server concurrency. Default: 4096; auto-derived for fully_async unless explicitly set
-  --sglang-max-running-requests N    SGLang max running requests. Default: 4096
-  --fully-async-group-concurrency N  Target in-flight prompt groups for fully_async rollout. Default: rollout-batch-size
+  --rollout-num-gpus-per-engine N    GPUs per SGLang engine. Defaults by model:
+                                     Qwen3-4B/8B=1, Qwen3-14B=2, Qwen3-30B-A3B/32B=4
+  --gpu-memory-utilization X         SGLang static memory fraction. Default: 0.6
+  --sglang-server-concurrency N      SGLang server concurrency. Default: 64
+  --sglang-max-running-requests N    SGLang max running requests. Default: 64
+  --sglang-router-request-timeout-secs N
+                                     SGLang router request timeout. Default: 21600
+  --fully-async-adaptive-concurrency BOOL
+                                     Adapt in-flight prompt groups from SGLang load. Default: true
+  --fully-async-initial-group-concurrency N
+                                     Initial in-flight groups. Default: 4x rollout engine count
+  --fully-async-max-group-concurrency N
+                                     Maximum in-flight groups. Default: 8x rollout engine count
+  --fully-async-concurrency-step N   Groups added/removed per adjustment. Default: engine count
+  --fully-async-concurrency-poll-interval X
+                                     Seconds between load samples. Default: 10
   --ray-num-cpus N                   Ray CPU resources. Default: 64
   --ray-job-wait 0|1                 Wait for Ray job submit. Default: 1
   -h, --help                         Show this help.
@@ -83,6 +106,9 @@ BASE_DIR="$(cd -- "${REPO_ROOT}/.." &>/dev/null && pwd)"
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-offline-rs-slime-fused-${TIMESTAMP}}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/experiments/rejection_sampling/${EXPERIMENT_NAME}}"
+RUNS_ROOT="${RUNS_ROOT:-/share/nlp/share/gem/runs}"
+RUN_ROOT="${RUN_ROOT:-${RUNS_ROOT}/${EXPERIMENT_NAME}}"
+MCP_ENV_ROOT="${MCP_ENV_ROOT:-${RUN_ROOT}/cache/mcp_envs}"
 LOG_ROOT="${LOG_ROOT:-${OUTPUT_DIR}/logs}"
 EPISODE_LOG_DIR_EXPLICIT=0
 if [ -n "${EPISODE_LOG_DIR:-}" ]; then
@@ -105,59 +131,74 @@ else
 fi
 
 MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
+#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
+#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-14B}"
 MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-14B}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
 
 SAMPLE_N="${SAMPLE_N:-32}"
 MAX_TRAJECTORY_PER_PROBLEM="${MAX_TRAJECTORY_PER_PROBLEM:-1}"
 MIN_SAMPLE_TRIAL="${MIN_SAMPLE_TRIAL:-1}"
-REWARD_THRESHOLD="${REWARD_THRESHOLD:-0.6}"
+REWARD_THRESHOLD="${REWARD_THRESHOLD:-0.8}"
 MIN_STEPS="${MIN_STEPS:-2}"
 CERTAINTY_FILTER="${CERTAINTY_FILTER:-False}"
+VALID_GROUPS_PER_SHARD="${VALID_GROUPS_PER_SHARD:-}"
+MAX_CANDIDATE_GROUPS_PER_SHARD="${MAX_CANDIDATE_GROUPS_PER_SHARD:-}"
 OFFLINE_RS_CHECKPOINT_ENABLE="${OFFLINE_RS_CHECKPOINT_ENABLE:-True}"
 OFFLINE_RS_RESUME="${OFFLINE_RS_RESUME:-True}"
+OFFLINE_RS_RESULTS_MODE="${OFFLINE_RS_RESULTS_MODE:-auto}"
 
-#DEFAULT_TRAIN_FILES=("${SCRIPT_DIR}/artifacts/asearcher.parquet")  # ASearcher-14K
-DEFAULT_TRAIN_FILES=("${SCRIPT_DIR}/artifacts/fused_mcp_search_train_shuffled.parquet")  # Fused MCP+WebQA (12k)
+DEFAULT_TRAIN_FILES=(
+   "${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"
+   "${SCRIPT_DIR}/artifacts/mcp_data_final/train.parquet"
+)
 TRAIN_FILE_PATHS=("${DEFAULT_TRAIN_FILES[@]}")
 SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
-DISABLE_THINKING="${DISABLE_THINKING:-true}"
+DISABLE_THINKING="${DISABLE_THINKING:-false}"
 DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
 FUSED_HARNESS="${FUSED_HARNESS:-gem}"
 harness_explicit=false
 
-MAX_STEPS="${MAX_STEPS:-128}"
-MCP_MAX_STEPS="${MCP_MAX_STEPS:-128}"
-WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-128}"
-CLI_MAX_STEPS="${CLI_MAX_STEPS:-128}"
+ENABLE_YARN="${ENABLE_YARN:-false}"
+YARN_FACTOR="${YARN_FACTOR:-1.0}"
+YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS:-32768}"
+MAX_STEPS="${MAX_STEPS:-64}"
+MCP_MAX_STEPS="${MCP_MAX_STEPS:-64}"
+MCP_MAX_TOOL_CALLS_PER_TURN="${MCP_MAX_TOOL_CALLS_PER_TURN:-1}"
+WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-64}"
+CLI_MAX_STEPS="${CLI_MAX_STEPS:-64}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-3600}"
-EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-3600}"
-PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-24576}"
+EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-300}"
+PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-8192}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
+SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-16}"
 
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-15472}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-24576}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-64}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-2048}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-}"
 NUM_EPOCH="${NUM_EPOCH:-1}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-1.0}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
-ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
-SGLANG_SERVER_CONCURRENCY_EXPLICIT=0
-if [ -n "${SGLANG_SERVER_CONCURRENCY+x}" ]; then
-   SGLANG_SERVER_CONCURRENCY_EXPLICIT=1
-fi
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-4096}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-4096}"
-FULLY_ASYNC_GROUP_CONCURRENCY="${FULLY_ASYNC_GROUP_CONCURRENCY:-}"
+SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-${GPU_MEMORY_UTILIZATION:-0.9}}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-64}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
+SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
+ROUTER_POLICY="${ROUTER_POLICY:-cache_aware}"
+FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY:-true}"
+FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY:-}"
+FULLY_ASYNC_MAX_GROUP_CONCURRENCY="${FULLY_ASYNC_MAX_GROUP_CONCURRENCY:-}"
+FULLY_ASYNC_CONCURRENCY_STEP="${FULLY_ASYNC_CONCURRENCY_STEP:-}"
+FULLY_ASYNC_CONCURRENCY_POLL_INTERVAL="${FULLY_ASYNC_CONCURRENCY_POLL_INTERVAL:-10}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 RAY_JOB_WAIT="${RAY_JOB_WAIT:-1}"
 
@@ -172,6 +213,8 @@ while [ "$#" -gt 0 ]; do
       --reward-threshold) REWARD_THRESHOLD="${2:?Missing value for --reward-threshold}"; shift 2 ;;
       --min-steps) MIN_STEPS="${2:?Missing value for --min-steps}"; shift 2 ;;
       --certainty-filter) CERTAINTY_FILTER="${2:?Missing value for --certainty-filter}"; shift 2 ;;
+      --valid-groups-per-shard) VALID_GROUPS_PER_SHARD="${2:?Missing value for --valid-groups-per-shard}"; shift 2 ;;
+      --max-candidate-groups-per-shard) MAX_CANDIDATE_GROUPS_PER_SHARD="${2:?Missing value for --max-candidate-groups-per-shard}"; shift 2 ;;
       --train-files) IFS=',' read -r -a TRAIN_FILE_PATHS <<< "${2:?Missing value for --train-files}"; shift 2 ;;
       --prompt-data) PROMPT_DATA="${2:?Missing value for --prompt-data}"; PROMPT_DATA_EXPLICIT=1; shift 2 ;;
       --output-dir)
@@ -193,32 +236,44 @@ while [ "$#" -gt 0 ]; do
       --checkpointing) OFFLINE_RS_CHECKPOINT_ENABLE="${2:?Missing value for --checkpointing}"; shift 2 ;;
       --checkpoint-path) OFFLINE_RS_CHECKPOINT_PATH="${2:?Missing value for --checkpoint-path}"; CHECKPOINT_PATH_EXPLICIT=1; shift 2 ;;
       --resume) OFFLINE_RS_RESUME="${2:?Missing value for --resume}"; shift 2 ;;
+      --results-mode) OFFLINE_RS_RESULTS_MODE="${2:?Missing value for --results-mode}"; shift 2 ;;
       --experiment-name) EXPERIMENT_NAME="${2:?Missing value for --experiment-name}"; shift 2 ;;
       --max-batches|--num-rollout) NUM_ROLLOUT="${2:?Missing value for --max-batches}"; shift 2 ;;
       --harness) FUSED_HARNESS="${2:?Missing value for --harness}"; harness_explicit=true; shift 2 ;;
       --unified-system-prompt) UNIFIED_SYSTEM_PROMPT=True; if [ "${harness_explicit}" = "false" ]; then FUSED_HARNESS=unified_gem; fi; shift ;;
       --no-unified-system-prompt) UNIFIED_SYSTEM_PROMPT=False; if [ "${harness_explicit}" = "false" ]; then FUSED_HARNESS=gem; fi; shift ;;
       --model) MODEL_DIR="${2:?Missing value for --model}"; shift 2 ;;
+      --enable-yarn) ENABLE_YARN="${2:?Missing value for --enable-yarn}"; shift 2 ;;
+      --yarn-factor) YARN_FACTOR="${2:?Missing value for --yarn-factor}"; shift 2 ;;
+      --yarn-original-max-position-embeddings) YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${2:?Missing value for --yarn-original-max-position-embeddings}"; shift 2 ;;
       --disable-thinking) DISABLE_THINKING="${2:?Missing value for --disable-thinking}"; shift 2 ;;
       --discard-historical-thinking) DISCARD_HISTORICAL_THINKING="${2:?Missing value for --discard-historical-thinking}"; shift 2 ;;
+      --mcp-disable-step-penalty) RLLM_MCP_DISABLE_STEP_PENALTY="${2:?Missing value for --mcp-disable-step-penalty}"; shift 2 ;;
       --max-steps) MAX_STEPS="${2:?Missing value for --max-steps}"; shift 2 ;;
       --mcp-max-steps) MCP_MAX_STEPS="${2:?Missing value for --mcp-max-steps}"; shift 2 ;;
+      --mcp-max-tool-calls-per-turn) MCP_MAX_TOOL_CALLS_PER_TURN="${2:?Missing value for --mcp-max-tool-calls-per-turn}"; shift 2 ;;
       --web-search-max-steps) WEB_SEARCH_MAX_STEPS="${2:?Missing value for --web-search-max-steps}"; shift 2 ;;
       --cli-max-steps) CLI_MAX_STEPS="${2:?Missing value for --cli-max-steps}"; shift 2 ;;
       --trajectory-timeout) TRAJECTORY_TIMEOUT="${2:?Missing value for --trajectory-timeout}"; shift 2 ;;
       --per-step-max-tokens) PER_STEP_MAX_TOKENS="${2:?Missing value for --per-step-max-tokens}"; shift 2 ;;
       --max-tool-output-length) MAX_TOOL_OUTPUT_LENGTH="${2:?Missing value for --max-tool-output-length}"; shift 2 ;;
       --terminal-log-style) TERMINAL_LOG_STYLE="${2:?Missing value for --terminal-log-style}"; shift 2 ;;
+      --show-rollout-progress-logs) SHOW_ROLLOUT_PROGRESS_LOGS="${2:?Missing value for --show-rollout-progress-logs}"; shift 2 ;;
       --model-config) MODEL_CONFIG="${2:?Missing value for --model-config}"; shift 2 ;;
       --rollout-batch-size) ROLLOUT_BATCH_SIZE="${2:?Missing value for --rollout-batch-size}"; shift 2 ;;
       --max-prompt-length) MAX_PROMPT_LENGTH="${2:?Missing value for --max-prompt-length}"; shift 2 ;;
       --max-response-length) MAX_RESPONSE_LENGTH="${2:?Missing value for --max-response-length}"; shift 2 ;;
       --rollout-gpus) ROLLOUT_GPUS="${2:?Missing value for --rollout-gpus}"; shift 2 ;;
       --rollout-num-gpus-per-engine) ROLLOUT_NUM_GPUS_PER_ENGINE="${2:?Missing value for --rollout-num-gpus-per-engine}"; shift 2 ;;
-      --gpu-memory-utilization) GPU_MEMORY_UTILIZATION="${2:?Missing value for --gpu-memory-utilization}"; shift 2 ;;
-      --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; SGLANG_SERVER_CONCURRENCY_EXPLICIT=1; shift 2 ;;
+      --gpu-memory-utilization) SGLANG_MEM_FRACTION_STATIC="${2:?Missing value for --gpu-memory-utilization}"; shift 2 ;;
+      --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
-      --fully-async-group-concurrency) FULLY_ASYNC_GROUP_CONCURRENCY="${2:?Missing value for --fully-async-group-concurrency}"; shift 2 ;;
+      --sglang-router-request-timeout-secs) SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${2:?Missing value for --sglang-router-request-timeout-secs}"; shift 2 ;;
+      --fully-async-adaptive-concurrency) FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${2:?Missing value for --fully-async-adaptive-concurrency}"; shift 2 ;;
+      --fully-async-initial-group-concurrency) FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY="${2:?Missing value for --fully-async-initial-group-concurrency}"; shift 2 ;;
+      --fully-async-max-group-concurrency) FULLY_ASYNC_MAX_GROUP_CONCURRENCY="${2:?Missing value for --fully-async-max-group-concurrency}"; shift 2 ;;
+      --fully-async-concurrency-step) FULLY_ASYNC_CONCURRENCY_STEP="${2:?Missing value for --fully-async-concurrency-step}"; shift 2 ;;
+      --fully-async-concurrency-poll-interval) FULLY_ASYNC_CONCURRENCY_POLL_INTERVAL="${2:?Missing value for --fully-async-concurrency-poll-interval}"; shift 2 ;;
       --ray-num-cpus) RAY_NUM_CPUS="${2:?Missing value for --ray-num-cpus}"; shift 2 ;;
       --ray-job-wait) RAY_JOB_WAIT="${2:?Missing value for --ray-job-wait}"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
@@ -242,32 +297,75 @@ fi
 
 source "${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
 
-FULLY_ASYNC_GROUP_CONCURRENCY="${FULLY_ASYNC_GROUP_CONCURRENCY:-${ROLLOUT_BATCH_SIZE}}"
-case "${ROLLOUT_FUNCTION_PATH}" in
-   *fully_async_rollout.generate_rollout_fully_async)
-      if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -le 0 ]; then
-         echo "Invalid ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE}; expected positive integer." >&2
-         exit 2
-      fi
-      ROLLOUT_NUM_ENGINES="$(( (ROLLOUT_GPUS + ROLLOUT_NUM_GPUS_PER_ENGINE - 1) / ROLLOUT_NUM_GPUS_PER_ENGINE ))"
-      if [ "${ROLLOUT_NUM_ENGINES}" -le 0 ]; then
-         echo "Invalid rollout engine count from rollout_gpus=${ROLLOUT_GPUS}, rollout_num_gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE}." >&2
-         exit 2
-      fi
-      if [ "${SGLANG_SERVER_CONCURRENCY_EXPLICIT}" = "0" ]; then
-         # fully_async_rollout treats sglang_server_concurrency * num_engines as
-         # in-flight prompt-group concurrency. Keep the group window bounded.
-         SGLANG_SERVER_CONCURRENCY="$(( (FULLY_ASYNC_GROUP_CONCURRENCY + ROLLOUT_NUM_ENGINES - 1) / ROLLOUT_NUM_ENGINES ))"
-         if [ "${SGLANG_SERVER_CONCURRENCY}" -lt 1 ]; then
-            SGLANG_SERVER_CONCURRENCY=1
-         fi
-      fi
+case "${MODEL_CONFIG,,}" in
+   qwen3-4b|qwen3-4b-*|qwen3-8b|qwen3-8b-*)
+      DEFAULT_ROLLOUT_NUM_GPUS_PER_ENGINE=1
+      ;;
+   qwen3-14b|qwen3-14b-*)
+      DEFAULT_ROLLOUT_NUM_GPUS_PER_ENGINE=2
+      ;;
+   qwen3-30b-a3b|qwen3-30b-a3b-*|qwen3-32b|qwen3-32b-*)
+      DEFAULT_ROLLOUT_NUM_GPUS_PER_ENGINE=4
       ;;
    *)
-      ROLLOUT_NUM_ENGINES="$(( (ROLLOUT_GPUS + ROLLOUT_NUM_GPUS_PER_ENGINE - 1) / ROLLOUT_NUM_GPUS_PER_ENGINE ))"
+      if [ -z "${ROLLOUT_NUM_GPUS_PER_ENGINE:-}" ]; then
+         echo "MODEL_CONFIG=${MODEL_CONFIG} has no default rollout tensor-parallel size; set ROLLOUT_NUM_GPUS_PER_ENGINE explicitly." >&2
+         exit 2
+      fi
+      DEFAULT_ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE}"
       ;;
 esac
-FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY="$((SGLANG_SERVER_CONCURRENCY * ROLLOUT_NUM_ENGINES))"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-${DEFAULT_ROLLOUT_NUM_GPUS_PER_ENGINE}}"
+
+if [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -lt 1 ] \
+   || [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
+   echo "ROLLOUT_GPUS=${ROLLOUT_GPUS} must be divisible by ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE}" >&2
+   exit 2
+fi
+ROLLOUT_ENGINE_COUNT=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
+FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 4))}"
+# Rejection sampling has long tool/retrieval gaps between model turns. Keep
+# enough trajectories in flight to refill every SGLang engine while allowing
+# the adaptive controller to back off under KV-cache pressure. Training
+# launchers do not use this script and retain their own defaults.
+FULLY_ASYNC_MAX_GROUP_CONCURRENCY="${FULLY_ASYNC_MAX_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 8))}"
+FULLY_ASYNC_CONCURRENCY_STEP="${FULLY_ASYNC_CONCURRENCY_STEP:-${ROLLOUT_ENGINE_COUNT}}"
+VALID_GROUPS_PER_SHARD="${VALID_GROUPS_PER_SHARD:-128}"
+MAX_CANDIDATE_GROUPS_PER_SHARD="${MAX_CANDIDATE_GROUPS_PER_SHARD:-$((VALID_GROUPS_PER_SHARD * 16))}"
+if [ "${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY}" -lt 1 ] \
+   || [ "${FULLY_ASYNC_MAX_GROUP_CONCURRENCY}" -lt "${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY}" ] \
+   || [ "${FULLY_ASYNC_CONCURRENCY_STEP}" -lt 1 ]; then
+   echo "Fully-async concurrency requires 1 <= initial <= max and step >= 1; got initial=${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY}, max=${FULLY_ASYNC_MAX_GROUP_CONCURRENCY}, step=${FULLY_ASYNC_CONCURRENCY_STEP}." >&2
+   exit 2
+fi
+
+if is_truthy "${ENABLE_YARN}"; then
+   python3 - "${YARN_FACTOR}" "${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}" "${MAX_CONTEXT_LEN}" <<'PY' || exit 2
+import math
+import sys
+
+factor = float(sys.argv[1])
+original_context = int(sys.argv[2])
+target_context = int(sys.argv[3])
+if not math.isfinite(factor) or factor <= 1:
+    raise SystemExit(f"YARN_FACTOR must be finite and greater than 1, got {factor}")
+if original_context <= 0:
+    raise SystemExit(
+        "YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS must be positive, "
+        f"got {original_context}"
+    )
+if target_context > int(factor * original_context):
+    raise SystemExit(
+        f"MAX_CONTEXT_LEN={target_context} exceeds the configured YaRN capacity "
+        f"{int(factor * original_context)}"
+    )
+PY
+   MODEL_ARGS+=(
+      --use-yarn-rope
+      --yarn-rope-scaling-factor "${YARN_FACTOR}"
+      --yarn-original-max-position-embeddings "${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
+   )
+fi
 
 RESOLVED_TRAIN_FILES=()
 for train_file in "${TRAIN_FILE_PATHS[@]}"; do
@@ -289,7 +387,7 @@ for train_file in "${TRAIN_FILE_PATHS[@]}"; do
    exit 1
 done
 
-mkdir -p "${OUTPUT_DIR}" "$(dirname "${PROMPT_DATA}")" "${DUMP_DETAILS}"
+mkdir -p "${OUTPUT_DIR}" "$(dirname "${PROMPT_DATA}")" "${DUMP_DETAILS}" "${MCP_ENV_ROOT}"
 python3 - "${PROMPT_DATA}" "${SHUFFLE_TRAIN_DATA}" "${SHUFFLE_SEED}" "${RESOLVED_TRAIN_FILES[@]}" <<'PY'
 import sys
 from pathlib import Path
@@ -345,6 +443,25 @@ if [ "${TRAIN_NUM_ROWS}" -le 0 ]; then
 fi
 AUTO_NUM_ROLLOUT=$(( (TRAIN_NUM_ROWS + ROLLOUT_BATCH_SIZE - 1) / ROLLOUT_BATCH_SIZE * NUM_EPOCH ))
 NUM_ROLLOUT="${NUM_ROLLOUT:-${AUTO_NUM_ROLLOUT}}"
+
+case "${OFFLINE_RS_RESULTS_MODE}" in
+   auto)
+      expected_prompts=$((NUM_ROLLOUT * ROLLOUT_BATCH_SIZE))
+      if [ "${expected_prompts}" -gt "${TRAIN_NUM_ROWS}" ]; then
+         expected_prompts="${TRAIN_NUM_ROWS}"
+      fi
+      if [ $((expected_prompts * SAMPLE_N)) -gt 100000 ]; then
+         RESOLVED_RESULTS_MODE=manifest
+      else
+         RESOLVED_RESULTS_MODE=full
+      fi
+      ;;
+   full|manifest) RESOLVED_RESULTS_MODE="${OFFLINE_RS_RESULTS_MODE}" ;;
+   *)
+      echo "--results-mode must be full, manifest, or auto; got ${OFFLINE_RS_RESULTS_MODE}" >&2
+      exit 2
+      ;;
+esac
 
 mkdir -p "${EPISODE_LOG_DIR}" "$(dirname "${OFFLINE_RS_CHECKPOINT_PATH}")"
 RESUME_START_ROLLOUT_ID=0
@@ -415,21 +532,34 @@ export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export NUM_GPUS="${NUM_GPUS:-${ROLLOUT_GPUS}}"
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
-export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
+export NCCL_TIMEOUT="${NCCL_TIMEOUT:-7200}"
 export RAY_WARN_BLOCKING_GET_INSIDE_ASYNC="${RAY_WARN_BLOCKING_GET_INSIDE_ASYNC:-0}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
 export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-10000000000}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
+export RUNS_ROOT RUN_ROOT MCP_ENV_ROOT
+export SLIME_MCP_ENV_ROOT="${MCP_ENV_ROOT}"
+export SLIME_MCP_ENV_COPY_CONCURRENCY="${SLIME_MCP_ENV_COPY_CONCURRENCY:-32}"
+# Local MCP trajectory isolation is enabled by default. Keep the bounded
+# process-pool knobs in the Ray runtime so rejection sampling workers receive
+# the same isolation and fault-timeout policy as the launcher process.
+export SLIME_LOCAL_MCP_PROCESS_ISOLATION="${SLIME_LOCAL_MCP_PROCESS_ISOLATION:-true}"
+export SLIME_LOCAL_MCP_PROCESS_WORKERS="${SLIME_LOCAL_MCP_PROCESS_WORKERS:-}"
+export SLIME_LOCAL_MCP_PROCESS_START_METHOD="${SLIME_LOCAL_MCP_PROCESS_START_METHOD:-forkserver}"
+export SLIME_LOCAL_MCP_PROCESS_TIMEOUT="${SLIME_LOCAL_MCP_PROCESS_TIMEOUT:-120}"
+export SLIME_LOCAL_MCP_PROCESS_WARM_TIMEOUT="${SLIME_LOCAL_MCP_PROCESS_WARM_TIMEOUT:-60}"
 
 # Keep these defaults byte-for-byte aligned with train_fused_agent_sync.sh where
 # they define agent behavior. The rollout code consumes this env to choose
 # prompt harness, system prompt, tool schemas, parser behavior, and service IO.
 export RETRIEVAL_SERVER_URL="${RETRIEVAL_SERVER_URL:-http://10.2.152.50:65432}"
 export RLLM_RETRIEVAL_MODE="${RLLM_RETRIEVAL_MODE:-hybrid}"
+export RLLM_RETRIEVAL_CONCURRENCY="${RLLM_RETRIEVAL_CONCURRENCY:-512}"
+export RLLM_RETRIEVAL_CACHE_SIZE="${RLLM_RETRIEVAL_CACHE_SIZE:-4096}"
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
-export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-${RLLM_RETRIEVAL_MAX_RESULTS:-4}}"
+export RETRIEVAL_MAX_RESULTS="${RETRIEVAL_MAX_RESULTS:-${RLLM_RETRIEVAL_MAX_RESULTS:-8}}"
 export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-1}"
 export RLLM_RETRIEVAL_SUMMARIZE="${RLLM_RETRIEVAL_SUMMARIZE:-0}"
 export RLLM_RETRIEVAL_RETRY_BUDGET="${RLLM_RETRIEVAL_RETRY_BUDGET:-8}"
@@ -444,19 +574,23 @@ export DOCKER_HOST="${DOCKER_HOST:-tcp://10.2.152.50:2375}"
 export DOCKER_API_VERSION="${DOCKER_API_VERSION:-1.44}"
 export RLLM_MCP_MIN_NOFILE="${RLLM_MCP_MIN_NOFILE:-4096}"
 export RLLM_MCP_FD_THROTTLE_THRESHOLD="${RLLM_MCP_FD_THROTTLE_THRESHOLD:-4096}"
-export RLLM_MCP_INIT_TIMEOUT="${RLLM_MCP_INIT_TIMEOUT:-32}"
+export RLLM_MCP_INIT_TIMEOUT="${RLLM_MCP_INIT_TIMEOUT:-64}"
 export RLLM_MCP_START_RETRIES="${RLLM_MCP_START_RETRIES:-8}"
 export RLLM_MCP_START_WAIT_TIMEOUT="${RLLM_MCP_START_WAIT_TIMEOUT:-0}"
 export RLLM_MCP_TOOL_TIMEOUT="${RLLM_MCP_TOOL_TIMEOUT:-8}"
 export RLLM_MCP_MAX_ACTIVE_SERVERS="${RLLM_MCP_MAX_ACTIVE_SERVERS:-128}"
 export RLLM_MCP_PREFILTER_WORKERS="${RLLM_MCP_PREFILTER_WORKERS:-8}"
 export RLLM_MCP_DISABLE_STEP_PENALTY="${RLLM_MCP_DISABLE_STEP_PENALTY:-True}"
+# Reject verifier results that report an internal tool error while claiming success.
+# This is rejection-sampling-only; ordinary training launchers leave it disabled.
+export SLIME_MCP_STRICT_VERIFIER="${SLIME_MCP_STRICT_VERIFIER:-true}"
 export FUSED_HARNESS="${FUSED_HARNESS}"
 export FUSED_UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT}"
 export FUSED_DISABLE_THINKING="${DISABLE_THINKING}"
 export FUSED_DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING}"
 export FUSED_MAX_STEPS="${FUSED_MAX_STEPS:-${MAX_STEPS}}"
 export FUSED_MCP_MAX_STEPS="${FUSED_MCP_MAX_STEPS:-${MCP_MAX_STEPS}}"
+export FUSED_MCP_MAX_TOOL_CALLS_PER_TURN="${MCP_MAX_TOOL_CALLS_PER_TURN}"
 export FUSED_WEB_SEARCH_MAX_STEPS="${FUSED_WEB_SEARCH_MAX_STEPS:-${WEB_SEARCH_MAX_STEPS}}"
 export FUSED_CLI_MAX_STEPS="${CLI_MAX_STEPS}"
 export FUSED_TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT}"
@@ -464,7 +598,20 @@ export FUSED_EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT}"
 export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-${MAX_RESPONSE_LENGTH}}"
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE}"
+export SLIME_FUSED_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS}"
 export SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}"
+export SLIME_FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY}"
+export SLIME_FULLY_ASYNC_INITIAL_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY}"
+export SLIME_FULLY_ASYNC_MAX_CONCURRENCY="${FULLY_ASYNC_MAX_GROUP_CONCURRENCY}"
+export SLIME_FULLY_ASYNC_CONCURRENCY_STEP="${FULLY_ASYNC_CONCURRENCY_STEP}"
+export SLIME_FULLY_ASYNC_CONCURRENCY_POLL_INTERVAL="${FULLY_ASYNC_CONCURRENCY_POLL_INTERVAL}"
+export SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS="${SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS:-true}"
+export SLIME_FULLY_ASYNC_NO_DATASET_WRAP="${SLIME_FULLY_ASYNC_NO_DATASET_WRAP:-true}"
+export SLIME_FULLY_ASYNC_CROSS_SHARD_PREFETCH="${SLIME_FULLY_ASYNC_CROSS_SHARD_PREFETCH:-true}"
+export SLIME_FULLY_ASYNC_PREFETCH_GROUPS="${SLIME_FULLY_ASYNC_PREFETCH_GROUPS:-${ROLLOUT_BATCH_SIZE}}"
+export SLIME_FULLY_ASYNC_VALID_GROUPS_PER_SHARD="${VALID_GROUPS_PER_SHARD}"
+export SLIME_FULLY_ASYNC_MAX_CANDIDATE_GROUPS_PER_SHARD="${MAX_CANDIDATE_GROUPS_PER_SHARD}"
+export SLIME_FUSED_PROFILE_DIR="${SLIME_FUSED_PROFILE_DIR:-${OUTPUT_DIR}/trajectory_profiles}"
 export CREDIT_ASSIGNMENT_ENABLE="${CREDIT_ASSIGNMENT_ENABLE:-True}"
 export CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR="${CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR:-True}"
 export CREDIT_ASSIGNMENT_THINK_PARSER_ERROR="${CREDIT_ASSIGNMENT_THINK_PARSER_ERROR:-True}"
@@ -496,6 +643,7 @@ keys = (
     "TOKENIZERS_PARALLELISM", "VLLM_ALLOW_LONG_MAX_MODEL_LEN",
     "VLLM_ENGINE_ITERATION_TIMEOUT_S", "VLLM_WORKER_MULTIPROC_METHOD",
     "PYTORCH_CUDA_ALLOC_CONF", "RETRIEVAL_SERVER_URL", "RLLM_RETRIEVAL_MODE",
+    "RLLM_RETRIEVAL_CONCURRENCY", "RLLM_RETRIEVAL_CACHE_SIZE",
     "RLLM_RETRIEVAL_MAX_WORDS", "RETRIEVAL_MAX_RESULTS", "RLLM_RETRIEVAL_SUMMARIZE",
     "FUSED_WEBQA_MIN_UNIQUE_SEARCHES", "RLLM_RETRIEVAL_RETRY_BUDGET",
     "RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET", "RLLM_RETRIEVAL_LEXRANK_FALLBACK",
@@ -505,13 +653,23 @@ keys = (
     "WANDB_API_KEY", "RLLM_MCP_MIN_NOFILE", "RLLM_MCP_FD_THROTTLE_THRESHOLD",
     "RLLM_MCP_INIT_TIMEOUT", "RLLM_MCP_START_RETRIES", "RLLM_MCP_START_WAIT_TIMEOUT",
     "RLLM_MCP_TOOL_TIMEOUT", "RLLM_MCP_MAX_ACTIVE_SERVERS", "RLLM_MCP_PREFILTER_WORKERS",
-    "RLLM_MCP_DISABLE_STEP_PENALTY", "FUSED_HARNESS", "FUSED_UNIFIED_SYSTEM_PROMPT",
+    "RLLM_MCP_DISABLE_STEP_PENALTY", "SLIME_MCP_STRICT_VERIFIER", "FUSED_HARNESS", "FUSED_UNIFIED_SYSTEM_PROMPT",
     "FUSED_DISABLE_THINKING", "FUSED_DISCARD_HISTORICAL_THINKING",
-    "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS",
+    "FUSED_MAX_STEPS", "FUSED_MCP_MAX_STEPS", "FUSED_MCP_MAX_TOOL_CALLS_PER_TURN",
     "FUSED_WEB_SEARCH_MAX_STEPS", "FUSED_CLI_MAX_STEPS", "FUSED_TRAJECTORY_TIMEOUT",
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "PER_STEP_MAX_TOKENS",
     "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH", "SLIME_FUSED_TERMINAL_LOG_STYLE",
-    "SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS", "SLIME_FUSED_TAIL_GUARD",
+    "SLIME_FUSED_PROGRESS_LOGS", "SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS", "SLIME_FUSED_TAIL_GUARD",
+    "SLIME_FULLY_ASYNC_ADAPTIVE_CONCURRENCY", "SLIME_FULLY_ASYNC_INITIAL_CONCURRENCY",
+    "SLIME_FULLY_ASYNC_MAX_CONCURRENCY", "SLIME_FULLY_ASYNC_CONCURRENCY_STEP",
+    "SLIME_FULLY_ASYNC_CONCURRENCY_POLL_INTERVAL", "SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS",
+    "SLIME_FULLY_ASYNC_NO_DATASET_WRAP", "SLIME_FULLY_ASYNC_CROSS_SHARD_PREFETCH",
+    "SLIME_FULLY_ASYNC_PREFETCH_GROUPS",
+    "SLIME_FUSED_PROFILE_DIR",
+    "RUNS_ROOT", "RUN_ROOT", "MCP_ENV_ROOT", "SLIME_MCP_ENV_ROOT", "SLIME_MCP_ENV_COPY_CONCURRENCY",
+    "SLIME_LOCAL_MCP_PROCESS_ISOLATION", "SLIME_LOCAL_MCP_PROCESS_WORKERS",
+    "SLIME_LOCAL_MCP_PROCESS_START_METHOD", "SLIME_LOCAL_MCP_PROCESS_TIMEOUT",
+    "SLIME_LOCAL_MCP_PROCESS_WARM_TIMEOUT",
     "SLIME_FUSED_TAIL_GUARD_TIME_GUARD", "SLIME_FUSED_TAIL_GUARD_TIME_MULTIPLIER",
     "SLIME_FUSED_TAIL_GUARD_TIME_SLACK_SECONDS", "SLIME_FUSED_TAIL_GUARD_MIN_COMPLETION_RATIO",
     "CREDIT_ASSIGNMENT_ENABLE", "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR", "CREDIT_ASSIGNMENT_THINK_PARSER_ERROR",
@@ -537,26 +695,33 @@ python3 - "${RUN_CONFIG}" \
    sample_n="${SAMPLE_N}" max_trajectory_per_problem="${MAX_TRAJECTORY_PER_PROBLEM}" \
    min_sample_trial="${MIN_SAMPLE_TRIAL}" reward_threshold="${REWARD_THRESHOLD}" \
    min_steps="${MIN_STEPS}" certainty_filter="${CERTAINTY_FILTER}" model="${MODEL_DIR}" \
+   model_config="${MODEL_CONFIG}" rollout_num_gpus_per_engine="${ROLLOUT_NUM_GPUS_PER_ENGINE}" \
    fused_harness="${FUSED_HARNESS}" unified_system_prompt="${UNIFIED_SYSTEM_PROMPT}" \
    rollout_function_path="${ROLLOUT_FUNCTION_PATH}" \
-   fully_async_group_concurrency="${FULLY_ASYNC_GROUP_CONCURRENCY}" \
-   fully_async_effective_group_concurrency="${FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY}" \
+   fully_async_adaptive_concurrency="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY}" \
+   fully_async_initial_group_concurrency="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY}" \
+   fully_async_max_group_concurrency="${FULLY_ASYNC_MAX_GROUP_CONCURRENCY}" \
    sglang_server_concurrency="${SGLANG_SERVER_CONCURRENCY}" \
-   sglang_server_concurrency_explicit="${SGLANG_SERVER_CONCURRENCY_EXPLICIT}" \
+   sglang_max_running_requests="${SGLANG_MAX_RUNNING_REQUESTS}" \
    custom_generate_function_path="${CUSTOM_GENERATE_FUNCTION_PATH}" num_rollout="${NUM_ROLLOUT}" \
    resume="${OFFLINE_RS_RESUME}" checkpointing="${OFFLINE_RS_CHECKPOINT_ENABLE}" \
+   results_mode="${RESOLVED_RESULTS_MODE}" no_dataset_wrap="${SLIME_FULLY_ASYNC_NO_DATASET_WRAP}" \
    checkpoint_path="${OFFLINE_RS_CHECKPOINT_PATH}" start_rollout_id="${RESUME_START_ROLLOUT_ID}" \
    episodes_dir="${EPISODE_LOG_DIR}" <<'PY'
 import json, sys
 path = sys.argv[1]
 config = dict(item.split("=", 1) for item in sys.argv[2:])
-with open(path, "w") as f:
-    json.dump(config, f, indent=4, sort_keys=True)
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(config, f, indent=4, ensure_ascii=False, sort_keys=True)
+    f.write("\n")
 print(f"Wrote {path}")
 PY
 
 ROLLOUT_ARGS=(
    --debug-rollout-only
+   --rollout-only-inference-fast-path
+   --rollout-only-skip-episode-dump
+   --async-save-debug-rollout-data
    --rollout-function-path "${ROLLOUT_FUNCTION_PATH}"
    --prompt-data "${PROMPT_DATA}"
    --input-key "${INPUT_KEY:-prompt}"
@@ -567,6 +732,7 @@ ROLLOUT_ARGS=(
    --num-rollout "${NUM_ROLLOUT}"
    --start-rollout-id "${RESUME_START_ROLLOUT_ID}"
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
+   --over-sampling-batch-size "${ROLLOUT_BATCH_SIZE}"
    --n-samples-per-prompt "${SAMPLE_N}"
    --rollout-max-context-len "${MAX_CONTEXT_LEN}"
    --rollout-max-prompt-len "${MAX_PROMPT_LENGTH}"
@@ -576,54 +742,35 @@ ROLLOUT_ARGS=(
    --custom-generate-function-path "${CUSTOM_GENERATE_FUNCTION_PATH}"
    --apply-chat-template
    --dump-details "${DUMP_DETAILS}"
-   --global-batch-size "$((ROLLOUT_BATCH_SIZE * SAMPLE_N))"
-   --num-steps-per-rollout 1
 )
 
 CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}"
-   --ref-load "${MODEL_DIR}"
    --load "${OUTPUT_DIR}"
    --save "${OUTPUT_DIR}"
-   --save-interval 1
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
-   --sglang-mem-fraction-static "${GPU_MEMORY_UTILIZATION}"
+   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
    --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}"
+   --sglang-router-request-timeout-secs "${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS}"
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
    --sglang-context-length "${MAX_CONTEXT_LEN}"
-   --sglang-disable-custom-all-reduce
-)
-
-CLUSTER_ARGS=(
-   --actor-num-nodes 1
-   --actor-num-gpus-per-node 1
-   --rollout-num-gpus "${ROLLOUT_GPUS}"
-   --update-weights-interval 1
-)
-
-MISC_ARGS=(
-   --attention-dropout 0.0
-   --hidden-dropout 0.0
-   --accumulate-allreduce-grads-in-fp32
-   --attention-softmax-in-fp32
-   --attention-backend flash
-   --micro-batch-size 1
-   --max-tokens-per-gpu "${MAX_CONTEXT_LEN}"
-   --log-probs-max-tokens-per-gpu "${MAX_CONTEXT_LEN}"
+   --router-policy "${ROUTER_POLICY}"
 )
 
 echo "Experiment: ${EXPERIMENT_NAME}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Prompt data: ${PROMPT_DATA}; rows=${TRAIN_NUM_ROWS}; rollout_batch_size=${ROLLOUT_BATCH_SIZE}; sample_n=${SAMPLE_N}; num_rollout=${NUM_ROLLOUT}; start_rollout_id=${RESUME_START_ROLLOUT_ID}"
 echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
-echo "Rollout concurrency: fully_async_group_concurrency=${FULLY_ASYNC_GROUP_CONCURRENCY}; effective_group_concurrency=${FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY}; rollout_num_engines=${ROLLOUT_NUM_ENGINES}; sglang_server_concurrency=${SGLANG_SERVER_CONCURRENCY}; explicit_sglang_server_concurrency=${SGLANG_SERVER_CONCURRENCY_EXPLICIT}"
-echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}, max_steps=${MAX_STEPS}, mcp_max_steps=${MCP_MAX_STEPS}, web_search_max_steps=${WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
+echo "SGLang: rollout_tp=${ROLLOUT_NUM_GPUS_PER_ENGINE}; rollout_engines=${ROLLOUT_ENGINE_COUNT}; mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}; server_concurrency=${SGLANG_SERVER_CONCURRENCY}; max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}; router_policy=${ROUTER_POLICY}"
+echo "Fully async task filling: adaptive=${FULLY_ASYNC_ADAPTIVE_CONCURRENCY}; group_concurrency=${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY}-${FULLY_ASYNC_MAX_GROUP_CONCURRENCY}; step=${FULLY_ASYNC_CONCURRENCY_STEP}; poll_interval=${FULLY_ASYNC_CONCURRENCY_POLL_INTERVAL}s"
+echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}, max_steps=${MAX_STEPS}, mcp_max_steps=${MCP_MAX_STEPS}, mcp_max_tool_calls_per_turn=${MCP_MAX_TOOL_CALLS_PER_TURN}, web_search_max_steps=${WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}"
 echo "Debug rollout dump: ${DUMP_DETAILS}/rollout_data/{rollout_id}.pt"
 echo "Per-batch trajectory shards: ${EPISODE_LOG_DIR}/global_steps_{rollout_id}.json"
 echo "Checkpoint: ${OFFLINE_RS_CHECKPOINT_PATH}"
+echo "Results mode: ${RESOLVED_RESULTS_MODE}"
 
 if [ "${SKIP_RAY_ROLLOUT}" != "1" ]; then
    RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
@@ -650,22 +797,63 @@ if [ "${SKIP_RAY_ROLLOUT}" != "1" ]; then
       --runtime-env-json="${RUNTIME_ENV_JSON}" \
       "${RAY_JOB_SUBMIT_ARGS[@]}" \
       -- python3 -u train.py \
-      "${CLUSTER_ARGS[@]}" \
+      --rollout-num-gpus "${ROLLOUT_GPUS}" \
       "${MODEL_ARGS[@]}" \
       "${CKPT_ARGS[@]}" \
       "${ROLLOUT_ARGS[@]}" \
-      "${SGLANG_ARGS[@]}" \
-      "${MISC_ARGS[@]}"
+      "${SGLANG_ARGS[@]}"
 
    if [ "${RAY_JOB_WAIT}" != "1" ]; then
       echo "Ray job submitted without waiting. Run the script again with --ray-job-wait 1 to checkpoint and merge after it finishes."
       exit 0
    fi
+
+   RAY_JOB_STATUS="$(ray job status --address="${RAY_DASHBOARD_ADDRESS}" "${RAY_SUBMISSION_ID}" 2>/dev/null || true)"
+   if ! grep -qi "succeeded" <<<"${RAY_JOB_STATUS}"; then
+      echo "Ray job ${RAY_SUBMISSION_ID} did not succeed; refusing to merge incomplete rollout data." >&2
+      printf '%s\n' "${RAY_JOB_STATUS}" >&2
+      exit 1
+   fi
 fi
+
+NUM_ROLLOUT=$(python3 - "${DUMP_DETAILS}/rollout_data" "${NUM_ROLLOUT}" <<'PY'
+import sys
+from pathlib import Path
+
+import torch
+
+rollout_dir = Path(sys.argv[1])
+configured = int(sys.argv[2])
+completed = 0
+while completed < configured:
+    path = rollout_dir / f"{completed}.pt"
+    if not path.is_file():
+        break
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if int(payload.get("num_samples", len(payload.get("samples", ())))) <= 0:
+        break
+    completed += 1
+print(completed)
+PY
+)
+if [ "${NUM_ROLLOUT}" -le 0 ]; then
+   echo "No non-empty rejection-sampling shards were completed." >&2
+   exit 1
+fi
+echo "Completed non-empty rollout shards: ${NUM_ROLLOUT}"
+
+for ((rollout_id = RESUME_START_ROLLOUT_ID; rollout_id < NUM_ROLLOUT; rollout_id++)); do
+   rollout_path="${DUMP_DETAILS}/rollout_data/${rollout_id}.pt"
+   if [ ! -s "${rollout_path}" ]; then
+      echo "Missing completed rollout shard: ${rollout_path}" >&2
+      exit 1
+   fi
+done
 
 python3 - "${OUTPUT_DIR}" "${DUMP_DETAILS}/rollout_data" "${EPISODE_LOG_DIR}" \
    "${OFFLINE_RS_CHECKPOINT_PATH}" "${OFFLINE_RS_CHECKPOINT_ENABLE}" "${REWARD_THRESHOLD}" "${MIN_STEPS}" \
-   "${MAX_TRAJECTORY_PER_PROBLEM}" "${MIN_SAMPLE_TRIAL}" "${CERTAINTY_FILTER}" "${NUM_ROLLOUT}" <<'PY'
+   "${MAX_TRAJECTORY_PER_PROBLEM}" "${MIN_SAMPLE_TRIAL}" "${CERTAINTY_FILTER}" "${NUM_ROLLOUT}" \
+   "${RESOLVED_RESULTS_MODE}" <<'PY'
 import json
 import math
 import re
@@ -687,6 +875,7 @@ max_keep = int(sys.argv[8])
 min_trials = int(sys.argv[9])
 certainty_filter = sys.argv[10].lower() in {"1", "true", "yes", "on"}
 num_rollout = int(sys.argv[11])
+results_mode = sys.argv[12]
 
 episodes_dir.mkdir(parents=True, exist_ok=True)
 checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -766,6 +955,297 @@ def rollout_sort_key(path):
     return rid if rid is not None else 10**12
 
 
+def atomic_json_dump(path, payload, *, indent=4, sort_keys=False):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=indent, sort_keys=sort_keys, default=str)
+        f.write("\n")
+    temporary.replace(path)
+
+
+if results_mode == "manifest":
+    accepted_episodes_dir = output_dir / "accepted_episodes"
+    accepted_episodes_dir.mkdir(parents=True, exist_ok=True)
+    sample_index_path = output_dir / "rejection_sampling_sample_index.json"
+    sample_index_tmp = sample_index_path.with_suffix(sample_index_path.suffix + ".tmp")
+    results_path = output_dir / "rejection_sampling_results.json"
+    summary_path = output_dir / "rejection_sampling_summary.json"
+
+    accepted_keys = set()
+    accepted_problem_ids = set()
+    rejected_problem_ids = set()
+    seen_problem_ids = set()
+    group_summaries = []
+    batch_summaries = []
+    accepted_refs = []
+    rollout_files = []
+    num_samples = 0
+    num_episodes = 0
+
+    def annotate_episode(ep, accepted):
+        value = json.loads(json.dumps(ep, ensure_ascii=False, default=str))
+        value["is_accepted"] = bool(accepted)
+        ep_metadata = value.setdefault("metadata", {})
+        if isinstance(ep_metadata, dict):
+            ep_metadata["is_accepted"] = bool(accepted)
+            profile = ep_metadata.get("fused_profile")
+            if isinstance(profile, dict):
+                profile["accepted"] = bool(accepted)
+        for traj in value.get("trajectories", []) or []:
+            if isinstance(traj, dict):
+                traj["is_accepted"] = bool(accepted)
+        return value
+
+    def episode_rows(batch, rollout_id, selected_keys, *, accepted_only):
+        rows = []
+        seen_episodes = set()
+        for sample in batch:
+            selected = sample_key(sample) in selected_keys
+            if accepted_only and not selected:
+                continue
+            ep = episode(sample)
+            if not ep:
+                continue
+            key = str(ep.get("id") or sample_key(sample))
+            if key in seen_episodes:
+                continue
+            seen_episodes.add(key)
+            row = _episode_to_batch_dict(
+                annotate_episode(ep, selected),
+                rollout_id,
+                "train",
+                0,
+                args=None,
+                sample_metadata=metadata(sample),
+                eval_reward=None,
+            )
+            row["is_accepted"] = selected
+            if isinstance(row.get("metadata"), dict):
+                row["metadata"]["is_accepted"] = selected
+            for traj in row.get("trajectories", []) or []:
+                if isinstance(traj, dict):
+                    traj["is_accepted"] = selected
+            rows.append(row)
+        return rows
+
+    with sample_index_tmp.open("w", encoding="utf-8") as index_file:
+        index_file.write("[\n")
+        first_index_item = True
+        for rollout_path in sorted(rollout_dir.glob("*.pt"), key=rollout_sort_key):
+            rollout_id = rollout_id_from_path(rollout_path)
+            if rollout_id is None:
+                continue
+            batch = batch_samples(rollout_path)
+            groups = defaultdict(list)
+            for sample in batch:
+                groups[problem_id(sample)].append(sample)
+
+            repeated = seen_problem_ids.intersection(groups)
+            if repeated:
+                preview = ", ".join(sorted(repeated)[:5])
+                raise RuntimeError(
+                    "Manifest merge requires each problem to stay in one rollout shard; "
+                    f"repeated problem ids: {preview}"
+                )
+            seen_problem_ids.update(groups)
+
+            batch_accepted_keys = set()
+            for pid, items in sorted(groups.items()):
+                trials = len(items)
+                good = [
+                    item for item in items
+                    if reward_value(item) >= reward_threshold and step_count(item) >= min_steps
+                ]
+                pass_rate = len(good) / trials if trials else 0.0
+                kept = []
+                if trials >= min_trials and (not certainty_filter or (0.0 < pass_rate < 1.0)):
+                    good.sort(
+                        key=lambda item: (
+                            reward_value(item),
+                            step_count(item),
+                            -len(str(item.get("response", ""))),
+                        ),
+                        reverse=True,
+                    )
+                    kept = good[:max_keep]
+                selected = {sample_key(item) for item in kept}
+                batch_accepted_keys.update(selected)
+                accepted_keys.update(selected)
+                if selected:
+                    accepted_problem_ids.add(pid)
+                if len(selected) < trials:
+                    rejected_problem_ids.add(pid)
+                group_summaries.append(
+                    {
+                        "problem_id": pid,
+                        "rollout_id": rollout_id,
+                        "trials": trials,
+                        "accepted": len(selected),
+                        "pass_rate": pass_rate,
+                        "max_reward": max((reward_value(item) for item in items), default=math.nan),
+                    }
+                )
+
+            all_episode_rows = episode_rows(batch, rollout_id, batch_accepted_keys, accepted_only=False)
+            accepted_episode_rows = episode_rows(batch, rollout_id, batch_accepted_keys, accepted_only=True)
+            episode_path = episodes_dir / f"global_steps_{rollout_id}.json"
+            accepted_episode_path = accepted_episodes_dir / f"global_steps_{rollout_id}.json"
+            atomic_json_dump(
+                episode_path,
+                {
+                    "training_step": rollout_id,
+                    "epoch": 0,
+                    "mode": "train",
+                    "num_episodes": len(all_episode_rows),
+                    "trajectories": all_episode_rows,
+                },
+            )
+            atomic_json_dump(
+                accepted_episode_path,
+                {
+                    "training_step": rollout_id,
+                    "epoch": 0,
+                    "mode": "train",
+                    "num_episodes": len(accepted_episode_rows),
+                    "trajectories": accepted_episode_rows,
+                },
+            )
+
+            for row_index, sample in enumerate(batch):
+                key = sample_key(sample)
+                selected = key in batch_accepted_keys
+                profile = dict(metadata(sample).get("fused_profile") or {})
+                profile["accepted"] = selected
+                item = {
+                    "rollout_id": rollout_id,
+                    "row": row_index,
+                    "sample_key": key,
+                    "problem_id": problem_id(sample),
+                    "group_index": sample.get("group_index"),
+                    "index": sample.get("index"),
+                    "reward": reward_value(sample),
+                    "steps": step_count(sample),
+                    "status": sample.get("status"),
+                    "task_type": metadata(sample).get("fused_task_type"),
+                    "termination": metadata(sample).get("fused_termination"),
+                    "is_accepted": selected,
+                    "profile": profile,
+                    "rollout_shard": str(rollout_path),
+                    "episode_shard": str(episode_path),
+                }
+                if not first_index_item:
+                    index_file.write(",\n")
+                rendered_item = json.dumps(item, ensure_ascii=False, indent=4, default=str)
+                index_file.write("\n".join("    " + line for line in rendered_item.splitlines()))
+                first_index_item = False
+                if selected:
+                    accepted_refs.append(item)
+
+            num_samples += len(batch)
+            num_episodes += len(all_episode_rows)
+            rollout_files.append(str(rollout_path))
+            batch_summaries.append(
+                {
+                    "rollout_id": rollout_id,
+                    "rollout_path": str(rollout_path),
+                    "episode_path": str(episode_path),
+                    "accepted_episode_path": str(accepted_episode_path),
+                    "num_samples": len(batch),
+                    "num_episodes": len(all_episode_rows),
+                    "num_accepted": len(batch_accepted_keys),
+                }
+            )
+
+            if checkpointing:
+                completed = [item["rollout_id"] for item in batch_summaries]
+                completed_set = set(completed)
+                next_rollout_id = 0
+                while next_rollout_id < num_rollout and next_rollout_id in completed_set:
+                    next_rollout_id += 1
+                atomic_json_dump(
+                    checkpoint_path,
+                    {
+                        "next_rollout_id": next_rollout_id,
+                        "completed_rollout_ids": completed,
+                        "num_rollout": num_rollout,
+                        "num_samples": num_samples,
+                        "num_accepted": len(accepted_keys),
+                        "accepted_sample_keys": sorted(accepted_keys),
+                        "accepted_problem_ids": sorted(accepted_problem_ids),
+                        "rejected_problem_ids": sorted(rejected_problem_ids),
+                        "results": str(results_path),
+                        "episodes_dir": str(episodes_dir),
+                        "results_mode": "manifest",
+                    },
+                    sort_keys=True,
+                )
+
+            del batch, all_episode_rows, accepted_episode_rows
+
+        index_file.write("\n]\n")
+
+    sample_index_tmp.replace(sample_index_path)
+    accepted_problem_ids = sorted(accepted_problem_ids)
+    rejected_problem_ids = sorted(rejected_problem_ids)
+    summary = {
+        "results_mode": "manifest",
+        "rollout_dir": str(rollout_dir),
+        "num_rollout_files": len(rollout_files),
+        "episodes_dir": str(episodes_dir),
+        "accepted_episodes_dir": str(accepted_episodes_dir),
+        "num_episode_shards": len(batch_summaries),
+        "num_samples": num_samples,
+        "num_groups": len(group_summaries),
+        "num_accepted": len(accepted_keys),
+        "num_rejected": num_samples - len(accepted_keys),
+        "num_accepted_problems": len(accepted_problem_ids),
+        "num_rejected_problems": len(rejected_problem_ids),
+        "reward_threshold": reward_threshold,
+        "min_steps": min_steps,
+        "max_trajectory_per_problem": max_keep,
+        "min_sample_trial": min_trials,
+        "certainty_filter": certainty_filter,
+        "checkpoint_path": str(checkpoint_path),
+        "sample_index": str(sample_index_path),
+        "results": str(results_path),
+    }
+    results = {
+        "summary": summary,
+        "samples": {
+            "storage": "rollout_shards_with_json_index",
+            "num_samples": num_samples,
+            "num_accepted": len(accepted_keys),
+            "num_rejected": num_samples - len(accepted_keys),
+            "index": str(sample_index_path),
+            "rollout_shards": rollout_files,
+            "accepted_items": accepted_refs,
+        },
+        "episodes": {
+            "storage": "episode_shards",
+            "num_episodes": num_episodes,
+            "num_accepted": len(accepted_keys),
+            "num_rejected": num_episodes - len(accepted_keys),
+            "shards": batch_summaries,
+        },
+        "groups": {
+            "num_groups": len(group_summaries),
+            "accepted_problem_ids": accepted_problem_ids,
+            "rejected_problem_ids": rejected_problem_ids,
+            "items": group_summaries,
+        },
+        "global_steps": {
+            "mode": "train",
+            "num_shards": len(batch_summaries),
+            "shards": batch_summaries,
+            "num_episodes": num_episodes,
+        },
+    }
+    atomic_json_dump(results_path, results)
+    atomic_json_dump(summary_path, summary, sort_keys=True)
+    print(json.dumps(summary, ensure_ascii=False, indent=4, sort_keys=True))
+    raise SystemExit(0)
+
+
 samples = []
 samples_by_rollout = {}
 for path in sorted(rollout_dir.glob("*.pt"), key=rollout_sort_key):
@@ -817,6 +1297,9 @@ def annotate_sample(sample):
     item = dict(sample)
     item.pop("_rollout_dump", None)
     item["is_accepted"] = sample_key(sample) in accepted_keys
+    item_metadata = item.get("metadata")
+    if isinstance(item_metadata, dict) and isinstance(item_metadata.get("fused_profile"), dict):
+        item_metadata["fused_profile"]["accepted"] = item["is_accepted"]
     return item
 
 
@@ -826,6 +1309,9 @@ def annotate_episode(ep, accepted):
     metadata = value.setdefault("metadata", {})
     if isinstance(metadata, dict):
         metadata["is_accepted"] = bool(accepted)
+        profile = metadata.get("fused_profile")
+        if isinstance(profile, dict):
+            profile["accepted"] = bool(accepted)
     for traj in value.get("trajectories", []) or []:
         if isinstance(traj, dict):
             traj["is_accepted"] = bool(accepted)
@@ -845,7 +1331,15 @@ def write_batch_shard(rollout_id, batch):
         seen.add(key)
         accepted = sample_key(sample) in accepted_keys
         annotated_ep = annotate_episode(ep, accepted)
-        row = _episode_to_batch_dict(annotated_ep, rollout_id, "train", 0)
+        row = _episode_to_batch_dict(
+            annotated_ep,
+            rollout_id,
+            "train",
+            0,
+            args=None,
+            sample_metadata=metadata(sample),
+            eval_reward=None,
+        )
         row["is_accepted"] = accepted
         if isinstance(row.get("metadata"), dict):
             row["metadata"]["is_accepted"] = accepted
@@ -974,8 +1468,9 @@ results = {
 with results_path.open("w", encoding="utf-8") as f:
     json.dump(results, f, ensure_ascii=False, indent=4, default=str)
     f.write("\n")
-with summary_path.open("w") as f:
+with summary_path.open("w", encoding="utf-8") as f:
     json.dump(summary, f, ensure_ascii=False, indent=4, sort_keys=True)
+    f.write("\n")
 
 print(json.dumps(summary, ensure_ascii=False, indent=4, sort_keys=True))
 PY

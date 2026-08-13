@@ -153,6 +153,10 @@ def test_eval_rollout_log_adds_pass_at_k_and_pass_all(monkeypatch):
     assert log_dict["eval/frontierscience_olympiad/pass@3/std"] == 0.236
     assert log_dict["eval/frontierscience_olympiad/pass^3/mean"] == 0.5
     assert log_dict["eval/frontierscience_olympiad/pass^3/std"] == 0.236
+    assert log_dict["eval/frontierscience_olympiad/dynamic_filter/valid_groups"] == 1
+    assert log_dict["eval/frontierscience_olympiad/dynamic_filter/roi"] == 0.5
+    assert log_dict["eval/dynamic_filter/valid_groups"] == 1
+    assert log_dict["eval/dynamic_filter/roi"] == 0.5
 
 
 def test_eval_rollout_log_display_formats_percentage_metrics_only():
@@ -169,7 +173,7 @@ def test_eval_rollout_log_display_formats_percentage_metrics_only():
     assert display["eval/search_r1"] == 20.7
     assert display["eval/search_r1/pass@1/mean"] == 20.7
     assert display["eval/search_r1/rewards/web_search"] == 20.7
-    assert display["eval/search_r1/response_length/mean"] == 258.93184
+    assert display["eval/search_r1/response_length/mean"] == 258.93
     assert display["eval/search_r1/nq/num_problems"] == 500
 
 

@@ -55,6 +55,7 @@ class RolloutDataSource(DataSource):
         self.sample_group_index = 0
         self.sample_index = 0
         self.sample_offset = 0
+        self._rollout_cursor_snapshots = {}
         # TODO remove this
         self.metadata = {}
 
@@ -90,7 +91,15 @@ class RolloutDataSource(DataSource):
     def get_samples(self, num_samples):
         # TODO further improve code
         if self.dataset is not None:
-            if self.sample_offset + num_samples <= len(self.dataset):
+            no_wrap = getattr(self.args, "rollout_only_inference_fast_path", False) and os.environ.get(
+                "SLIME_FULLY_ASYNC_NO_DATASET_WRAP", "false"
+            ).lower() in {"1", "true", "yes", "y", "on"}
+            if no_wrap:
+                prompt_samples = self.dataset.samples[
+                    self.sample_offset : min(len(self.dataset), self.sample_offset + num_samples)
+                ]
+                self.sample_offset += len(prompt_samples)
+            elif self.sample_offset + num_samples <= len(self.dataset):
                 prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]
                 self.sample_offset += num_samples
             else:
@@ -124,7 +133,7 @@ class RolloutDataSource(DataSource):
         if not self.args.rollout_global_dataset:
             return
 
-        state_dict = {
+        state_dict = self._rollout_cursor_snapshots.pop(rollout_id, None) or {
             "sample_offset": self.sample_offset,
             "epoch_id": self.epoch_id,
             "sample_group_index": self.sample_group_index,
@@ -134,6 +143,15 @@ class RolloutDataSource(DataSource):
         path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(state_dict, path)
+
+    def snapshot_cursor_for_rollout(self, rollout_id):
+        self._rollout_cursor_snapshots[rollout_id] = {
+            "sample_offset": self.sample_offset,
+            "epoch_id": self.epoch_id,
+            "sample_group_index": self.sample_group_index,
+            "sample_index": self.sample_index,
+            "metadata": copy.deepcopy(self.metadata),
+        }
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:

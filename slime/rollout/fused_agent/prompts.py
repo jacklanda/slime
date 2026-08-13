@@ -48,7 +48,7 @@ CRITICAL RULES:
 2. Plan your approach, then call tools step by step to collect evidence.
 3. Start retrieval broadly. If a tool returns an empty result, retry with fewer filters or use a listing tool before narrowing the query.
 4. Be precise in tool arguments and respect parameter types.
-5. Emit tool calls exactly in the format shown in the Tools section below.
+5. Emit exactly one tool call per assistant response, exactly in the format shown in the Tools section below. Emit no prose or final answer outside that call.
 6. Submit your final answer as a JSON value via the finish tool: a JSON array directly when the task asks for multiple items, not wrapped in another object.
 7. Never submit an empty answer when the task asks you to extract or analyze evidence. The finish result must be pure JSON and must not contain another tool call.
 """
@@ -102,6 +102,7 @@ GENERAL RULES:
 2. Use only tools shown in the current schema.
 3. Plan before acting, call tools step by step, and adapt when a tool fails.
 4. Submit only when the available evidence supports the final answer or final filesystem state.
+5. Emit exactly one tool call per assistant response and no prose or final answer outside that call.
 
 TASK-SPECIFIC RULES:
 - MCP: start with broad/listing queries; after an empty result, remove filters and retrieve evidence before submitting a JSON value.
@@ -140,7 +141,14 @@ def finish_schema(
         result_schema.setdefault("description", "Final answer or JSON value.")
     elif structured_result:
         result_schema = {
-            "type": ["string", "object", "array", "number", "boolean", "null"],
+            "anyOf": [
+                {"type": "string"},
+                {"type": "object"},
+                {"type": "array"},
+                {"type": "number"},
+                {"type": "boolean"},
+                {"type": "null"},
+            ],
             "description": "Final answer or JSON value.",
         }
     else:

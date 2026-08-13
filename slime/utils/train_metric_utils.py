@@ -4,7 +4,7 @@ from collections.abc import Callable
 from copy import deepcopy
 
 from slime.utils import logging_utils
-from slime.utils.metric_utils import compute_rollout_step
+from slime.utils.metric_utils import compute_rollout_step, format_metrics_for_display
 from slime.utils.timer import Timer
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ def log_perf_data_raw(
 
     log_dict.update(_compute_rllm_timing_metrics(log_dict, timer_instance.seq_lens))
 
-    logger.info(f"perf {rollout_id}: {log_dict}")
+    logger.info(f"perf {rollout_id}: {format_metrics_for_display(log_dict)}")
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step

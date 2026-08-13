@@ -80,7 +80,7 @@ class QwenToolParser:
     def get_tool_prompt(self, tools_schema: str) -> str:
         return (
             "\n# Tools\n\n"
-            "You may call one or more functions to assist with the user query.\n\n"
+            "Call exactly one function per assistant response.\n\n"
             "You are provided with function signatures within <tools></tools> XML tags:\n"
             f"<tools>\n{tools_schema}\n</tools>\n\n"
             "For each function call, return a valid json object with function name and arguments "
@@ -88,6 +88,7 @@ class QwenToolParser:
             "<tool_call>\n"
             '{"name": <function-name>, "arguments": <args-json-object>}\n'
             "</tool_call>\n\n"
+            "Return only that single tool-call block: no prose, answer, JSON, or second call outside it. "
             "Make sure all curly braces and XML tags are correctly balanced and closed strictly."
         )
 
@@ -562,7 +563,7 @@ class Qwen3CoderToolParser(QwenToolParser):
         self._tool_parameter_config = self._extract_parameter_config(tools_schema)
         return (
             "\n# Tools\n\n"
-            "You may call one or more functions to assist with the user query.\n\n"
+            "Call exactly one function per assistant response.\n\n"
             "You are provided with function signatures within <tools></tools> XML tags:\n"
             f"<tools>\n{tools_schema}\n</tools>\n\n"
             "For each function call, return the function name and parameters within a pairwise "
@@ -576,7 +577,7 @@ class Qwen3CoderToolParser(QwenToolParser):
             "</tool_call>\n\n"
             "For multiple parameters, emit one <parameter=...></parameter> block per parameter "
             "inside the same function block.\n"
-            "For multiple tool calls, emit multiple <tool_call></tool_call> blocks.\n"
+            "Return only one <tool_call></tool_call> block: no prose, answer, JSON, or second call outside it.\n"
             "Do not put JSON tool-call objects inside <tool_call> for this model family."
         )
 

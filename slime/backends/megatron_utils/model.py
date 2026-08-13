@@ -30,6 +30,7 @@ except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.metric_utils import format_metrics_for_display
 from slime.utils.visualization import print_metrics_table
 
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -1238,7 +1239,7 @@ def train(
                 if accumulated_step_id == 0 and not getattr(args, "use_rollout_routing_replay", False) and "train/kl_loss" in log_dict:
                     assert log_dict["train/kl_loss"] < 1e-8, f"{log_dict=}"
 
-            logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict}")
+            logger.info(f"{role_tag}step {accumulated_step_id}: {format_metrics_for_display(log_dict)}")
             if role == "actor" and getattr(args, "print_train_metrics_table", False):
                 table_log_dict = {**(train_metrics_table_extra or {}), **log_dict}
                 print_metrics_table(table_log_dict, accumulated_step_id, title=f"Actor Update {accumulated_step_id}")

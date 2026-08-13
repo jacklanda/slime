@@ -7,8 +7,26 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+class _DisplayFloat(float):
+    def __repr__(self) -> str:
+        return f"{self:.2f}"
+
+
 def dict_add_prefix(d: dict[str, Any], prefix: str) -> dict[str, Any]:
     return {f"{prefix}{k}": v for k, v in d.items()}
+
+
+def format_metrics_for_display(value: Any) -> Any:
+    """Return a display-only copy with floating-point values rounded to two decimals."""
+    if isinstance(value, dict):
+        return {key: format_metrics_for_display(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [format_metrics_for_display(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(format_metrics_for_display(item) for item in value)
+    if isinstance(value, (float, np.floating)):
+        return _DisplayFloat(round(float(value), 2))
+    return value
 
 
 def compute_pass_rate(

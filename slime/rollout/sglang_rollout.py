@@ -637,6 +637,8 @@ async def generate_and_rm_group(args: Namespace, group: list[Sample], sampling_p
     # ``list[Sample]`` for plain rollouts and ``list[list[Sample]]`` for
     # the fan-out case.
     state = GenerateState(args)
+    group_started_at = time.time()
+    group_started_monotonic = time.monotonic()
 
     if state.aborted:
         return group
@@ -656,9 +658,8 @@ async def generate_and_rm_group(args: Namespace, group: list[Sample], sampling_p
         tasks.append(asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation)))
 
     group_timeout = _rollout_group_timeout(args, evaluation=evaluation)
-    try:
-        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=group_timeout)
-        group = []
+    async def collect_results(results: list[Any]) -> list[Sample] | list[list[Sample]]:
+        collected = []
         for sample, result in zip(group_samples, results, strict=True):
             if isinstance(result, BaseException):
                 logger.error(
@@ -666,23 +667,42 @@ async def generate_and_rm_group(args: Namespace, group: list[Sample], sampling_p
                     sample.index,
                     exc_info=(type(result), result, result.__traceback__),
                 )
-                group.append(_failed_task_sample(sample, result, evaluation=evaluation))
+                collected.append(_failed_task_sample(sample, result, evaluation=evaluation))
             else:
-                group.append(result)
+                collected.append(result)
+        return collected
+
+    gather_task = asyncio.ensure_future(asyncio.gather(*tasks, return_exceptions=True))
+    try:
+        results = await asyncio.wait_for(asyncio.shield(gather_task), timeout=group_timeout)
+        group = await collect_results(results)
     except asyncio.TimeoutError:
-        logger.warning(
-            "Rollout group timed out after %.1fs; cancelling %s unfinished sample tasks.",
-            group_timeout,
-            sum(not task.done() for task in tasks),
-        )
-        for task in tasks:
-            if not task.done():
+        unfinished = [task for task in tasks if not task.done()]
+        # The timeout callback can run after all tasks finished when the event
+        # loop was busy. Do not turn completed results into timeout failures.
+        if not unfinished:
+            group = await collect_results(gather_task.result())
+            logger.warning(
+                "Rollout group deadline callback arrived late after %.1fs; all %d sample tasks had completed.",
+                time.monotonic() - group_started_monotonic,
+                len(tasks),
+            )
+        else:
+            logger.warning(
+                "Rollout group timed out after %.1fs (elapsed %.1fs); completed=%d unfinished=%d; cancelling unfinished tasks.",
+                group_timeout,
+                time.monotonic() - group_started_monotonic,
+                len(tasks) - len(unfinished),
+                len(unfinished),
+            )
+            for task in unfinished:
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        group = [
-            _task_result_or_timeout(task, sample, evaluation=evaluation)
-            for sample, task in zip(group_samples, tasks, strict=True)
-        ]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(gather_task, return_exceptions=True)
+            group = [
+                _task_result_or_timeout(task, sample, evaluation=evaluation)
+                for sample, task in zip(group_samples, tasks, strict=True)
+            ]
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
@@ -691,6 +711,24 @@ async def generate_and_rm_group(args: Namespace, group: list[Sample], sampling_p
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
 
+    group_finished_at = time.time()
+    for sample in _flatten_samples(group):
+        metadata = dict(sample.metadata or {})
+        profile = dict(metadata.get("fused_profile") or {})
+        profile.update(
+            {
+                "group_start_time_s": group_started_at,
+                "group_end_time_s": group_finished_at,
+                "group_total_time_s": group_finished_at - group_started_at,
+            }
+        )
+        metadata["fused_profile"] = profile
+        episode = metadata.get("rllm_episode")
+        if isinstance(episode, dict):
+            episode_metadata = episode.setdefault("metadata", {})
+            if isinstance(episode_metadata, dict):
+                episode_metadata["fused_profile"] = dict(profile)
+        sample.metadata = metadata
     return group
 
 
@@ -889,6 +927,7 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
                 all_data.append(group)
             completed_groups += 1
             flat_group = _flatten_samples(group)
+            metric_gatherer.on_completed_group(args, flat_group)
             if any(is_infra_failure(sample) for sample in flat_group):
                 dynamic_filter_output = DynamicFilterOutput(keep=False, reason="infra_failure")
             else:

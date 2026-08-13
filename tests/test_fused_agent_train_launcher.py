@@ -10,6 +10,101 @@ NUM_GPUS = 0
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("model_patterns", "expected_tp"),
+    [
+        ("qwen3-4b|qwen3-4b-*|qwen3-8b|qwen3-8b-*", 1),
+        ("qwen3-14b|qwen3-14b-*", 2),
+        ("qwen3-30b-a3b|qwen3-30b-a3b-*|qwen3-32b|qwen3-32b-*", 4),
+    ],
+)
+@pytest.mark.parametrize(
+    "launcher_name",
+    ["train_qwen3_fused_agent_sync.sh", "run_qwen3_rejection_sampling.sh"],
+)
+def test_qwen3_launchers_choose_rollout_tp_by_model(launcher_name, model_patterns, expected_tp):
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments" / launcher_name).read_text(encoding="utf-8")
+
+    assert f"{model_patterns})" in launcher
+    assert f"DEFAULT_ROLLOUT_NUM_GPUS_PER_ENGINE={expected_tp}" in launcher
+    assert (
+        'ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-'
+        '${DEFAULT_ROLLOUT_NUM_GPUS_PER_ENGINE}}"'
+    ) in launcher
+
+
+@pytest.mark.unit
+def test_qwen3_rejection_sampling_defaults_to_adaptive_fully_async_task_filling():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/run_qwen3_rejection_sampling.sh").read_text(encoding="utf-8")
+
+    assert (
+        'ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-'
+        'slime.rollout.fully_async_rollout.generate_rollout_fully_async}"'
+    ) in launcher
+    assert 'FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY:-true}"' in launcher
+    assert 'FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 4))}"' in launcher
+    assert 'FULLY_ASYNC_MAX_GROUP_CONCURRENCY="${FULLY_ASYNC_MAX_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 8))}"' in launcher
+    assert 'export SLIME_FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY}"' in launcher
+    assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-2048}"' in launcher
+    assert 'SAMPLE_N="${SAMPLE_N:-32}"' in launcher
+    assert 'export SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS="${SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS:-true}"' in launcher
+
+
+@pytest.mark.unit
+def test_qwen3_rejection_sampling_uses_inference_only_fast_path():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/run_qwen3_rejection_sampling.sh").read_text(encoding="utf-8")
+
+    assert "--debug-rollout-only" in launcher
+    assert "--rollout-only-inference-fast-path" in launcher
+    assert "--rollout-only-skip-episode-dump" in launcher
+    assert "--async-save-debug-rollout-data" in launcher
+    assert "--sglang-enable-deterministic-inference" not in launcher
+    assert "--sglang-disable-piecewise-cuda-graph" not in launcher
+    assert "--log-probs-max-tokens-per-gpu" not in launcher
+    assert "--global-batch-size" not in launcher
+    assert "--num-steps-per-rollout" not in launcher
+    assert "--actor-num-nodes" not in launcher
+    assert "--actor-num-gpus-per-node" not in launcher
+    assert "--update-weights-interval" not in launcher
+    assert "--micro-batch-size" not in launcher
+
+    for training_launcher in (
+        "train_odyssey_qwen3_multinode_sync.sh",
+        "train_gemma4_fused_agent_async.sh",
+    ):
+        training = (repo_root / "experiments" / training_launcher).read_text(encoding="utf-8")
+        assert "--rollout-only-inference-fast-path" not in training
+        assert "--rollout-only-skip-episode-dump" not in training
+        assert "--async-save-debug-rollout-data" not in training
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("launcher_name", ["train_qwen3_fused_agent_sync.sh", "train_odyssey_qwen3_multinode_sync.sh"])
+def test_qwen3_training_launchers_default_to_adaptive_fully_async(launcher_name):
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments" / launcher_name).read_text(encoding="utf-8")
+    assert (
+        'ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-'
+        'slime.rollout.fully_async_rollout.generate_rollout_fully_async}"'
+    ) in launcher
+    assert 'FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY:-true}"' in launcher
+    assert 'export SLIME_FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY}"' in launcher
+
+
+@pytest.mark.unit
+def test_qwen3_rejection_sampling_uses_final_search_and_mcp_training_data():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/run_qwen3_rejection_sampling.sh").read_text(encoding="utf-8")
+
+    assert '"${SCRIPT_DIR}/artifacts/search_data_final/train.parquet"' in launcher
+    assert '"${SCRIPT_DIR}/artifacts/mcp_data_final/train.parquet"' in launcher
+    assert "fused_mcp_search_train_shuffled.parquet" not in launcher
+
+
+@pytest.mark.unit
 def test_sglang_accepts_megatron_on_policy_target():
     parser = argparse.ArgumentParser()
     add_sglang_arguments(parser)
@@ -147,6 +242,54 @@ def test_odyssey_launcher_enforces_strict_dynamic_sampling():
     assert "--fully-async-filter-relax-after-groups 0" in launcher
     assert "This launcher requires strict dynamic sampling" in launcher
     assert '--dynamic-sampling-filter-path "${DYNAMIC_SAMPLING_FILTER_PATH}"' in launcher
+
+
+@pytest.mark.unit
+def test_launchers_provision_per_trajectory_mcp_workspaces():
+    repo_root = Path(__file__).resolve().parents[1]
+    rejection = (repo_root / "experiments/run_qwen3_rejection_sampling.sh").read_text(encoding="utf-8")
+    odyssey = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
+
+    assert 'MCP_ENV_ROOT="${MCP_ENV_ROOT:-${RUN_ROOT}/cache/mcp_envs}"' in rejection
+    assert 'export SLIME_MCP_ENV_ROOT="${MCP_ENV_ROOT}"' in rejection
+    assert 'MCP_ENV_ROOT="${MCP_ENV_ROOT:-${RUN_ROOT}/cache/mcp_envs}"' in odyssey
+    assert 'export SLIME_MCP_ENV_ROOT="${MCP_ENV_ROOT}"' in odyssey
+    assert 'SLIME_MCP_ENV_COPY_CONCURRENCY' in rejection
+    assert 'SLIME_MCP_ENV_COPY_CONCURRENCY' in odyssey
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "launcher_name",
+    [
+        "train_gemma4_fused_agent_async.sh",
+        "train_gemma4_fused_agent_sync.sh",
+        "train_odyssey_qwen3_multinode_sync.sh",
+        "train_qwen3.5_fused_agent_async.sh",
+        "train_qwen3.5_fused_agent_sync.sh",
+        "train_qwen3_fused_agent_async.sh",
+        "train_qwen3_fused_agent_gspo_async.sh",
+        "train_qwen3_fused_agent_sync.sh",
+        "train_qwen3_swe_agent_sync.sh",
+    ],
+)
+def test_training_launchers_enable_and_propagate_local_mcp_process_isolation(launcher_name):
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments" / launcher_name).read_text(encoding="utf-8")
+
+    assert 'MCP_ENV_ROOT="${MCP_ENV_ROOT:-${RUN_ROOT}/cache/mcp_envs}"' in launcher
+    assert 'SLIME_LOCAL_MCP_PROCESS_ISOLATION="${SLIME_LOCAL_MCP_PROCESS_ISOLATION:-true}"' in launcher
+    assert 'SLIME_LOCAL_MCP_PROCESS_START_METHOD="${SLIME_LOCAL_MCP_PROCESS_START_METHOD:-forkserver}"' in launcher
+    for key in (
+        "SLIME_MCP_ENV_ROOT",
+        "SLIME_MCP_ENV_COPY_CONCURRENCY",
+        "SLIME_LOCAL_MCP_PROCESS_ISOLATION",
+        "SLIME_LOCAL_MCP_PROCESS_WORKERS",
+        "SLIME_LOCAL_MCP_PROCESS_START_METHOD",
+        "SLIME_LOCAL_MCP_PROCESS_TIMEOUT",
+        "SLIME_LOCAL_MCP_PROCESS_WARM_TIMEOUT",
+    ):
+        assert launcher.count(key) >= 2, f"{key} is not propagated through Ray runtime env"
 
 
 @pytest.mark.unit

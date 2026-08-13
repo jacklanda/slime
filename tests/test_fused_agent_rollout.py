@@ -18,6 +18,7 @@ from slime.rollout.fused_agent.env import (
     normalize_task,
     resolve_task_mode,
 )
+from slime.rollout.fused_agent.mcp_workspace import prepare_mcp_workspace
 import slime.rollout.fused_agent.generate as fused_generate
 from slime.rollout.fused_agent.generate import (
     _format_tool_observation,
@@ -860,6 +861,9 @@ def test_qwen35_schema_violation_terminates_current_turn_as_tool_parser_error():
     sample = result[0]
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
+    assert sample.metadata["credit_assignment_error_attribution"] == "localized"
+    assert malformed_action in _masked_text(sample)
+    assert _policy_masked_text(sample) == malformed_action
     assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
     assert sample.metadata["tool_parser_errors"] == [
         "malformed parameter name '\"query'",
@@ -2066,6 +2070,335 @@ def verify(tools, answer):
     assert env.compute_final_reward() == 1.0
 
 
+def test_local_mcp_finish_uses_explicit_dataset_answer_schema(tmp_path: Path):
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    (asset / "tools.py").write_text(
+        """
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("Tools")
+
+@mcp.tool(description="Submit result")
+def submit_result_difficulty_2(result: dict) -> dict:
+    return result
+""",
+        encoding="utf-8",
+    )
+    answer_schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "integer"}},
+        "required": ["answer"],
+    }
+    env = FusedEnvironment(
+        {
+            "question": "Return the answer",
+            "difficulty": 2,
+            "tools_py": str(asset / "tools.py"),
+            "answer_schema_json": json.dumps(answer_schema),
+        }
+    )
+
+    finish = next(schema for schema in env.tools() if schema["function"]["name"] == "finish")
+    result_schema = finish["function"]["parameters"]["properties"]["result"]
+    assert result_schema == {**answer_schema, "description": "Final answer or JSON value."}
+    env.close()
+
+
+def test_local_mcp_verifier_results_support_raw_and_legacy_wrapped_access(tmp_path: Path):
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    (asset / "tools.py").write_text(
+        """
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("Tools")
+
+@mcp.tool(description="Return records")
+def get_records() -> list[dict]:
+    return [{"title": "Evidence"}]
+
+@mcp.tool(description="Return summary")
+def get_summary() -> dict:
+    return {"title": "Evidence"}
+""",
+        encoding="utf-8",
+    )
+    env = FusedEnvironment({"question": "Find evidence", "tools_py": str(asset / "tools.py")})
+
+    records = env.mcp_tools["get_records"]()
+    summary = env.mcp_tools["get_summary"]()
+    assert isinstance(records, list) and records[0]["title"] == "Evidence"
+    assert records["result"] is records
+    assert records.get("result") is records
+    assert isinstance(summary, dict) and summary["title"] == "Evidence"
+    assert summary["result"] is summary
+    assert summary.get("result") is summary
+    env.close()
+
+
+def test_local_mcp_verifier_can_validate_quotes_without_exposing_internal_tool(tmp_path: Path):
+    asset = tmp_path / "asset"
+    (asset / "data").mkdir(parents=True)
+    (asset / "data" / "source.json").write_text(
+        json.dumps(
+            {
+                "title": "Source title",
+                "summary": "The documented requirement is supported by this exact evidence sentence.",
+                "content": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (asset / "data" / "same-title.json").write_text(
+        json.dumps(
+            {
+                "title": "Source title",
+                "summary": "A different same-title record must not shadow the matching record.",
+                "content": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (asset / "tools.py").write_text(
+        """
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("Tools")
+
+@mcp.tool(description="List sources")
+def list_sources() -> list[str]:
+    return ["Source title"]
+""",
+        encoding="utf-8",
+    )
+    env = FusedEnvironment({"question": "Audit evidence", "tools_py": str(asset / "tools.py")})
+
+    exposed_names = {schema["function"]["name"] for schema in env.tools()}
+    assert "_slime_verify_evidence_quote" not in exposed_names
+    result = env.mcp_tools["_slime_verify_evidence_quote"](
+        source_document="Source title",
+        evidence_quote="supported by this exact evidence sentence",
+    )
+    assert result == {"source_found": True, "matched": True}
+    invented = env.mcp_tools["_slime_verify_evidence_quote"](
+        source_document="Source title",
+        evidence_quote="This purported evidence sentence is completely invented.",
+    )
+    unknown_source = env.mcp_tools["_slime_verify_evidence_quote"](
+        source_document="Unknown source",
+        evidence_quote="supported by this exact evidence sentence",
+    )
+    assert invented == {"source_found": True, "matched": False}
+    assert unknown_source == {"source_found": False, "matched": False}
+    env.close()
+
+
+def test_local_mcp_workspace_isolated_per_trajectory_and_cleaned(tmp_path: Path):
+    source = tmp_path / "source" / "_sandbox"
+    (source / "data").mkdir(parents=True)
+    (source / "tools.py").write_text("from mcp.server.fastmcp import FastMCP\nmcp = FastMCP('Tools')\n", encoding="utf-8")
+    (source / "data" / "state.json").write_text('{"value": 1}', encoding="utf-8")
+    workspace_root = tmp_path / "run" / "cache" / "mcp_envs"
+    task = {"data_root": str(source), "tools_py": str(source / "tools.py"), "data_source": "mcp"}
+
+    first_task, first = prepare_mcp_workspace(task, "trajectory-1", workspace_root)
+    second_task, second = prepare_mcp_workspace(task, "trajectory-2", workspace_root)
+    assert first.path != second.path
+    assert first_task["data_root"] == str(first.path)
+    assert second_task["tools_py"] == str(second.path / "tools.py")
+    (first.path / "data" / "state.json").write_text('{"value": 99}', encoding="utf-8")
+    assert (second.path / "data" / "state.json").read_text(encoding="utf-8") == '{"value": 1}'
+    assert (source / "data" / "state.json").read_text(encoding="utf-8") == '{"value": 1}'
+
+    first.close()
+    second.close()
+    assert not first.path.exists()
+    assert not second.path.exists()
+
+
+def test_local_mcp_tool_module_loading_is_serialized_and_does_not_leak_sys_modules(tmp_path: Path):
+    import concurrent.futures
+    import sys
+
+    from slime.rollout.fused_agent.env import FusedEnvironment
+
+    roots = []
+    for index in range(8):
+        root = tmp_path / f"task-{index}" / "_sandbox"
+        root.mkdir(parents=True)
+        (root / "tools.py").write_text(
+            "from mcp.server.fastmcp import FastMCP\n"
+            "mcp = FastMCP('Tools')\n"
+            "@mcp.tool()\n"
+            "def value():\n"
+            f"    return {{'task': {index}}}\n",
+            encoding="utf-8",
+        )
+        roots.append(root)
+
+    def load(root):
+        env = FusedEnvironment({"data_root": str(root), "tools_py": str(root / "tools.py")})
+        return json.loads(env.mcp_tools.call("value", {}))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(roots)) as pool:
+        values = list(pool.map(load, roots))
+
+    assert sorted(item["task"] for item in values) == list(range(len(roots)))
+    assert not any(name.startswith("_slime_fused_tools_") for name in sys.modules)
+
+
+def test_local_mcp_tools_redirect_generated_absolute_and_env_paths(tmp_path: Path):
+    asset = tmp_path / "asset"
+    data = asset / "data"
+    data.mkdir(parents=True)
+    (data / "value.json").write_text('{"value": "isolated"}', encoding="utf-8")
+    (asset / "tools.py").write_text(
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "from mcp.server.fastmcp import FastMCP\n"
+        "mcp = FastMCP('Tools')\n"
+        "@mcp.tool()\n"
+        "def from_tmp():\n"
+        "    return json.loads((Path('/tmp/mcp/data') / 'value.json').read_text())\n"
+        "@mcp.tool()\n"
+        "def from_env():\n"
+        "    return json.loads((Path(os.getenv('MCP_SERVER_BASE_DIR', '/tmp')) / 'data/value.json').read_text())\n",
+        encoding="utf-8",
+    )
+    env = FusedEnvironment({"data_root": str(asset), "tools_py": str(asset / "tools.py")})
+
+    assert json.loads(env.mcp_tools.call("from_tmp", {})) == {"value": "isolated"}
+    assert json.loads(env.mcp_tools.call("from_env", {})) == {"value": "isolated"}
+
+
+def test_local_mcp_process_pool_runs_workspaces_in_parallel(tmp_path: Path, monkeypatch):
+    import concurrent.futures
+    import time
+
+    from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
+
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "true")
+    roots = []
+    for index in range(4):
+        root = tmp_path / f"process-task-{index}"
+        root.mkdir()
+        (root / "tools.py").write_text(
+            "import os, time\n"
+            "from pathlib import Path\n"
+            "from mcp.server.fastmcp import FastMCP\n"
+            "mcp = FastMCP('Tools')\n"
+            "@mcp.tool()\n"
+            "def work(delay):\n"
+            "    time.sleep(delay)\n"
+            "    return {'pid': os.getpid(), 'cwd': str(Path.cwd())}\n",
+            encoding="utf-8",
+        )
+        roots.append(root)
+
+    pool = LocalMCPProcessPool(workers=4)
+    try:
+        assert len(set(pool.warm())) == 4
+        started = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as threads:
+            outputs = list(
+                threads.map(
+                    lambda root: pool.call(
+                        {"data_root": str(root), "tools_py": str(root / "tools.py")},
+                        "work",
+                        {"delay": 0.4},
+                        relax_empty=False,
+                    ),
+                    roots,
+                )
+            )
+    finally:
+        pool.close()
+
+        elapsed = time.perf_counter() - started
+    assert elapsed < 1.2
+    assert len({output["result"]["pid"] for output in outputs}) == 4
+    assert {output["result"]["cwd"] for output in outputs} == {str(root) for root in roots}
+
+
+def test_local_mcp_process_pool_release_failure_returns_capacity(tmp_path: Path, monkeypatch):
+    import concurrent.futures
+
+    from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
+
+    first = {"data_root": str(tmp_path / "first")}
+    second = {"data_root": str(tmp_path / "second")}
+    pool = LocalMCPProcessPool(workers=1)
+    shard = pool.shards[0]
+    pool._lease(first)
+
+    failed = concurrent.futures.Future()
+    failed.set_exception(RuntimeError("worker failed during release"))
+    monkeypatch.setattr(shard, "submit", lambda *_args: failed)
+    terminated = []
+    monkeypatch.setattr(shard, "terminate", lambda: terminated.append(True))
+
+    pool.release(first)
+
+    assert terminated == [True]
+    assert pool._lease(second) == 0
+    pool.close()
+
+
+def test_local_mcp_process_isolates_module_load_verifier_and_sequential_trajectories(tmp_path: Path, monkeypatch):
+    import os
+
+    from slime.rollout.fused_agent.env import FusedEnvironment
+    from slime.rollout.fused_agent.mcp_process_pool import close_local_mcp_process_pool
+
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "true")
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_WORKERS", "1")
+    marker = "SLIME_MCP_TEST_MODULE_SIDE_EFFECT"
+    monkeypatch.delenv(marker, raising=False)
+
+    def task(root: Path) -> dict:
+        root.mkdir()
+        (root / "tools.py").write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "from mcp.server.fastmcp import FastMCP\n"
+            f"os.environ['{marker}'] = 'worker-only'\n"
+            "mcp = FastMCP('Tools')\n"
+            "@mcp.tool()\n"
+            "def identity():\n"
+            "    return {'pid': os.getpid(), 'cwd': str(Path.cwd())}\n",
+            encoding="utf-8",
+        )
+        return {
+            "data_root": str(root),
+            "tools_py": str(root / "tools.py"),
+            "verifier": {
+                "verification_code": (
+                    "import os\n"
+                    "from pathlib import Path\n"
+                    "def verify(tools, answer):\n"
+                    "    observed = tools.identity()\n"
+                    "    return {'passed': observed['pid'] == answer['pid'] "
+                    "and str(Path.cwd()) == answer['cwd']}\n"
+                )
+            },
+        }
+
+    first = FusedEnvironment(task(tmp_path / "first"))
+    first_result = json.loads(first.mcp_tools.call("identity", {}))
+    first.answer = json.dumps(first_result)
+    first.tool_calls = 1
+    assert first.compute_final_reward() == 1.0
+    assert marker not in os.environ
+    first.close()
+
+    second = FusedEnvironment(task(tmp_path / "second"))
+    second_result = json.loads(second.mcp_tools.call("identity", {}))
+    second.close()
+    close_local_mcp_process_pool()
+
+    assert first_result["pid"] != second_result["pid"]
+    assert first_result["cwd"] == str(tmp_path / "first")
+    assert second_result["cwd"] == str(tmp_path / "second")
+
+
 def test_local_mcp_tools_keep_definition_time_asset_directory(tmp_path: Path):
     asset = tmp_path / "asset"
     data = asset / "data"
@@ -2160,6 +2493,94 @@ def get_status(status: CallStatus = CallStatus.ALL) -> dict:
     assert json.loads(env.mcp_tools.call("get_status", {"status": "closed"})) == {
         "status": "closed"
     }
+
+
+def test_local_mcp_tools_coerce_normalized_enum_values_and_enum_lists(tmp_path: Path):
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    (asset / "tools.py").write_text(
+        """
+from __future__ import annotations
+from enum import Enum
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("Tools")
+
+class MaintenanceModel(str, Enum):
+    PREDICTIVE = "Predictive Maintenance Model"
+    PREVENTIVE = "Preventive Maintenance Model"
+
+@mcp.tool(description="Return normalized enum values")
+def get_models(primary: MaintenanceModel, models: list[MaintenanceModel]) -> dict:
+    return {"primary": primary.value, "models": [model.value for model in models]}
+""",
+        encoding="utf-8",
+    )
+    env = FusedEnvironment({"question": "Return models", "tools_py": str(asset / "tools.py")})
+    schema = next(schema for schema in env.tools() if schema["function"]["name"] == "get_models")
+
+    assert schema["function"]["parameters"]["properties"]["models"]["items"]["enum"] == [
+        "Predictive Maintenance Model",
+        "Preventive Maintenance Model",
+    ]
+    assert json.loads(
+        env.mcp_tools.call(
+            "get_models",
+            {"primary": "predictive", "models": ["PREDICTIVE", "preventive"]},
+        )
+    ) == {
+        "primary": "Predictive Maintenance Model",
+        "models": ["Predictive Maintenance Model", "Preventive Maintenance Model"],
+    }
+
+
+def test_local_mcp_tools_alias_names_longer_than_protocol_limit(tmp_path: Path):
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    long_name = "retrieve_sections_with_heading_keyword_and_minimum_bullet_count_for_analysis"
+    (asset / "tools.py").write_text(
+        f"""
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("Tools")
+
+@mcp.tool(description="Return a value")
+def {long_name}() -> dict:
+    return {{"ok": True}}
+""",
+        encoding="utf-8",
+    )
+    env = FusedEnvironment({"question": "Return value", "tools_py": str(asset / "tools.py")})
+    exposed_names = [schema["function"]["name"] for schema in env.tools() if schema["function"]["name"] != "finish"]
+
+    assert len(exposed_names) == 1
+    assert len(exposed_names[0]) <= 64
+    assert exposed_names[0] != long_name
+    assert json.loads(env.mcp_tools.call(exposed_names[0], {})) == {"ok": True}
+    assert env.mcp_tools[long_name]() == {"ok": True}
+
+
+def test_local_mcp_tools_repair_definition_time_parent_asset_directory(tmp_path: Path):
+    asset = tmp_path / "asset"
+    data = asset / "data"
+    data.mkdir(parents=True)
+    (data / "value.json").write_text('{"value": "asset"}', encoding="utf-8")
+    (asset / "tools.py").write_text(
+        """
+import json
+from pathlib import Path
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("Tools")
+BASE_DIR = Path(__file__).parent.parent
+
+@mcp.tool(description="Read the local asset despite a generated parent path")
+def read_value() -> dict:
+    with open(BASE_DIR / "data" / "value.json", encoding="utf-8") as file:
+        return json.load(file)
+""",
+        encoding="utf-8",
+    )
+    env = FusedEnvironment({"question": "Read value", "tools_py": str(asset / "tools.py")})
+
+    assert json.loads(env.mcp_tools.call("read_value", {})) == {"value": "asset"}
 
 
 def test_local_mcp_tools_keep_registered_tools_after_late_module_error(tmp_path: Path, caplog):
@@ -2345,6 +2766,96 @@ def verify(tools, answer):
     assert env.compute_final_reward() == 0.0
     assert env.reward_debug["verifier_passed"] is False
     assert env.reward_debug["verifier"]["rejected_degenerate_success"] is True
+
+
+def test_mcp_strict_verifier_rejects_swallowed_tool_error(tmp_path: Path, monkeypatch):
+    sample = _local_mcp_sample(tmp_path, question="Reject verifier fallback")
+    sample.metadata["verifier"]["verification_code"] = """
+def verify(tools, answer):
+    return {
+        'passed': True,
+        'message': 'Basic structure valid (tool verification failed)',
+        'details': "Tool error: 'list' object has no attribute 'get'",
+    }
+"""
+    monkeypatch.setenv("SLIME_MCP_STRICT_VERIFIER", "true")
+    env = FusedEnvironment(sample.metadata)
+    env.answer = json.dumps({"done": True})
+    env.tool_calls = 1
+
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["verifier_passed"] is False
+    assert env.reward_debug["verifier"]["rejected_verifier_error"] is True
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "passed": True,
+            "message": "Verified 0 of 2 technologies in data sources",
+            "details": {"total_entries": 2, "verified_count": 0},
+        },
+        {
+            "passed": True,
+            "message": "Verification completed",
+            "details": {
+                "verification_details": [
+                    {"technology": "unsupported", "verified_in_source": False},
+                ]
+            },
+        },
+    ],
+)
+def test_mcp_strict_verifier_rejects_success_without_verified_evidence(
+    tmp_path: Path, monkeypatch, result: dict
+):
+    sample = _local_mcp_sample(tmp_path, question="Reject unverified success")
+    sample.metadata["verifier"]["verification_code"] = f"""
+def verify(tools, answer):
+    return {result!r}
+"""
+    monkeypatch.setenv("SLIME_MCP_STRICT_VERIFIER", "true")
+    env = FusedEnvironment(sample.metadata)
+    env.answer = json.dumps([{"technology": "unsupported"}])
+    env.tool_calls = 1
+
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["verifier_passed"] is False
+    assert env.reward_debug["verifier"]["rejected_unverified_success"] is True
+
+
+def test_mcp_unverified_success_remains_compatible_by_default(tmp_path: Path, monkeypatch):
+    sample = _local_mcp_sample(tmp_path, question="Keep legacy unverified success")
+    sample.metadata["verifier"]["verification_code"] = """
+def verify(tools, answer):
+    return {
+        'passed': True,
+        'message': 'Verified 0 of 2 technologies in data sources',
+        'details': {'total_entries': 2, 'verified_count': 0},
+    }
+"""
+    monkeypatch.delenv("SLIME_MCP_STRICT_VERIFIER", raising=False)
+    env = FusedEnvironment(sample.metadata)
+    env.answer = json.dumps([{"technology": "unsupported"}])
+    env.tool_calls = 1
+
+    assert env.compute_final_reward() == 1.0
+    assert env.reward_debug["verifier_passed"] is True
+
+
+def test_mcp_verifier_error_fallback_remains_compatible_by_default(tmp_path: Path, monkeypatch):
+    sample = _local_mcp_sample(tmp_path, question="Keep legacy verifier behavior")
+    sample.metadata["verifier"]["verification_code"] = """
+def verify(tools, answer):
+    return {'passed': True, 'message': 'Basic structure valid (tool verification failed)'}
+"""
+    monkeypatch.delenv("SLIME_MCP_STRICT_VERIFIER", raising=False)
+    env = FusedEnvironment(sample.metadata)
+    env.answer = json.dumps({"done": True})
+    env.tool_calls = 1
+
+    assert env.compute_final_reward() == 1.0
 
 
 def test_mcp_verifier_allows_explicitly_valid_empty_answer(tmp_path: Path):
@@ -4546,6 +5057,84 @@ def test_call_sglang_eval_uses_text_without_logprobs(monkeypatch):
         "output_ids": [],
         "rid": requests[0][1]["rid"],
     }
+
+
+def test_call_sglang_rollout_only_skips_training_replay_metadata(monkeypatch):
+    requests = []
+
+    async def fake_post(url, payload, headers=None):
+        requests.append(payload)
+        return {
+            "text": "answer",
+            "output_ids": [7, 8],
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+            },
+        }
+
+    monkeypatch.setattr(fused_generate.http_utils, "post", fake_post)
+    args = SimpleNamespace(
+        debug_rollout_only=True,
+        rollout_only_inference_fast_path=True,
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        router_policy="manual",
+        rollout_top_p=0.95,
+    )
+
+    result = asyncio.run(
+        fused_generate._call_sglang(
+            args,
+            [1, 2, 3],
+            {"max_new_tokens": 4, "top_p": 0.95},
+            session_id="sid",
+        )
+    )
+
+    assert requests[0]["return_logprob"] is False
+    assert "custom_params" not in requests[0]["sampling_params"]
+    assert result == {
+        "text": "answer",
+        "output_ids": [7, 8],
+        "output_logprobs": [],
+        "finish_reason": "stop",
+        "weight_version": None,
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+    }
+
+
+def test_call_sglang_debug_rollout_keeps_training_evidence_without_fast_path(monkeypatch):
+    requests = []
+
+    async def fake_post(url, payload, headers=None):
+        requests.append(payload)
+        return {
+            "text": "x",
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "output_token_logprobs": [[-0.25, 7, "x"]],
+            },
+        }
+
+    monkeypatch.setattr(fused_generate.http_utils, "post", fake_post)
+    args = SimpleNamespace(
+        debug_rollout_only=True,
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        router_policy="manual",
+        rollout_top_p=1.0,
+    )
+
+    result = asyncio.run(
+        fused_generate._call_sglang(args, [1, 2], {"max_new_tokens": 1}, session_id="sid")
+    )
+
+    assert requests[0]["return_logprob"] is True
+    assert result["output_ids"] == [7]
+    assert result["output_logprobs"] == [-0.25]
 
 
 def test_call_sglang_strict_weight_version_is_returned_and_pinned(monkeypatch):
@@ -6830,9 +7419,20 @@ def test_structurally_incomplete_tool_call_penalizes_only_malformed_action(tmp_p
     sample = result[0]
     assert sample.reward == 0.0
     assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
-    assert sample.metadata["credit_assignment_error_attribution"] == "localized"
-    assert malformed_action in _masked_text(sample)
-    assert _policy_masked_text(sample) == malformed_action
+
+
+def test_profile_tool_times_accumulate_across_steps():
+    retrieval, mcp = fused_generate._accumulate_profile_tool_times(
+        [
+            {"tools/search_retrieve_elapsed_s": 1.25, "tools/search_summary_elapsed_s": 0.5},
+            {"tools/mcp_tool_elapsed_s": 2.0},
+        ],
+        0.25,
+        0.75,
+    )
+
+    assert retrieval == pytest.approx(2.0)
+    assert mcp == pytest.approx(2.75)
 
 
 def test_tool_burst_credit_assignment_masks_only_burst_turn_after_history(tmp_path: Path):

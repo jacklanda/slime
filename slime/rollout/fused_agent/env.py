@@ -5,6 +5,7 @@ import asyncio
 from collections import OrderedDict
 import enum
 import functools
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -32,44 +33,57 @@ from .search_gym import search_schema
 
 logger = logging.getLogger(__name__)
 
+_MCP_TOOL_NAME_MAX_LENGTH = 64
+
 
 def _compile_generated_mcp_module(tools_py: Path):
-    """Compile an asset, repairing generated Enum classes missing an ``ALL`` member."""
+    """Compile an asset, repairing referenced members missing from generated enums."""
     source = tools_py.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(tools_py))
-    referenced_all = {
-        node.value.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute)
-        and node.attr == "ALL"
-        and isinstance(node.ctx, ast.Load)
-        and isinstance(node.value, ast.Name)
-    }
+    referenced_members: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Load)
+            and isinstance(node.value, ast.Name)
+        ):
+            referenced_members.setdefault(node.value.id, set()).add(node.attr)
     repaired = []
     for node in tree.body:
-        if not isinstance(node, ast.ClassDef) or node.name not in referenced_all:
+        if not isinstance(node, ast.ClassDef) or node.name not in referenced_members:
             continue
         is_enum = any(
             (isinstance(base, ast.Name) and base.id == "Enum")
             or (isinstance(base, ast.Attribute) and base.attr == "Enum")
             for base in node.bases
         )
-        has_all = any(
-            isinstance(statement, (ast.Assign, ast.AnnAssign))
-            and any(
-                isinstance(target, ast.Name) and target.id == "ALL"
-                for target in (statement.targets if isinstance(statement, ast.Assign) else [statement.target])
-            )
+        if not is_enum:
+            continue
+        existing = {
+            target.id
             for statement in node.body
-        )
-        if is_enum and not has_all:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            for target in (statement.targets if isinstance(statement, ast.Assign) else [statement.target])
+            if isinstance(target, ast.Name)
+        }
+        missing_members = {
+            member
+            for member in referenced_members[node.name] - existing
+            if member.isupper() and not member.startswith("_")
+        }
+        for member in sorted(missing_members):
             node.body.append(
                 ast.Assign(
-                    targets=[ast.Name(id="ALL", ctx=ast.Store())],
-                    value=ast.Constant(value="all"),
+                    targets=[ast.Name(id=member, ctx=ast.Store())],
+                    value=ast.Constant(value=member.casefold().replace("_", " ")),
                 )
             )
-            repaired.append(node.name)
+            repaired.append(f"{node.name}.{member}")
+    sandbox_data = str(tools_py.parent / "data")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value.rstrip("/") == "/tmp/mcp/data":
+                node.value = sandbox_data
     if repaired:
         ast.fix_missing_locations(tree)
         logger.info("Repaired missing ALL member in generated MCP enums %s: %s", tools_py, repaired)
@@ -180,7 +194,13 @@ _ATLAS_MUTATING_TOOLS = {
     "slack_conversations_add_message",
 }
 _mcp_tool_cwd_lock = threading.RLock()
+# Generated MCP modules temporarily install compatibility modules under
+# process-global names (``tools`` and ``mcp``) while they are executed. Keep
+# that short initialization window serialized; tool calls remain independent
+# because each bound function closes over its own workspace globals.
+_mcp_tool_module_load_lock = threading.RLock()
 _warned_partial_mcp_modules: set[Path] = set()
+_VERIFIER_EVIDENCE_TOOL = "_slime_verify_evidence_quote"
 
 
 def _get_shared_http_session() -> aiohttp.ClientSession:
@@ -403,6 +423,16 @@ def _mcp_finish_result_schema(
     task: dict[str, Any],
     candidates: dict[str, dict[str, Any]],
 ) -> dict | None:
+    explicit_schema = task.get("answer_schema")
+    if explicit_schema is None:
+        explicit_schema = task.get("answer_schema_json")
+    if isinstance(explicit_schema, str) and explicit_schema.strip():
+        explicit_schema = json.loads(explicit_schema)
+    if explicit_schema is not None:
+        if not isinstance(explicit_schema, dict):
+            raise TypeError("MCP answer_schema must be a JSON object")
+        return explicit_schema
+
     difficulty = task.get("difficulty")
     preferred_names = []
     if difficulty not in (None, ""):
@@ -543,14 +573,64 @@ class LocalMCPToolset:
         self.tools_py = self._resolve_tools_py(task)
         self.tools: dict[str, Callable[..., Any]] = {}
         self.descriptions: dict[str, str] = {}
+        self.tool_aliases: dict[str, str] = {}
+        self.exposed_tool_names: dict[str, str] = {}
         self.load_error = ""
         self.load_warning = ""
         self.last_call_info: dict[str, Any] = {}
+        self._isolated_schemas: list[dict[str, Any]] | None = None
         if self.tools_py:
             try:
-                self._load_tools(self.tools_py)
+                if (
+                    os.environ.get("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "true").lower()
+                    in {"1", "true", "yes", "on"}
+                    and os.environ.get("SLIME_LOCAL_MCP_PROCESS_WORKER") != "1"
+                ):
+                    from .mcp_process_pool import get_local_mcp_process_pool
+
+                    description = get_local_mcp_process_pool().describe(task)
+                    self._isolated_schemas = description["schemas"]
+                    self.load_error = description["load_error"]
+                    self.load_warning = description["load_warning"]
+                    if self.load_warning and self.tools_py not in _warned_partial_mcp_modules:
+                        _warned_partial_mcp_modules.add(self.tools_py)
+                        logger.warning(
+                            "MCP tool module %s failed after registering tools; keeping the registered tools: %s",
+                            self.tools_py,
+                            self.load_warning,
+                        )
+                    self.tool_aliases = description["tool_aliases"]
+                    self.tools = {name: self._isolated_tool_proxy(name) for name in description["tool_names"]}
+                    self.exposed_tool_names = {actual: exposed for exposed, actual in self.tool_aliases.items()}
+                    for name in self.tools:
+                        self.exposed_tool_names.setdefault(name, name)
+                else:
+                    self._load_tools(self.tools_py)
+                    self._build_tool_aliases()
             except Exception as e:
                 self.load_error = f"{type(e).__name__}: {e}"
+
+    def _isolated_tool_proxy(self, name: str) -> Callable[..., Any]:
+        def call(*args, **kwargs):
+            if args:
+                raise TypeError(f"Isolated MCP tool {name} requires keyword arguments")
+            return self.call_raw(name, kwargs, relax_empty=False)
+
+        return call
+
+    def _build_tool_aliases(self) -> None:
+        used = set(self.tools)
+        for name in self.tools:
+            exposed_name = name
+            if len(name) > _MCP_TOOL_NAME_MAX_LENGTH:
+                suffix = "_" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+                exposed_name = name[: _MCP_TOOL_NAME_MAX_LENGTH - len(suffix)] + suffix
+                if exposed_name in used:
+                    self.load_error = f"Generated MCP tool alias collides with an existing tool: {exposed_name}"
+                    return
+                self.tool_aliases[exposed_name] = name
+                used.add(exposed_name)
+            self.exposed_tool_names[name] = exposed_name
 
     def _resolve_tools_py(self, task: dict[str, Any]) -> Path | None:
         tools_py = task.get("tools_py")
@@ -595,42 +675,59 @@ class LocalMCPToolset:
 
                 return deco
 
-        old_modules = {name: sys.modules.get(name) for name in ("mcp", "mcp.server", "mcp.server.fastmcp", "tools")}
+        module_name = f"_slime_fused_tools_{abs(hash(str(tools_py)))}"
+        old_modules = {
+            name: sys.modules.get(name)
+            for name in ("mcp", "mcp.server", "mcp.server.fastmcp", "tools", module_name)
+        }
         exec_error: Exception | None = None
-        try:
-            mcp_mod = types.ModuleType("mcp")
-            server_mod = types.ModuleType("mcp.server")
-            fastmcp_mod = types.ModuleType("mcp.server.fastmcp")
-            fake_mcp = FakeFastMCP("Tools")
-            mcp_mod.tool = fake_mcp.tool
-            server_mod.fastmcp = fastmcp_mod
-            fastmcp_mod.FastMCP = FakeFastMCP
-            sys.modules["mcp"] = mcp_mod
-            sys.modules["mcp.server"] = server_mod
-            sys.modules["mcp.server.fastmcp"] = fastmcp_mod
+        module = None
+        with _mcp_tool_module_load_lock:
+            try:
+                mcp_mod = types.ModuleType("mcp")
+                server_mod = types.ModuleType("mcp.server")
+                fastmcp_mod = types.ModuleType("mcp.server.fastmcp")
+                fake_mcp = FakeFastMCP("Tools")
+                mcp_mod.tool = fake_mcp.tool
+                server_mod.fastmcp = fastmcp_mod
+                fastmcp_mod.FastMCP = FakeFastMCP
+                sys.modules["mcp"] = mcp_mod
+                sys.modules["mcp.server"] = server_mod
+                sys.modules["mcp.server.fastmcp"] = fastmcp_mod
 
-            module_name = f"_slime_fused_tools_{abs(hash(str(tools_py)))}"
-            spec = importlib.util.spec_from_file_location(module_name, tools_py)
-            if spec is None or spec.loader is None:
-                return
-            module = importlib.util.module_from_spec(spec)
-            module.mcp = FakeFastMCP("Tools")
-            sys.modules[module_name] = module
-            sys.modules["tools"] = module
-            exec(_compile_generated_mcp_module(tools_py), module.__dict__)
-        except Exception as e:
-            exec_error = e
-        finally:
-            for name, mod in old_modules.items():
-                if mod is None:
-                    sys.modules.pop(name, None)
-                else:
-                    sys.modules[name] = mod
+                spec = importlib.util.spec_from_file_location(module_name, tools_py)
+                if spec is None or spec.loader is None:
+                    return
+                module = importlib.util.module_from_spec(spec)
+                module.mcp = FakeFastMCP("Tools")
+                sys.modules[module_name] = module
+                sys.modules["tools"] = module
+                exec(_compile_generated_mcp_module(tools_py), module.__dict__)
+            except Exception as e:
+                exec_error = e
+            finally:
+                for name, mod in old_modules.items():
+                    if mod is None:
+                        sys.modules.pop(name, None)
+                    else:
+                        sys.modules[name] = mod
 
+        if module is None:
+            if exec_error is not None:
+                raise exec_error
+            return
         module_globals = dict(module.__dict__)
         for name, (fn, description, definition_globals) in registry.items():
             function_globals = module_globals.copy()
             function_globals.update(definition_globals)
+            if "BASE_DIR" in function_globals and (tools_py.parent / "data").is_dir():
+                # Generated tools use both Path and string BASE_DIR values;
+                # always bind either form to this trajectory's copied sandbox.
+                function_globals["BASE_DIR"] = (
+                    str(tools_py.parent)
+                    if isinstance(function_globals["BASE_DIR"], str)
+                    else tools_py.parent
+                )
             bound_fn = types.FunctionType(fn.__code__, function_globals, fn.__name__, fn.__defaults__, fn.__closure__)
             bound_fn.__kwdefaults__ = fn.__kwdefaults__
             bound_fn.__annotations__ = fn.__annotations__
@@ -653,24 +750,54 @@ class LocalMCPToolset:
                     self.load_warning,
                 )
 
+        def verify_evidence_quote(source_document: str, evidence_quote: str) -> dict[str, Any]:
+            normalized_quote = " ".join(str(evidence_quote or "").split()).casefold()
+            source_found = False
+            for path in (tools_py.parent / "data").glob("*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if str(payload.get("title") or "") != str(source_document or ""):
+                    continue
+                source_found = True
+                document = "\n".join(str(payload.get(key) or "") for key in ("title", "summary", "content"))
+                normalized_document = " ".join(document.split()).casefold()
+                if len(normalized_quote) >= 20 and normalized_quote in normalized_document:
+                    return {"source_found": True, "matched": True}
+            return {"source_found": source_found, "matched": False}
+
+        self.tools[_VERIFIER_EVIDENCE_TOOL] = verify_evidence_quote
+        self.descriptions[_VERIFIER_EVIDENCE_TOOL] = "Verifier-only local evidence validation."
+
     @staticmethod
     def _run_from_asset_dir(fn: Callable[..., Any], asset_dir: Path) -> Callable[..., Any]:
         @functools.wraps(fn)
         def wrapped(*args, **kwargs):
             with _mcp_tool_cwd_lock:
                 previous_cwd = Path.cwd()
+                previous_base_dir = os.environ.get("MCP_SERVER_BASE_DIR")
                 try:
                     os.chdir(asset_dir)
+                    os.environ["MCP_SERVER_BASE_DIR"] = str(asset_dir)
                     return fn(*args, **kwargs)
                 finally:
+                    if previous_base_dir is None:
+                        os.environ.pop("MCP_SERVER_BASE_DIR", None)
+                    else:
+                        os.environ["MCP_SERVER_BASE_DIR"] = previous_base_dir
                     os.chdir(previous_cwd)
 
         return wrapped
 
     def schemas(self) -> list[dict]:
+        if self._isolated_schemas is not None:
+            return self._isolated_schemas
         schemas = []
         submission_schemas = {}
         for name, fn in sorted(self.tools.items()):
+            if name.startswith("_slime_"):
+                continue
             sig = inspect.signature(fn)
             properties = {}
             required = []
@@ -691,6 +818,13 @@ class LocalMCPToolset:
                 properties[param_name] = {"type": typ, "description": ""}
                 if inspect.isclass(ann) and issubclass(ann, enum.Enum):
                     properties[param_name]["enum"] = [member.value for member in ann]
+                elif get_origin(ann) is list:
+                    item_types = get_args(ann)
+                    if len(item_types) == 1 and inspect.isclass(item_types[0]) and issubclass(item_types[0], enum.Enum):
+                        properties[param_name]["items"] = {
+                            "type": "string",
+                            "enum": [member.value for member in item_types[0]],
+                        }
                 if default is inspect._empty:
                     required.append(param_name)
             if _is_mcp_submission_tool(name):
@@ -698,7 +832,14 @@ class LocalMCPToolset:
                 if isinstance(candidate, dict):
                     submission_schemas[name] = candidate
                 continue
-            schemas.append(tool_schema(name, self.descriptions.get(name, ""), properties, required))
+            schemas.append(
+                tool_schema(
+                    self.exposed_tool_names.get(name, name),
+                    self.descriptions.get(name, ""),
+                    properties,
+                    required,
+                )
+            )
         schemas.append(
             finish_schema(
                 structured_result=True,
@@ -708,14 +849,15 @@ class LocalMCPToolset:
         return schemas
 
     def __contains__(self, name: str) -> bool:
-        return name in self.tools
+        return name in self.tools or name in self.tool_aliases
 
     def __getitem__(self, name: str) -> Callable[..., Any]:
-        return self._verifier_callable(name)
+        return self._verifier_callable(self.tool_aliases.get(name, name))
 
     def __getattr__(self, name: str) -> Any:
-        if name in self.tools:
-            return self._verifier_callable(name)
+        resolved_name = self.tool_aliases.get(name, name)
+        if resolved_name in self.tools:
+            return self._verifier_callable(resolved_name)
         raise AttributeError(name)
 
     def _verifier_callable(self, name: str) -> Callable[..., Any]:
@@ -724,7 +866,8 @@ class LocalMCPToolset:
         @functools.wraps(fn)
         def call(*args, **kwargs):
             bound = inspect.signature(fn).bind_partial(*args)
-            return self.call_raw(name, {**bound.arguments, **kwargs}, relax_empty=False)
+            result = self.call_raw(name, {**bound.arguments, **kwargs}, relax_empty=False)
+            return _verifier_result_compat(result)
 
         return call
 
@@ -741,9 +884,28 @@ class LocalMCPToolset:
 
     def call_raw(self, name: str, arguments: dict[str, Any], *, relax_empty: bool = True) -> Any:
         self.last_call_info = {"empty_result": False, "fallback_attempted": False, "fallback_used": False}
+        name = self.tool_aliases.get(name, name)
         fn = self.tools.get(name)
         if fn is None:
             return f"Error: unknown tool {name}"
+        if (
+            os.environ.get("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "true").lower() in {"1", "true", "yes", "on"}
+            and os.environ.get("SLIME_LOCAL_MCP_PROCESS_WORKER") != "1"
+        ):
+            try:
+                from .mcp_process_pool import get_local_mcp_process_pool
+
+                output = get_local_mcp_process_pool().call(
+                    self.task,
+                    name,
+                    arguments,
+                    relax_empty=relax_empty,
+                )
+                self.last_call_info = output["call_info"]
+                return output["result"]
+            except Exception as e:
+                self.last_call_info["process_isolation_error"] = f"{type(e).__name__}: {e}"
+                return f"Error calling {name}: isolated worker {type(e).__name__}: {e}"
         try:
             kwargs = _coerce_kwargs(fn, arguments)
             result = fn(**kwargs)
@@ -760,6 +922,52 @@ class LocalMCPToolset:
         except Exception as e:
             return f"Error calling {name}: {type(e).__name__}: {e}"
 
+    def close(self) -> None:
+        if (
+            os.environ.get("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "true").lower() in {"1", "true", "yes", "on"}
+            and os.environ.get("SLIME_LOCAL_MCP_PROCESS_WORKER") != "1"
+        ):
+            from .mcp_process_pool import get_local_mcp_process_pool
+
+            get_local_mcp_process_pool().release(self.task)
+
+
+class _VerifierResultDict(dict):
+    """Preserve raw dict behavior and the generator's legacy result wrapper."""
+
+    def __contains__(self, key: object) -> bool:
+        return key == "result" or super().__contains__(key)
+
+    def __getitem__(self, key: object) -> Any:
+        if key == "result" and not super().__contains__(key):
+            return self
+        return super().__getitem__(key)
+
+    def get(self, key: object, default: Any = None) -> Any:
+        if key == "result" and not super().__contains__(key):
+            return self
+        return super().get(key, default)
+
+
+class _VerifierResultList(list):
+    """Allow legacy result unwrapping without changing list semantics."""
+
+    def __getitem__(self, key: Any) -> Any:
+        if key == "result":
+            return self
+        return super().__getitem__(key)
+
+    def get(self, key: object, default: Any = None) -> Any:
+        return self if key == "result" else default
+
+
+def _verifier_result_compat(result: Any) -> Any:
+    if isinstance(result, dict) and not isinstance(result, _VerifierResultDict):
+        return _VerifierResultDict(result)
+    if isinstance(result, list) and not isinstance(result, _VerifierResultList):
+        return _VerifierResultList(result)
+    return result
+
 
 def _coerce_kwargs(fn: Callable[..., Any], arguments: dict[str, Any]) -> dict[str, Any]:
     sig = inspect.signature(fn)
@@ -770,7 +978,9 @@ def _coerce_kwargs(fn: Callable[..., Any], arguments: dict[str, Any]) -> dict[st
         value = arguments[name]
         ann = _parameter_annotation(fn, name, param.annotation)
         try:
-            if ann in (int, "int"):
+            if value is None and _is_enum_type(ann) and isinstance(param.default, ann):
+                value = param.default
+            elif ann in (int, "int"):
                 value = int(value)
             elif ann in (float, "float"):
                 value = float(value)
@@ -778,17 +988,51 @@ def _coerce_kwargs(fn: Callable[..., Any], arguments: dict[str, Any]) -> dict[st
                 value = value.lower() in {"1", "true", "yes", "y", "on"}
             elif (get_origin(ann) is dict or ann in (dict, "dict")) and isinstance(value, str):
                 value = json.loads(value)
-            elif (get_origin(ann) is list or ann in (list, "list")) and isinstance(value, str):
-                value = json.loads(value)
+            elif get_origin(ann) is list or ann in (list, "list"):
+                if isinstance(value, str):
+                    value = json.loads(value)
+                item_types = get_args(ann)
+                if isinstance(value, list) and len(item_types) == 1 and _is_enum_type(item_types[0]):
+                    value = [_coerce_enum_value(item_types[0], item) for item in value]
             elif inspect.isclass(ann) and issubclass(ann, enum.Enum) and not isinstance(value, ann):
-                try:
-                    value = ann(value)
-                except ValueError:
-                    value = ann[str(value)]
+                value = _coerce_enum_value(ann, value)
         except Exception:
             pass
         kwargs[name] = value
     return kwargs
+
+
+def _is_enum_type(annotation: Any) -> bool:
+    return inspect.isclass(annotation) and issubclass(annotation, enum.Enum)
+
+
+def _normalize_enum_token(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+
+
+def _coerce_enum_value(enum_type: type[enum.Enum], value: Any) -> Any:
+    if value is None or isinstance(value, enum_type):
+        return value
+    try:
+        return enum_type(value)
+    except (TypeError, ValueError):
+        pass
+    token = _normalize_enum_token(value)
+    exact_matches = [
+        member
+        for member in enum_type
+        if token in {_normalize_enum_token(member.name), _normalize_enum_token(member.value)}
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    contained_matches = [
+        member
+        for member in enum_type
+        if token and token in _normalize_enum_token(member.value)
+    ]
+    if len(contained_matches) == 1:
+        return contained_matches[0]
+    raise ValueError(f"{value!r} does not uniquely identify a {enum_type.__name__}")
 
 
 def _relax_optional_tool_arguments(fn: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -966,7 +1210,7 @@ class FusedEnvironment:
                         "reward_debug": self.reward_debug,
                     },
                 )
-            reward = self.compute_final_reward()
+            reward = await asyncio.to_thread(self.compute_final_reward)
             return "Submitted.", reward, True, {"reward_debug": self.reward_debug}
         self.tool_calls += 1
         if self.mode == "web_search" and name in {"web_search", "search", "web_search_wiki"}:
@@ -984,7 +1228,7 @@ class FusedEnvironment:
             if isinstance(self.mcp_tools, AtlasMCPToolset):
                 result = await self.mcp_tools.call(name, args)
             else:
-                result = self.mcp_tools.call(name, args)
+                result = await asyncio.to_thread(self.mcp_tools.call, name, args)
             call_info = getattr(self.mcp_tools, "last_call_info", {}) or {}
             empty_result = bool(call_info.get("empty_result", _is_empty_mcp_result(result)))
             if empty_result:
@@ -1185,7 +1429,9 @@ class FusedEnvironment:
         return _limit_words(content, max_words=word_budget), 0.0, False, metrics
 
     def compute_final_reward(self, *, require_tool_evidence: bool = True) -> float:
+        verifier_started_at = _now_monotonic()
         reward = self._compute_final_reward(require_tool_evidence=require_tool_evidence)
+        self.verifier_elapsed_s = _now_monotonic() - verifier_started_at
         if reward <= 0.0 and self.infra_failure_reasons:
             self.reward_debug = {
                 **self.reward_debug,
@@ -1279,13 +1525,42 @@ class FusedEnvironment:
             return 0.0
         namespace: dict[str, Any] = {}
         try:
-            exec(str(verifier["verification_code"]), namespace)
-            verify = namespace.get("verify")
-            if not callable(verify):
-                return None
-            result = verify(self.mcp_tools, answer)
+            if isinstance(self.mcp_tools, LocalMCPToolset) and (
+                os.environ.get("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "true").lower()
+                in {"1", "true", "yes", "on"}
+                and os.environ.get("SLIME_LOCAL_MCP_PROCESS_WORKER") != "1"
+            ):
+                from .mcp_process_pool import get_local_mcp_process_pool
+
+                verified = get_local_mcp_process_pool().verify(
+                    self.task,
+                    str(verifier["verification_code"]),
+                    answer,
+                )
+                if not verified["has_verifier"]:
+                    return None
+                result = verified["result"]
+            else:
+                exec(str(verifier["verification_code"]), namespace)
+                verify = namespace.get("verify")
+                if not callable(verify):
+                    return None
+                result = verify(self.mcp_tools, answer)
             if isinstance(result, dict):
                 passed = bool(result.get("passed") or result.get("success"))
+                strict_verifier = os.environ.get("SLIME_MCP_STRICT_VERIFIER", "false").lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                if passed and strict_verifier:
+                    if _verifier_reports_error(result):
+                        result = {**result, "passed": False, "rejected_verifier_error": True}
+                        passed = False
+                    elif _verifier_reports_no_verified_evidence(result):
+                        result = {**result, "passed": False, "rejected_unverified_success": True}
+                        passed = False
                 if passed and not allow_empty_answer and _verifier_reports_missing_evidence(result):
                     passed = False
                     result = {**result, "passed": False, "rejected_degenerate_success": True}
@@ -1315,6 +1590,8 @@ class FusedEnvironment:
             return 0.0
 
     def close(self) -> None:
+        if isinstance(self.mcp_tools, LocalMCPToolset):
+            self.mcp_tools.close()
         if self.docker_env is not None:
             self.docker_env.close()
 
@@ -1331,6 +1608,61 @@ def _verifier_reports_missing_evidence(result: dict[str, Any]) -> bool:
             "no content could be verified",
         )
     )
+
+
+def _verifier_reports_error(result: dict[str, Any]) -> bool:
+    """Detect a verifier that swallowed an exception but still returned success."""
+    text = " ".join(
+        str(result.get(key) or "")
+        for key in ("message", "reason", "details", "error", "verifier_error")
+    ).strip().lower()
+    if not text:
+        return False
+    return any(
+        phrase in text
+        for phrase in (
+            "tool verification failed",
+            "tool error:",
+            "verification failed",
+            "verifier error:",
+            "exception:",
+            "traceback",
+        )
+    )
+
+
+def _verifier_reports_no_verified_evidence(result: dict[str, Any]) -> bool:
+    """Detect a successful verifier result that explicitly verified nothing."""
+    message = str(result.get("message") or result.get("reason") or "").strip().lower()
+    if re.search(r"\bverified\s+0\s+of\s+[1-9][0-9]*\b", message):
+        return True
+
+    details = result.get("details")
+    if not isinstance(details, dict):
+        return False
+
+    verified_count = details.get("verified_count")
+    total_entries = details.get("total_entries")
+    if (
+        isinstance(verified_count, (int, float))
+        and not isinstance(verified_count, bool)
+        and verified_count == 0
+        and isinstance(total_entries, (int, float))
+        and not isinstance(total_entries, bool)
+        and total_entries > 0
+    ):
+        return True
+
+    verification_details = details.get("verification_details")
+    if isinstance(verification_details, list) and verification_details:
+        evidence_flags = [
+            item.get("verified_in_source")
+            for item in verification_details
+            if isinstance(item, dict) and "verified_in_source" in item
+        ]
+        if evidence_flags and not any(flag is True for flag in evidence_flags):
+            return True
+    return False
 
 
 def _extract_ground_truth(label: Any) -> Any:

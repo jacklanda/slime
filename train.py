@@ -20,6 +20,40 @@ from slime.utils.train_step_metrics import build_step_timing_metrics
 logger = logging.getLogger(__name__)
 
 
+def _run_rollout_only(args, rollout_manager, num_rollout_per_epoch):
+    """Run inference rollouts without allocating or calling trainer actors."""
+    if args.start_rollout_id is None:
+        args.start_rollout_id = 0
+    if args.rollout_global_dataset:
+        ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
+
+    if args.num_rollout == 0 and args.eval_interval is not None:
+        ray.get(rollout_manager.eval.remote(rollout_id=0))
+
+    for rollout_id in range(args.start_rollout_id, args.num_rollout):
+        step_start = perf_counter()
+        if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
+            ray.get(rollout_manager.eval.remote(rollout_id))
+
+        generated_samples = ray.get(rollout_manager.generate.remote(rollout_id))
+        if generated_samples == 0:
+            logger.info("rollout-only dataset exhausted at step %s", rollout_id)
+            break
+
+        if not getattr(args, "rollout_only_skip_episode_dump", False):
+            ray.get(rollout_manager.save_rllm_episodes.remote(rollout_id))
+
+        # The inference fast path commits the cursor before its asynchronous
+        # shard write. Other rollout-only workflows persist it here.
+        if args.rollout_global_dataset and not getattr(args, "rollout_only_inference_fast_path", False):
+            ray.get(rollout_manager.save.remote(rollout_id))
+
+        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+            ray.get(rollout_manager.eval.remote(rollout_id))
+
+        logger.info("rollout-only step %s completed in %.2fs", rollout_id, perf_counter() - step_start)
+
+
 def train(args):
     configure_logger()
     release_train = args.release_train
@@ -31,6 +65,14 @@ def train(args):
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+
+    if getattr(args, "debug_rollout_only", False):
+        try:
+            _run_rollout_only(args, rollout_manager, num_rollout_per_epoch)
+        finally:
+            ray.get(rollout_manager.dispose.remote())
+            finish_tracking(args)
+        return
 
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 

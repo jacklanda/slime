@@ -28,6 +28,7 @@ from .cut_bill import local_search_schema as cut_bill_search_schema
 from .cut_bill import run_search as run_cut_bill_search
 from .cut_bill import system_prompt as cut_bill_system_prompt
 from .env import FusedEnvironment, _format_retrieval, normalize_task, resolve_task_mode
+from .mcp_workspace import cleanup_mcp_workspace, is_local_mcp_task, prepare_mcp_workspace
 from .history import messages_without_historical_thinking as _messages_without_historical_thinking
 from .history import strip_trailing_chat_template_stop as _strip_trailing_chat_template_stop
 from .parser import Gemma4ToolParser, ToolCall, make_tool_parser
@@ -392,6 +393,53 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     """
     state = GenerateState(args)
     task = _task_from_sample(base_sample)
+    session_id = base_sample.session_id or uuid.uuid4().hex
+    base_sample.session_id = session_id
+    trajectory_setup_started_at = time.time()
+    mcp_workspace = None
+    local_mcp_process_leased = False
+    if is_local_mcp_task(task):
+        prepare_task = asyncio.create_task(
+            asyncio.to_thread(
+                prepare_mcp_workspace,
+                task,
+                session_id,
+                os.environ.get("SLIME_MCP_ENV_ROOT"),
+            )
+        )
+        try:
+            task, mcp_workspace = await asyncio.shield(prepare_task)
+        except asyncio.CancelledError:
+            # Cancelling the coroutine cannot interrupt the worker thread
+            # running rsync. Drain it before returning so a completed copy is
+            # still removed and never becomes a leaked trajectory workspace.
+            try:
+                prepared = await asyncio.shield(prepare_task)
+            except BaseException:
+                prepared = None
+            if prepared is not None:
+                _, mcp_workspace = prepared
+                await asyncio.to_thread(cleanup_mcp_workspace, mcp_workspace)
+            raise
+        # The main rollout finally block owns normal cleanup. This callback
+        # covers setup/parser failures that occur before that block starts.
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            async def cleanup_finished_local_mcp() -> None:
+                if local_mcp_process_leased:
+                    from .mcp_process_pool import get_local_mcp_process_pool
+
+                    await asyncio.to_thread(get_local_mcp_process_pool().release, task)
+                await asyncio.to_thread(cleanup_mcp_workspace, mcp_workspace)
+
+            current_task.add_done_callback(lambda _done: asyncio.create_task(cleanup_finished_local_mcp()))
+        if _env_bool("SLIME_LOCAL_MCP_PROCESS_ISOLATION", True):
+            from .mcp_process_pool import get_local_mcp_process_pool
+
+            process_pool = get_local_mcp_process_pool()
+            while not process_pool.try_lease(task):
+                await asyncio.sleep(0.01)
+            local_mcp_process_leased = True
     harness = normalize_harness(os.environ.get("FUSED_HARNESS", getattr(args, "fused_harness", "gem")))
     rllm_deepresearch = harness == "rllm_deepresearch"
     cut_bill = harness == "cut_bill"
@@ -402,26 +450,37 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     rag = harness == "rag"
     reasoning_only = harness in {"cot", "rag", "bare"}
     retrieval_max_results = int(os.environ.get("RETRIEVAL_MAX_RESULTS", "10" if research_search else "5"))
-    env = FusedEnvironment(
-        task,
-        # Training and evaluation may intentionally use different retrieval services.
-        retrieval_url=os.environ.get(
-            "EVAL_RETRIEVAL_SERVER_URL" if evaluation else "TRAIN_RETRIEVAL_SERVER_URL",
-            os.environ.get("RETRIEVAL_SERVER_URL"),
-        ),
-        retrieval_max_results=retrieval_max_results,
-        enable_tools=not reasoning_only,
-        search_gym=search_gym,
-        agentcpm_explore=agentcpm_explore,
-        deepsearch_world=deepsearch_world,
-        rag=rag,
-    )
-    observation, info = env.reset()
+    try:
+        env = await asyncio.to_thread(
+            FusedEnvironment,
+            task,
+            # Training and evaluation may intentionally use different retrieval services.
+            retrieval_url=os.environ.get(
+                "EVAL_RETRIEVAL_SERVER_URL" if evaluation else "TRAIN_RETRIEVAL_SERVER_URL",
+                os.environ.get("RETRIEVAL_SERVER_URL"),
+            ),
+            retrieval_max_results=retrieval_max_results,
+            enable_tools=not reasoning_only,
+            search_gym=search_gym,
+            agentcpm_explore=agentcpm_explore,
+            deepsearch_world=deepsearch_world,
+            rag=rag,
+        )
+        observation, info = env.reset()
+    except BaseException:
+        if is_local_mcp_task(task) and _env_bool("SLIME_LOCAL_MCP_PROCESS_ISOLATION", True):
+            from .mcp_process_pool import get_local_mcp_process_pool
+
+            get_local_mcp_process_pool().release(task)
+        await asyncio.to_thread(cleanup_mcp_workspace, mcp_workspace)
+        raise
+    mcp_init_time = time.time() - trajectory_setup_started_at if env.mode == "mcp" else 0.0
     retrieved_context = ""
     rag_retrieval_info: dict[str, Any] = {}
     if rag:
         if env.mode != "web_search":
             env.close()
+            await asyncio.to_thread(cleanup_mcp_workspace, mcp_workspace)
             raise ValueError(f"rag only supports web-search tasks, got task mode {env.mode!r}")
         retrieved_context, _, _, rag_retrieval_info = await env.step(
             ToolCall("web_search", {"query": observation, "max_results": retrieval_max_results})
@@ -429,9 +488,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     deepsearch_task = observation
     if research_search and env.mode != "web_search":
         env.close()
+        await asyncio.to_thread(cleanup_mcp_workspace, mcp_workspace)
         raise ValueError(f"{harness} only supports web-search tasks, got task mode {env.mode!r}")
     if deepsearch_world and env.mode != "web_search":
         env.close()
+        await asyncio.to_thread(cleanup_mcp_workspace, mcp_workspace)
         raise ValueError(f"deepsearch_world only supports web-search tasks, got task mode {env.mode!r}")
     base_max_steps = int(
         os.environ.get(
@@ -495,6 +556,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     ngram_repetition_threshold = float(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD", "0.35"))
     ngram_repetition_min_tokens = int(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS", "128"))
     repeated_search_max_strikes = max(1, int(os.environ.get("FUSED_REPEATED_SEARCH_MAX_STRIKES", "2")))
+    inference_only = bool(getattr(args, "rollout_only_inference_fast_path", False))
     detect_abnormal_trajectories = not evaluation and not research_search
     detect_eval_response_anomalies = evaluation and not deepsearch_world
 
@@ -530,14 +592,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     )
     manager = (
         None
-        if evaluation
+        if evaluation or inference_only
         else TrajectoryManager(
             fork_threshold_tokens=int(os.environ.get("SLIME_FUSED_FORK_THRESHOLD_TOKENS", "1024")),
             strict_append_only=strict_tito and _tito_model_type(model_name) == "gemma4",
         )
     )
-    session_id = base_sample.session_id or uuid.uuid4().hex
-    base_sample.session_id = session_id
     eval_sglang_session = (
         EvalSGLangSession.for_eval(
             args,
@@ -559,6 +619,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     episode_start_timestamp = _utc_timestamp()
     llm_time = 0.0
     env_time = 0.0
+    retrieval_time = 0.0
+    mcp_tool_time = 0.0
     pending_turns: list[dict[str, Any]] = []
     tito_prefix_ids: list[int] = []
     tito_messages_snapshot: list[dict[str, Any]] | None = None
@@ -934,28 +996,29 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 pending_turns.append(
                     {
                         "turn": TurnRecord(
-                            prompt_ids=prompt_ids,
+                            prompt_ids=[] if inference_only else prompt_ids,
                             output_ids=output_ids,
                             finish_reason="tool_calls" if parsed_actions else finish_reason,
                             output_log_probs=output_logprobs,
                             weight_version=(
                                 str(observed_weight_version) if observed_weight_version is not None else None
                             ),
-                            require_rollout_logprobs=True,
+                            require_rollout_logprobs=not inference_only,
                             require_weight_version=require_weight_version,
-                            context_delta_ids=context_delta_ids,
+                            context_delta_ids=[] if inference_only else context_delta_ids,
                             tito_boundary_before=tito_boundary_before,
                             tito_model_type=_tito_model_type(model_name),
                             tito_context_reason=tito_context_reason,
                             disable_thinking=disable_thinking,
-                            loss_mask=response_loss_mask,
+                            loss_mask=None if inference_only else response_loss_mask,
                             rollout_top_p_token_ids=output.get("rollout_top_p_token_ids"),
                             rollout_top_p_token_offsets=output.get("rollout_top_p_token_offsets"),
                             prompt_context_start_idx=prompt_context_start_idx,
                         ),
-                        "prompt_messages": list(messages),
-                        "response_message": assistant_msg,
+                        "prompt_messages": [] if inference_only else list(messages),
+                        "response_message": None if inference_only else assistant_msg,
                         "raw_response": response,
+                        "skip_credit_assignment": inference_only,
                         "metadata": {
                             "sid": session_id,
                             "step": step_idx,
@@ -1030,7 +1093,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
 
             if reasoning_only:
                 env.answer = response
-                final_reward = env.compute_final_reward(require_tool_evidence=False)
+                final_reward = await asyncio.to_thread(env.compute_final_reward, require_tool_evidence=False)
                 final_done = True
                 last_info = {
                     "termination_reason": "reasoning_only",
@@ -1092,7 +1155,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             if research_search:
                 if not actions:
                     env.answer = response
-                    final_reward = env.compute_final_reward(require_tool_evidence=False)
+                    final_reward = await asyncio.to_thread(env.compute_final_reward, require_tool_evidence=False)
                     final_done = True
                     last_info = {"termination_reason": "rllm_dr_no_tool_call", "reward_debug": env.reward_debug}
                     trajectory_steps.append(
@@ -1116,7 +1179,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     env.answer = str(
                         actions[-1].arguments.get("result") or actions[-1].arguments.get("answer") or ""
                     )
-                    final_reward = env.compute_final_reward(require_tool_evidence=False)
+                    final_reward = await asyncio.to_thread(env.compute_final_reward, require_tool_evidence=False)
                     final_done = True
                     last_info = {"termination_reason": "env_done", "reward_debug": env.reward_debug}
                     trajectory_steps.append(
@@ -1173,6 +1236,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 env.tool_calls += len(actions)
                 raw_observations = [result[0] for result in results]
                 env_infos = [result[1] for result in results]
+                retrieval_time, mcp_tool_time = _accumulate_profile_tool_times(
+                    env_infos, retrieval_time, mcp_tool_time
+                )
                 formatted_observations = [
                     _format_tool_observation(parser, action.name, raw_observation)
                     for action, raw_observation in zip(actions, raw_observations, strict=True)
@@ -1710,6 +1776,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 final_reward = batch_reward
                 final_done = batch_done
                 last_info = _merge_tool_infos(env_infos)
+                retrieval_time, mcp_tool_time = _accumulate_profile_tool_times(
+                    env_infos, retrieval_time, mcp_tool_time
+                )
                 if recoverable_tool_schema_errors:
                     last_info.update(
                         {
@@ -1759,6 +1828,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             final_reward = float(reward)
             final_done = bool(done)
             last_info = dict(env_info or {})
+            retrieval_time, mcp_tool_time = _accumulate_profile_tool_times(
+                [last_info], retrieval_time, mcp_tool_time
+            )
             if recoverable_tool_schema_errors:
                 last_info.update(
                     {
@@ -1888,12 +1960,13 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     )
 
         if not final_done and final_reward == 0.0:
-            final_reward = env.compute_final_reward()
+            final_reward = await asyncio.to_thread(env.compute_final_reward)
             last_info = {"reward_debug": env.reward_debug, **last_info}
     finally:
         if eval_sglang_session is not None:
             await eval_sglang_session.close(background=True)
         env.close()
+        await asyncio.to_thread(cleanup_mcp_workspace, mcp_workspace)
 
     termination_reason = last_info.get("termination_reason", "env_done" if final_done else "unknown")
     if (
@@ -1953,6 +2026,34 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         "fused_tito_incremental_turns": tito_reasons.count("append_delta"),
         "fused_tito_prompt_prefix_mismatch_turns": tito_reasons.count("prompt_prefix_mismatch"),
         "fused_tito_incremental_tokenization_failed_turns": tito_reasons.count("tito_incremental_tokenization_failed"),
+        "fused_profile": {
+            "trajectory_start_time_s": episode_start_time,
+            "trajectory_end_time_s": episode_end_time,
+            "trajectory_total_time_s": episode_end_time - episode_start_time,
+            "llm_decode_time_s": llm_time,
+            "retrieval_time_s": retrieval_time,
+            "mcp_init_time_s": mcp_init_time,
+            "mcp_tool_time_s": mcp_tool_time,
+            "verifier_time_s": float(getattr(env, "verifier_elapsed_s", 0.0) or 0.0),
+            "parser_error": bool(credit_event in {"tool_parser_error", "think_parser_error"}),
+            "parser_error_count": int(last_info.get("tool_parser_error_count", 0) or 0),
+            "termination_reason": termination_reason,
+            "response_tokens": total_completion_tokens,
+            "accepted": None,
+        },
+    }
+    if mcp_workspace is not None:
+        common_metadata.update(
+            {
+                "mcp_env_id": mcp_workspace.task_id,
+                "mcp_env_path": str(mcp_workspace.path),
+                "mcp_env_source_root": str(mcp_workspace.source_root),
+            }
+        )
+    mcp_metadata = {
+        key: common_metadata[key]
+        for key in ("mcp_env_id", "mcp_env_path", "mcp_env_source_root")
+        if key in common_metadata
     }
     if recoverable_tool_parser_errors:
         common_metadata.update(
@@ -2022,20 +2123,6 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             )
         ]
 
-    assert manager is not None
-    # Turn recording + trajectory assembly touch every token of the episode;
-    # keep them off the event loop since whole waves of trajectories finish
-    # (and hit this path) together.
-    await asyncio.to_thread(
-        _record_pending_turns,
-        manager,
-        session_id=session_id,
-        pending_turns=pending_turns,
-        credit_event=credit_event,
-        credit_step_index=credit_step_index,
-        parser_error_token_window=credit_assignment_parser_error_token_window,
-    )
-
     episode_dict = _rllm_episode_dict(
         base_sample=base_sample,
         task=task,
@@ -2052,6 +2139,37 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         steps=trajectory_steps,
         task_type=env.mode,
         discard_historical_thinking_enabled=discard_historical_thinking,
+    )
+    if inference_only:
+        episode_dict["metadata"]["segment_count"] = 1
+        return [
+            Sample(
+                index=base_sample.index,
+                group_index=base_sample.group_index,
+                rollout_id=base_sample.rollout_id if base_sample.rollout_id is not None else base_sample.index,
+                prompt=base_sample.prompt,
+                label=base_sample.label,
+                reward=final_reward,
+                response=final_response,
+                response_length=total_completion_tokens,
+                status=Sample.Status.TRUNCATED if last_finish_reason == "length" else Sample.Status.COMPLETED,
+                metadata={**common_metadata, "segment_count": 1, "rllm_episode": episode_dict},
+                session_id=session_id,
+            )
+        ]
+
+    assert manager is not None
+    # Turn recording + trajectory assembly touch every token of the episode;
+    # keep them off the event loop since whole waves of trajectories finish
+    # (and hit this path) together.
+    await asyncio.to_thread(
+        _record_pending_turns,
+        manager,
+        session_id=session_id,
+        pending_turns=pending_turns,
+        credit_event=credit_event,
+        credit_step_index=credit_step_index,
+        parser_error_token_window=credit_assignment_parser_error_token_window,
     )
     samples = await asyncio.to_thread(
         manager.get_trajectory,
@@ -2101,6 +2219,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 "fused_tool_call_turns": total_tool_call_turns,
                 "segment_count": 0,
                 "rllm_episode": episode_dict,
+                **mcp_metadata,
                 **last_info,
             },
         )
@@ -2322,6 +2441,16 @@ def _merge_tool_infos(infos: list[dict[str, Any]]) -> dict[str, Any]:
     if len(infos) > 1:
         merged["tools/batched_calls"] = len(infos)
     return merged
+
+
+def _accumulate_profile_tool_times(
+    infos: list[dict[str, Any]], retrieval_time: float, mcp_tool_time: float
+) -> tuple[float, float]:
+    for info in infos:
+        retrieval_time += float(info.get("tools/search_retrieve_elapsed_s", 0.0) or 0.0)
+        retrieval_time += float(info.get("tools/search_summary_elapsed_s", 0.0) or 0.0)
+        mcp_tool_time += float(info.get("tools/mcp_tool_elapsed_s", 0.0) or 0.0)
+    return retrieval_time, mcp_tool_time
 
 
 def _valid_tool_names(tools: list[dict]) -> set[str]:
@@ -2750,6 +2879,8 @@ async def _mark_pending_turn_error_span(
     output_len: int,
     attribution: str = "localized",
 ) -> None:
+    if item.get("skip_credit_assignment", False):
+        return
     item["credit_assignment_error_attribution"] = attribution
     if attribution == "unattributable":
         return
@@ -3737,7 +3868,10 @@ async def _call_sglang(
         "spaces_between_special_tokens": False,
         "no_stop_trim": True,
     }
-    top_p_replay_required = not evaluation and float(getattr(args, "rollout_top_p", 1.0)) != 1.0
+    inference_only = bool(getattr(args, "rollout_only_inference_fast_path", False))
+    top_p_replay_required = (
+        not evaluation and not inference_only and float(getattr(args, "rollout_top_p", 1.0)) != 1.0
+    )
     if top_p_replay_required:
         request_sampling_params["custom_params"] = {
             **dict(request_sampling_params.get("custom_params") or {}),
@@ -3761,7 +3895,7 @@ async def _call_sglang(
         "rid": rid,
         "input_ids": prompt_ids,
         "sampling_params": request_sampling_params,
-        "return_logprob": not evaluation,
+        "return_logprob": not evaluation and not inference_only,
     }
     if session_params is not None:
         payload["session_params"] = session_params
@@ -3821,6 +3955,20 @@ async def _call_sglang(
             "completion_tokens": int(completion_tokens) if completion_tokens is not None else None,
             "output_ids": output.get("output_ids") or [],
             "rid": meta.get("id") or output.get("rid") or rid,
+        }
+    if inference_only:
+        output_ids = output.get("output_ids") or []
+        if output.get("text") and not output_ids:
+            raise ValueError("SGLang returned generated text without output token ids")
+        completion_tokens = meta.get("completion_tokens")
+        return {
+            "text": output.get("text") or "",
+            "output_ids": output_ids,
+            "output_logprobs": [],
+            "finish_reason": finish_reason,
+            "weight_version": observed_weight_version,
+            "prompt_tokens": int(meta.get("prompt_tokens", effective_prompt_tokens)),
+            "completion_tokens": int(completion_tokens) if completion_tokens is not None else len(output_ids),
         }
     token_logprobs = meta.get("output_token_logprobs") or []
     # Unpacking per-token logprob/top-p payloads is CPU work proportional to

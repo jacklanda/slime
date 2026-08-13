@@ -22,6 +22,10 @@ class _RolloutManager:
     def __init__(self, events):
         self.check_weights = _RemoteMethod(lambda action: events.append(action))
         self.generate = _RemoteMethod(lambda rollout_id: events.append(f"generate:{rollout_id}"))
+        self.load = _RemoteMethod(lambda rollout_id: events.append(f"load:{rollout_id}"))
+        self.save = _RemoteMethod(lambda rollout_id: events.append(f"save:{rollout_id}"))
+        self.save_rllm_episodes = _RemoteMethod(lambda rollout_id: events.append(f"episodes:{rollout_id}"))
+        self.eval = _RemoteMethod(lambda rollout_id: events.append(f"eval:{rollout_id}"))
         self.dispose = _RemoteMethod(lambda: events.append("dispose"))
 
 
@@ -106,6 +110,45 @@ def test_release_train_recreates_actor_before_equality_recheck(monkeypatch):
     train_module.train(args)
 
     assert events[:6] == ["update_weights", "snapshot", "reset_tensors", "create", "update_weights", "compare"]
+
+
+def test_debug_rollout_only_never_creates_or_calls_training_models(monkeypatch):
+    train_module = importlib.import_module("train")
+    events = []
+    rollout_manager = _RolloutManager(events)
+    args = SimpleNamespace(
+        debug_rollout_only=True,
+        eval_interval=None,
+        num_rollout=2,
+        release_train=False,
+        rollout_global_dataset=True,
+        rollout_only_skip_episode_dump=True,
+        start_rollout_id=0,
+    )
+
+    monkeypatch.setattr(train_module, "configure_logger", lambda: None)
+    monkeypatch.setattr(train_module, "create_placement_groups", lambda args: {"rollout": object()})
+    monkeypatch.setattr(train_module, "create_rollout_manager", lambda args, pg: (rollout_manager, None))
+    monkeypatch.setattr(
+        train_module,
+        "create_training_models",
+        lambda *args, **kwargs: pytest.fail("rollout-only mode must not create trainer actors"),
+    )
+    monkeypatch.setattr(train_module, "init_tracking", lambda args: None)
+    monkeypatch.setattr(train_module, "finish_tracking", lambda args: events.append("finish_tracking"))
+    monkeypatch.setattr(train_module.ray, "get", lambda value: value)
+
+    train_module.train(args)
+
+    assert events == [
+        "load:-1",
+        "generate:0",
+        "save:0",
+        "generate:1",
+        "save:1",
+        "dispose",
+        "finish_tracking",
+    ]
 
 
 def test_mismatch_bucket_contributions_are_additive_per_dimension():

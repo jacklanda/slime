@@ -6,6 +6,7 @@ import os
 import random
 import time
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,7 @@ from slime.utils.metric_utils import (
     compute_rollout_step,
     compute_statistics,
     dict_add_prefix,
+    format_metrics_for_display,
 )
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.prompt_equal import (
@@ -83,6 +85,8 @@ _SGLANG_PREFILL_PERF_FIELDS = (
     ("prefill/transfer_total_mb", "pd_transfer_total_mb"),
     ("prefill/retry_count", "pd_prefill_retry_count"),
 )
+
+
 _SGLANG_DECODE_PERF_FIELDS = (
     ("decode/prealloc_duration", "pd_decode_prealloc_duration"),
     ("decode/bootstrap_duration", "pd_decode_bootstrap_duration"),
@@ -90,6 +94,39 @@ _SGLANG_DECODE_PERF_FIELDS = (
     ("decode/transfer_duration", "pd_decode_transfer_duration"),
     ("decode/forward_duration", "pd_decode_forward_duration"),
 )
+
+
+def _write_debug_rollout_data(args, data, rollout_id: int, evaluation: bool, path: Path) -> None:
+    if evaluation:
+        dump_samples = [sample for info in data.values() for sample in info["samples"]]
+    else:
+        dump_samples = data
+
+    task_groups: dict[int | str, dict[str, Any]] = {}
+    for position, sample in enumerate(dump_samples):
+        group_index = sample.group_index if sample.group_index is not None else f"ungrouped:{position}"
+        group = task_groups.setdefault(
+            group_index,
+            {"group_index": sample.group_index, "sample_positions": [], "trajectory_ids": []},
+        )
+        group["sample_positions"].append(position)
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        episode = metadata.get("rllm_episode") if isinstance(metadata.get("rllm_episode"), dict) else {}
+        trajectory_id = episode.get("id") or sample.session_id
+        if trajectory_id is not None and trajectory_id not in group["trajectory_ids"]:
+            group["trajectory_ids"].append(trajectory_id)
+
+    dump_data = {
+        "rollout_id": rollout_id,
+        "num_task_groups": len(task_groups),
+        "samples_per_task_group": int(getattr(args, "n_samples_per_prompt", 1)),
+        "num_samples": len(dump_samples),
+        "task_groups": list(task_groups.values()),
+        "samples": [sample.to_dict() for sample in dump_samples],
+    }
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(dump_data, temp_path)
+    temp_path.replace(path)
 
 
 def _tags_enable_generation(tags: list[str] | None) -> bool:
@@ -875,6 +912,12 @@ class RolloutManager:
         ).remote()
         self.rollout_id = -1
         self._pending_rllm_episode_samples: dict[int, list[Sample]] = {}
+        self._debug_dump_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="rollout-dump")
+            if getattr(self.args, "async_save_debug_rollout_data", False)
+            else None
+        )
+        self._debug_dump_future: Future | None = None
 
         self._health_monitors = []
         if not self.args.debug_train_only and self.args.use_fault_tolerance:
@@ -912,6 +955,18 @@ class RolloutManager:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
+        if (
+            getattr(self.args, "rollout_only_inference_fast_path", False)
+            and self.args.rollout_function_path
+            == "slime.rollout.fully_async_rollout.generate_rollout_fully_async"
+        ):
+            from slime.rollout.fully_async_rollout import shutdown_fully_async_rollout_worker
+
+            shutdown_fully_async_rollout_worker(cancel_inflight=True)
+        if getattr(self, "_debug_dump_future", None) is not None:
+            self._debug_dump_future.result()
+        if getattr(self, "_debug_dump_executor", None) is not None:
+            self._debug_dump_executor.shutdown(wait=True)
         for monitor in self._health_monitors:
             monitor.stop()
         logging_utils.finish_tracking(self.args)
@@ -964,11 +1019,15 @@ class RolloutManager:
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        if getattr(self.args, "rollout_only_inference_fast_path", False) and self.args.rollout_global_dataset:
+            # Commit the prompt cursor before the large shard is written in the
+            # background. A completed shard can then never point past resume state.
+            self.data_source.save(rollout_id)
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         rollout_metrics = _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
             # if debug rollout only, we don't convert samples to train data and directly return
-            return
+            return len(data)
         data = self._convert_samples_to_train_data(data)
         return self._split_train_data_by_dp(data, rollout_metrics=rollout_metrics)
 
@@ -1132,7 +1191,7 @@ class RolloutManager:
                 samples=[sample for dataset in data.values() for sample in dataset["samples"]],
                 mode="eval",
             )
-        else:
+        elif not getattr(self.args, "rollout_only_skip_episode_dump", False):
             self._pending_rllm_episode_samples[rollout_id] = data
 
         # TODO to be refactored (originally Buffer._set_data)
@@ -1140,18 +1199,17 @@ class RolloutManager:
             path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
             logger.info(f"Save debug rollout data to {path}")
             path.parent.mkdir(parents=True, exist_ok=True)
-
-            # TODO may improve the format
-            if evaluation:
-                dump_data = dict(
-                    samples=[sample.to_dict() for dataset_name, info in data.items() for sample in info["samples"]]
-                )
+            debug_dump_executor = getattr(self, "_debug_dump_executor", None)
+            if debug_dump_executor is None:
+                _write_debug_rollout_data(self.args, data, rollout_id, evaluation, path)
             else:
-                dump_data = dict(
-                    samples=[sample.to_dict() for sample in data],
+                # Bound memory to one pending batch while overlapping its CPU
+                # serialization and disk write with the next rollout batch.
+                if getattr(self, "_debug_dump_future", None) is not None:
+                    self._debug_dump_future.result()
+                self._debug_dump_future = debug_dump_executor.submit(
+                    _write_debug_rollout_data, self.args, data, rollout_id, evaluation, path
                 )
-
-            torch.save(dict(rollout_id=rollout_id, **dump_data), path)
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
         return _post_process_rewards(self.args, samples, self.custom_reward_post_process_func)
@@ -1740,6 +1798,8 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
             return
 
     log_dict = extra_metrics or {}
+    total_completed_groups = 0
+    total_valid_groups = 0
     for key in data.keys():
         rewards = data[key]["rewards"]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
@@ -1754,6 +1814,11 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
         group_size = _eval_dataset_group_size(args, key)
+        completed_groups, valid_groups = _reward_group_validity_counts(rewards, group_size)
+        total_completed_groups += completed_groups
+        total_valid_groups += valid_groups
+        log_dict[f"eval/{key}/dynamic_filter/valid_groups"] = valid_groups
+        log_dict[f"eval/{key}/dynamic_filter/roi"] = round(valid_groups / completed_groups, 2) if completed_groups else 0.0
         log_dict |= dict_add_prefix(
             compute_pass_at_k_and_pass_all(
                 flat_rewards=rewards,
@@ -1775,6 +1840,11 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
                 f"eval/{key}/",
             )
 
+    log_dict["eval/dynamic_filter/valid_groups"] = total_valid_groups
+    log_dict["eval/dynamic_filter/roi"] = (
+        round(total_valid_groups / total_completed_groups, 2) if total_completed_groups else 0.0
+    )
+
     logger.info(f"eval {rollout_id}: {_format_eval_log_dict_for_display(log_dict)}")
 
     step = compute_rollout_step(args, rollout_id)
@@ -1782,6 +1852,22 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
     logging_utils.log(args, log_dict, step_key="eval/step", rollout_id=rollout_id)
 
     return log_dict
+
+
+def _reward_group_validity_counts(rewards: list[float], group_size: int) -> tuple[int, int]:
+    if group_size <= 0:
+        return 0, 0
+    completed_groups = len(rewards) // group_size
+    valid_groups = 0
+    for offset in range(0, completed_groups * group_size, group_size):
+        try:
+            values = [float(value) for value in rewards[offset : offset + group_size]]
+        except (TypeError, ValueError):
+            continue
+        finite_values = [value for value in values if np.isfinite(value)]
+        if len(finite_values) > 1 and max(finite_values) - min(finite_values) > 1e-6:
+            valid_groups += 1
+    return completed_groups, valid_groups
 
 
 def _compute_mcp_atlas_coverage_metrics(rewards: list[float], samples: list[Sample] | None) -> dict[str, float]:
@@ -1812,10 +1898,11 @@ def _compute_mcp_atlas_coverage_metrics(rewards: list[float], samples: list[Samp
 
 
 def _format_eval_log_dict_for_display(log_dict: dict[str, Any]) -> dict[str, Any]:
-    return {
+    percentage_display = {
         key: round(float(value) * 100, 1) if _is_eval_percentage_metric(key, value) else value
         for key, value in log_dict.items()
     }
+    return format_metrics_for_display(percentage_display)
 
 
 def _is_eval_percentage_metric(key: str, value: Any) -> bool:
@@ -1947,7 +2034,7 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     log_dict = {**(rollout_extra_metrics or {})}
     log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), "rollout/")
     log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
-    logger.info(f"perf {rollout_id}: {log_dict}")
+    logger.info(f"perf {rollout_id}: {format_metrics_for_display(log_dict)}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step", rollout_id=rollout_id)

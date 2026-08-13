@@ -1499,6 +1499,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Subsample a portion of the debug rollout data for faster debugging.",
             )
             parser.add_argument(
+                "--rollout-only-inference-fast-path",
+                action="store_true",
+                default=False,
+                help=(
+                    "In --debug-rollout-only mode, emit lightweight inference samples without requesting "
+                    "rollout logprobs or building trainable trajectory segments."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-only-skip-episode-dump",
+                action="store_true",
+                default=False,
+                help=(
+                    "In --debug-rollout-only mode, skip the duplicate rLLM episode shard write. "
+                    "Use this when a custom offline pipeline consumes --save-debug-rollout-data instead."
+                ),
+            )
+            parser.add_argument(
+                "--async-save-debug-rollout-data",
+                action="store_true",
+                default=False,
+                help="Write debug rollout .pt files in a background thread so the next rollout can start immediately.",
+            )
+            parser.add_argument(
                 "--save-debug-train-data",
                 type=str,
                 default=None,
@@ -2211,6 +2235,13 @@ def slime_validate_args(args):
         if args.train_memory_margin_bytes > 0:
             logger.warning("Force train_memory_margin_bytes=0 since debug_rollout_only does not support it")
             args.train_memory_margin_bytes = 0
+
+    if (
+        getattr(args, "rollout_only_inference_fast_path", False)
+        or getattr(args, "rollout_only_skip_episode_dump", False)
+        or getattr(args, "async_save_debug_rollout_data", False)
+    ) and not args.debug_rollout_only:
+        raise ValueError("rollout-only fast-path options require --debug-rollout-only")
 
     assert not (args.debug_rollout_only and args.debug_train_only), (
         "debug_rollout_only and debug_train_only cannot be set at the same time, " "please set only one of them."
