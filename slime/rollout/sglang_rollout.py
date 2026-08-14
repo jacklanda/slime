@@ -24,7 +24,8 @@ from tqdm import tqdm
 from slime.backends.sglang_utils.server_control import abort_servers_until_idle
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput, MetricGatherer, call_dynamic_filter
-from slime.rollout.filter_hub.dynamic_sampling_filters import is_infra_failure
+from slime.rollout.failure_types import FailureClass
+from slime.rollout.filter_hub.dynamic_sampling_filters import group_failure_class
 from slime.rollout.task_family import (
     has_task_family_quota_candidates,
     parse_task_family_quotas,
@@ -638,7 +639,6 @@ async def generate_and_rm_group(args: Namespace, group: list[Sample], sampling_p
     # the fan-out case.
     state = GenerateState(args)
     group_started_at = time.time()
-    group_started_monotonic = time.monotonic()
 
     if state.aborted:
         return group
@@ -649,60 +649,87 @@ async def generate_and_rm_group(args: Namespace, group: list[Sample], sampling_p
             sample.session_id = str(uuid.uuid4())
 
     group_samples = group
-    tasks = []
-    for idx, sample in enumerate(group_samples):
+    slot_bases = copy.deepcopy(group_samples)
+    slot_sampling_params = []
+    for idx in range(len(group_samples)):
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
-            seed = state.group_sampling_seeds[idx]
-            current_sampling_params["sampling_seed"] = seed
-        tasks.append(asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation)))
+            current_sampling_params["sampling_seed"] = state.group_sampling_seeds[idx]
+        slot_sampling_params.append(current_sampling_params)
 
+    retry_times = max(0, int(getattr(args, "rollout_infra_retry_times", 2) or 0))
     group_timeout = _rollout_group_timeout(args, evaluation=evaluation)
-    async def collect_results(results: list[Any]) -> list[Sample] | list[list[Sample]]:
-        collected = []
-        for sample, result in zip(group_samples, results, strict=True):
-            if isinstance(result, BaseException):
-                logger.error(
-                    "Rollout task failed for sample index=%s; converting only this sample to a failed sample.",
-                    sample.index,
-                    exc_info=(type(result), result, result.__traceback__),
-                )
-                collected.append(_failed_task_sample(sample, result, evaluation=evaluation))
-            else:
-                collected.append(result)
-        return collected
+    slot_results: list[Any | None] = [None] * len(group_samples)
+    attempts = [0] * len(group_samples)
+    pending_slots = list(range(len(group_samples)))
 
-    gather_task = asyncio.ensure_future(asyncio.gather(*tasks, return_exceptions=True))
-    try:
-        results = await asyncio.wait_for(asyncio.shield(gather_task), timeout=group_timeout)
-        group = await collect_results(results)
-    except asyncio.TimeoutError:
-        unfinished = [task for task in tasks if not task.done()]
-        # The timeout callback can run after all tasks finished when the event
-        # loop was busy. Do not turn completed results into timeout failures.
-        if not unfinished:
-            group = await collect_results(gather_task.result())
-            logger.warning(
-                "Rollout group deadline callback arrived late after %.1fs; all %d sample tasks had completed.",
-                time.monotonic() - group_started_monotonic,
-                len(tasks),
+    while pending_slots:
+        tasks: dict[asyncio.Task, tuple[int, Sample]] = {}
+        for slot in pending_slots:
+            sample = group_samples[slot] if attempts[slot] == 0 else copy.deepcopy(slot_bases[slot])
+            if attempts[slot] > 0:
+                sample.session_id = str(uuid.uuid4())
+            sample.metadata = {
+                **dict(sample.metadata or {}),
+                "rollout_logical_slot": slot,
+                "infra_retry_attempt": attempts[slot],
+            }
+            task = asyncio.create_task(
+                generate_and_rm(args, sample, slot_sampling_params[slot].copy(), evaluation=evaluation)
             )
-        else:
+            tasks[task] = (slot, sample)
+
+        done, unfinished = await asyncio.wait(tasks, timeout=group_timeout)
+        if unfinished:
             logger.warning(
-                "Rollout group timed out after %.1fs (elapsed %.1fs); completed=%d unfinished=%d; cancelling unfinished tasks.",
+                "Rollout group attempt timed out after %.1fs; completed=%d unfinished=%d; cancelling unfinished slots.",
                 group_timeout,
-                time.monotonic() - group_started_monotonic,
-                len(tasks) - len(unfinished),
+                len(done),
                 len(unfinished),
             )
             for task in unfinished:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await asyncio.gather(gather_task, return_exceptions=True)
-            group = [
-                _task_result_or_timeout(task, sample, evaluation=evaluation)
-                for sample, task in zip(group_samples, tasks, strict=True)
-            ]
+            await asyncio.gather(*unfinished, return_exceptions=True)
+
+        for task, (slot, sample) in tasks.items():
+            if task in unfinished:
+                slot_results[slot] = _timeout_sample(sample, evaluation=evaluation)
+                continue
+            try:
+                slot_results[slot] = task.result()
+            except Exception as exc:
+                logger.error(
+                    "Rollout task failed for sample index=%s; converting only this slot to a failed sample.",
+                    sample.index,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                slot_results[slot] = _failed_task_sample(sample, exc, evaluation=evaluation)
+
+        retry_slots = []
+        for slot in pending_slots:
+            result = slot_results[slot]
+            if _result_failure_class(result) != FailureClass.RETRYABLE_INFRA or attempts[slot] >= retry_times:
+                continue
+            attempts[slot] += 1
+            retry_slots.append(slot)
+            logger.warning(
+                "Retrying rollout logical slot=%d sample_index=%s after retryable infra failure (%d/%d).",
+                slot,
+                slot_bases[slot].index,
+                attempts[slot],
+                retry_times,
+            )
+        pending_slots = retry_slots
+
+    group = slot_results
+    for slot, (result, attempt) in enumerate(zip(group, attempts, strict=True)):
+        for sample in _flatten_samples([result]):
+            sample.metadata = {
+                **dict(sample.metadata or {}),
+                "rollout_logical_slot": slot,
+                "infra_retry_attempt": attempt,
+                "infra_retry_count": attempt,
+            }
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
@@ -749,11 +776,23 @@ def _timeout_sample(sample: Sample, *, evaluation: bool) -> Sample:
     timed_out.status = Sample.Status.FAILED
     timed_out.reward = 0.0
     timed_out.rollout_log_probs = [0.0] * timed_out.response_length
+    stage = str((sample.metadata or {}).get("rollout_stage") or "unknown")
+    # A group deadline alone cannot prove that normal decode/tool work failed.
+    # Only stages entered by a dedicated transport/lease failure are replaceable.
+    failure_class = (
+        FailureClass.RETRYABLE_INFRA.value
+        if stage in {"mcp_lease", "sglang_transport"}
+        else FailureClass.PERMANENT_TASK.value
+        if stage == "verifier"
+        else FailureClass.POLICY.value
+    )
     timed_out.metadata = {
         **dict(sample.metadata or {}),
         "termination_reason": "timeout",
         "fused_termination": "timeout",
         "fused_error": "rollout_group_timeout",
+        "rollout_timeout_stage": stage,
+        "failure_class": failure_class,
         "evaluation": evaluation,
     }
     return timed_out
@@ -768,20 +807,32 @@ def _failed_task_sample(sample: Sample, exc: BaseException, *, evaluation: bool)
             "fused_error": "rollout_task_exception",
             "rollout_exception_type": type(exc).__name__,
             "rollout_exception": str(exc),
+            "failure_class": _exception_failure_class(exc).value,
         }
     )
     return failed
 
 
-def _task_result_or_timeout(task: asyncio.Task, sample: Sample, *, evaluation: bool):
-    if task.cancelled():
-        return _timeout_sample(sample, evaluation=evaluation)
-    try:
-        result = task.result()
-    except Exception as exc:
-        logger.exception("Rollout task failed for sample index=%s; converting it to a failed sample.", sample.index)
-        return _failed_task_sample(sample, exc, evaluation=evaluation)
-    return result
+def _exception_failure_class(exc: BaseException) -> FailureClass:
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code == 429 or (isinstance(status_code, int) and status_code >= 500):
+        return FailureClass.RETRYABLE_INFRA
+    if isinstance(exc, (ConnectionError, TimeoutError)) or type(exc).__name__ in {
+        "BrokenProcessPool",
+        "ConnectError",
+        "ConnectionClosed",
+        "MCPLeaseTimeout",
+        "PoolClosed",
+        "ReadError",
+        "RemoteProtocolError",
+        "TransportError",
+    }:
+        return FailureClass.RETRYABLE_INFRA
+    return FailureClass.PERMANENT_TASK
+
+
+def _result_failure_class(result: Any) -> FailureClass | None:
+    return group_failure_class([result])
 
 
 def _group_has_trainable_response(group: list[Sample] | list[list[Sample]]) -> bool:
@@ -876,16 +927,19 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
+        collector_timeout = _rollout_group_timeout(args, evaluation=False) * (
+            max(0, int(getattr(args, "rollout_infra_retry_times", 2) or 0)) + 1
+        ) + 1.0
         done, state.pendings = await asyncio.wait(
             state.pendings,
-            timeout=_rollout_group_timeout(args, evaluation=False),
+            timeout=collector_timeout,
             return_when=asyncio.FIRST_COMPLETED,
         )
         if not done and state.pendings:
             task = next(iter(state.pendings))
             logger.warning(
-                "Rollout collection timed out waiting for a finished group after %.1fs; cancelling one pending group.",
-                _rollout_group_timeout(args, evaluation=False),
+                "Rollout collector watchdog expired after %.1fs; cancelling one group that did not enforce its own deadline.",
+                collector_timeout,
             )
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -928,8 +982,9 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
             completed_groups += 1
             flat_group = _flatten_samples(group)
             metric_gatherer.on_completed_group(args, flat_group)
-            if any(is_infra_failure(sample) for sample in flat_group):
-                dynamic_filter_output = DynamicFilterOutput(keep=False, reason="infra_failure")
+            failure_class = group_failure_class(flat_group)
+            if failure_class is not None:
+                dynamic_filter_output = DynamicFilterOutput(keep=False, reason=failure_class.value)
             else:
                 dynamic_filter_output = call_dynamic_filter(
                     dynamic_filter,
@@ -938,7 +993,7 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
                     rollout_id=rollout_id,
                 )
             relax_filter = (
-                dynamic_filter_output.reason != "infra_failure"
+                failure_class is None
                 and filter_relax_after > 0
                 and completed_groups >= filter_relax_after
                 and _group_has_trainable_response(group)

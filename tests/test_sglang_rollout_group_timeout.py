@@ -69,6 +69,8 @@ def test_generate_group_timeout_returns_failed_tail_sample(monkeypatch):
     assert out[1].status == Sample.Status.FAILED
     assert out[1].reward == 0.0
     assert out[1].metadata["fused_error"] == "rollout_group_timeout"
+    assert out[1].metadata["rollout_timeout_stage"] == "unknown"
+    assert out[1].metadata["failure_class"] == "policy_failure"
 
 
 def test_sync_rollout_enforces_task_family_quota(monkeypatch):
@@ -161,6 +163,106 @@ def test_generate_group_isolates_sample_exception(monkeypatch, caplog):
     assert "bad Qwen3.5 trajectory" in caplog.text
 
 
+def test_generate_group_retries_only_failed_infra_slot(monkeypatch):
+    monkeypatch.setattr(sglang_rollout, "GenerateState", _FakeGenerateState)
+    calls = []
+
+    async def fail_once(_args, sample, sampling_params, evaluation=False):
+        calls.append((sample.index, sampling_params.get("sampling_seed"), sample.session_id))
+        if sample.index == 1 and sum(index == 1 for index, _seed, _session in calls) == 1:
+            sample.status = Sample.Status.FAILED
+            sample.reward = 0.0
+            sample.metadata["failure_class"] = "retryable_infra"
+            return sample
+        sample.status = Sample.Status.COMPLETED
+        sample.reward = 1.0
+        return sample
+
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", fail_once)
+    group = [Sample(index=0, prompt="a"), Sample(index=1, prompt="b")]
+    out = asyncio.run(
+        sglang_rollout.generate_and_rm_group(
+            Namespace(
+                sglang_enable_deterministic_inference=False,
+                group_rm=False,
+                rollout_infra_retry_times=1,
+            ),
+            group,
+            sampling_params={"sampling_seed": 71},
+        )
+    )
+
+    assert [index for index, _seed, _session in calls] == [0, 1, 1]
+    assert [seed for _index, seed, _session in calls] == [71, 71, 71]
+    assert calls[1][2] != calls[2][2]
+    assert all(sample.status == Sample.Status.COMPLETED for sample in out)
+    assert out[0].metadata["infra_retry_count"] == 0
+    assert out[1].metadata["infra_retry_count"] == 1
+
+
+def test_generate_group_does_not_retry_permanent_task_failure(monkeypatch):
+    monkeypatch.setattr(sglang_rollout, "GenerateState", _FakeGenerateState)
+    calls = 0
+
+    async def fail_permanently(_args, sample, _sampling_params, evaluation=False):
+        nonlocal calls
+        calls += 1
+        sample.status = Sample.Status.FAILED
+        sample.reward = 0.0
+        sample.metadata["failure_class"] = "permanent_task_failure"
+        return sample
+
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", fail_permanently)
+    out = asyncio.run(
+        sglang_rollout.generate_and_rm_group(
+            Namespace(
+                sglang_enable_deterministic_inference=False,
+                group_rm=False,
+                rollout_infra_retry_times=3,
+            ),
+            [Sample(index=0, prompt="a")],
+            sampling_params={},
+        )
+    )
+
+    assert calls == 1
+    assert out[0].metadata["failure_class"] == "permanent_task_failure"
+    assert out[0].metadata["infra_retry_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("stage", "failure_class"),
+    [
+        ("tool_operation", "policy_failure"),
+        ("llm_decode", "policy_failure"),
+        ("verifier", "permanent_task_failure"),
+    ],
+)
+def test_group_timeout_classifies_current_trajectory_stage(stage, failure_class):
+    sample = Sample(index=0, metadata={"rollout_stage": stage})
+
+    timed_out = sglang_rollout._timeout_sample(sample, evaluation=False)
+
+    assert timed_out.metadata["rollout_timeout_stage"] == stage
+    assert timed_out.metadata["failure_class"] == failure_class
+
+
+@pytest.mark.parametrize(
+    ("status_code", "failure_class"),
+    [
+        (429, "retryable_infra"),
+        (503, "retryable_infra"),
+        (400, "permanent_task_failure"),
+    ],
+)
+def test_http_failure_classification_distinguishes_transient_statuses(status_code, failure_class):
+    response = type("Response", (), {"status_code": status_code})()
+    exc = type("HTTPFailure", (RuntimeError,), {})(f"HTTP {status_code}")
+    exc.response = response
+
+    assert sglang_rollout._exception_failure_class(exc).value == failure_class
+
+
 class _FakeRolloutGenerateState:
     def __init__(self, args):
         self.args = args
@@ -236,6 +338,7 @@ def test_rollout_collection_excludes_timeout_group_from_training(monkeypatch):
                 rollout_sample_filter_path=None,
                 rollout_all_samples_process_path=None,
                 partial_rollout=False,
+                rollout_infra_retry_times=0,
             ),
             rollout_id=0,
             data_source=data_source,
@@ -247,7 +350,7 @@ def test_rollout_collection_excludes_timeout_group_from_training(monkeypatch):
     assert len(group) == 2
     assert [sample.index for sample in group] == [2, 3]
     assert all(sample.status == Sample.Status.COMPLETED for sample in group)
-    assert out.metrics["rollout/dynamic_filter/drop_infra_failure"] == 1
+    assert out.metrics["rollout/dynamic_filter/drop_policy_failure"] == 1
 
 
 def test_sync_rollout_relaxes_dynamic_filter_after_configured_groups(monkeypatch):

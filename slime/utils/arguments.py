@@ -495,6 +495,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-infra-retry-times",
+                type=int,
+                default=2,
+                help="Number of replacements for each logical rollout slot after retryable infrastructure failures.",
+            )
+            parser.add_argument(
                 "--rollout-task-family-quotas",
                 type=str,
                 default=None,

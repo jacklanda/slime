@@ -10,7 +10,8 @@ import slime.rollout.fully_async_rollout as fully_async
 from slime.rollout.sglang_rollout import generate_and_rm_group
 from slime.ray.rollout import RolloutManager
 from slime.rollout.base_types import RolloutFnTrainOutput
-from slime.rollout.filter_hub.dynamic_sampling_filters import is_infra_failure
+from slime.rollout.failure_types import FailureClass
+from slime.rollout.filter_hub.dynamic_sampling_filters import is_infra_failure, sample_failure_class
 from slime.utils.types import Sample
 
 
@@ -277,7 +278,7 @@ class FakeWorker:
         self.paused = True
 
 
-def test_fully_async_collects_valid_groups_and_reports_candidate_shortfall(monkeypatch):
+def test_fully_async_ignores_legacy_valid_group_target_and_collects_fixed_batch(monkeypatch):
     invalid = [[_sample(i * 2, 0.0), _sample(i * 2 + 1, 0.0)] for i in range(3)]
     valid = [[_sample(10, 0.0), _sample(11, 1.0)]]
     worker = FakeWorker([*invalid, *valid])
@@ -288,20 +289,20 @@ def test_fully_async_collects_valid_groups_and_reports_candidate_shortfall(monke
     args = SimpleNamespace(
         rollout_global_dataset=True,
         rollout_only_inference_fast_path=True,
-        rollout_batch_size=64,
+        rollout_batch_size=4,
         dynamic_sampling_filter_path=None,
         reward_key=None,
     )
 
     output = asyncio.run(fully_async._generate_rollout_async(args, rollout_id=0, data_buffer=None))
 
-    assert output.samples == valid
+    assert output.samples == [*invalid, *valid]
     assert output.metrics["rollout/dynamic_filter/valid_groups"] == 1
-    assert output.metrics["rollout/dynamic_filter/valid_group_shortfall"] == 1
-    assert output.metrics["rollout/dynamic_filter/drop_zero_reward_variance"] == 3
+    assert "rollout/dynamic_filter/valid_group_shortfall" not in output.metrics
+    assert output.metrics["rollout/dynamic_filter/kept_groups"] == 4
 
 
-def test_valid_group_collection_requeues_batch_overflow(monkeypatch):
+def test_fixed_batch_collection_requeues_batch_overflow(monkeypatch):
     first = [_sample(0, 0.0), _sample(1, 1.0)]
     second = [_sample(2, 0.0), _sample(3, 1.0)]
     worker = FakeWorker([first, second])
@@ -312,7 +313,7 @@ def test_valid_group_collection_requeues_batch_overflow(monkeypatch):
     args = SimpleNamespace(
         rollout_global_dataset=True,
         rollout_only_inference_fast_path=True,
-        rollout_batch_size=64,
+        rollout_batch_size=1,
         dynamic_sampling_filter_path=None,
         reward_key=None,
     )
@@ -504,7 +505,7 @@ def test_fully_async_dynamic_filter_keeps_nonzero_variance_groups(monkeypatch):
 def test_fully_async_dynamic_filter_excludes_infra_failure_from_zero_reward(monkeypatch):
     failed = _sample(0, 0.0)
     failed.status = Sample.Status.FAILED
-    failed.metadata.update({"fused_error": "rollout_group_timeout"})
+    failed.metadata.update({"fused_error": "rollout_group_timeout", "failure_class": "retryable_infra"})
     groups = [
         [failed, _sample(1, 0.0)],
         [_sample(2, 0.0), _sample(3, 1.0)],
@@ -523,15 +524,25 @@ def test_fully_async_dynamic_filter_excludes_infra_failure_from_zero_reward(monk
     output = asyncio.run(fully_async._generate_rollout_async(args, rollout_id=0, data_buffer=None))
 
     assert output.samples == [groups[1]]
-    assert output.metrics["rollout/dynamic_filter/drop_infra_failure"] == 1
+    assert output.metrics["rollout/dynamic_filter/drop_retryable_infra"] == 1
 
 
-def test_verifier_exception_is_classified_as_infra_failure():
+def test_verifier_exception_is_classified_as_permanent_task_failure():
     sample = _sample(0, 0.0)
     sample.status = Sample.Status.COMPLETED
     sample.metadata["fused_reward_debug"] = {"reward": 0.0, "verifier_error": "RuntimeError: unavailable"}
 
-    assert is_infra_failure(sample) is True
+    assert is_infra_failure(sample) is False
+    assert sample_failure_class(sample) == FailureClass.PERMANENT_TASK
+
+
+def test_failed_status_without_explicit_infra_is_policy_failure():
+    sample = _sample(0, 0.0)
+    sample.status = Sample.Status.FAILED
+    sample.metadata["fused_error"] = "empty_trajectory"
+
+    assert is_infra_failure(sample) is False
+    assert sample_failure_class(sample) == FailureClass.POLICY
 
 
 def test_fully_async_omits_candidate_and_selected_fused_distributions(monkeypatch):

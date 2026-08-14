@@ -22,10 +22,9 @@ Core rejection-sampling options:
   --reward-threshold X               Minimum reward accepted. Default: 0.6
   --min-steps N                      Minimum fused trajectory steps accepted. Default: 2
   --certainty-filter BOOL            Drop groups with pass_rate 0 or 1. Default: False
-  --valid-groups-per-shard N         Finish a shard after collecting N non-zero-variance groups.
-                                     Default: 8
-  --max-candidate-groups-per-shard N Maximum prompt groups attempted to reach the valid target.
-                                     Default: 16x valid-groups-per-shard
+  --valid-groups-per-shard N         Deprecated compatibility option; ignored.
+  --max-candidate-groups-per-shard N Deprecated compatibility option; ignored.
+                                     Shards always contain rollout-batch-size groups.
 
 Data/output options:
   --train-files LIST                 Comma-separated parquet files. Defaults to the final Search and MCP train sets.
@@ -130,18 +129,18 @@ else
    PROMPT_DATA="${OUTPUT_DIR}/fused_train.parquet"
 fi
 
-MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
-#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
+#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
+MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-14B}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-14B}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
 
 SAMPLE_N="${SAMPLE_N:-32}"
-MAX_TRAJECTORY_PER_PROBLEM="${MAX_TRAJECTORY_PER_PROBLEM:-1}"
+MAX_TRAJECTORY_PER_PROBLEM="${MAX_TRAJECTORY_PER_PROBLEM:-32}"
 MIN_SAMPLE_TRIAL="${MIN_SAMPLE_TRIAL:-1}"
-REWARD_THRESHOLD="${REWARD_THRESHOLD:-0.8}"
+REWARD_THRESHOLD="${REWARD_THRESHOLD:-1.0}"
 MIN_STEPS="${MIN_STEPS:-2}"
 CERTAINTY_FILTER="${CERTAINTY_FILTER:-False}"
 VALID_GROUPS_PER_SHARD="${VALID_GROUPS_PER_SHARD:-}"
@@ -172,26 +171,26 @@ MCP_MAX_STEPS="${MCP_MAX_STEPS:-64}"
 MCP_MAX_TOOL_CALLS_PER_TURN="${MCP_MAX_TOOL_CALLS_PER_TURN:-1}"
 WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-64}"
 CLI_MAX_STEPS="${CLI_MAX_STEPS:-64}"
-TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-3600}"
+TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-300}"
 PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-8192}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
-ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-16}"
+ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS:-64}"
 
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-15472}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-24576}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-2048}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-4096}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-}"
 NUM_EPOCH="${NUM_EPOCH:-1}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-1.0}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-${GPU_MEMORY_UTILIZATION:-0.9}}"
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-64}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-128}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-128}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
 ROUTER_POLICY="${ROUTER_POLICY:-cache_aware}"
 FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY:-true}"
@@ -330,8 +329,6 @@ FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY:-
 # launchers do not use this script and retain their own defaults.
 FULLY_ASYNC_MAX_GROUP_CONCURRENCY="${FULLY_ASYNC_MAX_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 8))}"
 FULLY_ASYNC_CONCURRENCY_STEP="${FULLY_ASYNC_CONCURRENCY_STEP:-${ROLLOUT_ENGINE_COUNT}}"
-VALID_GROUPS_PER_SHARD="${VALID_GROUPS_PER_SHARD:-128}"
-MAX_CANDIDATE_GROUPS_PER_SHARD="${MAX_CANDIDATE_GROUPS_PER_SHARD:-$((VALID_GROUPS_PER_SHARD * 16))}"
 if [ "${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY}" -lt 1 ] \
    || [ "${FULLY_ASYNC_MAX_GROUP_CONCURRENCY}" -lt "${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY}" ] \
    || [ "${FULLY_ASYNC_CONCURRENCY_STEP}" -lt 1 ]; then
@@ -609,8 +606,6 @@ export SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS="${SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS:-t
 export SLIME_FULLY_ASYNC_NO_DATASET_WRAP="${SLIME_FULLY_ASYNC_NO_DATASET_WRAP:-true}"
 export SLIME_FULLY_ASYNC_CROSS_SHARD_PREFETCH="${SLIME_FULLY_ASYNC_CROSS_SHARD_PREFETCH:-true}"
 export SLIME_FULLY_ASYNC_PREFETCH_GROUPS="${SLIME_FULLY_ASYNC_PREFETCH_GROUPS:-${ROLLOUT_BATCH_SIZE}}"
-export SLIME_FULLY_ASYNC_VALID_GROUPS_PER_SHARD="${VALID_GROUPS_PER_SHARD}"
-export SLIME_FULLY_ASYNC_MAX_CANDIDATE_GROUPS_PER_SHARD="${MAX_CANDIDATE_GROUPS_PER_SHARD}"
 export SLIME_FUSED_PROFILE_DIR="${SLIME_FUSED_PROFILE_DIR:-${OUTPUT_DIR}/trajectory_profiles}"
 export CREDIT_ASSIGNMENT_ENABLE="${CREDIT_ASSIGNMENT_ENABLE:-True}"
 export CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR="${CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR:-True}"
@@ -772,6 +767,101 @@ echo "Per-batch trajectory shards: ${EPISODE_LOG_DIR}/global_steps_{rollout_id}.
 echo "Checkpoint: ${OFFLINE_RS_CHECKPOINT_PATH}"
 echo "Results mode: ${RESOLVED_RESULTS_MODE}"
 
+EPISODE_WATCHER_PID=""
+stop_episode_watcher() {
+   if [ -n "${EPISODE_WATCHER_PID}" ] && kill -0 "${EPISODE_WATCHER_PID}" 2>/dev/null; then
+      kill "${EPISODE_WATCHER_PID}" 2>/dev/null || true
+      wait "${EPISODE_WATCHER_PID}" 2>/dev/null || true
+   fi
+   EPISODE_WATCHER_PID=""
+}
+
+start_episode_watcher() {
+   python3 -u - "${DUMP_DETAILS}/rollout_data" "${EPISODE_LOG_DIR}" \
+      "${RESUME_START_ROLLOUT_ID}" "${NUM_ROLLOUT}" <<'PY' &
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+import torch
+from slime.utils.episode_dump import _episode_to_batch_dict
+
+rollout_dir = Path(sys.argv[1])
+episodes_dir = Path(sys.argv[2])
+next_rollout_id = int(sys.argv[3])
+num_rollout = int(sys.argv[4])
+running = True
+
+
+def stop(_signum, _frame):
+    global running
+    running = False
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+episodes_dir.mkdir(parents=True, exist_ok=True)
+
+while running and next_rollout_id < num_rollout:
+    rollout_path = rollout_dir / f"{next_rollout_id}.pt"
+    if not rollout_path.is_file():
+        time.sleep(0.5)
+        continue
+    try:
+        payload = torch.load(rollout_path, map_location="cpu", weights_only=False)
+    except (EOFError, OSError, RuntimeError):
+        time.sleep(0.5)
+        continue
+    trajectories = []
+    seen = set()
+    for sample in payload.get("samples", []):
+        metadata = sample.get("metadata") if isinstance(sample, dict) else getattr(sample, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        episode = metadata.get("rllm_episode")
+        if not isinstance(episode, dict):
+            continue
+        episode_id = str(episode.get("id") or f"sample:{len(trajectories)}")
+        if episode_id in seen:
+            continue
+        seen.add(episode_id)
+        trajectories.append(
+            _episode_to_batch_dict(
+                episode,
+                next_rollout_id,
+                "train",
+                0,
+                args=None,
+                sample_metadata=metadata,
+                eval_reward=None,
+            )
+        )
+    destination = episodes_dir / f"global_steps_{next_rollout_id}.json"
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(
+            {
+                "training_step": next_rollout_id,
+                "epoch": 0,
+                "mode": "train",
+                "num_episodes": len(trajectories),
+                "trajectories": trajectories,
+            },
+            stream,
+            ensure_ascii=False,
+            indent=4,
+            default=str,
+        )
+        stream.write("\n")
+    os.replace(temporary, destination)
+    print(f"Persisted fixed-batch episode shard: {destination} ({len(trajectories)} episodes)", flush=True)
+    next_rollout_id += 1
+PY
+   EPISODE_WATCHER_PID=$!
+}
+
 if [ "${SKIP_RAY_ROLLOUT}" != "1" ]; then
    RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
    if ray job list --address="${RAY_DASHBOARD_ADDRESS}" >/dev/null 2>&1; then
@@ -792,6 +882,11 @@ if [ "${SKIP_RAY_ROLLOUT}" != "1" ]; then
 
    echo "Ray submission id: ${RAY_SUBMISSION_ID}"
 
+   if [ "${RAY_JOB_WAIT}" = "1" ]; then
+      start_episode_watcher
+      trap stop_episode_watcher EXIT INT TERM
+   fi
+
    ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
       --submission-id="${RAY_SUBMISSION_ID}" \
       --runtime-env-json="${RUNTIME_ENV_JSON}" \
@@ -802,6 +897,9 @@ if [ "${SKIP_RAY_ROLLOUT}" != "1" ]; then
       "${CKPT_ARGS[@]}" \
       "${ROLLOUT_ARGS[@]}" \
       "${SGLANG_ARGS[@]}"
+
+   stop_episode_watcher
+   trap - EXIT INT TERM
 
    if [ "${RAY_JOB_WAIT}" != "1" ]; then
       echo "Ray job submitted without waiting. Run the script again with --ray-job-wait 1 to checkpoint and merge after it finishes."

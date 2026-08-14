@@ -25,6 +25,21 @@ def call_dynamic_filter(fn, *args, **kwargs):
 def is_valid_reward_group(args, samples) -> bool:
     rewards = []
     for sample in samples:
+        status = getattr(sample, "status", None)
+        if getattr(status, "value", status) == "failed":
+            return False
+        metadata = sample.metadata if isinstance(getattr(sample, "metadata", None), dict) else {}
+        if metadata.get("failure_class") or metadata.get("infra_failure") or metadata.get("fused_infra_failure"):
+            return False
+        for key in ("fused_reward_debug", "reward_debug"):
+            debug = metadata.get(key)
+            if isinstance(debug, dict) and (
+                debug.get("failure_class")
+                or debug.get("infra_failure")
+                or debug.get("tools_load_error")
+                or debug.get("verifier_error")
+            ):
+                return False
         try:
             reward = float(sample.get_reward_value(args))
         except (AttributeError, KeyError, TypeError, ValueError):

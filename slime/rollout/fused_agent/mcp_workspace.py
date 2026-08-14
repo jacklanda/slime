@@ -1,19 +1,21 @@
-"""Per-trajectory filesystem workspaces for local MCP tasks.
+"""Filesystem workspaces for local MCP tasks.
 
 MCP task assets are immutable inputs, but many generated tools use SQLite,
-JSON, or other files relative to the task sandbox.  A workspace is copied
-before a trajectory starts and removed after it finishes, so concurrent
-trajectories never share mutable task state.
+JSON, or other files relative to the task sandbox. By default, a workspace is
+copied for each trajectory. Task-scoped workspaces can be enabled explicitly
+when trajectories should reuse the same mutable task state.
 """
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import os
 import shutil
 import subprocess
 import threading
 import uuid
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,8 @@ _COPY_WORKERS_DEFAULT = 32
 _copy_semaphore = threading.BoundedSemaphore(
     max(1, int(os.environ.get("SLIME_MCP_ENV_COPY_CONCURRENCY", str(_COPY_WORKERS_DEFAULT))))
 )
+_task_workspace_lock = threading.Lock()
+_task_workspaces: dict[tuple[int, Path, Path], Future[tuple[Path, str]]] = {}
 
 
 def _resolve_input_path(value: Any) -> Path | None:
@@ -91,12 +95,13 @@ def _copy_tree(source: Path, destination: Path) -> None:
 
 @dataclass
 class MCPWorkspace:
-    """A single trajectory's copied MCP sandbox."""
+    """A handle to a copied MCP sandbox."""
 
     path: Path
     source_root: Path
     task_id: str
     root: Path
+    task_scoped: bool = False
     _closed: bool = False
 
     @property
@@ -128,13 +133,72 @@ class MCPWorkspace:
         if self._closed:
             return
         self._closed = True
-        if self.root not in self.path.parents:
-            raise RuntimeError(f"Refusing to remove MCP workspace outside configured root: {self.path}")
-        shutil.rmtree(self.path, ignore_errors=True)
+        if not self.task_scoped:
+            _remove_workspace(self.path, self.root)
+
+
+def _remove_workspace(path: Path, root: Path) -> None:
+    if root not in path.parents:
+        raise RuntimeError(f"Refusing to remove MCP workspace outside configured root: {path}")
+    shutil.rmtree(path, ignore_errors=True)
+    try:
+        path.parent.rmdir()
+    except OSError:
+        pass
+
+
+def _prepare_task_workspace(source_root: Path, configured_root: Path, task_root: Path) -> tuple[Path, str]:
+    key = (os.getpid(), configured_root, source_root)
+    with _task_workspace_lock:
+        future = _task_workspaces.get(key)
+        if future is None:
+            future = Future()
+            _task_workspaces[key] = future
+            create = True
+        else:
+            create = False
+
+    if not create:
+        return future.result()
+
+    task_id = f"shared-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    destination = task_root / task_id
+    staging = task_root / f".tmp-{task_id}"
+    try:
+        _copy_tree(source_root, staging)
+        staging.replace(destination)
+        result = (destination, task_id)
+        future.set_result(result)
+        return result
+    except BaseException as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        future.set_exception(exc)
+        with _task_workspace_lock:
+            if _task_workspaces.get(key) is future:
+                del _task_workspaces[key]
+        raise
+
+
+def cleanup_task_workspaces() -> None:
+    """Remove task-scoped workspaces owned by this process."""
+
+    pid = os.getpid()
+    with _task_workspace_lock:
+        owned = [(key, future) for key, future in _task_workspaces.items() if key[0] == pid]
+        for key, _future in owned:
+            del _task_workspaces[key]
+
+    for (_owner_pid, configured_root, _source_root), future in owned:
+        if not future.done() or future.cancelled():
+            continue
         try:
-            self.path.parent.rmdir()
-        except OSError:
-            pass
+            path, _task_id = future.result()
+        except BaseException:
+            continue
+        _remove_workspace(path, configured_root)
+
+
+atexit.register(cleanup_task_workspaces)
 
 
 def prepare_mcp_workspace(
@@ -142,7 +206,7 @@ def prepare_mcp_workspace(
     session_id: str,
     root: str | os.PathLike[str] | None = None,
 ) -> tuple[dict[str, Any], MCPWorkspace]:
-    """Copy one local MCP task into a unique trajectory directory."""
+    """Prepare a trajectory- or task-scoped local MCP workspace."""
 
     if not is_local_mcp_task(task):
         raise ValueError("prepare_mcp_workspace called for a non-local MCP task")
@@ -155,6 +219,14 @@ def prepare_mcp_workspace(
     task_key = hashlib.sha256(str(source_root).encode("utf-8")).hexdigest()[:20]
     task_root = configured_root / f"task-{task_key}"
     task_root.mkdir(parents=True, exist_ok=True)
+    scope = os.environ.get("SLIME_MCP_WORKSPACE_SCOPE", "trajectory").strip().lower()
+    if scope not in {"trajectory", "task"}:
+        raise ValueError(f"SLIME_MCP_WORKSPACE_SCOPE must be 'trajectory' or 'task', got {scope!r}")
+    if scope == "task":
+        destination, task_id = _prepare_task_workspace(source_root, configured_root, task_root)
+        workspace = MCPWorkspace(destination, source_root, task_id, configured_root, task_scoped=True)
+        return workspace.apply(task), workspace
+
     task_id = f"{session_id}-{uuid.uuid4().hex[:12]}"
     destination = task_root / task_id
     staging = task_root / f".tmp-{task_id}"

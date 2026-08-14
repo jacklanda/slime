@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import types
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Union, get_args, get_origin
@@ -460,6 +461,7 @@ class AtlasMCPToolset:
         self._dirty_servers: set[str] = set()
         self.load_error = ""
         self.load_warning = ""
+        self.load_failure_class = ""
         self.last_infra_failure = ""
         try:
             all_tools = _load_atlas_tool_schemas(self.base_url)
@@ -486,6 +488,18 @@ class AtlasMCPToolset:
                 self.load_error = "MCP-Atlas task does not define ENABLED_TOOLS"
         except Exception as exc:
             self.load_error = f"{type(exc).__name__}: {exc}"
+            status_code = getattr(exc, "code", None)
+            self.load_failure_class = (
+                "retryable_infra"
+                if isinstance(exc, (ConnectionError, TimeoutError))
+                or (isinstance(exc, urllib.error.URLError) and status_code is None)
+                or status_code == 429
+                or (isinstance(status_code, int) and status_code >= 500)
+                or type(exc).__name__ in {"ClientConnectionError", "ConnectError", "TransportError"}
+                else "permanent_task_failure"
+            )
+            if self.load_failure_class == "retryable_infra":
+                self.last_infra_failure = f"atlas_load_{type(exc).__name__}"
 
     def schemas(self) -> list[dict[str, Any]]:
         schemas = []
@@ -578,6 +592,8 @@ class LocalMCPToolset:
         self.load_error = ""
         self.load_warning = ""
         self.last_call_info: dict[str, Any] = {}
+        self.last_infra_failure = ""
+        self.load_failure_class = ""
         self._isolated_schemas: list[dict[str, Any]] | None = None
         if self.tools_py:
             try:
@@ -609,6 +625,13 @@ class LocalMCPToolset:
                     self._build_tool_aliases()
             except Exception as e:
                 self.load_error = f"{type(e).__name__}: {e}"
+                self.load_failure_class = (
+                    "retryable_infra"
+                    if type(e).__name__ in {"MCPLeaseTimeout", "BrokenProcessPool", "TimeoutError"}
+                    else "permanent_task_failure"
+                )
+                if self.load_failure_class == "retryable_infra":
+                    self.last_infra_failure = f"local_mcp_describe_{type(e).__name__}"
 
     def _isolated_tool_proxy(self, name: str) -> Callable[..., Any]:
         def call(*args, **kwargs):
@@ -883,6 +906,7 @@ class LocalMCPToolset:
         return json.dumps(result, ensure_ascii=False, default=str)
 
     def call_raw(self, name: str, arguments: dict[str, Any], *, relax_empty: bool = True) -> Any:
+        self.last_infra_failure = ""
         self.last_call_info = {"empty_result": False, "fallback_attempted": False, "fallback_used": False}
         name = self.tool_aliases.get(name, name)
         fn = self.tools.get(name)
@@ -904,7 +928,15 @@ class LocalMCPToolset:
                 self.last_call_info = output["call_info"]
                 return output["result"]
             except Exception as e:
-                self.last_call_info["process_isolation_error"] = f"{type(e).__name__}: {e}"
+                self.last_infra_failure = f"local_mcp_{type(e).__name__}"
+                self.last_call_info.update(
+                    {
+                        "process_isolation_error": f"{type(e).__name__}: {e}",
+                        "infra_failure": True,
+                        "infra_failure_reason": self.last_infra_failure,
+                        "failure_class": "retryable_infra",
+                    }
+                )
                 return f"Error calling {name}: isolated worker {type(e).__name__}: {e}"
         try:
             kwargs = _coerce_kwargs(fn, arguments)
@@ -923,13 +955,8 @@ class LocalMCPToolset:
             return f"Error calling {name}: {type(e).__name__}: {e}"
 
     def close(self) -> None:
-        if (
-            os.environ.get("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "true").lower() in {"1", "true", "yes", "on"}
-            and os.environ.get("SLIME_LOCAL_MCP_PROCESS_WORKER") != "1"
-        ):
-            from .mcp_process_pool import get_local_mcp_process_pool
-
-            get_local_mcp_process_pool().release(self.task)
+        # Isolated describe/call/verify operations own their process leases.
+        return None
 
 
 class _VerifierResultDict(dict):
@@ -1124,7 +1151,7 @@ class FusedEnvironment:
         self.reward_debug: dict[str, Any] = {}
         if enable_tools and self.mode == "mcp":
             self.mcp_tools = AtlasMCPToolset(self.task) if _is_atlas_mcp_task(self.task) else LocalMCPToolset(self.task)
-            if self.mcp_tools.load_error:
+            if self.mcp_tools.load_error and getattr(self.mcp_tools, "load_failure_class", "") == "retryable_infra":
                 self.infra_failure_reasons.append("mcp_tools_load_error")
         else:
             self.mcp_tools = None
@@ -1445,7 +1472,12 @@ class FusedEnvironment:
         if verifier_reward is not None:
             return verifier_reward
         if self.mode == "mcp" and self.mcp_tools is not None and self.mcp_tools.load_error:
-            self.reward_debug = {"type": self.mode, "reward": 0.0, "tools_load_error": self.mcp_tools.load_error}
+            self.reward_debug = {
+                "type": self.mode,
+                "reward": 0.0,
+                "tools_load_error": self.mcp_tools.load_error,
+                "failure_class": getattr(self.mcp_tools, "load_failure_class", "") or "permanent_task_failure",
+            }
             return 0.0
         if self.mode in {"cli", "et"} and self.docker_env is not None:
             reward = self.docker_env.compute_final_reward()
@@ -1585,6 +1617,11 @@ class FusedEnvironment:
                 "type": self.mode,
                 "reward": 0.0,
                 "verifier_error": f"{type(e).__name__}: {e}",
+                "failure_class": (
+                    "retryable_infra"
+                    if type(e).__name__ in {"MCPLeaseTimeout", "BrokenProcessPool", "TimeoutError"}
+                    else "permanent_task_failure"
+                ),
                 "tool_calls": self.tool_calls,
             }
             return 0.0

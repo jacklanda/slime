@@ -3,6 +3,7 @@ import os
 import torch
 
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput
+from slime.rollout.failure_types import FailureClass
 from slime.utils.credit_assignment import CreditAssignmentConfig, excluded_from_reward_baseline
 from slime.utils.prompt_equal import has_multi_segment_trajectories, trajectory_level_samples, uses_prompt_equal_loss
 from slime.utils.types import Sample
@@ -11,49 +12,92 @@ __all__ = [
     "check_reward_nonzero_std",
     "check_reward_nonzero_std_and_fused_steps",
     "is_infra_failure",
+    "group_failure_class",
+    "sample_failure_class",
 ]
 
 
-_INFRA_TERMINATIONS = {
-    "error",
-    "env_init_error",
+_RETRYABLE_INFRA_TERMINATIONS = {
     "infra_failure",
-    "rollout_group_timeout",
+    "mcp_lease_timeout",
+    "mcp_process_failure",
+    "sglang_transport_error",
+}
+
+_PERMANENT_TASK_TERMINATIONS = {
+    "env_init_error",
+    "error",
     "rollout_task_exception",
-    "timeout",
 }
 
 
+def sample_failure_class(sample: Sample) -> FailureClass | None:
+    """Classify a failed trajectory without treating every FAILED status as infra."""
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    explicit = metadata.get("failure_class")
+    if explicit:
+        if isinstance(explicit, FailureClass):
+            return explicit
+        try:
+            return FailureClass(str(explicit))
+        except ValueError:
+            pass
+
+    for key in ("fused_reward_debug", "reward_debug"):
+        reward_debug = metadata.get(key)
+        if not isinstance(reward_debug, dict):
+            continue
+        debug_class = reward_debug.get("failure_class")
+        if debug_class:
+            try:
+                return FailureClass(str(debug_class))
+            except ValueError:
+                pass
+        if reward_debug.get("tools_load_error") or reward_debug.get("verifier_error"):
+            return FailureClass.PERMANENT_TASK
+        if reward_debug.get("infra_failure"):
+            return FailureClass.RETRYABLE_INFRA
+
+    if metadata.get("infra_failure") or metadata.get("fused_infra_failure"):
+        return FailureClass.RETRYABLE_INFRA
+    termination = str(metadata.get("fused_termination") or metadata.get("termination_reason") or "").lower()
+    if termination in _RETRYABLE_INFRA_TERMINATIONS:
+        return FailureClass.RETRYABLE_INFRA
+    if termination in _PERMANENT_TASK_TERMINATIONS:
+        return FailureClass.PERMANENT_TASK
+
+    status = getattr(sample, "status", None)
+    if status == Sample.Status.FAILED or getattr(status, "value", status) == Sample.Status.FAILED.value:
+        return FailureClass.POLICY
+    return None
+
+
+def group_failure_class(samples) -> FailureClass | None:
+    classes = {sample_failure_class(sample) for sample in _iter_samples(samples)}
+    classes.discard(None)
+    if FailureClass.PERMANENT_TASK in classes:
+        return FailureClass.PERMANENT_TASK
+    if FailureClass.POLICY in classes:
+        return FailureClass.POLICY
+    if FailureClass.RETRYABLE_INFRA in classes:
+        return FailureClass.RETRYABLE_INFRA
+    return None
+
+
 def is_infra_failure(sample: Sample) -> bool:
-    """Return whether a sample failed outside the policy's task decision.
+    """Return whether a sample has an explicitly retryable infrastructure failure.
 
     Infrastructure failures must not be treated as ordinary zero-reward model
     outcomes: doing so creates artificial negative advantages and can collapse
     a prompt group's reward variance.
     """
-    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-    status = getattr(sample, "status", None)
-    if status == Sample.Status.FAILED or getattr(status, "value", status) == Sample.Status.FAILED.value:
-        return True
-    if metadata.get("infra_failure") or metadata.get("fused_infra_failure"):
-        return True
-    termination = str(metadata.get("fused_termination") or metadata.get("termination_reason") or "").lower()
-    if termination in _INFRA_TERMINATIONS:
-        return True
-    for key in ("fused_reward_debug", "reward_debug"):
-        reward_debug = metadata.get(key)
-        if isinstance(reward_debug, dict) and (
-            reward_debug.get("infra_failure")
-            or reward_debug.get("tools_load_error")
-            or reward_debug.get("verifier_error")
-        ):
-            return True
-    return False
+    return sample_failure_class(sample) == FailureClass.RETRYABLE_INFRA
 
 
 def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
-    if any(is_infra_failure(sample) for sample in _iter_samples(samples)):
-        return DynamicFilterOutput(keep=False, reason="infra_failure")
+    failure_class = group_failure_class(samples)
+    if failure_class is not None:
+        return DynamicFilterOutput(keep=False, reason=failure_class.value)
     if uses_prompt_equal_loss(samples) or has_multi_segment_trajectories(samples):
         # Judge variance on trajectory-level rewards so sparse placeholders or
         # legacy duplicated segment rewards cannot fake or dilute the std.

@@ -1462,6 +1462,7 @@ def test_fused_metrics_count_each_segmented_trajectory_once():
                 "fused_rollout_weight_version_count": 1,
                 "fused_rollout_logprob_invalid_ratio": 0.0,
                 "fused_tito_boundary_count": 1,
+                "infra_retry_count": 1,
                 "segment_count": 2,
             }
         )
@@ -1474,6 +1475,7 @@ def test_fused_metrics_count_each_segmented_trajectory_once():
     assert stats["workflow_values"]["rollout_weight_version_count"] == [1.0, 1.0]
     assert stats["workflow_values"]["rollout_logprob_invalid_ratio"] == [0.0, 0.0]
     assert stats["workflow_values"]["tito_boundary_count"] == [1.0, 1.0]
+    assert stats["workflow_values"]["infra_retry_count"] == [1.0, 1.0]
     assert stats["workflow_values"]["segment_count"] == [2.0, 2.0]
     assert len(stats["group_rewards"]) == 2
 

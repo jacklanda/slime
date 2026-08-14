@@ -50,6 +50,21 @@ def test_qwen3_rejection_sampling_defaults_to_adaptive_fully_async_task_filling(
     assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-2048}"' in launcher
     assert 'SAMPLE_N="${SAMPLE_N:-32}"' in launcher
     assert 'export SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS="${SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS:-true}"' in launcher
+    assert 'export SLIME_FULLY_ASYNC_CROSS_SHARD_PREFETCH="${SLIME_FULLY_ASYNC_CROSS_SHARD_PREFETCH:-true}"' in launcher
+    assert "export SLIME_FULLY_ASYNC_VALID_GROUPS_PER_SHARD" not in launcher
+    assert "export SLIME_FULLY_ASYNC_MAX_CANDIDATE_GROUPS_PER_SHARD" not in launcher
+
+
+@pytest.mark.unit
+def test_qwen3_rejection_sampling_persists_each_fixed_batch_episode_shard():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/run_qwen3_rejection_sampling.sh").read_text(encoding="utf-8")
+
+    assert "start_episode_watcher" in launcher
+    assert 'rollout_path = rollout_dir / f"{next_rollout_id}.pt"' in launcher
+    assert 'destination = episodes_dir / f"global_steps_{next_rollout_id}.json"' in launcher
+    assert 'temporary = destination.with_suffix(destination.suffix + ".tmp")' in launcher
+    assert "os.replace(temporary, destination)" in launcher
 
 
 @pytest.mark.unit
@@ -242,6 +257,10 @@ def test_odyssey_launcher_enforces_strict_dynamic_sampling():
     assert "--fully-async-filter-relax-after-groups 0" in launcher
     assert "This launcher requires strict dynamic sampling" in launcher
     assert '--dynamic-sampling-filter-path "${DYNAMIC_SAMPLING_FILTER_PATH}"' in launcher
+    assert 'ROLLOUT_INFRA_RETRY_TIMES="${ROLLOUT_INFRA_RETRY_TIMES:-2}"' in launcher
+    assert '--rollout-infra-retry-times "${ROLLOUT_INFRA_RETRY_TIMES}"' in launcher
+    assert 'SLIME_LOCAL_MCP_LEASE_TIMEOUT="${SLIME_LOCAL_MCP_LEASE_TIMEOUT:-120}"' in launcher
+    assert launcher.count("SLIME_LOCAL_MCP_LEASE_TIMEOUT") >= 2
 
 
 @pytest.mark.unit
@@ -254,6 +273,7 @@ def test_launchers_provision_per_trajectory_mcp_workspaces():
     assert 'export SLIME_MCP_ENV_ROOT="${MCP_ENV_ROOT}"' in rejection
     assert 'MCP_ENV_ROOT="${MCP_ENV_ROOT:-${RUN_ROOT}/cache/mcp_envs}"' in odyssey
     assert 'export SLIME_MCP_ENV_ROOT="${MCP_ENV_ROOT}"' in odyssey
+    assert 'export SLIME_MCP_WORKSPACE_SCOPE="${SLIME_MCP_WORKSPACE_SCOPE:-task}"' in odyssey
     assert 'SLIME_MCP_ENV_COPY_CONCURRENCY' in rejection
     assert 'SLIME_MCP_ENV_COPY_CONCURRENCY' in odyssey
 

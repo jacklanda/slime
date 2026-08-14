@@ -45,7 +45,7 @@ from slime.rollout.filter_hub.base_types import (
     call_dynamic_filter,
     is_valid_reward_group,
 )
-from slime.rollout.filter_hub.dynamic_sampling_filters import is_infra_failure
+from slime.rollout.filter_hub.dynamic_sampling_filters import group_failure_class
 from slime.rollout.task_family import (
     has_task_family_quota_candidates as _has_task_family_quota_candidates,
     parse_task_family_quotas as _parse_task_family_quotas,
@@ -393,20 +393,13 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
     metric_gatherer = MetricGatherer()
 
     target = args.rollout_batch_size
-    valid_target = max(0, _int_env("SLIME_FULLY_ASYNC_VALID_GROUPS_PER_SHARD", 0))
-    collect_valid_groups = valid_target > 0 and getattr(args, "rollout_only_inference_fast_path", False)
-    if collect_valid_groups:
-        target = valid_target
     cross_shard_prefetch = (
         keep_all_groups
-        and not collect_valid_groups
         and getattr(args, "rollout_only_inference_fast_path", False)
         and _env_bool("SLIME_FULLY_ASYNC_CROSS_SHARD_PREFETCH", False)
     )
     shard_offset = max(0, rollout_id - int(getattr(args, "start_rollout_id", 0) or 0)) * args.rollout_batch_size
     if (
-        not collect_valid_groups
-        and
         getattr(args, "rollout_only_inference_fast_path", False)
         and _env_bool("SLIME_FULLY_ASYNC_NO_DATASET_WRAP", False)
     ):
@@ -416,11 +409,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
         if target <= 0:
             worker.pause()
             return RolloutFnTrainOutput(samples=[], metrics={})
-    candidate_budget = target
-    if collect_valid_groups:
-        candidate_budget = max(target, _int_env("SLIME_FULLY_ASYNC_MAX_CANDIDATE_GROUPS_PER_SHARD", target * 16))
-        worker.resume(work_limit=candidate_budget)
-    elif cross_shard_prefetch:
+    if cross_shard_prefetch:
         total_remaining = max(0, len(data_buffer) - int(getattr(args, "start_rollout_id", 0) or 0) * args.rollout_batch_size)
         prefetch_groups = max(0, _int_env("SLIME_FULLY_ASYNC_PREFETCH_GROUPS", args.rollout_batch_size))
         worker.resume(work_limit=min(total_remaining, shard_offset + target + prefetch_groups), continuous=True)
@@ -434,12 +423,10 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
     quota_candidate_multiplier = max(1, _int_env("SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER", 4))
     candidate_limit = target * quota_candidate_multiplier if quotas else target
     logger.info(
-        "fully-async rollout %d: target=%d candidate_limit=%d candidate_budget=%d valid_only=%s queue_warm=%d",
+        "fully-async rollout %d: fixed_batch_target=%d candidate_limit=%d queue_warm=%d",
         rollout_id,
         target,
         candidate_limit,
-        candidate_budget,
-        collect_valid_groups,
         worker.queue_size(),
     )
 
@@ -458,7 +445,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
         completed = (
             worker.get_completed_groups_for_range(shard_offset, shard_offset + target)
             if cross_shard_prefetch
-            else worker.get_completed_groups(limit=None if collect_valid_groups else remaining)
+            else worker.get_completed_groups(limit=remaining)
         )
         for completed_index, (gid, group) in enumerate(completed):
             if len(collected) >= target:
@@ -468,7 +455,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
             flat_group = _flatten_samples(group)
             metric_gatherer.on_completed_group(args, flat_group)
             valid_reward_group = is_valid_reward_group(args, flat_group)
-            if collect_valid_groups:
+            if getattr(args, "rollout_only_inference_fast_path", False):
                 await asyncio.to_thread(
                     _write_trajectory_profile_shard,
                     args,
@@ -477,18 +464,15 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
                     flat_group,
                     valid_reward_group,
                 )
-            if collect_valid_groups and not valid_reward_group:
-                metric_gatherer.on_dynamic_filter_drop(reason="zero_reward_variance")
-                dropped_groups += 1
-                continue
+            failure_class = group_failure_class(flat_group)
             if keep_all_groups:
                 dynamic_filter_output = DynamicFilterOutput(keep=True, reason="keep_all")
-            elif any(is_infra_failure(sample) for sample in flat_group):
-                dynamic_filter_output = DynamicFilterOutput(keep=False, reason="infra_failure")
+            elif failure_class is not None:
+                dynamic_filter_output = DynamicFilterOutput(keep=False, reason=failure_class.value)
             else:
                 dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, flat_group, rollout_id=rollout_id)
             relax_filter = (
-                dynamic_filter_output.reason != "infra_failure"
+                failure_class is None
                 and filter_relax_after > 0
                 and completed_groups >= filter_relax_after
             )
@@ -504,29 +488,11 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
             collected[gid] = group
             drained += 1
 
-        if collect_valid_groups and completed_groups >= candidate_budget and len(collected) < target:
-            logger.warning(
-                "fully-async rollout %d exhausted %d candidate groups with only %d/%d valid groups",
-                rollout_id,
-                candidate_budget,
-                len(collected),
-                target,
-            )
-            break
-        if collect_valid_groups and worker.exhausted_and_idle() and len(collected) < target:
-            logger.warning(
-                "fully-async rollout %d exhausted the dataset with only %d/%d valid groups",
-                rollout_id,
-                len(collected),
-                target,
-            )
-            break
-
         if not drained:
             await asyncio.sleep(0.05)
 
         now = time.time()
-        if _env_bool("SLIME_FUSED_PROGRESS_LOGS", False) and now - last_log > LOG_EVERY:
+        if now - last_log > LOG_EVERY:
             logger.info(
                 "fully-async rollout %d: collected %d/%d, dropped=%d/%d, queue=%d, elapsed=%.1fs",
                 rollout_id,
@@ -578,8 +544,6 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
     metrics["rollout/dynamic_filter/completed_groups"] = completed_groups
     metrics["rollout/dynamic_filter/dropped_groups"] = dropped_groups
     metrics["rollout/dynamic_filter/kept_groups"] = len(out)
-    metrics["rollout/dynamic_filter/target_valid_groups"] = valid_target
-    metrics["rollout/dynamic_filter/valid_group_shortfall"] = max(0, valid_target - len(out))
     metrics["rollout/config/fused_webqa_min_unique_searches"] = _int_env("FUSED_WEBQA_MIN_UNIQUE_SEARCHES", 2)
     metrics["rollout/config/fused_repeated_search_max_strikes"] = _int_env("FUSED_REPEATED_SEARCH_MAX_STRIKES", 2)
     for family, count in candidate_family_counts.items():

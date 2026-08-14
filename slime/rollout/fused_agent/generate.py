@@ -395,9 +395,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     task = _task_from_sample(base_sample)
     session_id = base_sample.session_id or uuid.uuid4().hex
     base_sample.session_id = session_id
+    base_sample.metadata = {**dict(base_sample.metadata or {}), "rollout_stage": "setup"}
     trajectory_setup_started_at = time.time()
     mcp_workspace = None
-    local_mcp_process_leased = False
     if is_local_mcp_task(task):
         prepare_task = asyncio.create_task(
             asyncio.to_thread(
@@ -426,20 +426,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         current_task = asyncio.current_task()
         if current_task is not None:
             async def cleanup_finished_local_mcp() -> None:
-                if local_mcp_process_leased:
-                    from .mcp_process_pool import get_local_mcp_process_pool
-
-                    await asyncio.to_thread(get_local_mcp_process_pool().release, task)
                 await asyncio.to_thread(cleanup_mcp_workspace, mcp_workspace)
 
             current_task.add_done_callback(lambda _done: asyncio.create_task(cleanup_finished_local_mcp()))
-        if _env_bool("SLIME_LOCAL_MCP_PROCESS_ISOLATION", True):
-            from .mcp_process_pool import get_local_mcp_process_pool
-
-            process_pool = get_local_mcp_process_pool()
-            while not process_pool.try_lease(task):
-                await asyncio.sleep(0.01)
-            local_mcp_process_leased = True
     harness = normalize_harness(os.environ.get("FUSED_HARNESS", getattr(args, "fused_harness", "gem")))
     rllm_deepresearch = harness == "rllm_deepresearch"
     cut_bill = harness == "cut_bill"
@@ -468,10 +457,6 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         )
         observation, info = env.reset()
     except BaseException:
-        if is_local_mcp_task(task) and _env_bool("SLIME_LOCAL_MCP_PROCESS_ISOLATION", True):
-            from .mcp_process_pool import get_local_mcp_process_pool
-
-            get_local_mcp_process_pool().release(task)
         await asyncio.to_thread(cleanup_mcp_workspace, mcp_workspace)
         raise
     mcp_init_time = time.time() - trajectory_setup_started_at if env.mode == "mcp" else 0.0
@@ -842,6 +827,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 }
                 break
 
+            base_sample.metadata["rollout_stage"] = "llm_decode"
             llm_start = time.time()
             try:
                 request_prompt_ids = prompt_ids
@@ -1761,6 +1747,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 for action in actions:
                     if action.name != "finish":
                         used_non_finish_tool = True
+                    base_sample.metadata["rollout_stage"] = "verifier" if action.name == "finish" else "tool_operation"
                     obs, reward, done, env_info = await env.step(action)
                     executed_actions.append(action)
                     raw_observations.append(obs)
@@ -1821,6 +1808,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             if action.name != "finish":
                 used_non_finish_tool = True
             env_start = time.time()
+            base_sample.metadata["rollout_stage"] = "verifier" if action.name == "finish" else "tool_operation"
             obs, reward, done, env_info = await env.step(action)
             step_env_time = time.time() - env_start
             env_time += step_env_time
@@ -1960,6 +1948,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     )
 
         if not final_done and final_reward == 0.0:
+            base_sample.metadata["rollout_stage"] = "verifier"
             final_reward = await asyncio.to_thread(env.compute_final_reward)
             last_info = {"reward_debug": env.reward_debug, **last_info}
     finally:

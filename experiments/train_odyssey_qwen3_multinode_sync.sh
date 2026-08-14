@@ -1,9 +1,7 @@
 #!/bin/bash
-# Single-node synchronous fused-agent training launcher for current slime.
+# Two-node synchronous fused-agent training launcher for current slime.
 #
-# The actor and rollout engines are colocated on all eight GPUs of
-# hgx-hyperplane01. This includes physical GPU 2, which previously exhibited
-# CUDA MMU faults, as explicitly requested for this launcher.
+# The actor and rollout engines are colocated on all eight GPUs of each node.
 
 set -ex
 
@@ -57,8 +55,11 @@ Options:
   --retrieval-lexrank-multiprocessing BOOL
                                          Retrieval LexRank multiprocessing env.
   --retrieval-lexrank-workers N          Retrieval LexRank workers env.
-  --master-addr HOST                     Ray head address. Default: hgx-hyperplane01.
-  --socket-ifname NAME                   Interface used by Gloo/NCCL. Default: enp168s0f0np0.
+  --master-addr HOST                     Ray head address. Default: dgx-hyperplane14.
+  --worker-addr HOST                     Ray worker address. Defaults to the other node in
+                                         the dgx-hyperplane14/dgx-hyperplane17 pair.
+  --ray-ssh-user USER                    SSH user used to start Ray on the worker. Default: current user.
+  --socket-ifname NAME                   Interface used by Gloo/NCCL. Default: enp225s0f0np0.
   --ray-num-cpus N                       Ray CPU resource count.
   --tail-guard BOOL                      Stored in env for compatible fused code.
   --tail-guard-time-guard BOOL           Stored in env for compatible fused code.
@@ -105,8 +106,10 @@ Options:
   --cli-max-steps N                      CLI fused agent max steps env.
   --trajectory-timeout N                 Fused trajectory timeout env.
   --eval-trajectory-timeout N            Fused eval trajectory timeout env.
-  --rollout-group-timeout N              Cancel and replace a training prompt group whose trajectories
-                                         do not all finish within N seconds. Default: 600.
+  --rollout-group-timeout N              Per-attempt deadline for each prompt group's unfinished slots.
+                                         Timeout classification uses the active trajectory stage. Default: 3600.
+  --rollout-infra-retry-times N          Replacement attempts per logical slot after retryable infra failure.
+                                         Default: 2.
   --eval-interval N                      Run interval eval every N rollout steps.
   --eval-config PATH                     Structured slime eval dataset config. Overrides generated benchmarks.
   --eval-prompt-data NAME PATH [...]     Legacy eval dataset name/path pairs.
@@ -134,9 +137,9 @@ Options:
   --offload-train BOOL                   Offload trainer model between phases. Disabled by --release-train.
   --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: true.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 64.
+  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 128.
   --sglang-router-request-timeout-secs N Router request timeout. Default: 21600.
-  --sglang-max-running-requests N        SGLang max running requests. Default: 64.
+  --sglang-max-running-requests N        SGLang max running requests. Default: 128.
   --colocate                             Share trainer and rollout GPUs with offload. Required by this launcher.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
@@ -157,11 +160,13 @@ TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 # Alternate training and rollout across all eight GPU slots on one node.
 COLOCATE="${COLOCATE:-true}"
-ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-1}"
+ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
 HYPERPLANE01_CUDA_VISIBLE_DEVICES="${HYPERPLANE01_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-MASTER_ADDR="${MASTER_ADDR:-hgx-hyperplane01}"
-SOCKET_IFNAME="${SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-enp168s0f0np0}}"
+MASTER_ADDR="${MASTER_ADDR:-dgx-hyperplane14}"
+WORKER_ADDR="${WORKER_ADDR:-}"
+RAY_SSH_USER="${RAY_SSH_USER:-$(id -un)}"
+SOCKET_IFNAME="${SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-enp225s0f0np0}}"
 RAY_BIN="${RAY_BIN:-$(command -v ray)}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
 DISABLE_THINKING="${DISABLE_THINKING:-false}"
@@ -172,10 +177,10 @@ DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-8}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
-#TRAIN_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND:-${RETRIEVAL_BACKEND:-local}}"
-TRAIN_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND:-${RETRIEVAL_BACKEND:-serper}}"
+TRAIN_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND:-${RETRIEVAL_BACKEND:-local}}"
+#TRAIN_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND:-${RETRIEVAL_BACKEND:-serper}}"
 EVAL_RETRIEVAL_BACKEND="${EVAL_RETRIEVAL_BACKEND:-serper}"
-RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-256}"
+RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-512}"
 RETRIEVAL_MODE="${RETRIEVAL_MODE:-${RLLM_RETRIEVAL_MODE:-hybrid}}"
 RETRIEVAL_CACHE_SIZE="${RETRIEVAL_CACHE_SIZE:-4096}"
 SERPER_SERVER_HOST="${SERPER_SERVER_HOST:-127.0.0.1}"
@@ -188,7 +193,7 @@ TAIL_GUARD_TIME_MULTIPLIER="${TAIL_GUARD_TIME_MULTIPLIER:-1.05}"
 TAIL_GUARD_TIME_SLACK_SECONDS="${TAIL_GUARD_TIME_SLACK_SECONDS:-16}"
 TAIL_GUARD_MIN_COMPLETION_RATIO="${TAIL_GUARD_MIN_COMPLETION_RATIO:-0.60}"
 CREDIT_ASSIGNMENT_ENABLE="${CREDIT_ASSIGNMENT_ENABLE:-True}"
-CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR="${CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR:-False}"
+CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR="${CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR:-True}"
 CREDIT_ASSIGNMENT_THINK_PARSER_ERROR="${CREDIT_ASSIGNMENT_THINK_PARSER_ERROR:-True}"
 CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY="${CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY:-True}"
 CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS="${CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS:-True}"
@@ -224,16 +229,16 @@ WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS:-64}"
 CLI_MAX_STEPS="${CLI_MAX_STEPS:-64}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-7200}"
-# Synchronous collection otherwise waits for every trajectory in a prompt group.
-# A single pathological 64-step trajectory can leave all colocated GPUs waiting
-# for hours, so bound the group and let the collector replace timed-out samples.
+# Bound each group attempt. The rollout stage determines whether an unfinished
+# slot is retryable infra, permanent task failure, or policy behavior.
 ROLLOUT_GROUP_TIMEOUT="${ROLLOUT_GROUP_TIMEOUT:-3600}"
+ROLLOUT_INFRA_RETRY_TIMES="${ROLLOUT_INFRA_RETRY_TIMES:-4}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-48}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-32}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-128}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-128}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-50}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
@@ -319,6 +324,8 @@ while [ "$#" -gt 0 ]; do
       --retrieval-lexrank-multiprocessing) RLLM_RETRIEVAL_LEXRANK_MULTIPROCESSING="${2:?Missing value for --retrieval-lexrank-multiprocessing}"; shift 2 ;;
       --retrieval-lexrank-workers) RLLM_RETRIEVAL_LEXRANK_WORKERS="${2:?Missing value for --retrieval-lexrank-workers}"; shift 2 ;;
       --master-addr) MASTER_ADDR="${2:?Missing value for --master-addr}"; shift 2 ;;
+      --worker-addr) WORKER_ADDR="${2:?Missing value for --worker-addr}"; shift 2 ;;
+      --ray-ssh-user) RAY_SSH_USER="${2:?Missing value for --ray-ssh-user}"; shift 2 ;;
       --socket-ifname) SOCKET_IFNAME="${2:?Missing value for --socket-ifname}"; shift 2 ;;
       --ray-num-cpus) RAY_NUM_CPUS="${2:?Missing value for --ray-num-cpus}"; shift 2 ;;
       --tail-guard) TAIL_GUARD="${2:?Missing value for --tail-guard}"; shift 2 ;;
@@ -378,6 +385,7 @@ while [ "$#" -gt 0 ]; do
       --trajectory-timeout) TRAJECTORY_TIMEOUT="${2:?Missing value for --trajectory-timeout}"; shift 2 ;;
       --eval-trajectory-timeout) EVAL_TRAJECTORY_TIMEOUT="${2:?Missing value for --eval-trajectory-timeout}"; shift 2 ;;
       --rollout-group-timeout) ROLLOUT_GROUP_TIMEOUT="${2:?Missing value for --rollout-group-timeout}"; shift 2 ;;
+      --rollout-infra-retry-times) ROLLOUT_INFRA_RETRY_TIMES="${2:?Missing value for --rollout-infra-retry-times}"; shift 2 ;;
       --eval-interval) EVAL_INTERVAL="${2:?Missing value for --eval-interval}"; shift 2 ;;
       --eval-config) EVAL_CONFIG="${2:?Missing value for --eval-config}"; shift 2 ;;
       --eval-benchmarks-root) EVAL_BENCHMARKS_ROOT="${2:?Missing value for --eval-benchmarks-root}"; shift 2 ;;
@@ -427,12 +435,22 @@ if ! is_truthy "${COLOCATE}"; then
    echo "This launcher is fixed to collocate mode; remove --no-colocate or set COLOCATE=true." >&2
    exit 2
 fi
-if [ "${ACTOR_NUM_NODES}" -ne 1 ] || [ "${ACTOR_NUM_GPUS_PER_NODE}" -ne 8 ]; then
-   echo "This launcher requires ACTOR_NUM_NODES=1 and ACTOR_NUM_GPUS_PER_NODE=8." >&2
+if [ "${ACTOR_NUM_NODES}" -ne 2 ] || [ "${ACTOR_NUM_GPUS_PER_NODE}" -ne 8 ]; then
+   echo "This launcher requires ACTOR_NUM_NODES=2 and ACTOR_NUM_GPUS_PER_NODE=8." >&2
    exit 2
 fi
-if [ "${MASTER_ADDR%%.*}" != "hgx-hyperplane01" ]; then
-   echo "This launcher is fixed to hgx-hyperplane01; got MASTER_ADDR=${MASTER_ADDR}." >&2
+case "${MASTER_ADDR%%.*}" in
+   dgx-hyperplane14|dgx-hyperplane17) ;;
+   *) echo "This launcher requires dgx-hyperplane14 or dgx-hyperplane17 as the Ray head; got MASTER_ADDR=${MASTER_ADDR}." >&2; exit 2 ;;
+esac
+if [ -z "${WORKER_ADDR}" ]; then
+   case "${MASTER_ADDR%%.*}" in
+      dgx-hyperplane14) WORKER_ADDR="dgx-hyperplane17" ;;
+      dgx-hyperplane17) WORKER_ADDR="dgx-hyperplane14" ;;
+   esac
+fi
+if [ "${WORKER_ADDR%%.*}" = "${MASTER_ADDR%%.*}" ]; then
+   echo "Ray head and worker must be different hosts; both resolve from ${MASTER_ADDR}." >&2
    exit 2
 fi
 if [ ! -x "${RAY_BIN}" ]; then
@@ -505,7 +523,7 @@ RUNS_ROOT="${RUNS_ROOT:-/share/nlp/share/gem/runs}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 
 default_experiment_name() {
-   local prefix="odyssey-q3-4b-think-dev"
+   local prefix="odyssey-q3-4b-local-dev"
    #local prefix="odyssey-q3-8b-think-dev"
    #local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
    #local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
@@ -901,15 +919,15 @@ MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-20480}"
 LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"
 LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-8192}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 # One prompt group already expands to N_SAMPLES_PER_PROMPT concurrent traces.
 # Match the submission wave to the target group count so dynamic filtering can
 # refill incrementally without leaving hundreds of requests to abort afterward.
 OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-${ROLLOUT_BATCH_SIZE}}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
-NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
-NUM_ROLLOUT="${NUM_ROLLOUT:-300}"
+NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-2}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-360}"
 EFFECTIVE_GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT / NUM_STEPS_PER_ROLLOUT))}"
 TRAIN_DATA_PARALLEL_SIZE=$((ACTOR_GPUS / TP_SIZE / CP_SIZE / PP_SIZE))
 MICRO_BATCH_DATA_PARALLEL_SIZE=$((MICRO_BATCH_SIZE * TRAIN_DATA_PARALLEL_SIZE))
@@ -932,9 +950,9 @@ fi
 # override remains available for debugging or legacy experiments.
 ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.fully_async_rollout.generate_rollout_fully_async}"
 FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY:-true}"
-FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY:-${ROLLOUT_ENGINE_COUNT}}"
-FULLY_ASYNC_MAX_GROUP_CONCURRENCY="${FULLY_ASYNC_MAX_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 2))}"
-FULLY_ASYNC_CONCURRENCY_STEP="${FULLY_ASYNC_CONCURRENCY_STEP:-$(( (ROLLOUT_ENGINE_COUNT + 1) / 2 ))}"
+FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 4))}"
+FULLY_ASYNC_MAX_GROUP_CONCURRENCY="${FULLY_ASYNC_MAX_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 8))}"
+FULLY_ASYNC_CONCURRENCY_STEP="${FULLY_ASYNC_CONCURRENCY_STEP:-${ROLLOUT_ENGINE_COUNT}}"
 FULLY_ASYNC_CONCURRENCY_POLL_INTERVAL="${FULLY_ASYNC_CONCURRENCY_POLL_INTERVAL:-10}"
 
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-${MAX_CONTEXT_LEN}}"
@@ -1090,6 +1108,7 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len "${MAX_RESPONSE_LENGTH}"
    --rollout-temperature "${TEMPERATURE}"
    --rollout-top-p "${TOP_P:-1.0}"
+   --rollout-infra-retry-times "${ROLLOUT_INFRA_RETRY_TIMES}"
 
    --global-batch-size "${EFFECTIVE_GLOBAL_BATCH_SIZE}"
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
@@ -1343,6 +1362,7 @@ export RUNS_ROOT RUN_ROOT SAVE_DIR LOG_ROOT EPISODE_LOG_DIR DUMP_DETAILS EVAL_CA
 export UPDATE_WEIGHT_DISK_DIR WANDB_DIR WANDB_CACHE_DIR HF_HOME TORCH_HOME TRITON_CACHE_DIR XDG_CACHE_HOME MCP_ENV_ROOT
 export SLIME_MCP_ENV_ROOT="${MCP_ENV_ROOT}"
 export SLIME_MCP_ENV_COPY_CONCURRENCY="${MCP_ENV_COPY_CONCURRENCY}"
+export SLIME_MCP_WORKSPACE_SCOPE="${SLIME_MCP_WORKSPACE_SCOPE:-task}"
 export SLIME_FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY}"
 export SLIME_FULLY_ASYNC_INITIAL_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY}"
 export SLIME_FULLY_ASYNC_MAX_CONCURRENCY="${FULLY_ASYNC_MAX_GROUP_CONCURRENCY}"
@@ -1388,7 +1408,7 @@ export SLIME_FUSED_REQUIRE_WEIGHT_VERSION="${SLIME_FUSED_REQUIRE_WEIGHT_VERSION:
 # Fused-agent service knobs inherited from the rllm launcher. They are runtime
 # env only; current slime code consumes the subset used by selected generators.
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
-export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-3}"
+export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-1}"
 # Summarize is a ~2s LLM call per search with a large retry budget; on slow
 # trajectories it stacks up and blows the 180s rollout collection timeout,
 # causing groups to be dropped. Default off and use raw retrieve docs instead.
@@ -1406,9 +1426,10 @@ export RLLM_RETRIEVAL_LEXRANK_WORKERS="${RLLM_RETRIEVAL_LEXRANK_WORKERS:-32}"
 export DOCKER_HOST="${DOCKER_HOST:-tcp://10.2.152.50:2375}"
 export DOCKER_API_VERSION="${DOCKER_API_VERSION:-1.44}"
 export SLIME_LOCAL_MCP_PROCESS_ISOLATION="${SLIME_LOCAL_MCP_PROCESS_ISOLATION:-true}"
-export SLIME_LOCAL_MCP_PROCESS_WORKERS="${SLIME_LOCAL_MCP_PROCESS_WORKERS:-}"
+export SLIME_LOCAL_MCP_PROCESS_WORKERS="${SLIME_LOCAL_MCP_PROCESS_WORKERS:-32}"
 export SLIME_LOCAL_MCP_PROCESS_START_METHOD="${SLIME_LOCAL_MCP_PROCESS_START_METHOD:-forkserver}"
 export SLIME_LOCAL_MCP_PROCESS_TIMEOUT="${SLIME_LOCAL_MCP_PROCESS_TIMEOUT:-120}"
+export SLIME_LOCAL_MCP_LEASE_TIMEOUT="${SLIME_LOCAL_MCP_LEASE_TIMEOUT:-120}"
 export SLIME_LOCAL_MCP_PROCESS_WARM_TIMEOUT="${SLIME_LOCAL_MCP_PROCESS_WARM_TIMEOUT:-60}"
 export RLLM_MCP_MIN_NOFILE="${RLLM_MCP_MIN_NOFILE:-4096}"
 export RLLM_MCP_FD_THROTTLE_THRESHOLD="${RLLM_MCP_FD_THROTTLE_THRESHOLD:-4096}"
@@ -1493,9 +1514,9 @@ keys = (
     "RLLM_RETRIEVAL_LEXRANK_MULTIPROCESSING", "RLLM_RETRIEVAL_LEXRANK_WORKERS",
     "DOCKER_HOST", "DOCKER_API_VERSION", "WANDB_API_KEY",
     "WANDB_DIR", "WANDB_CACHE_DIR", "HF_HOME", "TORCH_HOME", "TRITON_CACHE_DIR", "XDG_CACHE_HOME",
-    "MCP_ENV_ROOT", "SLIME_MCP_ENV_ROOT", "SLIME_MCP_ENV_COPY_CONCURRENCY",
+    "MCP_ENV_ROOT", "SLIME_MCP_ENV_ROOT", "SLIME_MCP_ENV_COPY_CONCURRENCY", "SLIME_MCP_WORKSPACE_SCOPE",
     "SLIME_LOCAL_MCP_PROCESS_ISOLATION", "SLIME_LOCAL_MCP_PROCESS_WORKERS", "SLIME_LOCAL_MCP_PROCESS_START_METHOD",
-    "SLIME_LOCAL_MCP_PROCESS_TIMEOUT", "SLIME_LOCAL_MCP_PROCESS_WARM_TIMEOUT",
+    "SLIME_LOCAL_MCP_PROCESS_TIMEOUT", "SLIME_LOCAL_MCP_LEASE_TIMEOUT", "SLIME_LOCAL_MCP_PROCESS_WARM_TIMEOUT",
     "SLIME_FULLY_ASYNC_ADAPTIVE_CONCURRENCY", "SLIME_FULLY_ASYNC_INITIAL_CONCURRENCY",
     "SLIME_FULLY_ASYNC_MAX_CONCURRENCY", "SLIME_FULLY_ASYNC_CONCURRENCY_STEP",
     "SLIME_FULLY_ASYNC_CONCURRENCY_POLL_INTERVAL", "SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS",
@@ -1553,7 +1574,7 @@ echo "W&B enabled: ${USE_WANDB}"
 echo "Custom generate: ${CUSTOM_GENERATE_FUNCTION_PATH:-<stock slime rollout>}"
 echo "Custom reward post-process: ${CUSTOM_REWARD_POST_PROCESS_PATH:-<vanilla>}"
 echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
-echo "Cluster: head=${MASTER_ADDR}, nodes=${ACTOR_NUM_NODES}, actor/Ray/rollout GPUs=${ACTOR_NUM_GPUS_PER_NODE}/${NUM_GPUS_PER_NODE}/${NUM_GPUS_PER_NODE}, socket_ifname=${SOCKET_IFNAME}"
+echo "Cluster: head=${MASTER_ADDR}, worker=${WORKER_ADDR}, nodes=${ACTOR_NUM_NODES}, actor/Ray/rollout GPUs=${ACTOR_NUM_GPUS_PER_NODE}/${NUM_GPUS_PER_NODE}/${NUM_GPUS_PER_NODE}, socket_ifname=${SOCKET_IFNAME}"
 echo "Actor GPUs: ${ACTOR_GPUS}, actor TP=${TP_SIZE}, CP=${CP_SIZE}, PP=${PP_SIZE}, rollout GPUs: ${ROLLOUT_GPUS}, rollout TP=${ROLLOUT_NUM_GPUS_PER_ENGINE}, rollout engines=${ROLLOUT_ENGINE_COUNT}, colocate=${COLOCATE}, offload_train=${OFFLOAD_TRAIN}"
 echo "Training token budgets: max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}, log_probs_max_tokens_per_gpu=${LOG_PROBS_MAX_TOKENS_PER_GPU}, log_probs_chunk_size=${LOG_PROBS_CHUNK_SIZE}, max_context_len=${MAX_CONTEXT_LEN}"
 echo "YaRN: enable=${ENABLE_YARN}, factor=${YARN_FACTOR}, original_max_position_embeddings=${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
@@ -1603,6 +1624,11 @@ if [ -z "${MASTER_NODE_IP}" ]; then
    echo "Failed to resolve Ray head ${MASTER_ADDR}." >&2
    exit 2
 fi
+WORKER_NODE_IP="$(getent ahostsv4 "${WORKER_ADDR}" | awk 'NR == 1 {print $1}')"
+if [ -z "${WORKER_NODE_IP}" ]; then
+   echo "Failed to resolve Ray worker ${WORKER_ADDR}." >&2
+   exit 2
+fi
 if [ "$(hostname -s)" != "${MASTER_ADDR%%.*}" ] \
    && ! hostname -I | tr ' ' '\n' | grep -Fxq "${MASTER_NODE_IP}"; then
    echo "Run this launcher on the Ray head ${MASTER_ADDR} (${MASTER_NODE_IP}); current host is $(hostname -s)." >&2
@@ -1623,7 +1649,7 @@ if len(set(devices)) != len(devices):
     raise SystemExit(f"Ray head CUDA_VISIBLE_DEVICES contains duplicate GPU indices: {raw!r}")
 PY
 
-echo "Ray GPU visibility: head=${MASTER_ADDR}:${MASTER_CUDA_VISIBLE_DEVICES}"
+echo "Ray GPU visibility: head=${MASTER_ADDR}:${MASTER_CUDA_VISIBLE_DEVICES}, worker=${WORKER_ADDR}:${MASTER_CUDA_VISIBLE_DEVICES}"
 
 if "${RAY_BIN}" job list --address="${RAY_DASHBOARD_ADDRESS}" >/dev/null 2>&1; then
    RAYLET_PID="$(pgrep -n -x raylet || true)"
@@ -1650,7 +1676,55 @@ else
       --disable-usage-stats
 fi
 
-python3 - "${MASTER_NODE_IP}" "${MASTER_ADDR}" "${ACTOR_GPUS}" <<'PY'
+WORKER_READY="$({ RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0 python3 - "${MASTER_NODE_IP}" "${WORKER_NODE_IP}" "${NUM_GPUS_PER_NODE}" <<'PY'
+import sys
+
+import ray
+
+head_ip, worker_ip, required_gpus = sys.argv[1:]
+ray.init(address=f"{head_ip}:6379", logging_level="ERROR")
+matches = [
+    node
+    for node in ray.nodes()
+    if node.get("Alive") and node.get("NodeManagerAddress") == worker_ip
+]
+ready = len(matches) == 1 and int(matches[0].get("Resources", {}).get("GPU", 0)) == int(required_gpus)
+ray.shutdown()
+print("1" if ready else "0")
+PY
+} 2>/dev/null || true)"
+
+if [ "${WORKER_READY}" = "1" ]; then
+   echo "Reusing existing Ray worker on ${WORKER_ADDR} (${WORKER_NODE_IP})"
+else
+   echo "Starting Ray worker on ${WORKER_ADDR} (${WORKER_NODE_IP})"
+   SSH_TARGET="${RAY_SSH_USER}@${WORKER_ADDR}"
+   if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "${SSH_TARGET}" bash -s -- \
+      "${RAY_BIN}" "${MASTER_NODE_IP}" "${WORKER_NODE_IP}" "${NUM_GPUS_PER_NODE}" \
+      "${RAY_NUM_CPUS}" "${MASTER_CUDA_VISIBLE_DEVICES}" <<'REMOTE_RAY_WORKER'
+ray_bin="$1"
+head_ip="$2"
+worker_ip="$3"
+num_gpus="$4"
+num_cpus="$5"
+cuda_visible_devices="$6"
+
+"${ray_bin}" stop --force >/dev/null 2>&1 || true
+CUDA_VISIBLE_DEVICES="${cuda_visible_devices}" "${ray_bin}" start \
+   --address="${head_ip}:6379" \
+   --node-ip-address="${worker_ip}" \
+   --num-gpus="${num_gpus}" \
+   --num-cpus="${num_cpus}" \
+   --disable-usage-stats
+REMOTE_RAY_WORKER
+   then
+      echo "Failed to start Ray on ${SSH_TARGET}. Ensure passwordless SSH is available or start the worker manually with:" >&2
+      echo "  CUDA_VISIBLE_DEVICES=${MASTER_CUDA_VISIBLE_DEVICES} ${RAY_BIN} start --address=${MASTER_NODE_IP}:6379 --node-ip-address=${WORKER_NODE_IP} --num-gpus=${NUM_GPUS_PER_NODE} --num-cpus=${RAY_NUM_CPUS} --disable-usage-stats" >&2
+      exit 2
+   fi
+fi
+
+RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0 python3 - "${MASTER_NODE_IP}" "${MASTER_ADDR}" "${WORKER_NODE_IP}" "${WORKER_ADDR}" "${ACTOR_NUM_NODES}" "${NUM_GPUS_PER_NODE}" <<'PY'
 import socket
 import sys
 import time
@@ -1669,9 +1743,12 @@ def identities(host):
     return values
 
 
-head_ip, head_host, required_gpus = sys.argv[1:]
+head_ip, head_host, worker_ip, worker_host, required_nodes, gpus_per_node = sys.argv[1:]
 required_host = identities(head_host)
-required_gpus = int(required_gpus)
+required_worker = identities(worker_host) | {worker_ip}
+required_nodes = int(required_nodes)
+gpus_per_node = int(gpus_per_node)
+required_gpus = required_nodes * gpus_per_node
 ray.init(address=f"{head_ip}:6379", logging_level="ERROR")
 deadline = time.monotonic() + 120
 while True:
@@ -1683,15 +1760,29 @@ while True:
     matching_nodes = [
         node for node, node_identity in zip(alive_nodes, alive_identities, strict=True) if required_host & node_identity
     ]
-    host_gpus = int(matching_nodes[0].get("Resources", {}).get("GPU", 0)) if len(matching_nodes) == 1 else 0
+    matching_workers = [
+        node for node, node_identity in zip(alive_nodes, alive_identities, strict=True) if required_worker & node_identity
+    ]
+    node_gpus = [int(node.get("Resources", {}).get("GPU", 0)) for node in alive_nodes]
     gpu_count = int(ray.cluster_resources().get("GPU", 0))
-    if len(alive_nodes) == 1 and len(matching_nodes) == 1 and host_gpus == required_gpus and gpu_count == required_gpus:
-        print(f"Ray cluster ready: alive_nodes=1, GPUs={gpu_count}, host={head_host}")
+    if (
+        len(alive_nodes) == required_nodes
+        and len(matching_nodes) == 1
+        and len(matching_workers) == 1
+        and all(gpus == gpus_per_node for gpus in node_gpus)
+        and gpu_count == required_gpus
+    ):
+        print(
+            f"Ray cluster ready: alive_nodes={required_nodes}, GPUs={gpu_count}, "
+            f"head={head_host}, worker={worker_host}"
+        )
         break
     if time.monotonic() >= deadline:
         raise SystemExit(
             f"Ray cluster did not become ready: alive_nodes={len(alive_nodes)}, GPUs={gpu_count}, "
-            f"host_GPUs={host_gpus}, required_host={head_host}, required_GPUs={required_gpus}"
+            f"node_GPUs={node_gpus}, required_head={head_host}, required_worker={worker_host}, "
+            f"required_nodes={required_nodes}, "
+            f"required_GPUs={required_gpus}"
         )
     time.sleep(1)
 ray.shutdown()

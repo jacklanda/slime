@@ -2212,6 +2212,7 @@ def _collect_fused_agent_stats(args, all_samples: list[Sample]):
             "fused_tito_boundary_count",
             "fused_tito_exact_prefix_turns",
             "fused_tito_prompt_prefix_mismatch_turns",
+            "infra_retry_count",
             "segment_count",
         ):
             value = _coerce_finite_float(metadata.get(key))

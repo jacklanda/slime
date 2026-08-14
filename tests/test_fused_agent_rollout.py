@@ -18,7 +18,7 @@ from slime.rollout.fused_agent.env import (
     normalize_task,
     resolve_task_mode,
 )
-from slime.rollout.fused_agent.mcp_workspace import prepare_mcp_workspace
+from slime.rollout.fused_agent.mcp_workspace import cleanup_task_workspaces, prepare_mcp_workspace
 import slime.rollout.fused_agent.generate as fused_generate
 from slime.rollout.fused_agent.generate import (
     _format_tool_observation,
@@ -2214,6 +2214,42 @@ def test_local_mcp_workspace_isolated_per_trajectory_and_cleaned(tmp_path: Path)
     assert not second.path.exists()
 
 
+def test_local_mcp_workspace_reused_per_task(tmp_path: Path, monkeypatch):
+    import concurrent.futures
+
+    source = tmp_path / "source" / "_sandbox"
+    (source / "data").mkdir(parents=True)
+    (source / "tools.py").write_text("from mcp.server.fastmcp import FastMCP\nmcp = FastMCP('Tools')\n", encoding="utf-8")
+    (source / "data" / "state.json").write_text('{"value": 1}', encoding="utf-8")
+    workspace_root = tmp_path / "run" / "cache" / "mcp_envs"
+    task = {"data_root": str(source), "tools_py": str(source / "tools.py"), "data_source": "mcp"}
+    monkeypatch.setenv("SLIME_MCP_WORKSPACE_SCOPE", "task")
+
+    def prepare(index):
+        return prepare_mcp_workspace(task, f"trajectory-{index}", workspace_root)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        prepared = list(pool.map(prepare, range(8)))
+
+    rewritten_tasks = [rewritten for rewritten, _workspace in prepared]
+    workspaces = [workspace for _rewritten, workspace in prepared]
+    first = workspaces[0]
+    assert {workspace.path for workspace in workspaces} == {first.path}
+    assert {workspace.task_id for workspace in workspaces} == {first.task_id}
+    assert {rewritten["data_root"] for rewritten in rewritten_tasks} == {str(first.path)}
+    (first.path / "data" / "state.json").write_text('{"value": 99}', encoding="utf-8")
+    assert all(
+        (workspace.path / "data" / "state.json").read_text(encoding="utf-8") == '{"value": 99}'
+        for workspace in workspaces
+    )
+
+    for workspace in workspaces:
+        workspace.close()
+    assert first.path.exists()
+    cleanup_task_workspaces()
+    assert not first.path.exists()
+
+
 def test_local_mcp_tool_module_loading_is_serialized_and_does_not_leak_sys_modules(tmp_path: Path):
     import concurrent.futures
     import sys
@@ -2276,22 +2312,20 @@ def test_local_mcp_process_pool_runs_workspaces_in_parallel(tmp_path: Path, monk
     from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
 
     monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "true")
-    roots = []
-    for index in range(4):
-        root = tmp_path / f"process-task-{index}"
-        root.mkdir()
-        (root / "tools.py").write_text(
-            "import os, time\n"
-            "from pathlib import Path\n"
-            "from mcp.server.fastmcp import FastMCP\n"
-            "mcp = FastMCP('Tools')\n"
-            "@mcp.tool()\n"
-            "def work(delay):\n"
-            "    time.sleep(delay)\n"
-            "    return {'pid': os.getpid(), 'cwd': str(Path.cwd())}\n",
-            encoding="utf-8",
-        )
-        roots.append(root)
+    root = tmp_path / "shared-process-task"
+    root.mkdir()
+    (root / "tools.py").write_text(
+        "import os, time\n"
+        "from pathlib import Path\n"
+        "from mcp.server.fastmcp import FastMCP\n"
+        "mcp = FastMCP('Tools')\n"
+        "@mcp.tool()\n"
+        "def work(delay):\n"
+        "    time.sleep(delay)\n"
+        "    return {'pid': os.getpid(), 'cwd': str(Path.cwd())}\n",
+        encoding="utf-8",
+    )
+    task = {"data_root": str(root), "tools_py": str(root / "tools.py")}
 
     pool = LocalMCPProcessPool(workers=4)
     try:
@@ -2300,13 +2334,13 @@ def test_local_mcp_process_pool_runs_workspaces_in_parallel(tmp_path: Path, monk
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as threads:
             outputs = list(
                 threads.map(
-                    lambda root: pool.call(
-                        {"data_root": str(root), "tools_py": str(root / "tools.py")},
+                    lambda _index: pool.call(
+                        task,
                         "work",
                         {"delay": 0.4},
                         relax_empty=False,
                     ),
-                    roots,
+                    range(4),
                 )
             )
     finally:
@@ -2315,31 +2349,61 @@ def test_local_mcp_process_pool_runs_workspaces_in_parallel(tmp_path: Path, monk
         elapsed = time.perf_counter() - started
     assert elapsed < 1.2
     assert len({output["result"]["pid"] for output in outputs}) == 4
-    assert {output["result"]["cwd"] for output in outputs} == {str(root) for root in roots}
+    assert {output["result"]["cwd"] for output in outputs} == {str(root)}
 
 
-def test_local_mcp_process_pool_release_failure_returns_capacity(tmp_path: Path, monkeypatch):
-    import concurrent.futures
-
+def test_local_mcp_process_pool_release_returns_capacity_on_terminate_failure(monkeypatch):
     from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
 
-    first = {"data_root": str(tmp_path / "first")}
-    second = {"data_root": str(tmp_path / "second")}
     pool = LocalMCPProcessPool(workers=1)
     shard = pool.shards[0]
-    pool._lease(first)
+    index = pool._acquire()
+    monkeypatch.setattr(shard, "terminate", lambda: (_ for _ in ()).throw(RuntimeError("terminate failed")))
 
-    failed = concurrent.futures.Future()
-    failed.set_exception(RuntimeError("worker failed during release"))
-    monkeypatch.setattr(shard, "submit", lambda *_args: failed)
-    terminated = []
-    monkeypatch.setattr(shard, "terminate", lambda: terminated.append(True))
+    with pytest.raises(RuntimeError, match="terminate failed"):
+        pool._release(index)
 
-    pool.release(first)
-
-    assert terminated == [True]
-    assert pool._lease(second) == 0
+    assert pool._acquire() == 0
     pool.close()
+
+
+def test_local_mcp_process_pool_lease_acquire_times_out(monkeypatch):
+    from slime.rollout.failure_types import MCPLeaseTimeout
+    from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
+
+    pool = LocalMCPProcessPool(workers=1)
+    index = pool._acquire()
+    try:
+        with pytest.raises(MCPLeaseTimeout, match="No local MCP process worker"):
+            pool._acquire(timeout=0.01)
+    finally:
+        pool._release(index)
+        pool.close()
+
+
+def test_local_mcp_process_failure_propagates_retryable_infra(monkeypatch):
+    from slime.rollout.fused_agent import mcp_process_pool
+    from slime.rollout.fused_agent.env import LocalMCPToolset
+
+    class BrokenPool:
+        def call(self, *_args, **_kwargs):
+            raise TimeoutError("worker stalled")
+
+    toolset = LocalMCPToolset.__new__(LocalMCPToolset)
+    toolset.task = {"tools_py": "/tmp/tools.py"}
+    toolset.tools = {"lookup": lambda: None}
+    toolset.tool_aliases = {}
+    toolset.last_call_info = {}
+    toolset.last_infra_failure = ""
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "true")
+    monkeypatch.delenv("SLIME_LOCAL_MCP_PROCESS_WORKER", raising=False)
+    monkeypatch.setattr(mcp_process_pool, "get_local_mcp_process_pool", lambda: BrokenPool())
+
+    result = toolset.call_raw("lookup", {})
+
+    assert result.startswith("Error calling lookup: isolated worker TimeoutError")
+    assert toolset.last_infra_failure == "local_mcp_TimeoutError"
+    assert toolset.last_call_info["failure_class"] == "retryable_infra"
 
 
 def test_local_mcp_process_isolates_module_load_verifier_and_sequential_trajectories(tmp_path: Path, monkeypatch):
@@ -2356,14 +2420,15 @@ def test_local_mcp_process_isolates_module_load_verifier_and_sequential_trajecto
     def task(root: Path) -> dict:
         root.mkdir()
         (root / "tools.py").write_text(
-            "import os\n"
+            "import os, uuid\n"
             "from pathlib import Path\n"
             "from mcp.server.fastmcp import FastMCP\n"
             f"os.environ['{marker}'] = 'worker-only'\n"
+            "INSTANCE_ID = uuid.uuid4().hex\n"
             "mcp = FastMCP('Tools')\n"
             "@mcp.tool()\n"
             "def identity():\n"
-            "    return {'pid': os.getpid(), 'cwd': str(Path.cwd())}\n",
+            "    return {'pid': os.getpid(), 'cwd': str(Path.cwd()), 'instance_id': INSTANCE_ID}\n",
             encoding="utf-8",
         )
         return {
@@ -2375,8 +2440,8 @@ def test_local_mcp_process_isolates_module_load_verifier_and_sequential_trajecto
                     "from pathlib import Path\n"
                     "def verify(tools, answer):\n"
                     "    observed = tools.identity()\n"
-                    "    return {'passed': observed['pid'] == answer['pid'] "
-                    "and str(Path.cwd()) == answer['cwd']}\n"
+                    "    return {'passed': str(Path.cwd()) == answer['cwd'], "
+                    "'worker_instance_id': observed['instance_id']}\n"
                 )
             },
         }
@@ -2386,6 +2451,7 @@ def test_local_mcp_process_isolates_module_load_verifier_and_sequential_trajecto
     first.answer = json.dumps(first_result)
     first.tool_calls = 1
     assert first.compute_final_reward() == 1.0
+    assert first.reward_debug["verifier"]["worker_instance_id"] != first_result["instance_id"]
     assert marker not in os.environ
     first.close()
 
@@ -2886,8 +2952,8 @@ def test_mcp_tool_load_error_is_nonfatal(tmp_path: Path):
     assert info["task_type"] == "mcp"
     assert "env_error" in info
     assert env.compute_final_reward() == 0.0
-    assert env.reward_debug["infra_failure"] is True
-    assert env.reward_debug["infra_failure_reasons"] == ["mcp_tools_load_error"]
+    assert env.reward_debug["failure_class"] == "permanent_task_failure"
+    assert "infra_failure" not in env.reward_debug
 
 
 def test_mcp_tool_elapsed_time_is_reported(tmp_path: Path, monkeypatch):

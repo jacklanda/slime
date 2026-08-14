@@ -14,17 +14,19 @@ class _Engine:
     def __init__(self, reported_version=None):
         self.version = "default"
         self.reported_version = reported_version
+        self.continue_generation_calls = 0
         self.pull_weights = _RemoteCall(lambda _version: None)
         self.pause_generation = _RemoteCall(lambda: None)
         self.flush_cache = _RemoteCall(lambda: None)
         self.update_weights_from_disk = _RemoteCall(self._update)
-        self.get_weight_version = _RemoteCall(
-            lambda: self.reported_version if self.reported_version is not None else self.version
-        )
-        self.continue_generation = _RemoteCall(lambda: None)
+        self.get_weight_version = _RemoteCall(lambda: self.reported_version if self.reported_version is not None else self.version)
+        self.continue_generation = _RemoteCall(self._continue_generation)
 
     def _update(self, *, model_path, weight_version):
         self.version = weight_version
+
+    def _continue_generation(self):
+        self.continue_generation_calls += 1
 
 
 def _group(monkeypatch, engines):
@@ -52,6 +54,19 @@ def test_full_disk_reload_verifies_versions_after_engine_update(monkeypatch, tmp
     _group(monkeypatch, engines)._reload_rollout_weights_from_disk(tmp_path, "1")
 
     assert [engine.version for engine in engines] == ["1"] * 4
+    assert [engine.continue_generation_calls for engine in engines] == [1] * 4
+
+
+@pytest.mark.unit
+def test_full_disk_reload_keeps_generation_paused_until_kv_onload(monkeypatch, tmp_path):
+    engines = [_Engine() for _ in range(4)]
+    group = _group(monkeypatch, engines)
+    group.args.offload_rollout = True
+
+    group._reload_rollout_weights_from_disk(tmp_path, "1")
+
+    assert [engine.version for engine in engines] == ["1"] * 4
+    assert [engine.continue_generation_calls for engine in engines] == [0] * 4
 
 
 @pytest.mark.unit

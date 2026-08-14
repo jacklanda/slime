@@ -342,4 +342,7 @@ class RayTrainGroup:
             validate_rollout_weight_versions(weight_version, engine_versions)
         if not self.args.update_weight_disk_keep_files:
             shutil.rmtree(disk_weight_dir, ignore_errors=True)
-        ray.get([engine.continue_generation.remote() for engine in engines])
+        # Colocated engines still have their KV cache offloaded here.  The
+        # rollout manager resumes generation after onload_kv restores it.
+        if not self.args.offload_rollout:
+            ray.get([engine.continue_generation.remote() for engine in engines])
