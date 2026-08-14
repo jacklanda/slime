@@ -20,6 +20,7 @@ from slime.backends.sglang_utils.external import start_external_rollout_servers
 from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine, remove_worker_from_router
 from slime.rollout.base_types import call_rollout_fn
+from slime.rollout.filter_hub.dynamic_sampling_filters import check_reward_nonzero_std
 from slime.utils import logging_utils
 from slime.utils.credit_assignment import (
     CreditAssignmentConfig,
@@ -342,6 +343,25 @@ def convert_samples_to_train_data(
     if has_explicit_policy_mask:
         train_data["policy_loss_masks"] = policy_loss_masks
 
+    # Count only gradient-bearing policy tokens from reward-varying groups.
+    sample_groups: dict[Any, list[int]] = defaultdict(list)
+    for position, sample in enumerate(samples):
+        group_id = sample.group_index
+        if group_id is None:
+            group_id = sample.rollout_id
+        if group_id is None:
+            group_id = sample.index
+        if group_id is None:
+            group_id = f"ungrouped:{position}"
+        sample_groups[group_id].append(position)
+    useful_sample_positions = {
+        position
+        for positions in sample_groups.values()
+        if check_reward_nonzero_std(args, [samples[position] for position in positions]).keep
+        for position in positions
+    }
+    useful_training_tokens = sum(sum(policy_loss_masks[position]) for position in useful_sample_positions)
+
     # Per-rollout aggregate, precomputed at the step level (where we can
     # see every sample of every rollout) and broadcast per-sample so the
     # per-mb loss reducer uses the correct whole-rollout denominator even
@@ -388,6 +408,7 @@ def convert_samples_to_train_data(
         "policy_loss_mask_sums": (
             [sum(m) for m in policy_loss_masks] if has_explicit_policy_mask else mask_sums_per_sample
         ),
+        "useful_training_tokens": useful_training_tokens,
         "credit_assignment_events": credit_assignment_events,
         "prompt_lengths": [len(sample.tokens) - sample.response_length for sample in samples],
         "response_lengths": [sample.response_length for sample in samples],

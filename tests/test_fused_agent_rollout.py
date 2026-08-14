@@ -2352,6 +2352,76 @@ def test_local_mcp_process_pool_runs_workspaces_in_parallel(tmp_path: Path, monk
     assert {output["result"]["cwd"] for output in outputs} == {str(root)}
 
 
+def test_local_mcp_describe_cache_is_singleflight_versioned_and_copied(tmp_path: Path, monkeypatch):
+    import concurrent.futures
+    import threading
+    import time
+
+    from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
+
+    tools_py = tmp_path / "tools.py"
+    tools_py.write_text("# v1\n", encoding="utf-8")
+    task = {"data_root": str(tmp_path), "tools_py": str(tools_py)}
+    pool = LocalMCPProcessPool(workers=1)
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def describe_uncached(_task):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            version = calls
+        time.sleep(0.02)
+        return {
+            "schemas": [{"name": "tool", "version": version}],
+            "load_error": "",
+            "load_warning": "",
+            "tool_aliases": {},
+            "tool_names": ["tool"],
+        }
+
+    monkeypatch.setattr(pool, "_describe_uncached", describe_uncached)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as threads:
+            descriptions = list(threads.map(lambda _index: pool.describe(task), range(32)))
+        assert calls == 1
+        descriptions[0]["schemas"][0]["name"] = "mutated"
+        assert descriptions[1]["schemas"][0]["name"] == "tool"
+
+        tools_py.write_text("# version two\n", encoding="utf-8")
+        refreshed = pool.describe(task)
+        assert calls == 2
+        assert refreshed["schemas"][0]["version"] == 2
+    finally:
+        pool.close()
+
+
+def test_local_mcp_describe_cache_does_not_cache_failures(tmp_path: Path, monkeypatch):
+    from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
+
+    tools_py = tmp_path / "tools.py"
+    tools_py.write_text("# tools\n", encoding="utf-8")
+    task = {"data_root": str(tmp_path), "tools_py": str(tools_py)}
+    pool = LocalMCPProcessPool(workers=1)
+    calls = 0
+
+    def describe_uncached(_task):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("describe stalled")
+        return {"schemas": [], "load_error": "", "load_warning": "", "tool_aliases": {}, "tool_names": []}
+
+    monkeypatch.setattr(pool, "_describe_uncached", describe_uncached)
+    try:
+        with pytest.raises(TimeoutError, match="describe stalled"):
+            pool.describe(task)
+        assert pool.describe(task)["load_error"] == ""
+        assert calls == 2
+    finally:
+        pool.close()
+
+
 def test_local_mcp_process_pool_release_returns_capacity_on_terminate_failure(monkeypatch):
     from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
 

@@ -3,6 +3,7 @@ import copy
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -10,7 +11,6 @@ import time
 import uuid
 from argparse import Namespace
 from collections import Counter
-from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -504,8 +504,9 @@ async def generate_and_rm(
 
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
     custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
-    manages_eval_request_concurrency = evaluation and getattr(
-        custom_generate_func, "manages_eval_request_concurrency", False
+    manages_request_concurrency = custom_generate_func is not None and (
+        getattr(custom_generate_func, "manages_request_concurrency", False)
+        or (evaluation and getattr(custom_generate_func, "manages_eval_request_concurrency", False))
     )
 
     for attempt in range(retry_times + 1):
@@ -514,12 +515,12 @@ async def generate_and_rm(
             current_sampling_params = sampling_params.copy()
             current_sampling_params["sampling_seed"] = int(base_sampling_seed) + attempt * 1_000_003
 
-        if manages_eval_request_concurrency:
+        if manages_request_concurrency:
             if state.aborted:
                 sample.status = Sample.Status.ABORTED
                 return sample
             with state.dp_rank_context() as _:
-                sample = await custom_generate_func(args, sample, current_sampling_params, evaluation=True)
+                sample = await custom_generate_func(args, sample, current_sampling_params, evaluation=evaluation)
         else:
             async with state.semaphore:
                 if state.aborted:
@@ -878,7 +879,7 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     return aborted_samples
 
 
-async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
+async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
     Args:
@@ -914,6 +915,9 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
     drop_reasons: Counter[str] = Counter()
     dropped_terminations: Counter[str] = Counter()
     dropped_rewards: Counter[str] = Counter()
+    completed_family_counts: Counter[str] = Counter()
+    accepted_family_counts: Counter[str] = Counter()
+    submitted_family_counts: Counter[str] = Counter()
     started = time.time()
     last_log = started
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Trace collection")
@@ -921,9 +925,40 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
         task_family_quotas
         and not has_task_family_quota_candidates(data, target_data_size, task_family_quotas)
     ):
-        while state.remaining_batch_size < target_data_size:
-            # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
+        if task_family_quotas:
+            pending_family_counts = Counter(
+                sample_group_task_family(group) for group in state.pending_groups.values()
+            )
+            submit_limit = max(0, args.over_sampling_batch_size - len(state.pendings))
+            min_pending_groups = min(
+                args.over_sampling_batch_size,
+                max(0, int(os.environ.get("SLIME_SYNC_MIN_PENDING_GROUPS", "0"))),
+            )
+            family_plan = _task_family_submission_plan(
+                submit_limit,
+                target_data_size,
+                task_family_quotas,
+                accepted_family_counts,
+                completed_family_counts,
+                pending_family_counts,
+                min_pending_groups,
+            )
+            if family_plan:
+                if hasattr(data_source, "get_samples_by_family"):
+                    samples = data_source.get_samples_by_family(family_plan)
+                else:
+                    get_samples = data_source.get_samples if hasattr(data_source, "get_samples") else data_source
+                    samples = get_samples(sum(family_plan.values()))
+                if not samples:
+                    raise RuntimeError("Rollout data source returned no prompt groups")
+                submitted_family_counts.update(sample_group_task_family(group) for group in samples)
+                state.submit_generate_tasks(samples)
+        elif state.remaining_batch_size < target_data_size:
+            get_samples = data_source.get_samples if hasattr(data_source, "get_samples") else data_source
+            samples = get_samples(args.over_sampling_batch_size)
+            if not samples:
+                raise RuntimeError("Rollout data source returned no prompt groups")
+            submitted_family_counts.update(sample_group_task_family(group) for group in samples)
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
@@ -981,6 +1016,8 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
                 all_data.append(group)
             completed_groups += 1
             flat_group = _flatten_samples(group)
+            family = sample_group_task_family(group)
+            completed_family_counts[family] += 1
             metric_gatherer.on_completed_group(args, flat_group)
             failure_class = group_failure_class(flat_group)
             if failure_class is not None:
@@ -1016,6 +1053,8 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
             if not dynamic_filter_output.keep and relax_filter:
                 metric_gatherer.on_dynamic_filter_drop(reason=f"relaxed_{dynamic_filter_output.reason}")
 
+            accepted_family_counts[family] += 1
+
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size or task_family_quotas:
@@ -1027,15 +1066,6 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
                 data.append(group)
                 if pbar.n < pbar.total:
                     pbar.update(args.n_samples_per_prompt)
-        if (
-            task_family_quotas
-            and not state.pendings
-            and not has_task_family_quota_candidates(data, target_data_size, task_family_quotas)
-        ):
-            # Accepted candidates count toward remaining_batch_size in the
-            # stock collector. Once a complete wave lacks a required family,
-            # release that count so the next wave can be submitted.
-            state.remaining_batch_size = 0
         now = time.time()
         if now - last_log > 30.0:
             # logger.info(
@@ -1118,11 +1148,74 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
     metrics["rollout/dynamic_filter/completed_groups"] = completed_groups
     metrics["rollout/dynamic_filter/dropped_groups"] = dropped_groups
     metrics["rollout/dynamic_filter/kept_groups"] = len(data)
+    metrics["rollout/config/sync_min_pending_groups"] = min(
+        args.over_sampling_batch_size,
+        max(0, int(os.environ.get("SLIME_SYNC_MIN_PENDING_GROUPS", "0"))),
+    )
     for family, count in candidate_family_counts.items():
         metrics[f"rollout/task_family_candidates/{family}"] = count
     for family, count in selected_family_counts.items():
         metrics[f"rollout/task_family_selected/{family}"] = count
+    for family, count in submitted_family_counts.items():
+        metrics[f"rollout/task_family_submitted/{family}"] = count
+    for family, count in completed_family_counts.items():
+        metrics[f"rollout/task_family_roi/{family}"] = accepted_family_counts[family] / count
     return RolloutFnTrainOutput(samples=data, metrics=metrics), aborted_samples
+
+
+def _task_family_submission_plan(
+    submit_limit: int,
+    target: int,
+    quotas: dict[str, float],
+    accepted: Counter[str],
+    completed: Counter[str],
+    pending: Counter[str] | None = None,
+    min_pending_groups: int = 0,
+) -> dict[str, int]:
+    """Size a quota-aware wave from expected yield and a GPU-work reservoir."""
+    if not quotas or submit_limit <= 0:
+        return {}
+
+    pending = pending or Counter()
+    targets = task_family_quota_counts(target, quotas)
+    roi_prior = min(1.0, max(1e-3, float(os.environ.get("SLIME_TASK_FAMILY_ROI_PRIOR", "0.5"))))
+    prior_strength = max(0.0, float(os.environ.get("SLIME_TASK_FAMILY_ROI_PRIOR_STRENGTH", "4")))
+    weights = {}
+    roi_candidate_counts = {}
+    for family, family_target in targets.items():
+        remaining_deficit = max(0, family_target - accepted[family])
+        if remaining_deficit == 0:
+            continue
+        denominator = completed[family] + prior_strength
+        roi = (
+            (accepted[family] + roi_prior * prior_strength) / denominator
+            if denominator > 0
+            else roi_prior
+        )
+        roi = max(roi, 1e-3)
+        expected_pending_valid = pending[family] * roi
+        expected_deficit = max(0.0, remaining_deficit - expected_pending_valid)
+        weights[family] = remaining_deficit / roi
+        roi_candidate_counts[family] = expected_deficit / roi
+    if not weights:
+        return {}
+
+    total_weight = sum(weights.values())
+    roi_submit_count = math.ceil(sum(roi_candidate_counts.values()))
+    eligible_pending_count = sum(pending[family] for family in weights)
+    reservoir_submit_count = max(0, min_pending_groups - eligible_pending_count)
+    submit_count = min(submit_limit, max(roi_submit_count, reservoir_submit_count))
+    if submit_count == 0:
+        return {}
+    raw = {family: submit_count * weight / total_weight for family, weight in weights.items()}
+    plan = {family: int(value) for family, value in raw.items()}
+    remaining = submit_count - sum(plan.values())
+    for family in sorted(raw, key=lambda name: raw[name] - plan[name], reverse=True):
+        if remaining <= 0:
+            break
+        plan[family] += 1
+        remaining -= 1
+    return {family: count for family, count in plan.items() if count > 0}
 
 
 EVAL_PROMPT_DATASET = {}
@@ -1462,7 +1555,7 @@ def generate_rollout(args: Namespace, rollout_id: int, data_source: Any, evaluat
         output, _ = run(eval_rollout(args, rollout_id))
         return output
 
-    output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_source.get_samples))
+    output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_source))
     if aborted_samples:
         data_source.add_samples(aborted_samples)
     return output

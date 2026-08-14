@@ -1,6 +1,7 @@
 import asyncio
 import io
 from argparse import Namespace
+from collections import Counter
 from contextlib import nullcontext
 
 import pytest
@@ -659,6 +660,127 @@ def test_eval_custom_generator_can_manage_request_concurrency(monkeypatch):
     assert sample.response == "done"
     assert sample.metadata["eval_retry_count"] == 0
     assert sample.metadata["eval_retry_termination_reasons"] == []
+
+
+def test_training_custom_generator_can_manage_decode_request_concurrency(monkeypatch):
+    async def custom_generate(_args, sample, _sampling_params, evaluation=False):
+        assert evaluation is False
+        sample.reward = 1.0
+        sample.response = "done"
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    custom_generate.manages_request_concurrency = True
+
+    class BlockedOuterState:
+        aborted = False
+        semaphore = asyncio.Semaphore(0)
+
+        def __init__(self, _args):
+            pass
+
+        def dp_rank_context(self):
+            return nullcontext()
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", BlockedOuterState)
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda _path: custom_generate)
+    args = Namespace(
+        custom_generate_function_path="custom",
+        group_rm=False,
+        rm_type="",
+        partial_rollout=False,
+        mask_offpolicy_in_partial_rollout=False,
+    )
+
+    sample = asyncio.run(
+        asyncio.wait_for(
+            sglang_rollout.generate_and_rm(args, Sample(prompt="q"), {}, evaluation=False),
+            timeout=0.2,
+        )
+    )
+
+    assert sample.response == "done"
+
+
+def test_task_family_submission_plan_compensates_for_lower_roi():
+    plan = sglang_rollout._task_family_submission_plan(
+        submit_limit=10,
+        target=20,
+        quotas={"mcp": 0.5, "webqa": 0.5},
+        accepted=Counter({"mcp": 1, "webqa": 4}),
+        completed=Counter({"mcp": 8, "webqa": 5}),
+    )
+
+    assert sum(plan.values()) == 10
+    assert plan["mcp"] > plan["webqa"]
+
+
+def test_task_family_submission_plan_sizes_cold_start_by_quota_over_roi():
+    plan = sglang_rollout._task_family_submission_plan(
+        submit_limit=96,
+        target=16,
+        quotas={"mcp": 0.5, "webqa": 0.5},
+        accepted=Counter(),
+        completed=Counter(),
+    )
+
+    assert plan == {"mcp": 16, "webqa": 16}
+
+
+def test_task_family_submission_plan_refills_when_pending_yield_cannot_cover_tail():
+    plan = sglang_rollout._task_family_submission_plan(
+        submit_limit=10,
+        target=8,
+        quotas={"mcp": 0.5, "webqa": 0.5},
+        accepted=Counter({"mcp": 3, "webqa": 4}),
+        completed=Counter({"mcp": 20, "webqa": 8}),
+        pending=Counter({"mcp": 1}),
+    )
+
+    # Raw group counting sees 3 accepted + 1 pending MCP group and stalls.
+    # At the observed ROI, that pending group cannot cover the expected deficit.
+    assert plan == {"mcp": 4}
+
+
+def test_task_family_submission_plan_does_not_overfill_healthy_pending_wave():
+    plan = sglang_rollout._task_family_submission_plan(
+        submit_limit=96,
+        target=8,
+        quotas={"mcp": 0.5, "webqa": 0.5},
+        accepted=Counter(),
+        completed=Counter(),
+        pending=Counter({"mcp": 8, "webqa": 8}),
+    )
+
+    assert plan == {}
+
+
+def test_task_family_submission_plan_maintains_aggressive_pending_reservoir():
+    plan = sglang_rollout._task_family_submission_plan(
+        submit_limit=128,
+        target=8,
+        quotas={"mcp": 0.5, "webqa": 0.5},
+        accepted=Counter(),
+        completed=Counter(),
+        pending=Counter(),
+        min_pending_groups=64,
+    )
+
+    assert plan == {"mcp": 32, "webqa": 32}
+
+
+def test_task_family_submission_plan_stops_refilling_satisfied_family():
+    plan = sglang_rollout._task_family_submission_plan(
+        submit_limit=128,
+        target=8,
+        quotas={"mcp": 0.5, "webqa": 0.5},
+        accepted=Counter({"mcp": 3, "webqa": 4}),
+        completed=Counter({"mcp": 20, "webqa": 8}),
+        pending=Counter({"mcp": 1, "webqa": 20}),
+        min_pending_groups=64,
+    )
+
+    assert plan == {"mcp": 63}
 
 
 def test_eval_retries_non_env_done_termination_before_reward(monkeypatch):

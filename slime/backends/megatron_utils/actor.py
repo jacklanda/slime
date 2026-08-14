@@ -399,7 +399,11 @@ class MegatronTrainRayActor(TrainRayActor):
             result = self.train_critic(rollout_id, rollout_data)
         else:
             self.train_actor(rollout_id, rollout_data, external_data=external_data)
-            result = None
+            metrics_data = rollout_data.get("episode_metrics_data") or {}
+            if dist.get_rank() == 0 and "useful_training_tokens" in metrics_data:
+                result = {"useful_training_tokens": int(metrics_data["useful_training_tokens"])}
+            else:
+                result = None
 
         if self.args.offload_train:
             del rollout_data

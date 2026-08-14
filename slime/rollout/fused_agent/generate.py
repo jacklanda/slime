@@ -841,7 +841,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         step_sampling,
                         session_id=session_id,
                         evaluation=evaluation,
-                        request_semaphore=state.semaphore if evaluation else None,
+                        request_semaphore=state.semaphore,
                         session_params=session_params,
                         context_token_count=len(prompt_ids),
                         server_url=eval_sglang_session.server_url if session_params is not None else None,
@@ -872,7 +872,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         step_sampling,
                         session_id=session_id,
                         evaluation=evaluation,
-                        request_semaphore=state.semaphore if evaluation else None,
+                        request_semaphore=state.semaphore,
                         context_token_count=len(prompt_ids),
                         expected_weight_version=trajectory_weight_version,
                         require_weight_version=require_weight_version,
@@ -2252,6 +2252,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     return samples
 
 
+generate.manages_request_concurrency = True
 generate.manages_eval_request_concurrency = True
 
 

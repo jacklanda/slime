@@ -97,16 +97,27 @@ def test_qwen3_rejection_sampling_uses_inference_only_fast_path():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("launcher_name", ["train_qwen3_fused_agent_sync.sh", "train_odyssey_qwen3_multinode_sync.sh"])
-def test_qwen3_training_launchers_default_to_adaptive_fully_async(launcher_name):
+def test_qwen3_training_launcher_defaults_to_adaptive_fully_async():
     repo_root = Path(__file__).resolve().parents[1]
-    launcher = (repo_root / "experiments" / launcher_name).read_text(encoding="utf-8")
+    launcher = (repo_root / "experiments/train_qwen3_fused_agent_sync.sh").read_text(encoding="utf-8")
     assert (
         'ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-'
         'slime.rollout.fully_async_rollout.generate_rollout_fully_async}"'
     ) in launcher
     assert 'FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY:-true}"' in launcher
     assert 'export SLIME_FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY}"' in launcher
+
+
+@pytest.mark.unit
+def test_odyssey_sync_launcher_drains_rollouts_before_weight_updates():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
+
+    assert (
+        'ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-'
+        'slime.rollout.sglang_rollout.generate_rollout}"'
+    ) in launcher
+    assert 'export SLIME_FUSED_REQUIRE_WEIGHT_VERSION="${SLIME_FUSED_REQUIRE_WEIGHT_VERSION:-1}"' in launcher
 
 
 @pytest.mark.unit
@@ -244,6 +255,18 @@ def test_qwen3_sync_launcher_defaults_to_colocated_trainer_offload():
 
 
 @pytest.mark.unit
+def test_odyssey_sync_launcher_defaults_to_persistent_trainer_offload():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
+
+    assert 'RELEASE_TRAIN="${RELEASE_TRAIN:-false}"' in launcher
+    assert 'OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${COLOCATE}}"' in launcher
+    assert '--train-env-vars \'{"TMS_INIT_ENABLE_CPU_BACKUP":"1"}\'' in launcher
+    assert "--update-weight-mode full" in launcher
+    assert "--update-weight-transport disk" in launcher
+
+
+@pytest.mark.unit
 def test_odyssey_launcher_enforces_strict_dynamic_sampling():
     repo_root = Path(__file__).resolve().parents[1]
     launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
@@ -261,6 +284,17 @@ def test_odyssey_launcher_enforces_strict_dynamic_sampling():
     assert '--rollout-infra-retry-times "${ROLLOUT_INFRA_RETRY_TIMES}"' in launcher
     assert 'SLIME_LOCAL_MCP_LEASE_TIMEOUT="${SLIME_LOCAL_MCP_LEASE_TIMEOUT:-120}"' in launcher
     assert launcher.count("SLIME_LOCAL_MCP_LEASE_TIMEOUT") >= 2
+
+
+@pytest.mark.unit
+def test_odyssey_sync_launcher_keeps_aggressive_pending_group_reservoir():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
+
+    assert 'OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"' in launcher
+    assert 'SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS:-$((ROLLOUT_ENGINE_COUNT * 4))}"' in launcher
+    assert 'export SLIME_SYNC_MIN_PENDING_GROUPS="${SLIME_SYNC_MIN_PENDING_GROUPS:-${SYNC_MIN_PENDING_GROUPS}}"' in launcher
+    assert '"SLIME_SYNC_MIN_PENDING_GROUPS"' in launcher
 
 
 @pytest.mark.unit

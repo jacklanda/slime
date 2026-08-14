@@ -10,6 +10,7 @@ from slime.utils.data import Dataset
 from slime.utils.misc import load_function
 from slime.utils.processing_utils import load_processor, load_tokenizer
 from slime.utils.types import Sample
+from slime.rollout.task_family import normalize_task_family, sample_task_family
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class RolloutDataSource(DataSource):
         self.sample_group_index = 0
         self.sample_index = 0
         self.sample_offset = 0
+        self._deferred_prompt_samples = []
         self._rollout_cursor_snapshots = {}
         # TODO remove this
         self.metadata = {}
@@ -88,8 +90,7 @@ class RolloutDataSource(DataSource):
         else:
             self.dataset = None
 
-    def get_samples(self, num_samples):
-        # TODO further improve code
+    def _get_prompt_samples(self, num_samples):
         if self.dataset is not None:
             no_wrap = getattr(self.args, "rollout_only_inference_fast_path", False) and os.environ.get(
                 "SLIME_FULLY_ASYNC_NO_DATASET_WRAP", "false"
@@ -113,6 +114,9 @@ class RolloutDataSource(DataSource):
         else:
             prompt_samples = [Sample() for _ in range(num_samples)]
 
+        return prompt_samples
+
+    def _make_groups(self, prompt_samples):
         samples = []
         for prompt_sample in prompt_samples:
             group = []
@@ -126,6 +130,57 @@ class RolloutDataSource(DataSource):
             samples.append(group)
         return samples
 
+    def get_samples(self, num_samples):
+        # TODO further improve code
+        prompt_samples = self._deferred_prompt_samples[:num_samples]
+        del self._deferred_prompt_samples[: len(prompt_samples)]
+        if len(prompt_samples) < num_samples:
+            prompt_samples += self._get_prompt_samples(num_samples - len(prompt_samples))
+        return self._make_groups(prompt_samples)
+
+    def get_samples_by_family(self, family_counts: dict[str, int]) -> list[list[Sample]]:
+        """Fetch prompt groups before rollout according to a task-family plan.
+
+        Prompts scanned past the requested mix are deferred, not discarded. This
+        keeps the global dataset cursor resumable while avoiding expensive
+        generate-then-trim quota enforcement.
+        """
+        remaining = {
+            normalize_task_family(family): max(0, int(count))
+            for family, count in family_counts.items()
+            if int(count) > 0
+        }
+        target = sum(remaining.values())
+        if target == 0:
+            return []
+
+        selected = []
+        deferred = []
+        candidates = self._deferred_prompt_samples
+        self._deferred_prompt_samples = []
+        max_scan = max(target, len(self.dataset) if self.dataset is not None else target)
+        scanned = 0
+        while len(selected) < target and scanned < max_scan:
+            if not candidates:
+                fetch_size = min(max_scan - scanned, max(target - len(selected), 64))
+                candidates = self._get_prompt_samples(fetch_size)
+            prompt_sample = candidates.pop(0)
+            scanned += 1
+            family = sample_task_family(prompt_sample)
+            if remaining.get(family, 0) > 0:
+                selected.append(prompt_sample)
+                remaining[family] -= 1
+            else:
+                deferred.append(prompt_sample)
+
+        deferred.extend(candidates)
+        if len(selected) < target:
+            fill = min(target - len(selected), len(deferred))
+            selected.extend(deferred[:fill])
+            del deferred[:fill]
+        self._deferred_prompt_samples = deferred + self._deferred_prompt_samples
+        return self._make_groups(selected)
+
     def add_samples(self, samples: list[list[Sample]]):
         raise RuntimeError(f"Cannot add samples to {self.__class__.__name__}. This is a read-only data source.")
 
@@ -138,6 +193,7 @@ class RolloutDataSource(DataSource):
             "epoch_id": self.epoch_id,
             "sample_group_index": self.sample_group_index,
             "sample_index": self.sample_index,
+            "deferred_prompt_samples": self._deferred_prompt_samples,
             "metadata": self.metadata,
         }
         path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
@@ -150,6 +206,7 @@ class RolloutDataSource(DataSource):
             "epoch_id": self.epoch_id,
             "sample_group_index": self.sample_group_index,
             "sample_index": self.sample_index,
+            "deferred_prompt_samples": copy.deepcopy(self._deferred_prompt_samples),
             "metadata": copy.deepcopy(self.metadata),
         }
 
@@ -172,6 +229,7 @@ class RolloutDataSource(DataSource):
         self.epoch_id = state_dict.get("epoch_id", 0)
         self.sample_group_index = state_dict.get("sample_group_index", 0)
         self.sample_index = state_dict.get("sample_index", 0)
+        self._deferred_prompt_samples = state_dict.get("deferred_prompt_samples", [])
         self.metadata = state_dict.get("metadata", {})
 
         if self.args.rollout_global_dataset and self.args.rollout_shuffle and self.dataset is not None:
@@ -207,6 +265,26 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
 
         samples += super().get_samples(num_samples=num_samples)
         return samples
+
+    def get_samples_by_family(self, family_counts: dict[str, int]) -> list[list[Sample]]:
+        remaining = {
+            normalize_task_family(family): max(0, int(count))
+            for family, count in family_counts.items()
+            if int(count) > 0
+        }
+        selected = []
+        retained = []
+        for group in self.buffer:
+            family = sample_task_family(group[0])
+            if remaining.get(family, 0) > 0:
+                selected.append(group)
+                remaining[family] -= 1
+            else:
+                retained.append(group)
+        self.buffer = retained
+        if remaining:
+            selected.extend(super().get_samples_by_family(remaining))
+        return selected
 
     def _get_samples_from_buffer(self, num_samples: int) -> list[list[Sample]]:
         if len(self.buffer) == 0 or num_samples == 0:

@@ -183,7 +183,8 @@ class RayTrainGroup:
         """Do one rollout training. Returns a list of Ray refs (one per worker).
 
         For critics, each ref resolves to ``{"values": [cpu tensors...]}`` (or ``{}``
-        for non-last-PP-stage workers). Actor refs resolve to ``None``.
+        for non-last-PP-stage workers). The rank-0 actor ref resolves to a small
+        training-data metric summary; other actor refs resolve to ``None``.
 
         ``external_data`` may be a list (one item per worker) or a single dict
         broadcast to all workers.

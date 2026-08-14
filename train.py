@@ -131,16 +131,26 @@ def train(args):
             phase_times["trainer_create"] = perf_counter() - phase_start
 
         actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
+        actor_train_results = None
         phase_start = perf_counter()
         if args.use_critic:
             value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
             if actor_trains:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
+                actor_train_results = ray.get(
+                    actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs)
+                )
             else:
                 ray.get(value_refs)
         else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+            actor_train_results = ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
         train_time = perf_counter() - phase_start
+
+        useful_training_tokens = None
+        if actor_train_results is not None:
+            for result in actor_train_results:
+                if isinstance(result, dict) and "useful_training_tokens" in result:
+                    useful_training_tokens = int(result["useful_training_tokens"])
+                    break
 
         if actor_trains:
             phase_start = perf_counter()
@@ -190,6 +200,7 @@ def train(args):
             step_time=step_time,
             train_time=train_time,
             phase_times=phase_times,
+            useful_training_tokens=useful_training_tokens,
         )
         logger.info("step perf %s: %s", rollout_id, timing_metrics)
         timing_metrics["rollout/step"] = compute_rollout_step(args, rollout_id)

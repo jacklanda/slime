@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import atexit
+import copy
 import json
 import multiprocessing
 import os
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Any
 
@@ -175,6 +176,9 @@ class LocalMCPProcessPool:
         self._condition = threading.Condition()
         self._free = deque(range(self.workers))
         self._closed = False
+        self._describe_lock = threading.Lock()
+        self._describe_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+        self._describe_inflight: dict[tuple[Any, ...], concurrent.futures.Future] = {}
 
     def _acquire(self, timeout: float | None = None) -> int:
         with self._condition:
@@ -229,7 +233,24 @@ class LocalMCPProcessPool:
         finally:
             self._release(shard_index)
 
-    def describe(self, task: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _describe_cache_key(task: dict[str, Any]) -> tuple[Any, ...]:
+        tools_value = task.get("tools_py")
+        data_root_value = task.get("data_root")
+        tools_path = Path(str(tools_value)).resolve() if tools_value else None
+        data_root = Path(str(data_root_value)).resolve() if data_root_value else None
+        try:
+            stat = tools_path.stat() if tools_path is not None else None
+        except OSError:
+            stat = None
+        return (
+            str(data_root) if data_root is not None else None,
+            str(tools_path) if tools_path is not None else None,
+            stat.st_mtime_ns if stat is not None else None,
+            stat.st_size if stat is not None else None,
+        )
+
+    def _describe_uncached(self, task: dict[str, Any]) -> dict[str, Any]:
         timeout = max(1.0, float(os.environ.get("SLIME_LOCAL_MCP_PROCESS_TIMEOUT", "120")))
         lease_timeout = max(0.1, float(os.environ.get("SLIME_LOCAL_MCP_LEASE_TIMEOUT", str(timeout))))
         shard_index = self._acquire(timeout=lease_timeout)
@@ -237,6 +258,43 @@ class LocalMCPProcessPool:
             return self.shards[shard_index].submit(_worker_describe, task).result(timeout=timeout)
         finally:
             self._release(shard_index)
+
+    def describe(self, task: dict[str, Any]) -> dict[str, Any]:
+        key = self._describe_cache_key(task)
+        with self._describe_lock:
+            cached = self._describe_cache.get(key)
+            if cached is not None:
+                self._describe_cache.move_to_end(key)
+                return copy.deepcopy(cached)
+            future = self._describe_inflight.get(key)
+            if future is None:
+                future = concurrent.futures.Future()
+                self._describe_inflight[key] = future
+                leader = True
+            else:
+                leader = False
+
+        if not leader:
+            return copy.deepcopy(future.result())
+
+        try:
+            description = self._describe_uncached(task)
+        except BaseException as exc:
+            with self._describe_lock:
+                self._describe_inflight.pop(key, None)
+                future.set_exception(exc)
+            raise
+
+        with self._describe_lock:
+            if not description.get("load_error"):
+                self._describe_cache[key] = copy.deepcopy(description)
+                self._describe_cache.move_to_end(key)
+                max_entries = max(1, int(os.environ.get("SLIME_LOCAL_MCP_DESCRIBE_CACHE_SIZE", "4096")))
+                while len(self._describe_cache) > max_entries:
+                    self._describe_cache.popitem(last=False)
+            self._describe_inflight.pop(key, None)
+            future.set_result(copy.deepcopy(description))
+        return copy.deepcopy(description)
 
     def verify(self, task: dict[str, Any], verification_code: str, answer: Any) -> dict[str, Any]:
         timeout = max(1.0, float(os.environ.get("SLIME_LOCAL_MCP_PROCESS_TIMEOUT", "120")))
@@ -259,6 +317,8 @@ class LocalMCPProcessPool:
             self._condition.notify_all()
         for shard in self.shards:
             shard.close()
+        with self._describe_lock:
+            self._describe_cache.clear()
 
 
 _pool: LocalMCPProcessPool | None = None

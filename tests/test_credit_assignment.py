@@ -191,6 +191,33 @@ def test_rollout_conversion_separates_advantage_and_policy_masks():
     assert train_data["policy_rollout_mask_sums"] == [4, 4]
     assert train_data["episode_metrics_data"]["loss_mask_sums"] == [4, 2]
     assert train_data["episode_metrics_data"]["policy_loss_mask_sums"] == [2, 2]
+    assert train_data["episode_metrics_data"]["useful_training_tokens"] == 4
+
+
+def test_useful_training_tokens_exclude_zero_variance_groups():
+    samples = [
+        Sample(
+            index=position,
+            group_index=group_index,
+            tokens=[10, 20, *range(response_length)],
+            response_length=response_length,
+            reward=reward,
+            loss_mask=[1] * response_length,
+            policy_loss_mask=policy_mask,
+        )
+        for position, (group_index, reward, response_length, policy_mask) in enumerate(
+            [
+                (10, 0.0, 3, [1, 1, 0]),
+                (10, 1.0, 2, [1, 1]),
+                (20, 0.0, 4, [1, 1, 1, 1]),
+                (20, 0.0, 2, [1, 1]),
+            ]
+        )
+    ]
+
+    train_data = convert_samples_to_train_data(_args(), samples)
+
+    assert train_data["episode_metrics_data"]["useful_training_tokens"] == 4
 
 
 def test_rollout_conversion_preserves_explicit_tito_policy_masks_across_split_samples():
