@@ -264,6 +264,16 @@ def test_odyssey_launcher_enforces_strict_dynamic_sampling():
 
 
 @pytest.mark.unit
+def test_odyssey_launcher_balances_webqa_and_mcp_training_groups():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
+
+    assert 'ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"' in launcher
+    assert 'ROLLOUT_ARGS+=(--rollout-task-family-quotas "${ROLLOUT_TASK_FAMILY_QUOTAS}")' in launcher
+    assert "ROLLOUT_BATCH_SIZE must be even for the 50/50 webqa/mcp training mix" in launcher
+
+
+@pytest.mark.unit
 def test_launchers_provision_per_trajectory_mcp_workspaces():
     repo_root = Path(__file__).resolve().parents[1]
     rejection = (repo_root / "experiments/run_qwen3_rejection_sampling.sh").read_text(encoding="utf-8")
