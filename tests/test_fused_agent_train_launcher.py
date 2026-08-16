@@ -415,11 +415,11 @@ def test_odyssey_sync_launcher_drains_rollouts_before_weight_updates():
 
 
 @pytest.mark.unit
-def test_odyssey_sync_launcher_enables_binary_grm_training_rewards():
+def test_odyssey_sync_launcher_disables_grm_training_rewards_by_default():
     repo_root = Path(__file__).resolve().parents[1]
     launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
 
-    assert 'ENABLE_USE_GRM_TRAIN="${ENABLE_USE_GRM_TRAIN:-${enable_use_grm_train:-true}}"' in launcher
+    assert 'ENABLE_USE_GRM_TRAIN="${ENABLE_USE_GRM_TRAIN:-${enable_use_grm_train:-false}}"' in launcher
     assert '--enable_use_grm_train|--enable-use-grm-train)' in launcher
     assert 'ROLLOUT_ARGS+=(--enable-use-grm-train)' in launcher
     assert 'GRM_MODE="${GRM_MODE:-score}"' in launcher
@@ -428,7 +428,7 @@ def test_odyssey_sync_launcher_enables_binary_grm_training_rewards():
         'evals=${ENABLE_USE_GRM_EVALS}, eval_model=${EVAL_GRM_MODEL}'
     ) in launcher
     assert 'TRAIN_GRM_MODEL="${TRAIN_GRM_MODEL:-deepseek/deepseek-v4-flash-0731}"' in launcher
-    assert 'EVAL_GRM_MODEL="${EVAL_GRM_MODEL:-google/gemini-3.7-flash}"' in launcher
+    assert 'EVAL_GRM_MODEL="${EVAL_GRM_MODEL:-google/gemini-3-flash-preview}"' in launcher
     assert '--train-grm-model "${TRAIN_GRM_MODEL}"' in launcher
     assert '--eval-grm-model "${EVAL_GRM_MODEL}"' in launcher
 

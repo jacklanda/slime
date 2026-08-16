@@ -947,9 +947,27 @@ def _format_json_observation_item(item: Any, idx: int) -> str:
     else:
         source = item
 
-    title = source.get("title") or source.get("name") or source.get("id") or item.get("id")
+    title = (
+        source.get("title")
+        or source.get("heading")
+        or source.get("section_heading")
+        or source.get("name")
+        or source.get("id")
+        or item.get("id")
+    )
     url = source.get("url") or source.get("link")
-    body = source.get("chunk_text") or source.get("summary") or source.get("snippet") or source.get("text") or source.get("content") or item.get("text") or item.get("output")
+    body = (
+        source.get("chunk_text")
+        or source.get("summary")
+        or source.get("snippet")
+        or source.get("text")
+        or source.get("text_preview")
+        or source.get("text_excerpt")
+        or source.get("description")
+        or source.get("content")
+        or item.get("text")
+        or item.get("output")
+    )
 
     lines = []
     if title is not None:
@@ -967,7 +985,14 @@ def _format_json_observation_item(item: Any, idx: int) -> str:
             extras.append(f"{key}={source[key]}")
     if extras:
         lines.append(" | ".join(extras))
-    return "\n".join(lines)
+        return "\n".join(lines)
+
+    # Preserve useful information for tool-specific schemas that do not have
+    # a conventional title/body pair instead of rendering only ``[idx]``.
+    fallback = _clip_text(_stringify(item), 600)
+    if title is not None:
+        return f"[{idx}] {_stringify(title)}\n{fallback}"
+    return fallback
 
 
 def _format_search_result_line(idx: int, title: Any, body: Any) -> str:
