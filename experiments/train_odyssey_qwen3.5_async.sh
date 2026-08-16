@@ -825,19 +825,18 @@ if is_truthy "${NORMALIZE_ADVANTAGES}"; then
    GRPO_ARGS+=(--normalize-advantages)
 fi
 
-# Rollout correction defaults:
+# Optional rollout correction:
 # - TIS (Truncated Importance Sampling): soft correction. It multiplies pg_loss
 #   by a clipped importance weight exp(train_log_probs - rollout_log_probs).
 # - MIS (Masked Importance Sampling): hard correction through tis_mode=mask.
 #   It masks out tokens/sequences whose importance ratio leaves the trust range.
 # - RS (Rejection Sampling): an additional hard rejection mask, independent of
-#   the TIS weighting mode. The recommended default here is TIS + RS: keep the
-#   stable soft reweighting from TIS while rejecting severe rollout/trainer
-#   mismatches with RS. To try pure MIS, point ROLLOUT_CORRECTION_CONFIG at a
-#   config with tis_mode=mask and usually use_rs=false.
-# Disable all rollout correction with USE_TIS=0. Override the YAML path or hook
-# with ROLLOUT_CORRECTION_CONFIG / ROLLOUT_CORRECTION_FUNCTION.
-if is_truthy "${USE_TIS:-1}"; then
+#   the TIS weighting mode. TIS and RS are disabled by default; set USE_TIS=1
+#   to opt in to the configured TIS + RS correction. To try pure MIS, point
+#   ROLLOUT_CORRECTION_CONFIG at a config with tis_mode=mask and usually use_rs=false.
+# Override the YAML path or hook with ROLLOUT_CORRECTION_CONFIG /
+# ROLLOUT_CORRECTION_FUNCTION.
+if is_truthy "${USE_TIS:-0}"; then
    GRPO_ARGS+=(
       --use-tis
       --custom-config-path "${ROLLOUT_CORRECTION_CONFIG:-${REPO_ROOT}/experiments/fused_agent_tis_rs.yaml}"

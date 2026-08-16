@@ -226,6 +226,7 @@ KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
 # A zero-weight reference KL neither changes advantages nor the actor loss.
 # Keep the expensive reference-model forward opt-in for this Qwen3 workload.
 USE_KL_LOSS="${USE_KL_LOSS:-0}"
+USE_TIS="${USE_TIS:-0}"
 USE_WANDB="${USE_WANDB:-1}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
@@ -1298,16 +1299,16 @@ if is_truthy "${NORMALIZE_ADVANTAGES}"; then
    GRPO_ARGS+=(--normalize-advantages)
 fi
 
-# Rollout correction defaults:
+# Optional rollout correction:
 # - TIS (Truncated Importance Sampling): soft correction. It multiplies pg_loss
 #   by a clipped importance weight exp(train_log_probs - rollout_log_probs).
 # - MIS (Masked Importance Sampling): hard correction through tis_mode=mask.
 #   It masks out tokens/sequences whose importance ratio leaves the trust range.
 # - RS (Rejection Sampling): an additional hard rejection mask, independent of
-#   the TIS weighting mode. The stable default uses Slime's vanilla token TIS
-#   [0, 2], avoiding abrupt effective-batch changes. Custom MIS/RS remains
-#   opt-in via ROLLOUT_CORRECTION_CONFIG.
-if is_truthy "${USE_TIS:-1}"; then
+#   the TIS weighting mode. TIS is disabled by default for a clean DAPO objective;
+#   set USE_TIS=1 to opt in to Slime's vanilla token TIS [0, 2]. Custom MIS/RS
+#   remains opt-in via ROLLOUT_CORRECTION_CONFIG.
+if is_truthy "${USE_TIS}"; then
    GRPO_ARGS+=(--use-tis)
    if [ -n "${ROLLOUT_CORRECTION_CONFIG:-}" ]; then
       GRPO_ARGS+=(

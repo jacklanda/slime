@@ -1256,16 +1256,16 @@ if ! is_truthy "${GRPO_STD_NORMALIZATION}"; then
    GRPO_ARGS+=(--disable-grpo-std-normalization)
 fi
 
-# Rollout correction defaults:
+# Optional rollout correction:
 # - TIS (Truncated Importance Sampling): soft correction. It multiplies pg_loss
 #   by a clipped importance weight exp(train_log_probs - rollout_log_probs).
 # - MIS (Masked Importance Sampling): hard correction through tis_mode=mask.
 #   It masks out tokens/sequences whose importance ratio leaves the trust range.
 # - RS (Rejection Sampling): an additional hard rejection mask, independent of
-#   the TIS weighting mode. The stable default uses Slime's vanilla token TIS
-#   [0, 2], avoiding abrupt effective-batch changes. Custom MIS/RS remains
-#   opt-in via ROLLOUT_CORRECTION_CONFIG.
-if is_truthy "${USE_TIS:-1}"; then
+#   the TIS weighting mode. TIS is disabled by default; set USE_TIS=1 to opt in
+#   to Slime's vanilla token TIS [0, 2]. Custom MIS/RS remains opt-in via
+#   ROLLOUT_CORRECTION_CONFIG.
+if is_truthy "${USE_TIS:-0}"; then
    GRPO_ARGS+=(--use-tis)
    if [ -n "${ROLLOUT_CORRECTION_CONFIG:-}" ]; then
       GRPO_ARGS+=(
