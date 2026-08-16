@@ -803,9 +803,9 @@ class RolloutServer:
         generation requests queued in the SGLang scheduler when we release the
         memory pool; the scheduler then tries to ``prepare_for_extend`` against
         a pool that has already been moved to CPU and dies with a Triton
-        "Pointer argument ... cpu tensor" error, taking the engine down. The
-        abort pause stops admission, and the drain/freeze sequence below closes
-        the scheduler race before the pool disappears.
+        "Pointer argument ... cpu tensor" error, taking the engine down. Flush
+        is already part of ``release_memory_occupation``, so a pause here is
+        enough to stop new prefill before the pool disappears.
         """
         for g in self.server_groups:
             if g.needs_offload:
@@ -823,27 +823,6 @@ class RolloutServer:
                 "Pausing generation on %d offloaded SGLang engines before releasing memory.", len(pause_handles)
             )
             ray.get(pause_handles)
-
-            # The abort-mode pause blocks new tokenizer requests and aborts
-            # active ones, but it does not set the scheduler's _engine_paused
-            # flag. Drain first, then enqueue an in-place pause as a scheduler
-            # barrier so no late request can touch the KV pool after offload.
-            drain_handles = [
-                engine.flush_cache.remote()
-                for g in self.server_groups
-                if g.needs_offload
-                for engine in g.engines
-                if engine is not None
-            ]
-            ray.get(drain_handles)
-            freeze_handles = [
-                engine.pause_generation.remote(mode="in_place")
-                for g in self.server_groups
-                if g.needs_offload
-                for engine in g.engines
-                if engine is not None
-            ]
-            ray.get(freeze_handles)
 
         handles = []
         for g in self.server_groups:
@@ -932,17 +911,6 @@ class RolloutManager:
 
         self.generate_rollout = load_function(self.args.rollout_function_path)
         self.eval_generate_rollout = load_function(self.args.eval_function_path)
-        self._local_mcp_pool_warmed = (
-            not self.args.debug_train_only
-            and os.environ.get("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "true").lower() in {"1", "true", "yes", "on"}
-            and os.environ.get("SLIME_LOCAL_MCP_PROCESS_EAGER_WARM", "false").lower()
-            in {"1", "true", "yes", "on"}
-        )
-        if self._local_mcp_pool_warmed:
-            from slime.rollout.fused_agent.mcp_process_pool import get_local_mcp_process_pool
-
-            worker_pids = get_local_mcp_process_pool().warm()
-            logger.info("Warmed %d local MCP process workers", len(worker_pids))
         self.custom_reward_post_process_func = None
         if self.args.custom_reward_post_process_path is not None:
             self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
@@ -1008,10 +976,6 @@ class RolloutManager:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
-        if getattr(self, "_local_mcp_pool_warmed", False):
-            from slime.rollout.fused_agent.mcp_process_pool import close_local_mcp_process_pool
-
-            close_local_mcp_process_pool()
         if (
             getattr(self.args, "rollout_only_inference_fast_path", False)
             and self.args.rollout_function_path
@@ -1369,11 +1333,6 @@ class RolloutManager:
         if samples[0].metadata is not None:
             train_data["source_names"] = [get_source(sample) for sample in samples]
 
-        if os.environ.get("SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES", "0") == "1":
-            train_data["sglang_final_hidden_probe"] = [
-                (sample.metadata or {}).get("sglang_prefill_diagnostic") for sample in samples
-            ]
-
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -1426,7 +1385,6 @@ class RolloutManager:
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
                 "source_names",
-                "sglang_final_hidden_probe",
                 "mismatch_bucket_ids",
                 "prompt",
                 "teacher_log_probs",

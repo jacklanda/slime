@@ -344,9 +344,6 @@ def log_rollout_data(
                 "episode_metrics_data",
                 "rollout_metrics",
                 "source_names",
-                "sglang_final_hidden_probe",
-                "train_final_hidden_probe",
-                "train_first_divergence_probe",
                 "mismatch_bucket_ids",
             ]:
                 continue

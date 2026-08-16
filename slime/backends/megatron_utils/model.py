@@ -48,53 +48,6 @@ from .stateless_adam import StatelessAdam
 logger = logging.getLogger(__name__)
 
 
-def _capture_final_hidden_probe(
-    hidden_states: torch.Tensor,
-    total_lengths: Sequence[int],
-    response_lengths: Sequence[int],
-    diagnostics: Sequence[dict | None],
-) -> list[dict | None]:
-    if hidden_states.ndim >= 4:
-        if hidden_states.shape[1] != 1:
-            raise ValueError(f"Expected packed hidden states with batch dimension 1, got {hidden_states.shape}")
-        hidden_states = hidden_states[:, 0].reshape(hidden_states.shape[0], -1)
-    elif hidden_states.ndim == 3:
-        if hidden_states.shape[1] == 1:
-            hidden_states = hidden_states[:, 0]
-        else:
-            # FlashAttention THD tensors have shape [tokens, heads, head_dim].
-            hidden_states = hidden_states.reshape(hidden_states.shape[0], -1)
-    if hidden_states.ndim != 2:
-        raise ValueError(f"Expected packed hidden states with shape [tokens, hidden], got {hidden_states.shape}")
-
-    captured: list[dict | None] = []
-    start = 0
-    for total_length, response_length, diagnostic in zip(
-        total_lengths, response_lengths, diagnostics, strict=True
-    ):
-        end = start + int(total_length)
-        if diagnostic is None or "sglang_final_hidden_probe" not in diagnostic:
-            captured.append(None)
-        else:
-            columns = [int(column) for column in diagnostic["hidden_probe_columns"]]
-            prediction_start = end - int(response_length) - 1
-            prediction_end = end - 1
-            if prediction_start < start or prediction_end > hidden_states.shape[0]:
-                raise ValueError(
-                    "Megatron response hidden-state span is outside the packed sequence: "
-                    f"sample=[{start}, {end}), response_length={response_length}, hidden_tokens={hidden_states.shape[0]}"
-                )
-            probe = hidden_states[prediction_start:prediction_end, columns]
-            captured.append(
-                {
-                    "hidden_probe_columns": columns,
-                    "megatron_final_hidden_probe": probe.detach().float().cpu().tolist(),
-                }
-            )
-        start = end
-    return captured
-
-
 def _disable_tqdm_for_non_main_rank() -> bool:
     return not (mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1)
 
@@ -936,9 +889,6 @@ def train_one_step(
         """
 
         # Get the batch.
-        debug_micro_batch_indices = None
-        if args.save_debug_train_data is not None:
-            debug_micro_batch_indices = list(data_iterator.micro_batch_indices[data_iterator.offset])
         batch = get_batch(
             data_iterator,
             _with_rollout_top_p_token_keys(
@@ -961,17 +911,11 @@ def train_one_step(
                     "rollout_mask_sums",
                     "policy_rollout_mask_sums",
                     "mismatch_bucket_ids",
-                    "sglang_final_hidden_probe",
                 ],
             ),
             args.data_pad_size_multiplier,
             args.allgather_cp,
         )
-        if debug_micro_batch_indices is not None:
-            batch["_debug_train_log_probs_sink"] = (
-                data_iterator.rollout_data,
-                debug_micro_batch_indices,
-            )
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
@@ -1005,177 +949,7 @@ def train_one_step(
             if args.enable_mtp_training:
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
-            hidden_probe_handles = []
-            if (
-                (
-                    os.environ.get("SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES", "0") == "1"
-                    or os.environ.get("SLIME_DIAGNOSE_SGLANG_FIRST_DIVERGENCE", "0") == "1"
-                )
-                and debug_micro_batch_indices is not None
-                and mpu.is_pipeline_last_stage()
-                and any(diagnostic is not None for diagnostic in batch["sglang_final_hidden_probe"] or [])
-            ):
-                inner_model = model
-                while hasattr(inner_model, "module"):
-                    inner_model = inner_model.module
-
-                def save_hidden_probe(stage, hidden_states):
-                    captured = _capture_final_hidden_probe(
-                        hidden_states,
-                        batch["total_lengths"],
-                        batch["response_lengths"],
-                        batch["sglang_final_hidden_probe"],
-                    )
-                    sink, indices = batch["_debug_train_log_probs_sink"]
-                    if "train_final_hidden_probe" not in sink:
-                        sink["train_final_hidden_probe"] = [None] * len(sink["tokens"])
-                    for local_index, (index, probe) in enumerate(zip(indices, captured, strict=True)):
-                        if probe is not None:
-                            if stage == "final_norm":
-                                sink["train_final_hidden_probe"][index] = probe
-
-                            if "sglang_first_divergence_probe" in batch["sglang_final_hidden_probe"][local_index]:
-                                if "train_first_divergence_probe" not in sink:
-                                    sink["train_first_divergence_probe"] = [None] * len(sink["tokens"])
-                                if sink["train_first_divergence_probe"][index] is None:
-                                    sink["train_first_divergence_probe"][index] = {}
-                                sink["train_first_divergence_probe"][index][stage] = probe[
-                                    "megatron_final_hidden_probe"
-                                ]
-                                if stage == "final_norm" and mpu.get_tensor_model_parallel_rank() == 0:
-                                    rank = torch.distributed.get_rank()
-                                    sample_index = sink["sample_indices"][index]
-                                    base_path = Path(
-                                        args.save_debug_train_data.format(rollout_id=rollout_id, rank=rank)
-                                    )
-                                    probe_path = base_path.with_name(
-                                        f"{base_path.stem}_sample_{sample_index}_first_divergence.pt"
-                                    )
-                                    probe_path.parent.mkdir(parents=True, exist_ok=True)
-                                    torch.save(
-                                        {
-                                            "rollout_id": rollout_id,
-                                            "rank": rank,
-                                            "sample_index": sample_index,
-                                            "sglang": batch["sglang_final_hidden_probe"][local_index],
-                                            "megatron": sink["train_first_divergence_probe"][index],
-                                            "policy_loss_mask": batch["policy_loss_masks"][local_index].cpu(),
-                                        },
-                                        probe_path,
-                                    )
-                                    logger.info("Saved first-divergence probe to %s", probe_path)
-
-                def capture_positional_input(stage):
-                    def capture(_module, inputs):
-                        save_hidden_probe(stage, inputs[0])
-
-                    return capture
-
-                def capture_layer_input(stage):
-                    def capture(_module, inputs, kwargs):
-                        hidden_states = kwargs.get("hidden_states")
-                        if hidden_states is None:
-                            hidden_states = inputs[0]
-                        save_hidden_probe(stage, hidden_states)
-
-                    return capture
-
-                def capture_input_at(stage, index):
-                    def capture(_module, inputs):
-                        save_hidden_probe(stage, inputs[index])
-
-                    return capture
-
-                def capture_output(stage):
-                    def capture(_module, _inputs, output):
-                        if isinstance(output, tuple):
-                            output = output[0]
-                        save_hidden_probe(stage, output)
-
-                    return capture
-
-                hidden_probe_handles.append(
-                    inner_model.output_layer.register_forward_pre_hook(capture_positional_input("final_norm"))
-                )
-                if os.environ.get("SLIME_DIAGNOSE_SGLANG_FIRST_DIVERGENCE", "0") == "1":
-                    layers = inner_model.decoder.layers
-                    layer_0_attention = layers[0].self_attention
-                    for layer_index, stage in (
-                        (0, "embedding"),
-                        (1, "layer_0_mlp_residual"),
-                        (35, "layer_34_mlp_residual"),
-                    ):
-                        hidden_probe_handles.append(
-                            layers[layer_index].register_forward_pre_hook(
-                                capture_layer_input(stage), with_kwargs=True
-                            )
-                        )
-                    hidden_probe_handles.append(
-                        inner_model.decoder.final_layernorm.register_forward_pre_hook(
-                            capture_positional_input("layer_35_mlp_residual")
-                        )
-                    )
-                    hidden_probe_handles.append(
-                        layers[0].pre_mlp_layernorm.register_forward_pre_hook(
-                            capture_positional_input("layer_0_attention_residual")
-                        )
-                    )
-                    hidden_probe_handles.append(
-                        layers[1].self_attention.register_forward_pre_hook(
-                            capture_positional_input("layer_1_pre_norm")
-                        )
-                    )
-                    hidden_probe_handles.append(
-                        layer_0_attention.register_forward_pre_hook(
-                            capture_positional_input("layer_0_pre_norm")
-                        )
-                    )
-                    hidden_probe_handles.append(
-                        layer_0_attention.register_forward_hook(
-                            capture_output("layer_0_attention_output")
-                        )
-                    )
-                    for norm_name, pre_stage, post_stage in (
-                        ("q_layernorm", "layer_0_q_pre_norm", "layer_0_q_post_norm"),
-                        ("k_layernorm", "layer_0_k_pre_norm", "layer_0_k_post_norm"),
-                    ):
-                        norm = getattr(layer_0_attention, norm_name)
-                        hidden_probe_handles.append(
-                            norm.register_forward_pre_hook(capture_positional_input(pre_stage))
-                        )
-                        hidden_probe_handles.append(
-                            norm.register_forward_hook(capture_output(post_stage))
-                        )
-                    for input_index, stage in enumerate(
-                        ("layer_0_q_post_rope", "layer_0_k_post_rope", "layer_0_value")
-                    ):
-                        hidden_probe_handles.append(
-                            layer_0_attention.core_attention.register_forward_pre_hook(
-                                capture_input_at(stage, input_index)
-                            )
-                        )
-                    hidden_probe_handles.append(
-                        layer_0_attention.core_attention.register_forward_hook(
-                            capture_output("layer_0_attention_context")
-                        )
-                    )
-                    hidden_probe_handles.append(
-                        layers[0].mlp.register_forward_pre_hook(
-                            capture_positional_input("layer_0_pre_mlp_norm")
-                        )
-                    )
-                    hidden_probe_handles.append(
-                        layers[0].mlp.register_forward_hook(
-                            lambda _module, _inputs, output: save_hidden_probe(
-                                "layer_0_mlp_output", output[0]
-                            )
-                        )
-                    )
-            try:
-                output_tensor = model(**forward_kwargs)
-            finally:
-                for hidden_probe_handle in hidden_probe_handles:
-                    hidden_probe_handle.remove()
+            output_tensor = model(**forward_kwargs)
 
         gemma4_output_layer = None
         gemma4_output_weight = None

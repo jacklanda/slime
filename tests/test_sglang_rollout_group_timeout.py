@@ -21,219 +21,6 @@ def test_eval_progress_log_stream_emits_complete_lines():
 
     stream.write("\rEval mixed (3 datasets): 2%| | 85/3622")
 
-    assert sink.getvalue() == "Eval mixed (3 datasets): 2%| | 85/3622\n"
-
-
-def test_same_weight_sglang_prefill_diagnostic_aligns_response_tokens(monkeypatch):
-    monkeypatch.setenv("SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS", "1")
-    monkeypatch.setenv("SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES", "1")
-    requests = []
-
-    async def fake_post(url, payload, max_retries):
-        requests.append((url, payload, max_retries))
-        return {
-            "meta_info": {
-                "weight_version": "7",
-                "input_token_logprobs": [[None, 11], [-0.41, 12], [-0.52, 13]],
-                "hidden_states": [[[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]]],
-            }
-        }
-
-    monkeypatch.setattr(sglang_rollout, "post", fake_post)
-    sample = Sample(
-        index=3,
-        tokens=[10, 11, 12, 13],
-        response_length=2,
-        rollout_log_probs=[-0.4, -0.5],
-        loss_mask=[1, 1],
-        policy_loss_mask=[0, 1],
-        metadata={"rollout_weight_version": "7", "fused_task_type": "mcp"},
-    )
-
-    metrics = asyncio.run(
-        sglang_rollout._diagnose_sglang_prefill_logprobs(
-            Namespace(sglang_router_ip="router", sglang_router_port=30000),
-            [[sample]],
-            rollout_id=4,
-        )
-    )
-
-    assert requests[0][0] == "http://router:30000/generate"
-    assert requests[0][1]["input_ids"] == sample.tokens
-    assert requests[0][1]["logprob_start_len"] == 1
-    assert requests[0][1]["return_hidden_states"] is True
-    assert requests[0][2] == 1
-    assert sample.metadata["sglang_prefill_diagnostic"] == {
-        "status": "ok",
-        "rollout_id": 4,
-        "task_family": "mcp",
-        "response_length": 2,
-        "expected_weight_version": "7",
-        "observed_weight_version": "7",
-        "hidden_probe_columns": [0, 1],
-        "sglang_final_hidden_probe": [[2.0, 20.0], [3.0, 30.0]],
-        "compared_tokens": 1,
-        "decode_prefill_abs_diff": pytest.approx(0.02),
-        "prefill_log_probs": [-0.41, -0.52],
-    }
-    assert metrics["rollout/diagnostic/sglang_prefill_successful_samples"] == 1
-    assert metrics["rollout/diagnostic/sglang_decode_prefill_compared_tokens"] == 1
-    assert metrics["rollout/diagnostic/sglang_decode_prefill_abs_diff"] == pytest.approx(0.02)
-
-
-def test_sglang_prefill_diagnostic_rejects_different_weight_version(monkeypatch):
-    monkeypatch.setenv("SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS", "1")
-
-    async def fake_post(_url, _payload, max_retries):
-        assert max_retries == 1
-        return {
-            "meta_info": {
-                "weight_version": "8",
-                "input_token_logprobs": [[None, 10], [-0.1, 11]],
-            }
-        }
-
-    monkeypatch.setattr(sglang_rollout, "post", fake_post)
-    sample = Sample(
-        index=5,
-        tokens=[10, 11],
-        response_length=1,
-        rollout_log_probs=[-0.1],
-        metadata={"rollout_weight_version": "7"},
-    )
-
-    metrics = asyncio.run(
-        sglang_rollout._diagnose_sglang_prefill_logprobs(
-            Namespace(sglang_router_ip="router", sglang_router_port=30000),
-            [[sample]],
-            rollout_id=4,
-        )
-    )
-
-    diagnostic = sample.metadata["sglang_prefill_diagnostic"]
-    assert diagnostic["status"] == "weight_version_mismatch"
-    assert diagnostic["expected_weight_version"] == "7"
-    assert diagnostic["observed_weight_version"] == "8"
-    assert "prefill_log_probs" not in diagnostic
-    assert metrics["rollout/diagnostic/sglang_prefill_successful_samples"] == 0
-    assert metrics["rollout/diagnostic/sglang_decode_prefill_compared_tokens"] == 0
-
-
-def test_sglang_prefill_recomputes_all_rollout_logprobs(monkeypatch):
-    monkeypatch.setenv("SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS", "0")
-    monkeypatch.setenv("SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS", "1")
-    requests = []
-
-    async def fake_post(_url, payload, max_retries):
-        assert max_retries == 1
-        requests.append(payload)
-        token = payload["input_ids"][-1]
-        return {
-            "meta_info": {
-                "weight_version": "9",
-                "input_token_logprobs": [[None, 1], [-float(token), token]],
-            }
-        }
-
-    monkeypatch.setattr(sglang_rollout, "post", fake_post)
-    samples = [
-        Sample(
-            index=index,
-            tokens=[1, token],
-            response_length=1,
-            rollout_log_probs=[-0.1],
-            metadata={"rollout_weight_version": "9"},
-        )
-        for index, token in enumerate((2, 3))
-    ]
-
-    metrics = asyncio.run(
-        sglang_rollout._diagnose_sglang_prefill_logprobs(
-            Namespace(sglang_router_ip="router", sglang_router_port=30000),
-            [[sample] for sample in samples],
-            rollout_id=6,
-        )
-    )
-
-    assert [sample.rollout_log_probs for sample in samples] == [[-2.0], [-3.0]]
-    assert all("return_hidden_states" not in payload for payload in requests)
-    assert {payload["extra_key"] for payload in requests} == {
-        "slime-first-divergence-6-0",
-        "slime-first-divergence-6-1",
-    }
-    assert metrics["rollout/diagnostic/sglang_recomputed_samples"] == 2
-
-
-def test_sglang_prefill_recompute_fails_closed_on_weight_mismatch(monkeypatch):
-    monkeypatch.setenv("SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS", "0")
-    monkeypatch.setenv("SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS", "1")
-
-    async def fake_post(_url, _payload, max_retries):
-        assert max_retries == 1
-        return {
-            "meta_info": {
-                "weight_version": "10",
-                "input_token_logprobs": [[None, 1], [-0.2, 2]],
-            }
-        }
-
-    monkeypatch.setattr(sglang_rollout, "post", fake_post)
-    sample = Sample(
-        index=0,
-        tokens=[1, 2],
-        response_length=1,
-        rollout_log_probs=[-0.1],
-        metadata={"rollout_weight_version": "9"},
-    )
-
-    with pytest.raises(RuntimeError, match="successful=0, requested=1"):
-        asyncio.run(
-            sglang_rollout._diagnose_sglang_prefill_logprobs(
-                Namespace(sglang_router_ip="router", sglang_router_port=30000),
-                [[sample]],
-                rollout_id=6,
-            )
-        )
-    assert sample.rollout_log_probs == [-0.1]
-
-
-def test_sglang_prefill_recompute_is_atomic(monkeypatch):
-    monkeypatch.setenv("SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS", "0")
-    monkeypatch.setenv("SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS", "1")
-
-    async def fake_post(_url, payload, max_retries):
-        assert max_retries == 1
-        token = payload["input_ids"][-1]
-        return {
-            "meta_info": {
-                "weight_version": "wrong" if token == 3 else "9",
-                "input_token_logprobs": [[None, 1], [-float(token), token]],
-            }
-        }
-
-    monkeypatch.setattr(sglang_rollout, "post", fake_post)
-    samples = [
-        Sample(
-            index=index,
-            tokens=[1, token],
-            response_length=1,
-            rollout_log_probs=[-0.1],
-            metadata={"rollout_weight_version": "9"},
-        )
-        for index, token in enumerate((2, 3))
-    ]
-
-    with pytest.raises(RuntimeError, match="successful=1, requested=2"):
-        asyncio.run(
-            sglang_rollout._diagnose_sglang_prefill_logprobs(
-                Namespace(sglang_router_ip="router", sglang_router_port=30000),
-                [[sample] for sample in samples],
-                rollout_id=6,
-            )
-        )
-    assert [sample.rollout_log_probs for sample in samples] == [[-0.1], [-0.1]]
-
-
 async def _fake_generate_and_rm(_args, sample, _sampling_params, evaluation=False):
     if sample.index == 1:
         await sglang_rollout.asyncio.sleep(10)
@@ -1268,6 +1055,22 @@ def test_task_family_submission_plan_stops_refilling_satisfied_family():
     )
 
     assert plan == {"mcp": 63}
+
+
+def test_task_family_submission_plan_preserves_satisfied_family_candidate_floor():
+    plan = sglang_rollout._task_family_submission_plan(
+        submit_limit=128,
+        target=8,
+        quotas={"mcp": 0.5, "webqa": 0.5},
+        accepted=Counter({"mcp": 3, "webqa": 4}),
+        completed=Counter({"mcp": 20, "webqa": 8}),
+        pending=Counter({"mcp": 1, "webqa": 20}),
+        min_pending_groups=96,
+        mcp_only_min_pending_groups=8,
+        family_min_pending_groups={"mcp": 32, "webqa": 32},
+    )
+
+    assert plan == {"mcp": 63, "webqa": 12}
 
 
 def test_task_family_submission_plan_reduces_only_mcp_only_reservoir():

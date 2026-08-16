@@ -207,8 +207,8 @@ def test_rollout_report_matches_train_report_in_single_step(dp_partition):
 
 
 @pytest.mark.unit
-def test_log_rollout_data_skips_training_and_diagnostic_payloads(monkeypatch):
-    """Training internals and hidden-state diagnostics are not numeric metrics."""
+def test_log_rollout_data_skips_policy_masks(monkeypatch):
+    """Credit-assignment policy masks are integer training internals, not metrics."""
     from megatron.core import mpu as _mpu
 
     packed_seq_params_mod = types.ModuleType("megatron.core.packed_seq_params")
@@ -241,8 +241,6 @@ def test_log_rollout_data_skips_training_and_diagnostic_payloads(monkeypatch):
         "global_batch_sizes": [1],
         "num_microbatches": 1,
         "micro_batch_indices": [[0]],
-        "sglang_final_hidden_probe": [None],
-        "train_final_hidden_probe": [{"megatron_final_hidden_probe": [[1.0]]}],
         "rewards": [1.0],
     }
 
@@ -251,8 +249,6 @@ def test_log_rollout_data_skips_training_and_diagnostic_payloads(monkeypatch):
 
     assert "policy_loss_masks" not in captured
     assert "policy_rollout_mask_sums" not in captured
-    assert "sglang_final_hidden_probe" not in captured
-    assert "train_final_hidden_probe" not in captured
     assert captured["rewards"] == pytest.approx((1.0, 1))
 
 

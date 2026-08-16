@@ -641,6 +641,10 @@ def test_odyssey_sync_launcher_keeps_aggressive_pending_group_reservoir():
     assert 'OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"' in launcher
     assert "SYNC_MIN_PENDING_GROUPS=96" in launcher
     assert 'export SLIME_SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS}"' in launcher
+    assert 'SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-32}"' in launcher
+    assert 'SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-32}"' in launcher
+    assert 'export SLIME_SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS}"' in launcher
+    assert 'export SLIME_SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS}"' in launcher
     assert "MCP_ENV_COPY_CONCURRENCY=32" in launcher
     assert "export SLIME_LOCAL_MCP_PROCESS_WORKERS=32" in launcher
     assert 'ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"' in launcher

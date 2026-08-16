@@ -141,9 +141,9 @@ Options:
   --offload-train BOOL                   Offload trainer model between phases. Disabled by --release-train.
   --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: true.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 128.
+  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 256.
   --sglang-router-request-timeout-secs N Router request timeout. Default: 21600.
-  --sglang-max-running-requests N        SGLang max running requests. Default: 128.
+  --sglang-max-running-requests N        SGLang max running requests. Default: 256.
   --colocate                             Share trainer and rollout GPUs with offload. Required by this launcher.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
@@ -226,7 +226,7 @@ KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
 # A zero-weight reference KL neither changes advantages nor the actor loss.
 # Keep the expensive reference-model forward opt-in for this Qwen3 workload.
 USE_KL_LOSS="${USE_KL_LOSS:-0}"
-USE_WANDB="${USE_WANDB:-0}"
+USE_WANDB="${USE_WANDB:-1}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
@@ -248,8 +248,8 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-128}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-128}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-156}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-156}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-50}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
@@ -919,21 +919,27 @@ MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
 DEFAULT_TOKENS_PER_GPU=$(((MAX_CONTEXT_LEN + CP_SIZE - 1) / CP_SIZE))
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_PER_GPU}}"
 LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_PER_GPU}}"
-LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-8192}"
+# Batch-invariant log-softmax materializes [chunk, vocab] BF16 output during
+# backward recomputation. At vocab=151936, a 512-token chunk is about 148 MiB,
+# fitting the observed worst-case free memory after TorchMemorySaver's margin.
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-512}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 # Keep the post-filter training batch at 50/50 webqa and mcp. The synchronous
 # collector keeps sampling each family until both accepted quotas are full.
 ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
 # Bound aggressive admission even when low ROI or long-tail groups keep the
 # collector refilling candidates before the previous wave fully drains.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-64}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
-# Keep a 24-group reservoir (768 trajectories at n=32) without saturating the
-# decode queues and KV cache with thousands of multi-turn trajectories.
-SYNC_MIN_PENDING_GROUPS=24
-# MCP groups carry much larger prompts and longer tails. Once MCP is the only
-# unsatisfied quota, keep 256 rather than 768 trajectories in flight.
-SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-8}"
+# Keep 96 groups (3072 trajectories at n=32) admitted so tool and retrieval
+# waits cannot drain the decode engines. Extra requests are aborted once the
+# final per-family candidate selection has enough groups for the actor update.
+SYNC_MIN_PENDING_GROUPS=96
+# Preserve candidates from both families after either quota is satisfied. This
+# gives top-mean-step selection a deeper pool without changing the 50/50 batch.
+SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-32}"
+SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-32}"
+SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-96}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-196400}"
@@ -949,6 +955,7 @@ if [ $((EFFECTIVE_GLOBAL_BATCH_SIZE % MICRO_BATCH_DATA_PARALLEL_SIZE)) -ne 0 ]; 
    exit 2
 fi
 ENABLE_DYNAMIC_SAMPLING_FILTER="${ENABLE_DYNAMIC_SAMPLING_FILTER:-true}"
+#DYNAMIC_SAMPLING_FILTER_PATH="${DYNAMIC_SAMPLING_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
 DYNAMIC_SAMPLING_FILTER_PATH="${DYNAMIC_SAMPLING_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
 ENABLE_QUOTA_BUCKET_SAMPLING="${ENABLE_QUOTA_BUCKET_SAMPLING:-0}"
 # This launcher requires strict reward-variance filtering. Zero disables the
@@ -1339,17 +1346,11 @@ SGLANG_ARGS=(
    --sglang-context-length "${MAX_CONTEXT_LEN}"
    --sglang-enable-deterministic-inference
    --sglang-rl-on-policy-target megatron
-   # Decode stays on FA3. Full, uncached prefills use the SM80-compatible FA2
-   # raw kernel inside this backend to match Megatron Transformer Engine.
    --sglang-attention-backend fa3
    --sglang-disable-custom-all-reduce
    --sglang-disable-piecewise-cuda-graph
    --router-policy "${ROUTER_POLICY}"
 )
-if is_truthy "${SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES:-0}" \
-   || is_truthy "${SLIME_DIAGNOSE_SGLANG_FIRST_DIVERGENCE:-0}"; then
-   SGLANG_ARGS+=(--sglang-enable-return-hidden-states)
-fi
 WANDB_ARGS=()
 if [ "${USE_WANDB}" = "1" ]; then
    WANDB_ARGS=(
@@ -1403,11 +1404,6 @@ export UPDATE_WEIGHT_DISK_DIR WANDB_DIR WANDB_CACHE_DIR HF_HOME TORCH_HOME TORCH
 export TORCH_COMPILE_JOB_ID TORCHINDUCTOR_FORCE_DISABLE_CACHES
 export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=1
 export SLIME_SGLANG_EXACT_RMSNORM=1
-export SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS="${SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS:-0}"
-export SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES="${SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES:-0}"
-export SLIME_DIAGNOSE_SGLANG_FIRST_DIVERGENCE="${SLIME_DIAGNOSE_SGLANG_FIRST_DIVERGENCE:-0}"
-export SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS="${SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS:-1}"
-export SLIME_SGLANG_RECOMPUTE_CONCURRENCY="${SLIME_SGLANG_RECOMPUTE_CONCURRENCY:-8}"
 export SLIME_MCP_ENV_ROOT="${MCP_ENV_ROOT}"
 export SLIME_MCP_ENV_COPY_CONCURRENCY="${MCP_ENV_COPY_CONCURRENCY}"
 export SLIME_MCP_WORKSPACE_SCOPE="${SLIME_MCP_WORKSPACE_SCOPE:-task}"
@@ -1550,6 +1546,8 @@ export SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER="${SLIME_FUSED_QUOTA_CANDIDATE_MUL
 export SLIME_TASK_FAMILY_ROI_PRIOR="${SLIME_TASK_FAMILY_ROI_PRIOR:-0.5}"
 export SLIME_TASK_FAMILY_ROI_PRIOR_STRENGTH="${SLIME_TASK_FAMILY_ROI_PRIOR_STRENGTH:-4}"
 export SLIME_SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS}"
+export SLIME_SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS}"
+export SLIME_SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS}"
 export SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS}"
 
 # RUNTIME_ENV_JSON contains service credentials and is passed verbatim to Ray.
@@ -1564,10 +1562,7 @@ keys = (
     "SLIME_EPISODE_LOG_DIR", "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE",
     "SLIME_FUSED_EVAL_DUMP_FAILURES", "SLIME_FUSED_EVAL_USE_SGLANG_SESSION",
     "SLIME_FUSED_REQUIRE_WEIGHT_VERSION", "SLIME_SGLANG_BATCH_INVARIANT_LOGPROB",
-    "SLIME_SGLANG_EXACT_RMSNORM", "SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS",
-    "SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES",
-    "SLIME_DIAGNOSE_SGLANG_FIRST_DIVERGENCE",
-    "SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS", "SLIME_SGLANG_RECOMPUTE_CONCURRENCY",
+    "SLIME_SGLANG_EXACT_RMSNORM",
     "SLIME_SGLANG_TRANSPORT_RETRY_TIMES",
     "SLIME_SGLANG_TRANSPORT_RETRY_BACKOFF_SECONDS",
     "RAY_WARN_BLOCKING_GET_INSIDE_ASYNC", "TOKENIZERS_PARALLELISM",
@@ -1619,6 +1614,7 @@ keys = (
     "FUSED_HORIZON_REWARD_TARGET_STEPS", "FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS",
     "SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER", "SLIME_TASK_FAMILY_ROI_PRIOR",
     "SLIME_TASK_FAMILY_ROI_PRIOR_STRENGTH", "SLIME_SYNC_MIN_PENDING_GROUPS",
+    "SLIME_SYNC_WEBQA_MIN_PENDING_GROUPS", "SLIME_SYNC_MCP_MIN_PENDING_GROUPS",
     "SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
@@ -1656,7 +1652,7 @@ echo "Rollout collector: fully_async=${FULLY_ASYNC}, function=${ROLLOUT_FUNCTION
 echo "Compiler cache: force_disable=${TORCHINDUCTOR_FORCE_DISABLE_CACHES}, job_id=${TORCH_COMPILE_JOB_ID}, inductor_dir=${TORCHINDUCTOR_CACHE_DIR}, triton_dir=${TRITON_CACHE_DIR}"
 echo "SGLang abort: deadline=${SLIME_SGLANG_ABORT_TIMEOUT_SECONDS}s, http_timeout=${SLIME_SGLANG_ABORT_HTTP_TIMEOUT_SECONDS}s, retry_interval=${SLIME_SGLANG_ABORT_RETRY_INTERVAL_SECONDS}s"
 echo "SGLang transport retry: retries=${SLIME_SGLANG_TRANSPORT_RETRY_TIMES}, backoff=${SLIME_SGLANG_TRANSPORT_RETRY_BACKOFF_SECONDS}s"
-echo "Sync rollout admission: min_pending_groups=${SLIME_SYNC_MIN_PENDING_GROUPS}, mcp_only_min_pending_groups=${SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS}, max_pending_groups=${OVER_SAMPLING_BATCH_SIZE}"
+echo "Sync rollout admission: min_pending_groups=${SLIME_SYNC_MIN_PENDING_GROUPS}, webqa_min_pending_groups=${SLIME_SYNC_WEBQA_MIN_PENDING_GROUPS}, mcp_min_pending_groups=${SLIME_SYNC_MCP_MIN_PENDING_GROUPS}, mcp_only_min_pending_groups=${SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS}, max_pending_groups=${OVER_SAMPLING_BATCH_SIZE}"
 echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, mcp_max_tool_calls_per_turn=${FUSED_MCP_MAX_TOOL_CALLS_PER_TURN}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
 echo "Rollout timeouts: trajectory=${FUSED_TRAJECTORY_TIMEOUT}s, group=${SLIME_ROLLOUT_GROUP_TIMEOUT}s, eval_trajectory=${FUSED_EVAL_TRAJECTORY_TIMEOUT}s"
 echo "Training batches: micro_batch=${MICRO_BATCH_SIZE}, num_steps_per_rollout=${NUM_STEPS_PER_ROLLOUT}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}, rollout_temperature=${TEMPERATURE}"
