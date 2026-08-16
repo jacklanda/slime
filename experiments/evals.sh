@@ -289,6 +289,7 @@ if [ -n "${GRM_CONCURRENCY+x}" ]; then grm_concurrency_explicit=true; else grm_c
 if [ -n "${GRM_MAX_CONNECTIONS+x}" ]; then grm_max_connections_explicit=true; else grm_max_connections_explicit=false; fi
 if [ -n "${GRM_MAX_RETRIES+x}" ]; then grm_max_retries_explicit=true; else grm_max_retries_explicit=false; fi
 GRM_MODEL="${GRM_MODEL:-google/gemini-3-flash-preview}"
+#GRM_MODEL="${GRM_MODEL:-qwen/qwen3.8-27b}"
 GRM_BASE_URL="${GRM_BASE_URL:-}"
 GRM_MODE="${GRM_MODE:-score}"
 GRM_CONCURRENCY="${GRM_CONCURRENCY:-128}"
@@ -297,7 +298,7 @@ GRM_TIMEOUT="${GRM_TIMEOUT:-60}"
 GRM_MAX_RETRIES="${GRM_MAX_RETRIES:-32}"
 GRM_MAX_INPUT_TOKENS="${GRM_MAX_INPUT_TOKENS:-131072}"
 GRM_MAX_NEW_TOKENS="${GRM_MAX_NEW_TOKENS:-2048}"
-GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.0}"
+GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.6}"
 GRM_FAILURE_REWARD="${GRM_FAILURE_REWARD:-0.0}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.9}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-60}"

@@ -434,6 +434,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
     filter_relax_after = int(getattr(args, "fully_async_filter_relax_after_groups", 0) or 0)
     completed_groups = 0
     dropped_groups = 0
+    profile_groups = []
     started = time.time()
     last_log = started
     LOG_EVERY = 30.0
@@ -455,14 +456,11 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
             flat_group = _flatten_samples(group)
             metric_gatherer.on_completed_group(args, flat_group)
             valid_reward_group = is_valid_reward_group(args, flat_group)
-            if getattr(args, "rollout_only_inference_fast_path", False):
-                await asyncio.to_thread(
-                    _write_trajectory_profile_shard,
-                    args,
-                    rollout_id,
-                    gid,
-                    flat_group,
-                    valid_reward_group,
+            if getattr(args, "rollout_only_inference_fast_path", False) and os.environ.get(
+                "SLIME_FUSED_PROFILE_DIR"
+            ):
+                profile_groups.append(
+                    _trajectory_profile_group(args, rollout_id, gid, flat_group, valid_reward_group)
                 )
             failure_class = group_failure_class(flat_group)
             if keep_all_groups:
@@ -482,9 +480,9 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
                 continue
             if not dynamic_filter_output.keep and relax_filter:
                 metric_gatherer.on_dynamic_filter_drop(reason=f"relaxed_{dynamic_filter_output.reason}")
-            # Keep the seconds-long rich episode render off the event loop
-            # (same reasoning as the sync collection path).
-            await asyncio.to_thread(maybe_print_rollout_group, args, group, group_id=gid)
+            if getattr(args, "print_rollout_trajectory", False):
+                # Keep the seconds-long rich episode render off the event loop.
+                await asyncio.to_thread(maybe_print_rollout_group, args, group, group_id=gid)
             collected[gid] = group
             drained += 1
 
@@ -526,6 +524,15 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
         return 0
 
     out = _select_task_family_quota_groups(sorted(collected.values(), key=_key), target, args)
+    if profile_groups:
+        selected_group_objects = {id(group) for group in out}
+        selected_group_ids = {gid for gid, group in collected.items() if id(group) in selected_group_objects}
+        for profile_group in profile_groups:
+            selected_for_shard = profile_group["worker_group_id"] in selected_group_ids
+            profile_group["selected_for_shard"] = selected_for_shard
+            for record in profile_group["trajectories"]:
+                record["selected_for_shard"] = selected_for_shard
+        await asyncio.to_thread(_write_trajectory_profile_shard, rollout_id, profile_groups)
     if not cross_shard_prefetch:
         worker.pause()
     candidate_family_counts = Counter(_sample_group_task_family(group) for group in collected.values())
@@ -583,14 +590,9 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-def _write_trajectory_profile_shard(
-    args, rollout_id: int, gid: int, samples: list[Sample], selected_for_shard: bool
-) -> None:
-    profile_dir = os.environ.get("SLIME_FUSED_PROFILE_DIR")
-    if not profile_dir:
-        return
-    profile_dir = os.path.abspath(profile_dir)
-    os.makedirs(profile_dir, exist_ok=True)
+def _trajectory_profile_group(
+    args, rollout_id: int, gid: int, samples: list[Sample], valid_reward_group: bool
+) -> dict:
     records = []
     for sample in samples:
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
@@ -606,19 +608,30 @@ def _write_trajectory_profile_shard(
                 "termination_reason": metadata.get("fused_termination"),
                 "parser_error": metadata.get("credit_assignment_event")
                 in {"tool_parser_error", "think_parser_error"},
-                "selected_for_shard": selected_for_shard,
+                "valid_reward_group": valid_reward_group,
+                "selected_for_shard": False,
                 "profile": metadata.get("fused_profile") or {},
             }
         )
-    profile_path = os.path.join(profile_dir, f"rollout_{rollout_id:06d}_group_{gid:09d}.json")
+    return {
+        "worker_group_id": gid,
+        "valid_reward_group": valid_reward_group,
+        "selected_for_shard": False,
+        "trajectories": records,
+    }
+
+
+def _write_trajectory_profile_shard(rollout_id: int, groups: list[dict]) -> None:
+    profile_dir = os.path.abspath(os.environ["SLIME_FUSED_PROFILE_DIR"])
+    os.makedirs(profile_dir, exist_ok=True)
+    profile_path = os.path.join(profile_dir, f"rollout_{rollout_id:06d}.json")
     temporary_path = profile_path + ".tmp"
     with open(temporary_path, "w", encoding="utf-8") as stream:
         json.dump(
             {
                 "rollout_id": rollout_id,
-                "worker_group_id": gid,
-                "selected_for_shard": selected_for_shard,
-                "trajectories": records,
+                "num_groups": len(groups),
+                "groups": groups,
             },
             stream,
             ensure_ascii=False,

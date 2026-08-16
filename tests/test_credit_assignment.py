@@ -52,6 +52,23 @@ def test_credit_assignment_masks_only_valid_action_span():
     assert mask == [0, 0, 0, 1, 1, 0]
 
 
+def test_credit_assignment_caps_long_parser_error_action_span_to_window():
+    config = CreditAssignmentConfig(enable=True, tool_parser_error=True)
+    mask, event = build_policy_loss_mask(
+        metadata={
+            "tool_call_parse_error": True,
+            "credit_assignment_action_start": 1,
+            "credit_assignment_action_end": 9,
+        },
+        loss_mask=[1] * 10,
+        config=config,
+        parser_error_token_window=3,
+    )
+
+    assert event == "tool_parser_error"
+    assert mask == [0, 0, 0, 0, 0, 0, 1, 1, 1, 0]
+
+
 @pytest.mark.parametrize("attribution", ["unattributable", "localized"])
 def test_parser_error_without_reliable_span_penalizes_bounded_tail(attribution):
     config = CreditAssignmentConfig(enable=True, tool_parser_error=True)

@@ -661,9 +661,10 @@ class Gemma4ToolParser(QwenToolParser):
                 result_example = "[...]"
             else:
                 result_example = '<|"|>CONCISE_FINAL_ANSWER<|"|>'
+            command = 'command:<|"|>submit<|"|>,' if "command" in (finish_parameters.get("properties") or {}) else ""
             contract.append(
                 "- To finish, emit exactly: "
-                f'<|tool_call>call:finish{{command:<|"|>submit<|"|>,result:{result_example}}}<tool_call|>'
+                f"<|tool_call>call:finish{{{command}result:{result_example}}}<tool_call|>"
             )
         if structured_parameters:
             contract.append("- These parameters require unquoted structured values: " + ", ".join(structured_parameters))

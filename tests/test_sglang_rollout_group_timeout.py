@@ -8,6 +8,7 @@ import pytest
 
 from slime.rollout import sglang_rollout
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput
+from slime.rollout.task_family import select_task_family_quota_groups
 from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.types import Sample
 
@@ -21,6 +22,216 @@ def test_eval_progress_log_stream_emits_complete_lines():
     stream.write("\rEval mixed (3 datasets): 2%| | 85/3622")
 
     assert sink.getvalue() == "Eval mixed (3 datasets): 2%| | 85/3622\n"
+
+
+def test_same_weight_sglang_prefill_diagnostic_aligns_response_tokens(monkeypatch):
+    monkeypatch.setenv("SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS", "1")
+    monkeypatch.setenv("SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES", "1")
+    requests = []
+
+    async def fake_post(url, payload, max_retries):
+        requests.append((url, payload, max_retries))
+        return {
+            "meta_info": {
+                "weight_version": "7",
+                "input_token_logprobs": [[None, 11], [-0.41, 12], [-0.52, 13]],
+                "hidden_states": [[[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]]],
+            }
+        }
+
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    sample = Sample(
+        index=3,
+        tokens=[10, 11, 12, 13],
+        response_length=2,
+        rollout_log_probs=[-0.4, -0.5],
+        loss_mask=[1, 1],
+        policy_loss_mask=[0, 1],
+        metadata={"rollout_weight_version": "7", "fused_task_type": "mcp"},
+    )
+
+    metrics = asyncio.run(
+        sglang_rollout._diagnose_sglang_prefill_logprobs(
+            Namespace(sglang_router_ip="router", sglang_router_port=30000),
+            [[sample]],
+            rollout_id=4,
+        )
+    )
+
+    assert requests[0][0] == "http://router:30000/generate"
+    assert requests[0][1]["input_ids"] == sample.tokens
+    assert requests[0][1]["logprob_start_len"] == 1
+    assert requests[0][1]["return_hidden_states"] is True
+    assert requests[0][2] == 1
+    assert sample.metadata["sglang_prefill_diagnostic"] == {
+        "status": "ok",
+        "rollout_id": 4,
+        "task_family": "mcp",
+        "response_length": 2,
+        "expected_weight_version": "7",
+        "observed_weight_version": "7",
+        "hidden_probe_columns": [0, 1],
+        "sglang_final_hidden_probe": [[2.0, 20.0], [3.0, 30.0]],
+        "compared_tokens": 1,
+        "decode_prefill_abs_diff": pytest.approx(0.02),
+        "prefill_log_probs": [-0.41, -0.52],
+    }
+    assert metrics["rollout/diagnostic/sglang_prefill_successful_samples"] == 1
+    assert metrics["rollout/diagnostic/sglang_decode_prefill_compared_tokens"] == 1
+    assert metrics["rollout/diagnostic/sglang_decode_prefill_abs_diff"] == pytest.approx(0.02)
+
+
+def test_sglang_prefill_diagnostic_rejects_different_weight_version(monkeypatch):
+    monkeypatch.setenv("SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS", "1")
+
+    async def fake_post(_url, _payload, max_retries):
+        assert max_retries == 1
+        return {
+            "meta_info": {
+                "weight_version": "8",
+                "input_token_logprobs": [[None, 10], [-0.1, 11]],
+            }
+        }
+
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    sample = Sample(
+        index=5,
+        tokens=[10, 11],
+        response_length=1,
+        rollout_log_probs=[-0.1],
+        metadata={"rollout_weight_version": "7"},
+    )
+
+    metrics = asyncio.run(
+        sglang_rollout._diagnose_sglang_prefill_logprobs(
+            Namespace(sglang_router_ip="router", sglang_router_port=30000),
+            [[sample]],
+            rollout_id=4,
+        )
+    )
+
+    diagnostic = sample.metadata["sglang_prefill_diagnostic"]
+    assert diagnostic["status"] == "weight_version_mismatch"
+    assert diagnostic["expected_weight_version"] == "7"
+    assert diagnostic["observed_weight_version"] == "8"
+    assert "prefill_log_probs" not in diagnostic
+    assert metrics["rollout/diagnostic/sglang_prefill_successful_samples"] == 0
+    assert metrics["rollout/diagnostic/sglang_decode_prefill_compared_tokens"] == 0
+
+
+def test_sglang_prefill_recomputes_all_rollout_logprobs(monkeypatch):
+    monkeypatch.setenv("SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS", "0")
+    monkeypatch.setenv("SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS", "1")
+    requests = []
+
+    async def fake_post(_url, payload, max_retries):
+        assert max_retries == 1
+        requests.append(payload)
+        token = payload["input_ids"][-1]
+        return {
+            "meta_info": {
+                "weight_version": "9",
+                "input_token_logprobs": [[None, 1], [-float(token), token]],
+            }
+        }
+
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    samples = [
+        Sample(
+            index=index,
+            tokens=[1, token],
+            response_length=1,
+            rollout_log_probs=[-0.1],
+            metadata={"rollout_weight_version": "9"},
+        )
+        for index, token in enumerate((2, 3))
+    ]
+
+    metrics = asyncio.run(
+        sglang_rollout._diagnose_sglang_prefill_logprobs(
+            Namespace(sglang_router_ip="router", sglang_router_port=30000),
+            [[sample] for sample in samples],
+            rollout_id=6,
+        )
+    )
+
+    assert [sample.rollout_log_probs for sample in samples] == [[-2.0], [-3.0]]
+    assert all("return_hidden_states" not in payload for payload in requests)
+    assert {payload["extra_key"] for payload in requests} == {
+        "slime-first-divergence-6-0",
+        "slime-first-divergence-6-1",
+    }
+    assert metrics["rollout/diagnostic/sglang_recomputed_samples"] == 2
+
+
+def test_sglang_prefill_recompute_fails_closed_on_weight_mismatch(monkeypatch):
+    monkeypatch.setenv("SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS", "0")
+    monkeypatch.setenv("SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS", "1")
+
+    async def fake_post(_url, _payload, max_retries):
+        assert max_retries == 1
+        return {
+            "meta_info": {
+                "weight_version": "10",
+                "input_token_logprobs": [[None, 1], [-0.2, 2]],
+            }
+        }
+
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    sample = Sample(
+        index=0,
+        tokens=[1, 2],
+        response_length=1,
+        rollout_log_probs=[-0.1],
+        metadata={"rollout_weight_version": "9"},
+    )
+
+    with pytest.raises(RuntimeError, match="successful=0, requested=1"):
+        asyncio.run(
+            sglang_rollout._diagnose_sglang_prefill_logprobs(
+                Namespace(sglang_router_ip="router", sglang_router_port=30000),
+                [[sample]],
+                rollout_id=6,
+            )
+        )
+    assert sample.rollout_log_probs == [-0.1]
+
+
+def test_sglang_prefill_recompute_is_atomic(monkeypatch):
+    monkeypatch.setenv("SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS", "0")
+    monkeypatch.setenv("SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS", "1")
+
+    async def fake_post(_url, payload, max_retries):
+        assert max_retries == 1
+        token = payload["input_ids"][-1]
+        return {
+            "meta_info": {
+                "weight_version": "wrong" if token == 3 else "9",
+                "input_token_logprobs": [[None, 1], [-float(token), token]],
+            }
+        }
+
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    samples = [
+        Sample(
+            index=index,
+            tokens=[1, token],
+            response_length=1,
+            rollout_log_probs=[-0.1],
+            metadata={"rollout_weight_version": "9"},
+        )
+        for index, token in enumerate((2, 3))
+    ]
+
+    with pytest.raises(RuntimeError, match="successful=1, requested=2"):
+        asyncio.run(
+            sglang_rollout._diagnose_sglang_prefill_logprobs(
+                Namespace(sglang_router_ip="router", sglang_router_port=30000),
+                [[sample] for sample in samples],
+                rollout_id=6,
+            )
+        )
+    assert [sample.rollout_log_probs for sample in samples] == [[-0.1], [-0.1]]
 
 
 async def _fake_generate_and_rm(_args, sample, _sampling_params, evaluation=False):
@@ -74,6 +285,40 @@ def test_generate_group_timeout_returns_failed_tail_sample(monkeypatch):
     assert out[1].metadata["failure_class"] == "policy_failure"
 
 
+def test_generate_group_cancellation_reaps_sample_tasks(monkeypatch):
+    monkeypatch.setattr(sglang_rollout, "GenerateState", _FakeGenerateState)
+    child_started = asyncio.Event()
+    child_cancelled = asyncio.Event()
+
+    async def wait_until_cancelled(_args, sample, _sampling_params, evaluation=False):
+        child_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            child_cancelled.set()
+
+    async def run_test():
+        monkeypatch.setattr(sglang_rollout, "generate_and_rm", wait_until_cancelled)
+        group_task = asyncio.create_task(
+            sglang_rollout.generate_and_rm_group(
+                Namespace(
+                    sglang_enable_deterministic_inference=False,
+                    group_rm=False,
+                    rollout_infra_retry_times=0,
+                ),
+                [Sample(index=0, prompt="a")],
+                sampling_params={},
+            )
+        )
+        await child_started.wait()
+        group_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await group_task
+        assert child_cancelled.is_set()
+
+    asyncio.run(run_test())
+
+
 def test_sync_rollout_enforces_task_family_quota(monkeypatch):
     groups = []
     for index, family in enumerate(
@@ -86,7 +331,7 @@ def test_sync_rollout_enforces_task_family_quota(monkeypatch):
             response_length=1,
             reward=1.0,
             status=Sample.Status.COMPLETED,
-            metadata={"fused_task_type": family},
+            metadata={"fused_task_type": family, "fused_traj_steps": index},
         )
         groups.append([sample])
 
@@ -122,6 +367,7 @@ def test_sync_rollout_enforces_task_family_quota(monkeypatch):
         dynamic_sampling_filter_path=None,
         rollout_batch_size=4,
         rollout_task_family_quotas="mcp=0.5,webqa=0.5",
+        rollout_task_family_top_mean_steps=True,
         rollout_all_samples_process_path=None,
         fully_async_filter_relax_after_groups=0,
         n_samples_per_prompt=1,
@@ -134,10 +380,205 @@ def test_sync_rollout_enforces_task_family_quota(monkeypatch):
     families = [group[0].metadata["fused_task_type"] for group in output.samples]
     assert families.count("mcp") == 2
     assert families.count("web_search") == 2
+    assert [group[0].index for group in output.samples] == [2, 4, 6, 7]
     assert output.metrics["rollout/task_family_selected/mcp"] == 2
     assert output.metrics["rollout/task_family_selected/webqa"] == 2
+    assert output.metrics["rollout/task_family_selected_mean_steps/mcp"] == 3
+    assert output.metrics["rollout/task_family_selected_mean_steps/webqa"] == 6.5
+    assert output.metrics["rollout/config/task_family_top_mean_steps"] == 1
     assert aborted == []
     assert source_batches == []
+
+
+def test_task_family_quota_selects_top_mean_steps_and_dedupes_trajectory_segments():
+    mcp_high_max = [
+        Sample(index=0, metadata={"fused_task_type": "mcp", "parent_traj_id": "a", "fused_traj_steps": 10}),
+        Sample(index=1, metadata={"fused_task_type": "mcp", "parent_traj_id": "a", "fused_traj_steps": 10}),
+        Sample(index=2, metadata={"fused_task_type": "mcp", "parent_traj_id": "b", "fused_traj_steps": 0}),
+    ]
+    mcp_high_mean = [
+        Sample(index=3, metadata={"fused_task_type": "mcp", "parent_traj_id": "c", "fused_traj_steps": 6}),
+        Sample(index=4, metadata={"fused_task_type": "mcp", "parent_traj_id": "d", "fused_traj_steps": 6}),
+    ]
+    webqa_low = [Sample(index=5, metadata={"fused_task_type": "webqa", "fused_traj_steps": 3})]
+    webqa_high = [Sample(index=6, metadata={"fused_task_type": "webqa", "fused_traj_steps": 9})]
+
+    selected = select_task_family_quota_groups(
+        [mcp_high_max, webqa_low, mcp_high_mean, webqa_high],
+        target=2,
+        quota_spec="webqa=0.5,mcp=0.5",
+        prefer_higher_mean_steps=True,
+    )
+
+    assert selected == [webqa_high, mcp_high_mean]
+
+
+def test_sync_rollout_progress_log_breaks_down_task_families(monkeypatch, caplog):
+    groups = []
+    family_and_keep = [
+        *(("webqa", True) for _ in range(5)),
+        *(("mcp", True) for _ in range(2)),
+        *(("webqa", False) for _ in range(2)),
+        ("mcp", False),
+    ]
+    for index, (family, keep) in enumerate(family_and_keep):
+        groups.append(
+            [
+                Sample(
+                    index=index,
+                    prompt=f"q{index}",
+                    response="answer",
+                    response_length=1,
+                    reward=1.0,
+                    status=Sample.Status.COMPLETED,
+                    metadata={"fused_task_type": family, "keep": keep},
+                )
+            ]
+        )
+    final_group = [
+        Sample(
+            index=10,
+            prompt="q10",
+            response="answer",
+            response_length=1,
+            reward=1.0,
+            status=Sample.Status.COMPLETED,
+            metadata={"fused_task_type": "mcp", "keep": True},
+        )
+    ]
+
+    class ProgressGenerateState:
+        def __init__(self, _args):
+            self.reset()
+
+        def reset(self):
+            self.remaining_batch_size = 0
+            self.pendings = set()
+            self.pending_groups = {}
+            self.aborted = False
+
+        def submit_generate_tasks(self, submitted_groups):
+            async def complete(group):
+                return group
+
+            for group in submitted_groups:
+                task = asyncio.create_task(complete(group))
+                self.pendings.add(task)
+                self.pending_groups[task] = group
+            self.remaining_batch_size += len(submitted_groups)
+
+    source_batches = [groups, [final_group]]
+
+    def data_source(_num_samples):
+        return source_batches.pop(0)
+
+    def dynamic_filter(_args, samples, **_kwargs):
+        return DynamicFilterOutput(keep=samples[0].metadata["keep"], reason="test_drop")
+
+    class ProgressClock:
+        values = iter([1000.0, 1337.8, 1338.0])
+
+        @classmethod
+        def time(cls):
+            return next(cls.values)
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", ProgressGenerateState)
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda _path: dynamic_filter)
+    monkeypatch.setattr(sglang_rollout, "maybe_print_rollout_group", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(sglang_rollout, "time", ProgressClock)
+    args = Namespace(
+        rollout_global_dataset=True,
+        dynamic_sampling_filter_path="test.dynamic_filter",
+        rollout_batch_size=8,
+        rollout_task_family_quotas=None,
+        rollout_all_samples_process_path=None,
+        fully_async_filter_relax_after_groups=0,
+        n_samples_per_prompt=1,
+        over_sampling_batch_size=10,
+        rollout_sample_filter_path=None,
+    )
+
+    with caplog.at_level("INFO", logger="slime.rollout.sglang_rollout"):
+        output, aborted = asyncio.run(sglang_rollout.generate_rollout_async(args, 1, data_source))
+
+    assert len(output.samples) == 8
+    assert aborted == []
+    assert (
+        "rollout 1: valid=7/8 (webqa:5, mcp:2), "
+        "dropped=3/10 (webqa:2, mcp:1), pending=0, elapsed=337s"
+    ) in caplog.messages
+
+
+def test_sync_rollout_admission_only_quota_never_collects_past_target(monkeypatch):
+    groups = []
+    for index, family in enumerate(["webqa", "mcp", "webqa", "mcp", "webqa", "mcp"]):
+        groups.append(
+            [
+                Sample(
+                    index=index,
+                    prompt=f"q{index}",
+                    response="answer",
+                    response_length=1,
+                    reward=1.0,
+                    status=Sample.Status.COMPLETED,
+                    metadata={"fused_task_type": family},
+                )
+            ]
+        )
+
+    class AdmissionGenerateState:
+        def __init__(self, _args):
+            self.reset()
+
+        def reset(self):
+            self.remaining_batch_size = 0
+            self.pendings = set()
+            self.pending_groups = {}
+            self.aborted = False
+
+        def submit_generate_tasks(self, submitted_groups):
+            async def complete(group):
+                return group
+
+            for group in submitted_groups:
+                task = asyncio.create_task(complete(group))
+                self.pendings.add(task)
+                self.pending_groups[task] = group
+            self.remaining_batch_size += len(submitted_groups)
+
+    class AdmissionSource:
+        plans = []
+
+        def get_samples_by_family(self, plan):
+            self.plans.append(plan)
+            return groups
+
+    source = AdmissionSource()
+    monkeypatch.setenv("SLIME_SYNC_MIN_PENDING_GROUPS", "6")
+    monkeypatch.setattr(sglang_rollout, "GenerateState", AdmissionGenerateState)
+    monkeypatch.setattr(sglang_rollout, "maybe_print_rollout_group", lambda *_args, **_kwargs: None)
+    args = Namespace(
+        rollout_global_dataset=True,
+        dynamic_sampling_filter_path=None,
+        rollout_batch_size=4,
+        rollout_task_family_quotas="webqa=0.5,mcp=0.5",
+        rollout_task_family_admission_only=True,
+        rollout_all_samples_process_path=None,
+        fully_async_filter_relax_after_groups=0,
+        n_samples_per_prompt=1,
+        over_sampling_batch_size=6,
+        rollout_sample_filter_path=None,
+    )
+
+    output, aborted = asyncio.run(sglang_rollout.generate_rollout_async(args, 0, source))
+
+    assert len(output.samples) == 4
+    assert source.plans == [{"webqa": 3, "mcp": 3}]
+    assert output.metrics["rollout/dynamic_filter/completed_groups"] == 6
+    assert output.metrics["rollout/task_family_submitted/webqa"] == 3
+    assert output.metrics["rollout/task_family_submitted/mcp"] == 3
+    assert output.metrics["rollout/config/task_family_admission_only"] == 1
+    assert aborted == []
 
 
 def test_generate_group_isolates_sample_exception(monkeypatch, caplog):
@@ -426,6 +867,52 @@ def test_sync_rollout_does_not_relax_timeout_only_groups(monkeypatch):
                 timeout=2,
             )
         )
+
+
+def test_abort_cancels_pending_before_using_known_engine_urls(monkeypatch):
+    pending_group = [Sample(index=0, prompt="a", response="partial")]
+    events = []
+
+    class AbortGenerateState:
+        def __init__(self, _args):
+            self.aborted = False
+            self.pending_groups = {}
+            self.pendings = set()
+            task = asyncio.create_task(asyncio.sleep(10))
+            task.add_done_callback(lambda _task: events.append("cancelled"))
+            self.pendings.add(task)
+            self.pending_groups[task] = pending_group
+
+    async def unexpected_router_request(_url):
+        raise AssertionError("known engine URLs should avoid router discovery")
+
+    aborted_urls = []
+
+    async def abort_known_engines(urls):
+        events.append("abort")
+        aborted_urls.extend(urls)
+        return False
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", AbortGenerateState)
+    monkeypatch.setattr(sglang_rollout, "get", unexpected_router_request)
+    monkeypatch.setattr(sglang_rollout, "abort_servers_until_idle", abort_known_engines)
+
+    aborted = asyncio.run(
+        sglang_rollout.abort(
+            Namespace(
+                partial_rollout=True,
+                sglang_router_ip="router",
+                sglang_router_port=30000,
+                sglang_engine_urls=["http://engine-0", None, "http://engine-1"],
+            ),
+            rollout_id=7,
+        )
+    )
+
+    assert aborted_urls == ["http://engine-0", "http://engine-1"]
+    assert events == ["cancelled", "abort"]
+    assert aborted == [pending_group]
+    assert pending_group[0].metadata["start_rollout_id"] == 7
 
 
 def test_eval_generation_limits_inflight_tasks_and_preserves_order(monkeypatch):
@@ -781,6 +1268,43 @@ def test_task_family_submission_plan_stops_refilling_satisfied_family():
     )
 
     assert plan == {"mcp": 63}
+
+
+def test_task_family_submission_plan_reduces_only_mcp_only_reservoir():
+    mcp_only_plan = sglang_rollout._task_family_submission_plan(
+        submit_limit=128,
+        target=8,
+        quotas={"mcp": 0.5, "webqa": 0.5},
+        accepted=Counter({"mcp": 3, "webqa": 4}),
+        completed=Counter({"mcp": 20, "webqa": 8}),
+        pending=Counter({"mcp": 1, "webqa": 20}),
+        min_pending_groups=24,
+        mcp_only_min_pending_groups=8,
+    )
+    mixed_plan = sglang_rollout._task_family_submission_plan(
+        submit_limit=128,
+        target=8,
+        quotas={"mcp": 0.5, "webqa": 0.5},
+        accepted=Counter(),
+        completed=Counter(),
+        pending=Counter(),
+        min_pending_groups=24,
+        mcp_only_min_pending_groups=8,
+    )
+    webqa_only_plan = sglang_rollout._task_family_submission_plan(
+        submit_limit=128,
+        target=8,
+        quotas={"mcp": 0.5, "webqa": 0.5},
+        accepted=Counter({"mcp": 4, "webqa": 3}),
+        completed=Counter({"mcp": 8, "webqa": 8}),
+        pending=Counter({"mcp": 20, "webqa": 1}),
+        min_pending_groups=24,
+        mcp_only_min_pending_groups=8,
+    )
+
+    assert mcp_only_plan == {"mcp": 7}
+    assert mixed_plan == {"mcp": 12, "webqa": 12}
+    assert webqa_only_plan == {"webqa": 23}
 
 
 def test_eval_retries_non_env_done_termination_before_reward(monkeypatch):

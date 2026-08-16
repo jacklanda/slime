@@ -1,7 +1,13 @@
 import argparse
+import json
+import os
+import subprocess
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
+import torch
 
 from slime.backends.sglang_utils.arguments import add_sglang_arguments
 
@@ -47,7 +53,7 @@ def test_qwen3_rejection_sampling_defaults_to_adaptive_fully_async_task_filling(
     assert 'FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 4))}"' in launcher
     assert 'FULLY_ASYNC_MAX_GROUP_CONCURRENCY="${FULLY_ASYNC_MAX_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 8))}"' in launcher
     assert 'export SLIME_FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY}"' in launcher
-    assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-2048}"' in launcher
+    assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-4096}"' in launcher
     assert 'SAMPLE_N="${SAMPLE_N:-32}"' in launcher
     assert 'export SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS="${SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS:-true}"' in launcher
     assert 'export SLIME_FULLY_ASYNC_CROSS_SHARD_PREFETCH="${SLIME_FULLY_ASYNC_CROSS_SHARD_PREFETCH:-true}"' in launcher
@@ -56,15 +62,296 @@ def test_qwen3_rejection_sampling_defaults_to_adaptive_fully_async_task_filling(
 
 
 @pytest.mark.unit
-def test_qwen3_rejection_sampling_persists_each_fixed_batch_episode_shard():
+def test_qwen3_rejection_sampling_defers_episode_shards_until_final_merge():
     repo_root = Path(__file__).resolve().parents[1]
     launcher = (repo_root / "experiments/run_qwen3_rejection_sampling.sh").read_text(encoding="utf-8")
 
-    assert "start_episode_watcher" in launcher
-    assert 'rollout_path = rollout_dir / f"{next_rollout_id}.pt"' in launcher
-    assert 'destination = episodes_dir / f"global_steps_{next_rollout_id}.json"' in launcher
-    assert 'temporary = destination.with_suffix(destination.suffix + ".tmp")' in launcher
-    assert "os.replace(temporary, destination)" in launcher
+    assert "start_episode_watcher" not in launcher
+    assert "EPISODE_WATCHER_PID" not in launcher
+    assert 'rollout_path = rollout_dir / f"{next_rollout_id}.pt"' not in launcher
+    assert 'episode_path = episodes_dir / f"global_steps_{rollout_id}.json"' in launcher
+    assert 'export SLIME_TOOL_PARSER_ERROR_LOG_ENABLED="${SLIME_TOOL_PARSER_ERROR_LOG_ENABLED:-false}"' in launcher
+
+
+@pytest.mark.unit
+def test_qwen3_rejection_sampling_caches_prepared_parquet_and_keeps_checkpoint_bounded():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/run_qwen3_rejection_sampling.sh").read_text(encoding="utf-8")
+
+    assert 'fingerprint_path = output.with_suffix(output.suffix + ".fingerprint.json")' in launcher
+    assert 'print(f"Reusing cached fused train parquet: {output}")' in launcher
+    assert '"completed_shards": batch_summaries' in launcher
+    assert '"completed_rollout_ids": completed' not in launcher
+    assert '"accepted_problem_ids": sorted(accepted_problem_ids)' not in launcher
+    assert '"rejected_problem_ids": sorted(rejected_problem_ids)' not in launcher
+
+
+def _rs_episode(problem_id, trajectory_id, reward, num_steps):
+    timing = {"total_time_s": 0.1}
+    return {
+        "id": f"{problem_id}:{trajectory_id}",
+        "session_id": f"session-{problem_id}-{trajectory_id}",
+        "task": {"question": f"question-{problem_id}", "data_source": "test"},
+        "termination_reason": "env_done",
+        "metrics": {"test/pass@1": float(reward > 0), "traj/steps": float(num_steps)},
+        "metadata": {"timing": timing},
+        "info": {"timing": timing},
+        "trajectories": [
+            {
+                "name": "test_0",
+                "uid": f"uid-{problem_id}-{trajectory_id}",
+                "reward": reward,
+                "info": {"timing": timing},
+                "steps": [
+                    {
+                        "observation": f"observation-{step}",
+                        "thought": "",
+                        "action": f"action-{step}",
+                        "reward": reward if step == num_steps - 1 else 0.0,
+                        "done": step == num_steps - 1,
+                        "model_response": f"response-{step}",
+                        "info": {"timing": timing},
+                    }
+                    for step in range(num_steps)
+                ],
+            }
+        ],
+    }
+
+
+def _rs_sample(problem_id, trajectory_id, group_index, index, reward, num_steps):
+    return {
+        "group_index": group_index,
+        "index": index,
+        "rollout_id": 0,
+        "prompt": f"prompt-{problem_id}",
+        "response": f"response-{problem_id}-{trajectory_id}",
+        "reward": reward,
+        "status": "completed",
+        "metadata": {
+            "instance_id": problem_id,
+            "fused_task_type": "mcp",
+            "fused_traj_steps": num_steps,
+            "fused_termination": "env_done",
+            "fused_profile": {"llm_time_s": 0.05},
+            "rllm_episode": _rs_episode(problem_id, trajectory_id, reward, num_steps),
+        },
+    }
+
+
+def _prepare_rs_workflow_fixture(tmp_path):
+    train_a = tmp_path / "train-a.parquet"
+    train_b = tmp_path / "train-b.parquet"
+    pq.write_table(pa.table({"prompt": ["input-a"], "source": ["a"]}), train_a)
+    pq.write_table(pa.table({"prompt": ["input-b"], "difficulty": [2]}), train_b)
+
+    output_dir = tmp_path / "output"
+    rollout_dir = output_dir / "debug" / "rollout_data"
+    rollout_dir.mkdir(parents=True)
+    samples = [
+        _rs_sample("mixed", "bad", 0, 0, 0.0, 3),
+        _rs_sample("mixed", "good", 0, 1, 1.0, 3),
+        _rs_sample("certain", "good-a", 1, 2, 1.0, 3),
+        _rs_sample("certain", "good-b", 1, 3, 1.0, 3),
+    ]
+    torch.save({"rollout_id": 0, "num_samples": len(samples), "samples": samples}, rollout_dir / "0.pt")
+
+    model_dir = tmp_path / "model"
+    megatron_dir = tmp_path / "Megatron-LM"
+    model_dir.mkdir()
+    megatron_dir.mkdir()
+    return output_dir, (train_a, train_b), model_dir, megatron_dir
+
+
+def _run_rs_workflow(output_dir, train_files, model_dir, megatron_dir, results_mode):
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    for key in (
+        "MODEL_DIR",
+        "MEGATRON_LM_PATH",
+        "NUM_ROLLOUT",
+        "OUTPUT_DIR",
+        "PROMPT_DATA",
+        "RUN_ROOT",
+    ):
+        env.pop(key, None)
+    env.update(
+        {
+            "MEGATRON_LM_PATH": str(megatron_dir),
+            "RUNS_ROOT": str(output_dir.parent / "runs"),
+            "RUN_ROOT": str(output_dir.parent / "run"),
+            "MCP_ENV_ROOT": str(output_dir.parent / "mcp-envs"),
+            "SKIP_RAY_ROLLOUT": "1",
+            "TIMESTAMP": "20260815000000",
+        }
+    )
+    command = [
+        "bash",
+        str(repo_root / "experiments/run_qwen3_rejection_sampling.sh"),
+        "--train-files",
+        ",".join(str(path) for path in train_files),
+        "--output-dir",
+        str(output_dir),
+        "--model",
+        str(model_dir),
+        "--rollout-batch-size",
+        "2",
+        "--sample-n",
+        "2",
+        "--max-batches",
+        "1",
+        "--reward-threshold",
+        "0.6",
+        "--min-steps",
+        "2",
+        "--min-sample-trial",
+        "2",
+        "--max-trajectory-per-problem",
+        "1",
+        "--certainty-filter",
+        "True",
+        "--results-mode",
+        results_mode,
+        "--checkpointing",
+        "True",
+        "--resume",
+        "True",
+    ]
+    return subprocess.run(
+        command,
+        cwd=repo_root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+@pytest.mark.integration
+def test_qwen3_rejection_sampling_manifest_workflow_filters_caches_and_resumes(tmp_path):
+    output_dir, train_files, model_dir, megatron_dir = _prepare_rs_workflow_fixture(tmp_path)
+
+    first = _run_rs_workflow(output_dir, train_files, model_dir, megatron_dir, "manifest")
+
+    assert "All rollout batches already present; skipping Ray rollout" in first.stdout
+    prepared_path = output_dir / "fused_train.parquet"
+    fingerprint_path = prepared_path.with_suffix(".parquet.fingerprint.json")
+    episode_path = output_dir / "episodes/global_steps_0.json"
+    accepted_path = output_dir / "accepted_episodes/global_steps_0.json"
+    checkpoint_path = output_dir / "latest_checkpoint.json"
+    assert pq.ParquetFile(prepared_path).metadata.num_rows == 2
+    assert json.loads(fingerprint_path.read_text())["inputs"][0]["size"] == train_files[0].stat().st_size
+
+    summary = json.loads((output_dir / "rejection_sampling_summary.json").read_text())
+    assert summary["results_mode"] == "manifest"
+    assert summary["num_samples"] == 4
+    assert summary["num_groups"] == 2
+    assert summary["num_accepted"] == 1
+    assert summary["num_rejected"] == 3
+    assert summary["num_accepted_problems"] == 1
+
+    sample_index = json.loads((output_dir / "rejection_sampling_sample_index.json").read_text())
+    assert len(sample_index) == 4
+    assert [item["sample_key"] for item in sample_index if item["is_accepted"]] == ["mixed:good"]
+    results = json.loads((output_dir / "rejection_sampling_results.json").read_text())
+    group_results = {item["problem_id"]: item for item in results["groups"]["items"]}
+    assert group_results["mixed"]["pass_rate"] == 0.5
+    assert group_results["mixed"]["accepted"] == 1
+    assert group_results["certain"]["pass_rate"] == 1.0
+    assert group_results["certain"]["accepted"] == 0
+
+    accepted = json.loads(accepted_path.read_text())
+    assert accepted["accepted_sample_keys"] == ["mixed:good"]
+    assert [row["episode_id"] for row in accepted["trajectories"]] == ["mixed:good"]
+    assert json.loads(episode_path.read_text())["num_episodes"] == 4
+
+    checkpoint = json.loads(checkpoint_path.read_text())
+    assert checkpoint["next_rollout_id"] == 1
+    assert checkpoint["num_samples"] == 4
+    assert checkpoint["num_accepted"] == 1
+    assert len(checkpoint["completed_shards"]) == 1
+    assert "accepted_sample_keys" not in checkpoint
+    assert "accepted_problem_ids" not in checkpoint
+    assert "rejected_problem_ids" not in checkpoint
+    assert not list(output_dir.rglob("*.tmp"))
+
+    prepared_mtime = prepared_path.stat().st_mtime_ns
+    episode_mtime = episode_path.stat().st_mtime_ns
+    accepted_mtime = accepted_path.stat().st_mtime_ns
+    second = _run_rs_workflow(output_dir, train_files, model_dir, megatron_dir, "manifest")
+    assert "Reusing cached fused train parquet" in second.stdout
+    assert prepared_path.stat().st_mtime_ns == prepared_mtime
+    assert episode_path.stat().st_mtime_ns == episode_mtime
+    assert accepted_path.stat().st_mtime_ns == accepted_mtime
+
+    legacy_accepted = json.loads(accepted_path.read_text())
+    legacy_accepted.pop("accepted_sample_keys")
+    accepted_path.write_text(json.dumps(legacy_accepted, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
+    legacy_mtime = accepted_path.stat().st_mtime_ns
+    legacy_resume = _run_rs_workflow(output_dir, train_files, model_dir, megatron_dir, "manifest")
+    assert "Reusing cached fused train parquet" in legacy_resume.stdout
+    assert accepted_path.stat().st_mtime_ns == legacy_mtime
+    assert json.loads((output_dir / "rejection_sampling_summary.json").read_text())["num_accepted"] == 1
+
+    accepted_path.write_text("{invalid", encoding="utf-8")
+    rebuilt = _run_rs_workflow(output_dir, train_files, model_dir, megatron_dir, "manifest")
+    assert "Reusing cached fused train parquet" in rebuilt.stdout
+    assert json.loads(accepted_path.read_text())["accepted_sample_keys"] == ["mixed:good"]
+    assert not list(output_dir.rglob("*.tmp"))
+
+    old_fingerprint = json.loads(fingerprint_path.read_text())["digest"]
+    pq.write_table(
+        pa.table({"prompt": ["input-a", "input-a-updated"], "source": ["a", "a-updated"]}),
+        train_files[0],
+    )
+    invalidated = _run_rs_workflow(output_dir, train_files, model_dir, megatron_dir, "manifest")
+    assert "Wrote fused train parquet" in invalidated.stdout
+    assert pq.ParquetFile(prepared_path).metadata.num_rows == 3
+    assert json.loads(fingerprint_path.read_text())["digest"] != old_fingerprint
+    assert not list(output_dir.rglob("*.tmp"))
+
+
+@pytest.mark.integration
+def test_qwen3_rejection_sampling_full_workflow_preserves_complete_results(tmp_path):
+    output_dir, train_files, model_dir, megatron_dir = _prepare_rs_workflow_fixture(tmp_path)
+
+    _run_rs_workflow(output_dir, train_files, model_dir, megatron_dir, "full")
+
+    results = json.loads((output_dir / "rejection_sampling_results.json").read_text())
+    assert results["summary"]["num_samples"] == 4
+    assert results["summary"]["num_accepted"] == 1
+    assert len(results["samples"]["items"]) == 4
+    assert [item["metadata"]["rllm_episode"]["id"] for item in results["samples"]["items"] if item["is_accepted"]] == [
+        "mixed:good"
+    ]
+    assert len(results["episodes"]["items"]) == 4
+    assert results["global_steps"]["num_shards"] == 1
+    assert results["global_steps"]["num_episodes"] == 4
+
+    episode = json.loads((output_dir / "episodes/global_steps_0.json").read_text())
+    assert episode["accepted_sample_keys"] == ["mixed:good"]
+    checkpoint = json.loads((output_dir / "latest_checkpoint.json").read_text())
+    assert checkpoint["results_mode"] == "full"
+    assert checkpoint["next_rollout_id"] == 1
+    assert len(checkpoint["completed_shards"]) == 1
+    assert "accepted_sample_keys" not in checkpoint
+    assert "rejected_sample_keys" not in checkpoint
+    assert not list(output_dir.rglob("*.tmp"))
+
+
+@pytest.mark.integration
+def test_qwen3_rejection_sampling_resume_requires_atomic_rollout_pt_shard(tmp_path):
+    output_dir, train_files, model_dir, megatron_dir = _prepare_rs_workflow_fixture(tmp_path)
+    _run_rs_workflow(output_dir, train_files, model_dir, megatron_dir, "manifest")
+    rollout_path = output_dir / "debug/rollout_data/0.pt"
+    rollout_path.rename(rollout_path.with_suffix(".pt.saved"))
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        _run_rs_workflow(output_dir, train_files, model_dir, megatron_dir, "manifest")
+
+    assert "Resume start: rollout batch 0/1" in error.value.stdout
+    assert "No non-empty rejection-sampling shards were completed" in error.value.stderr
 
 
 @pytest.mark.unit
@@ -88,7 +375,7 @@ def test_qwen3_rejection_sampling_uses_inference_only_fast_path():
 
     for training_launcher in (
         "train_odyssey_qwen3_multinode_sync.sh",
-        "train_gemma4_fused_agent_async.sh",
+        "train_odyssey_gemma4_async.sh",
     ):
         training = (repo_root / "experiments" / training_launcher).read_text(encoding="utf-8")
         assert "--rollout-only-inference-fast-path" not in training
@@ -118,6 +405,48 @@ def test_odyssey_sync_launcher_drains_rollouts_before_weight_updates():
         'slime.rollout.sglang_rollout.generate_rollout}"'
     ) in launcher
     assert 'export SLIME_FUSED_REQUIRE_WEIGHT_VERSION="${SLIME_FUSED_REQUIRE_WEIGHT_VERSION:-1}"' in launcher
+    assert "--sglang-rl-on-policy-target megatron" in launcher
+    assert "--fp32-residual-connection" in launcher
+    assert "--batch-invariant-mode" in launcher
+    assert "export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=1" in launcher
+    assert "export SLIME_SGLANG_EXACT_RMSNORM=1" in launcher
+    assert '"SLIME_FUSED_REQUIRE_WEIGHT_VERSION", "SLIME_SGLANG_BATCH_INVARIANT_LOGPROB"' in launcher
+    assert '"SLIME_SGLANG_EXACT_RMSNORM"' in launcher
+
+
+@pytest.mark.unit
+def test_odyssey_sync_launcher_enables_binary_grm_training_rewards():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
+
+    assert 'ENABLE_USE_GRM_TRAIN="${ENABLE_USE_GRM_TRAIN:-${enable_use_grm_train:-true}}"' in launcher
+    assert '--enable_use_grm_train|--enable-use-grm-train)' in launcher
+    assert 'ROLLOUT_ARGS+=(--enable-use-grm-train)' in launcher
+    assert 'GRM_MODE="${GRM_MODE:-score}"' in launcher
+    assert (
+        'OpenRouter GRM: train=${ENABLE_USE_GRM_TRAIN}, train_model=${TRAIN_GRM_MODEL}, '
+        'evals=${ENABLE_USE_GRM_EVALS}, eval_model=${EVAL_GRM_MODEL}'
+    ) in launcher
+    assert 'TRAIN_GRM_MODEL="${TRAIN_GRM_MODEL:-deepseek/deepseek-v4-flash-0731}"' in launcher
+    assert 'EVAL_GRM_MODEL="${EVAL_GRM_MODEL:-google/gemini-3.7-flash}"' in launcher
+    assert '--train-grm-model "${TRAIN_GRM_MODEL}"' in launcher
+    assert '--eval-grm-model "${EVAL_GRM_MODEL}"' in launcher
+
+
+@pytest.mark.unit
+def test_all_training_launchers_use_separate_train_and_eval_grm_models():
+    repo_root = Path(__file__).resolve().parents[1]
+    launchers = sorted((repo_root / "experiments").glob("train_*.sh"))
+
+    assert launchers
+    for launcher_path in launchers:
+        launcher = launcher_path.read_text(encoding="utf-8")
+        assert 'TRAIN_GRM_MODEL="${TRAIN_GRM_MODEL:-deepseek/deepseek-v4-flash-0731}"' in launcher
+        assert 'EVAL_GRM_MODEL="${EVAL_GRM_MODEL:-google/gemini-3.7-flash}"' in launcher
+        assert '--train-grm-model "${TRAIN_GRM_MODEL}"' in launcher
+        assert '--eval-grm-model "${EVAL_GRM_MODEL}"' in launcher
+        assert 'GRM_MODEL="${GRM_MODEL:-' not in launcher
+        assert '--grm-model "${GRM_MODEL}"' not in launcher
 
 
 @pytest.mark.unit
@@ -187,20 +516,19 @@ def test_gemma4_e4b_sync_launcher_uses_e4b_model_shape():
 
 
 @pytest.mark.unit
-def test_gemma4_launcher_uses_trajectory_mean_grpo_by_default():
+def test_all_training_launchers_use_dapo_token_level_policy_gradient_loss():
     repo_root = Path(__file__).resolve().parents[1]
-    launcher = (repo_root / "experiments/train_gemma4_fused_agent_sync.sh").read_text(encoding="utf-8")
+    launchers = sorted((repo_root / "experiments").glob("train_*.sh"))
 
-    # Token-sum reduction makes a sequence-level GRPO advantage proportional to
-    # response length. Gemma4 must opt into that legacy behavior explicitly.
-    assert 'CALCULATE_PER_TOKEN_LOSS="${CALCULATE_PER_TOKEN_LOSS:-false}"' in launcher
-    perf_start = launcher.index("PERF_ARGS=(")
-    perf_end = launcher.index("if [ \"${USE_DYNAMIC_BATCH_SIZE:-1}\"", perf_start)
-    perf_args = launcher[perf_start:perf_end]
-    assert "\n   --calculate-per-token-loss\n" not in perf_args
-    assert 'if is_truthy "${CALCULATE_PER_TOKEN_LOSS}"; then' in launcher
-    assert "PERF_ARGS+=(--calculate-per-token-loss)" in launcher
-    assert "default false = trajectory/sample mean" in launcher
+    assert launchers
+    missing = []
+    for launcher in launchers:
+        text = launcher.read_text(encoding="utf-8")
+        perf_start = text.index("PERF_ARGS=(")
+        perf_end = text.index("\n)", perf_start)
+        if "--calculate-per-token-loss" not in text[perf_start:perf_end]:
+            missing.append(launcher.name)
+    assert not missing, f"training launchers missing --calculate-per-token-loss: {missing}"
 
 
 @pytest.mark.unit
@@ -262,6 +590,25 @@ def test_odyssey_sync_launcher_defaults_to_persistent_trainer_offload():
     assert 'RELEASE_TRAIN="${RELEASE_TRAIN:-false}"' in launcher
     assert 'OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${COLOCATE}}"' in launcher
     assert '--train-env-vars \'{"TMS_INIT_ENABLE_CPU_BACKUP":"1"}\'' in launcher
+    assert 'TRAIN_MEMORY_MARGIN_BYTES="${TRAIN_MEMORY_MARGIN_BYTES:-536870912}"' in launcher
+    assert '--train-memory-margin-bytes "${TRAIN_MEMORY_MARGIN_BYTES}"' in launcher
+    assert (
+        'PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False,'
+        'max_split_size_mb:256}"' in launcher
+    )
+    assert "--update-weight-mode full" in launcher
+    assert "--update-weight-transport disk" in launcher
+
+
+@pytest.mark.unit
+def test_single_node_odyssey_launcher_avoids_train_memory_saver_by_default():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments" / "train_odyssey_qwen3_sync.sh").read_text(encoding="utf-8")
+
+    assert 'COLOCATE="${COLOCATE:-true}"' in launcher
+    assert 'RELEASE_TRAIN="${RELEASE_TRAIN:-true}"' in launcher
+    assert 'OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${COLOCATE}}"' in launcher
+    assert "OFFLOAD_TRAIN=false" in launcher
     assert "--update-weight-mode full" in launcher
     assert "--update-weight-transport disk" in launcher
 
@@ -292,19 +639,32 @@ def test_odyssey_sync_launcher_keeps_aggressive_pending_group_reservoir():
     launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
 
     assert 'OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"' in launcher
-    assert 'SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS:-$((ROLLOUT_ENGINE_COUNT * 4))}"' in launcher
-    assert 'export SLIME_SYNC_MIN_PENDING_GROUPS="${SLIME_SYNC_MIN_PENDING_GROUPS:-${SYNC_MIN_PENDING_GROUPS}}"' in launcher
+    assert "SYNC_MIN_PENDING_GROUPS=96" in launcher
+    assert 'export SLIME_SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS}"' in launcher
+    assert "MCP_ENV_COPY_CONCURRENCY=32" in launcher
+    assert "export SLIME_LOCAL_MCP_PROCESS_WORKERS=32" in launcher
+    assert 'ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"' in launcher
+    assert 'SLIME_LOCAL_MCP_TOOLSET_CACHE_SIZE="${SLIME_LOCAL_MCP_TOOLSET_CACHE_SIZE:-64}"' in launcher
+    assert 'SLIME_LOCAL_MCP_PROCESS_EAGER_WARM="${SLIME_LOCAL_MCP_PROCESS_EAGER_WARM:-true}"' in launcher
+    assert launcher.count("SLIME_LOCAL_MCP_TOOLSET_CACHE_SIZE") >= 2
+    assert launcher.count("SLIME_LOCAL_MCP_PROCESS_EAGER_WARM") >= 2
     assert '"SLIME_SYNC_MIN_PENDING_GROUPS"' in launcher
 
 
 @pytest.mark.unit
-def test_odyssey_launcher_balances_webqa_and_mcp_training_groups():
+def test_odyssey_launchers_balance_webqa_and_mcp_training_groups():
     repo_root = Path(__file__).resolve().parents[1]
-    launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
+    launchers = [
+        (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8"),
+        (repo_root / "experiments/train_odyssey_qwen3_sync.sh").read_text(encoding="utf-8"),
+    ]
 
-    assert 'ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"' in launcher
-    assert 'ROLLOUT_ARGS+=(--rollout-task-family-quotas "${ROLLOUT_TASK_FAMILY_QUOTAS}")' in launcher
-    assert "ROLLOUT_BATCH_SIZE must be even for the 50/50 webqa/mcp training mix" in launcher
+    for launcher in launchers:
+        assert 'ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"' in launcher
+        assert '--rollout-task-family-quotas "${ROLLOUT_TASK_FAMILY_QUOTAS}"' in launcher
+        assert "--rollout-task-family-admission-only" not in launcher
+        assert "ROLLOUT_BATCH_SIZE must be even for the 50/50 webqa/mcp training mix" in launcher
+    assert "--rollout-task-family-top-mean-steps" in launchers[0]
 
 
 @pytest.mark.unit

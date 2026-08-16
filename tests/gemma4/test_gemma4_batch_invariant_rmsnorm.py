@@ -37,13 +37,19 @@ def test_gemma4_scale_rmsnorm_backward_matches_reference(monkeypatch, zero_cente
 
 @pytest.mark.unit
 @pytest.mark.parametrize("hidden_size", [256, 512, 2560])
-def test_gemma4_batch_invariant_rmsnorm_forward_matches_sglang(monkeypatch, hidden_size):
+@pytest.mark.parametrize(
+    "exact_rmsnorm_env",
+    ["SLIME_GEMMA4_BATCH_INVARIANT", "SLIME_SGLANG_EXACT_RMSNORM"],
+)
+def test_batch_invariant_rmsnorm_forward_matches_sglang(
+    monkeypatch, hidden_size, exact_rmsnorm_env
+):
     if not torch.cuda.is_available():
         pytest.skip("batch-invariant RMSNorm is CUDA-only")
 
     from sglang.srt.batch_invariant_ops.batch_invariant_ops import rms_norm as sglang_rms_norm
 
-    monkeypatch.setenv("SLIME_GEMMA4_BATCH_INVARIANT", "1")
+    monkeypatch.setenv(exact_rmsnorm_env, "1")
     torch.manual_seed(23)
     x = torch.randn(17, hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True)

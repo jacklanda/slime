@@ -1,5 +1,5 @@
 #!/bin/bash
-# Synchronous fused-agent training launcher for Gemma4 E4B on current slime.
+# Fully-async fused-agent training launcher for Gemma4 E4B on current slime.
 #
 # This uses array-based args, ray job submit, and a runtime PYTHONPATH rooted at
 # this slime checkout. The fused-agent workload knobs mirror the rllm fused
@@ -12,7 +12,7 @@ export PYTHONUNBUFFERED=1
 usage() {
    cat <<'EOF'
 Usage:
-  bash experiments/train_gemma4_fused_agent_sync.sh [options]
+  bash experiments/train_gemma4_fused_agent_async.sh [options]
 
 Options:
   --harness NAME                         Fused prompt harness: bare, cot, react, gem, unified_gem.
@@ -87,7 +87,8 @@ Options:
   --grpo-std-normalization                Keep GRPO's per-group std normalization. Default: disabled.
   --disable-grpo-std-normalization        Use mean-only GRPO advantages (default).
   --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
-  --grm-model NAME                       OpenRouter judge model. Default: google/gemini-3-flash-preview.
+  --train-grm-model NAME                 Training OpenRouter judge model. Default: deepseek/deepseek-v4-flash-0731.
+  --eval-grm-model NAME                  Evaluation OpenRouter judge model. Default: google/gemini-3.7-flash.
   --grm-base-url URL                     OpenRouter-compatible judge endpoint.
   --grm-openrouter-api-key KEY           GRM API key. Prefer the OPENROUTER_API_KEY environment variable.
   --grm-mode score|equivalence           GRM protocol. Default: score.
@@ -133,10 +134,11 @@ Options:
   --offload-train BOOL                   Offload trainer model between phases. Disabled by --release-train.
   --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: false.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 128.
+  --sglang-server-concurrency N          Per-engine fully-async group concurrency. Auto-derived unless explicitly set.
   --sglang-router-request-timeout-secs N Router request timeout. Default: 21600.
   --sglang-max-running-requests N        SGLang max running requests. Default: 64.
-  --colocate / --no-colocate             Share trainer and rollout GPUs with offload. Default: enabled.
+  --fully-async-group-concurrency N      Target in-flight prompt groups. Default: per-engine concurrency x engines.
+  --colocate / --no-colocate             Share trainer and rollout GPUs with offload. Colocation is unsupported.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
 EOF
@@ -149,21 +151,19 @@ is_truthy() {
    esac
 }
 
-PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
+PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-true}"
 ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
-# Alternate training and rollout across all eight GPUs. The pinned
-# torch_memory_saver revision includes the CUDA VMM granularity fix required by
-# repeated pause/resume cycles in long-running colocated jobs.
-COLOCATE="${COLOCATE:-true}"
+# Async training overlaps actor updates and rollout on disjoint GPU sets.
+COLOCATE="${COLOCATE:-false}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-false}"
 DISABLE_THINKING="${DISABLE_THINKING:-false}"
 ENABLE_YARN="${ENABLE_YARN:-false}"
 YARN_FACTOR="${YARN_FACTOR:-1.0}"
 YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS:-32768}"
 DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-8}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 TRAIN_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND:-${RETRIEVAL_BACKEND:-local}}"
@@ -191,7 +191,7 @@ CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD="${CREDIT_ASSIGNMENT_NGRAM_REPETITI
 CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS="${CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS:-160}"
 CREDIT_ASSIGNMENT_SEARCH_BYPASS="${CREDIT_ASSIGNMENT_SEARCH_BYPASS:-True}"
 CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL="${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL:-True}"
-CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER:-False}"
+CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER:-True}"
 CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP:-False}"
 CREDIT_ASSIGNMENT_MAX_TURNS="${CREDIT_ASSIGNMENT_MAX_TURNS:-True}"
 CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN:-True}"
@@ -236,6 +236,10 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
+SGLANG_SERVER_CONCURRENCY_EXPLICIT=0
+if [ -n "${SGLANG_SERVER_CONCURRENCY+x}" ]; then
+   SGLANG_SERVER_CONCURRENCY_EXPLICIT=1
+fi
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-24}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-24}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
@@ -275,10 +279,11 @@ EVAL_PROMPT_DATA=()
 # changes it. Release-train overrides this below because it replaces the trainer
 # actor instead of pausing it.
 OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-false}}"
-RELEASE_TRAIN="${RELEASE_TRAIN:-true}"
+RELEASE_TRAIN="${RELEASE_TRAIN:-false}"
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
-GRM_MODEL="${GRM_MODEL:-google/gemini-3-flash-preview}"
+TRAIN_GRM_MODEL="${TRAIN_GRM_MODEL:-deepseek/deepseek-v4-flash-0731}"
+EVAL_GRM_MODEL="${EVAL_GRM_MODEL:-google/gemini-3-flash-preview}"
 GRM_MODE="${GRM_MODE:-score}"
 GRM_CONCURRENCY="${GRM_CONCURRENCY:-128}"
 GRM_MAX_CONNECTIONS="${GRM_MAX_CONNECTIONS:-128}"
@@ -360,7 +365,8 @@ while [ "$#" -gt 0 ]; do
       --grpo-std-normalization) GRPO_STD_NORMALIZATION=true; shift ;;
       --disable-grpo-std-normalization) GRPO_STD_NORMALIZATION=false; shift ;;
       --enable_use_grm_evals|--enable-use-grm-evals) ENABLE_USE_GRM_EVALS="${2:?Missing value for --enable_use_grm_evals}"; shift 2 ;;
-      --grm-model) GRM_MODEL="${2:?Missing value for --grm-model}"; shift 2 ;;
+      --train-grm-model) TRAIN_GRM_MODEL="${2:?Missing value for --train-grm-model}"; shift 2 ;;
+      --eval-grm-model) EVAL_GRM_MODEL="${2:?Missing value for --eval-grm-model}"; shift 2 ;;
       --grm-base-url) GRM_BASE_URL="${2:?Missing value for --grm-base-url}"; shift 2 ;;
       --grm-openrouter-api-key)
          set +x
@@ -424,9 +430,10 @@ while [ "$#" -gt 0 ]; do
       --offload-train) OFFLOAD_TRAIN="${2:?Missing value for --offload-train}"; shift 2 ;;
       --release-train) RELEASE_TRAIN="${2:?Missing value for --release-train}"; shift 2 ;;
       --max-tool-output-length) MAX_TOOL_OUTPUT_LENGTH="${2:?Missing value for --max-tool-output-length}"; shift 2 ;;
-      --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
+      --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; SGLANG_SERVER_CONCURRENCY_EXPLICIT=1; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
       --sglang-router-request-timeout-secs) SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${2:?Missing value for --sglang-router-request-timeout-secs}"; shift 2 ;;
+      --fully-async-group-concurrency) FULLY_ASYNC_GROUP_CONCURRENCY="${2:?Missing value for --fully-async-group-concurrency}"; shift 2 ;;
       --colocate) COLOCATE=true; shift ;;
       --no-colocate) COLOCATE=false; shift ;;
       --experiment-name) EXPERIMENT_NAME="${2:?Missing value for --experiment-name}"; shift 2 ;;
@@ -438,16 +445,17 @@ done
 OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${COLOCATE}}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-40960}"
 
+if is_truthy "${COLOCATE}"; then
+   echo "Fully-async training does not support colocation; use --no-colocate." >&2
+   exit 2
+fi
+
 # Colocated trainer pause/resume uses a pinned CPU copy for every tracked CUDA
 # allocation. Long runs can exhaust/fragment CUDA host registrations and make
 # cudaMallocHost fail natively inside torch_memory_saver.pause(). Release-train
 # preserves model, optimizer, and RNG through a checkpoint while avoiding that
 # native path entirely.
 if is_truthy "${RELEASE_TRAIN}"; then
-   if ! is_truthy "${COLOCATE}"; then
-      echo "RELEASE_TRAIN=true requires COLOCATE=true in this launcher." >&2
-      exit 2
-   fi
    OFFLOAD_TRAIN=false
 fi
 
@@ -502,7 +510,7 @@ RUNS_ROOT="${RUNS_ROOT:-/share/nlp/share/gem/runs}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 
 default_experiment_name() {
-   local prefix="odyssey-g4-8b-it-dev"
+   local prefix="odyssey-g4-8b-it-async-dev"
    #local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
    #local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
    #local prefix="fused-dapo-q3-4b-dht-gem-sync-dev"  # w/o rft warmup
@@ -569,10 +577,10 @@ MODEL_ARGS=(
 # model implementation grows support for those layouts.
 DEFAULT_TP_SIZE=1
 
-# Colocated training and rollout both use the full node, matching the common
-# fused-agent launcher defaults while retaining Gemma4's TP constraints.
-ACTOR_GPUS="${ACTOR_GPUS:-8}"
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
+# Fully-async training splits the eight-GPU node evenly between actor and
+# rollout while retaining Gemma4's TP/CP constraints.
+ACTOR_GPUS="${ACTOR_GPUS:-4}"
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
 CP_SIZE="${CP_SIZE:-2}"
 PP_SIZE="${PP_SIZE:-1}"
@@ -882,6 +890,22 @@ LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"
 # can exhaust an 80 GiB rank even when the forward pass fits.
 LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-4096}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
+ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.fully_async_rollout.generate_rollout_fully_async}"
+FULLY_ASYNC_GROUP_CONCURRENCY="${FULLY_ASYNC_GROUP_CONCURRENCY:-$((SGLANG_SERVER_CONCURRENCY * ROLLOUT_ENGINE_COUNT))}"
+if ! [[ "${FULLY_ASYNC_GROUP_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+   echo "FULLY_ASYNC_GROUP_CONCURRENCY must be a positive integer; got ${FULLY_ASYNC_GROUP_CONCURRENCY}." >&2
+   exit 2
+fi
+# fully_async_rollout multiplies this per-engine value by the engine count to
+# determine the number of in-flight prompt groups.
+case "${ROLLOUT_FUNCTION_PATH}" in
+   *fully_async_rollout.generate_rollout_fully_async)
+      if [ "${SGLANG_SERVER_CONCURRENCY_EXPLICIT}" = "0" ]; then
+         SGLANG_SERVER_CONCURRENCY="$(( (FULLY_ASYNC_GROUP_CONCURRENCY + ROLLOUT_ENGINE_COUNT - 1) / ROLLOUT_ENGINE_COUNT ))"
+      fi
+      ;;
+esac
+FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY="$((SGLANG_SERVER_CONCURRENCY * ROLLOUT_ENGINE_COUNT))"
 # The fully-async collector counts prompt groups, so the default batch of eight
 # groups is selected as four MCP groups and four WebQA groups.
 #ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-mcp=0.5,webqa=0.5}"
@@ -906,8 +930,6 @@ FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS="${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS:-
 if ! is_truthy "${ENABLE_DYNAMIC_SAMPLING_FILTER}"; then
    DYNAMIC_SAMPLING_FILTER_PATH=""
 fi
-
-ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.sglang_rollout.generate_rollout}"
 
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-${MAX_CONTEXT_LEN}}"
 if [ "${MAX_MODEL_LEN}" -ne "${MAX_CONTEXT_LEN}" ]; then
@@ -1088,7 +1110,8 @@ fi
 if is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTOM_RM_PATH}" ]; then
    ROLLOUT_ARGS+=(
       --grm-custom-rm-path "${GRM_CUSTOM_RM_PATH}"
-      --grm-model "${GRM_MODEL}"
+      --train-grm-model "${TRAIN_GRM_MODEL}"
+      --eval-grm-model "${EVAL_GRM_MODEL}"
       --grm-mode "${GRM_MODE}"
       --grm-concurrency "${GRM_CONCURRENCY}"
       --grm-max-connections "${GRM_MAX_CONNECTIONS}"
@@ -1567,14 +1590,14 @@ echo "Rollout function: ${ROLLOUT_FUNCTION_PATH}"
 echo "Actor GPUs: ${ACTOR_GPUS}, actor TP=${TP_SIZE}, CP=${CP_SIZE}, PP=${PP_SIZE}, rollout GPUs: ${ROLLOUT_GPUS}, rollout TP=${ROLLOUT_NUM_GPUS_PER_ENGINE}, rollout engines=${ROLLOUT_ENGINE_COUNT}, colocate=${COLOCATE}, offload_train=${OFFLOAD_TRAIN}, ray GPUs=${NUM_GPUS}"
 echo "Training token budgets: max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}, log_probs_max_tokens_per_gpu=${LOG_PROBS_MAX_TOKENS_PER_GPU}, log_probs_chunk_size=${LOG_PROBS_CHUNK_SIZE}, max_context_len=${MAX_CONTEXT_LEN}"
 echo "YaRN: enable=${ENABLE_YARN}, factor=${YARN_FACTOR}, original_max_position_embeddings=${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
-echo "SGLang: mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}, server_concurrency=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}, deterministic_inference=${SGLANG_DETERMINISTIC_INFERENCE}"
+echo "SGLang: mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}, server_concurrency=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}, deterministic_inference=${SGLANG_DETERMINISTIC_INFERENCE}, fully_async_group_concurrency=${FULLY_ASYNC_GROUP_CONCURRENCY}, effective_group_concurrency=${FULLY_ASYNC_EFFECTIVE_GROUP_CONCURRENCY}"
 echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, mcp_max_tool_calls_per_turn=${FUSED_MCP_MAX_TOOL_CALLS_PER_TURN}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
 echo "Training batches: micro_batch=${MICRO_BATCH_SIZE}, num_steps_per_rollout=${NUM_STEPS_PER_ROLLOUT}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}, rollout_temperature=${TEMPERATURE}, rollout_top_p=${TOP_P}, rollout_top_k=${TOP_K}"
 echo "Retrieval: train_backend=${TRAIN_RETRIEVAL_BACKEND}, train_url=${TRAIN_RETRIEVAL_SERVER_URL}, eval_backend=${EVAL_RETRIEVAL_BACKEND}, eval_url=${EVAL_RETRIEVAL_SERVER_URL}, mode=${RLLM_RETRIEVAL_MODE}, concurrency=${RLLM_RETRIEVAL_CONCURRENCY}, cache_size=${RLLM_RETRIEVAL_CACHE_SIZE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RETRIEVAL_RETRY_BUDGET}, summary_retry=${RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RETRIEVAL_LEXRANK_FALLBACK}"
 echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, relax_after_groups=${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}, webqa_reward_match=${FUSED_WEBQA_REWARD_MATCH_MODE}"
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, benchmarks=${EVAL_INCLUDE_BENCHMARKS}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, temperature=${EVAL_TEMPERATURE}, top_p=${EVAL_TOP_P}, top_k=${EVAL_TOP_K}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}"
 echo "Eval scheduling: inflight=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS}, adaptive=${EVAL_ADAPTIVE_CONCURRENCY}, mix_datasets=${EVAL_MIX_DATASETS}, termination_retries=${EVAL_TERMINATION_RETRY_TIMES}, trajectory_sample_rate=${EVAL_TRAJECTORY_SAMPLE_RATE}, dump_failures=${EVAL_DUMP_FAILURES}, native_session=${NATIVE_SGLANG_SESSION}"
-echo "OpenRouter GRM evals: enable=${ENABLE_USE_GRM_EVALS}, model=${GRM_MODEL}, mode=${GRM_MODE}, concurrency=${GRM_CONCURRENCY}, max_connections=${GRM_MAX_CONNECTIONS}, timeout=${GRM_TIMEOUT}, retries=${GRM_MAX_RETRIES}, max_input_tokens=${GRM_MAX_INPUT_TOKENS}, max_new_tokens=${GRM_MAX_NEW_TOKENS}, custom_rm=${GRM_CUSTOM_RM_PATH}"
+echo "OpenRouter GRM evals: enable=${ENABLE_USE_GRM_EVALS}, train_model=${TRAIN_GRM_MODEL}, eval_model=${EVAL_GRM_MODEL}, mode=${GRM_MODE}, concurrency=${GRM_CONCURRENCY}, max_connections=${GRM_MAX_CONNECTIONS}, timeout=${GRM_TIMEOUT}, retries=${GRM_MAX_RETRIES}, max_input_tokens=${GRM_MAX_INPUT_TOKENS}, max_new_tokens=${GRM_MAX_NEW_TOKENS}, custom_rm=${GRM_CUSTOM_RM_PATH}"
 echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, std_normalization=${GRPO_STD_NORMALIZATION}, normalize_advantages=${NORMALIZE_ADVANTAGES}, kl_coef=${KL_COEF}, lr=${LR}, eps_clip=${EPS_CLIP:-0.2}, eps_clip_high=${EPS_CLIP_HIGH:-0.28}"
 echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING:-0}, path=${BUFFER_FILTER_PATH:-${ENABLE_QUOTA_BUCKET_SAMPLING:+slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps}}"
 echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}"
@@ -1680,7 +1703,7 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    --submission-id="${RAY_SUBMISSION_ID}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    "${RAY_JOB_SUBMIT_ARGS[@]}" \
-   -- python3 -u train.py \
+   -- python3 -u train_async.py \
    "${CLUSTER_ARGS[@]}" \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \

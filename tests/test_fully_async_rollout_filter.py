@@ -355,25 +355,70 @@ def test_generate_group_records_group_profile(monkeypatch):
     assert profile["group_total_time_s"] >= 0
 
 
-def test_trajectory_profile_json_keeps_rejected_candidates(tmp_path, monkeypatch):
+def test_trajectory_profile_json_aggregates_groups_by_rollout_shard(tmp_path, monkeypatch):
     profile_dir = tmp_path / "profiles"
     monkeypatch.setenv("SLIME_FUSED_PROFILE_DIR", str(profile_dir))
-    sample = _sample(7, 0.0, termination="ABNORMAL_PARSE_ERROR", credit_event="tool_parser_error")
-    sample.session_id = "trajectory-7"
-    sample.metadata["fused_profile"] = {"llm_decode_time_s": 1.5}
-
-    fully_async._write_trajectory_profile_shard(
-        SimpleNamespace(reward_key=None), 3, 11, [sample], selected_for_shard=False
+    monkeypatch.setenv("SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS", "true")
+    monkeypatch.setenv("SLIME_FULLY_ASYNC_CROSS_SHARD_PREFETCH", "false")
+    rejected = _sample(7, 0.0, termination="ABNORMAL_PARSE_ERROR", credit_event="tool_parser_error")
+    rejected.session_id = "trajectory-7"
+    rejected.metadata["fused_profile"] = {"llm_decode_time_s": 1.5}
+    accepted = _sample(8, 1.0)
+    worker = FakeWorker([[rejected], [accepted]])
+    worker.groups = [(11, [rejected]), (12, [accepted])]
+    monkeypatch.setattr(fully_async, "_get_global_worker", lambda args, data_buffer: worker)
+    args = SimpleNamespace(
+        rollout_global_dataset=True,
+        rollout_only_inference_fast_path=True,
+        rollout_batch_size=2,
+        dynamic_sampling_filter_path=None,
+        reward_key=None,
     )
 
-    path = profile_dir / "rollout_000003_group_000000011.json"
+    output = asyncio.run(fully_async._generate_rollout_async(args, rollout_id=3, data_buffer=None))
+
+    path = profile_dir / "rollout_000003.json"
     payload = json.loads(path.read_text())
-    record = payload["trajectories"][0]
-    assert payload["selected_for_shard"] is False
+    record = payload["groups"][0]["trajectories"][0]
+    assert output.samples == [[rejected], [accepted]]
+    assert payload["num_groups"] == 2
+    assert payload["groups"][0]["valid_reward_group"] is False
+    assert payload["groups"][0]["selected_for_shard"] is True
+    assert payload["groups"][1]["selected_for_shard"] is True
     assert record["parser_error"] is True
     assert record["termination_reason"] == "ABNORMAL_PARSE_ERROR"
     assert record["profile"]["llm_decode_time_s"] == 1.5
-    assert "\n    \"trajectories\": [\n" in path.read_text()
+    assert "\n    \"groups\": [\n" in path.read_text()
+    assert list(profile_dir.glob("*.json")) == [path]
+
+
+def test_trajectory_profile_shard_keeps_dynamic_filter_rejections(tmp_path, monkeypatch):
+    profile_dir = tmp_path / "profiles"
+    monkeypatch.setenv("SLIME_FUSED_PROFILE_DIR", str(profile_dir))
+    monkeypatch.setenv("SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS", "false")
+    monkeypatch.setenv("SLIME_FULLY_ASYNC_CROSS_SHARD_PREFETCH", "false")
+    rejected = [_sample(0, 0.0), _sample(1, 0.0)]
+    selected = [_sample(2, 0.0), _sample(3, 1.0)]
+    worker = FakeWorker([rejected, selected])
+    monkeypatch.setattr(fully_async, "_get_global_worker", lambda args, data_buffer: worker)
+    args = SimpleNamespace(
+        rollout_global_dataset=True,
+        rollout_only_inference_fast_path=True,
+        rollout_batch_size=1,
+        dynamic_sampling_filter_path="slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std",
+        reward_key=None,
+    )
+
+    output = asyncio.run(fully_async._generate_rollout_async(args, rollout_id=4, data_buffer=None))
+
+    payload = json.loads((profile_dir / "rollout_000004.json").read_text())
+    assert output.samples == [selected]
+    assert payload["num_groups"] == 2
+    assert payload["groups"][0]["valid_reward_group"] is False
+    assert payload["groups"][0]["selected_for_shard"] is False
+    assert payload["groups"][1]["valid_reward_group"] is True
+    assert payload["groups"][1]["selected_for_shard"] is True
+    assert list(profile_dir.glob("*.json")) == [profile_dir / "rollout_000004.json"]
 
 
 class SizedDataBuffer:

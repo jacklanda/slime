@@ -17,45 +17,122 @@ from typing import Any
 from slime.rollout.failure_types import MCPLeaseTimeout
 
 
-_worker_toolsets: dict[str, Any] = {}
+_WORKER_STATE_POLLUTED = "_slime_worker_state_polluted"
+_WORKER_TOOLSET_CACHE_KEYS = "_slime_worker_toolset_cache_keys"
+_worker_toolsets: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
 _process_context: multiprocessing.context.BaseContext | None = None
 _process_context_lock = threading.Lock()
 
 
-def _worker_toolset(task: dict[str, Any]):
+def _toolset_cache_key(task: dict[str, Any]) -> tuple[Any, ...]:
+    data_root_value = task.get("data_root")
+    tools_value = task.get("tools_py")
+    if not tools_value and data_root_value:
+        tools_value = Path(str(data_root_value)) / "tools.py"
+    tools_path = Path(str(tools_value)).resolve() if tools_value else None
+    try:
+        tools_stat = tools_path.stat() if tools_path is not None else None
+    except OSError:
+        tools_stat = None
+    policy = {
+        key: task.get(key)
+        for key in (
+            "enabled_tools",
+            "ENABLED_TOOLS",
+            "tool_groups",
+            "mcp_tool_groups",
+            "initial_tools",
+            "mcp_initial_tools",
+            "answer_schema",
+            "answer_schema_json",
+            "model_answer_schema",
+            "model_answer_schema_json",
+            "mcp_compact_finish_schema",
+            "mcp_finish_requires_command",
+        )
+        if key in task
+    }
+    policy_key = json.dumps(policy, ensure_ascii=False, sort_keys=True, default=str)
+    key = (
+        str(Path(str(data_root_value)).resolve()) if data_root_value else None,
+        str(tools_path) if tools_path is not None else None,
+        tools_stat.st_mtime_ns if tools_stat is not None else None,
+        tools_stat.st_size if tools_stat is not None else None,
+        policy_key,
+    )
+    return key
+
+
+def _worker_toolset(task: dict[str, Any], max_entries: int):
     os.environ["SLIME_LOCAL_MCP_PROCESS_WORKER"] = "1"
     from .env import LocalMCPToolset
 
-    key = str(task.get("tools_py") or task.get("data_root"))
+    key = _toolset_cache_key(task)
     toolset = _worker_toolsets.get(key)
     if toolset is None:
         toolset = LocalMCPToolset(task)
         _worker_toolsets[key] = toolset
+        while len(_worker_toolsets) > max_entries:
+            _evicted_key, evicted = _worker_toolsets.popitem(last=False)
+            evicted.close()
+    else:
+        _worker_toolsets.move_to_end(key)
     return toolset
 
 
-def _worker_call(task: dict[str, Any], name: str, arguments: dict[str, Any], relax_empty: bool) -> dict[str, Any]:
-    toolset = _worker_toolset(task)
+def _worker_process_state() -> tuple[Path, dict[str, str]]:
+    os.environ["SLIME_LOCAL_MCP_PROCESS_WORKER"] = "1"
+    return Path.cwd(), dict(os.environ)
+
+
+def _mark_worker_state(payload: dict[str, Any], initial_state: tuple[Path, dict[str, str]]) -> dict[str, Any]:
+    initial_cwd, initial_environ = initial_state
+    payload[_WORKER_STATE_POLLUTED] = Path.cwd() != initial_cwd or dict(os.environ) != initial_environ
+    payload[_WORKER_TOOLSET_CACHE_KEYS] = list(_worker_toolsets)
+    return payload
+
+
+def _worker_call(
+    task: dict[str, Any],
+    name: str,
+    arguments: dict[str, Any],
+    relax_empty: bool,
+    max_cache_entries: int,
+) -> dict[str, Any]:
+    initial_state = _worker_process_state()
+    toolset = _worker_toolset(task, max_cache_entries)
     result = toolset.call_raw(name, arguments, relax_empty=relax_empty)
     # Keep the IPC contract stable even when generated tools return local
     # enums, dataclasses, or other objects that multiprocessing cannot pickle.
     result = json.loads(json.dumps(result, ensure_ascii=False, default=str))
-    return {"result": result, "call_info": dict(toolset.last_call_info)}
+    return _mark_worker_state({"result": result, "call_info": dict(toolset.last_call_info)}, initial_state)
 
 
-def _worker_describe(task: dict[str, Any]) -> dict[str, Any]:
-    toolset = _worker_toolset(task)
-    return {
-        "schemas": toolset.schemas(),
-        "load_error": toolset.load_error,
-        "load_warning": toolset.load_warning,
-        "tool_aliases": dict(toolset.tool_aliases),
-        "tool_names": list(toolset.tools),
-    }
+def _worker_describe(task: dict[str, Any], max_cache_entries: int) -> dict[str, Any]:
+    initial_state = _worker_process_state()
+    toolset = _worker_toolset(task, max_cache_entries)
+    return _mark_worker_state(
+        {
+            "schemas": toolset.schemas(),
+            "all_schemas": toolset._all_schemas(),
+            "finish_result_schema": toolset.finish_result_schema,
+            "load_error": toolset.load_error,
+            "load_warning": toolset.load_warning,
+            "tool_aliases": dict(toolset.tool_aliases),
+            "tool_names": list(toolset.tools),
+        },
+        initial_state,
+    )
 
 
-def _worker_verify(task: dict[str, Any], verification_code: str, answer: Any) -> dict[str, Any]:
-    toolset = _worker_toolset(task)
+def _worker_verify(
+    task: dict[str, Any],
+    verification_code: str,
+    answer: Any,
+    max_cache_entries: int,
+) -> dict[str, Any]:
+    initial_state = _worker_process_state()
+    toolset = _worker_toolset(task, max_cache_entries)
     workspace = Path(str(task.get("data_root") or task.get("tools_py"))).resolve()
     if workspace.is_file():
         workspace = workspace.parent
@@ -68,16 +145,24 @@ def _worker_verify(task: dict[str, Any], verification_code: str, answer: Any) ->
         exec(verification_code, namespace)
         verify = namespace.get("verify")
         if not callable(verify):
-            return {"has_verifier": False, "result": None}
-        result = verify(toolset, answer)
+            payload = {"has_verifier": False, "result": None, "verifier_calls": []}
+        else:
+            toolset.begin_verification()
+            result = verify(toolset, answer)
+            result = json.loads(json.dumps(result, ensure_ascii=False, default=str))
+            payload = {
+                "has_verifier": True,
+                "result": result,
+                "verifier_calls": list(toolset.verifier_calls),
+                "local_evidence_overlap": toolset.answer_has_local_evidence(answer),
+            }
     finally:
         if previous_base_dir is None:
             os.environ.pop("MCP_SERVER_BASE_DIR", None)
         else:
             os.environ["MCP_SERVER_BASE_DIR"] = previous_base_dir
         os.chdir(previous_cwd)
-    result = json.loads(json.dumps(result, ensure_ascii=False, default=str))
-    return {"has_verifier": True, "result": result}
+    return _mark_worker_state(payload, initial_state)
 
 
 def _worker_ping() -> int:
@@ -117,6 +202,7 @@ class _ProcessShard:
         self.index = index
         self.lock = threading.Lock()
         self.executor: concurrent.futures.ProcessPoolExecutor | None = None
+        self.cached_keys: set[tuple[Any, ...]] = set()
 
     def _start(self) -> concurrent.futures.ProcessPoolExecutor:
         if self.executor is None:
@@ -133,21 +219,30 @@ class _ProcessShard:
         arguments: dict[str, Any],
         relax_empty: bool,
         timeout: float,
+        max_cache_entries: int,
     ) -> dict[str, Any]:
-        with self.lock:
-            executor = self._start()
-            future = executor.submit(_worker_call, task, name, arguments, relax_empty)
-            try:
-                return future.result(timeout=timeout)
-            except BaseException:
-                self._terminate_locked()
-                raise
+        future = self.submit(_worker_call, task, name, arguments, relax_empty, max_cache_entries)
+        return self.result(future, timeout)
 
     def submit(self, fn, *args) -> concurrent.futures.Future:
         with self.lock:
             return self._start().submit(fn, *args)
 
+    def result(self, future: concurrent.futures.Future, timeout: float) -> dict[str, Any]:
+        try:
+            result = future.result(timeout=timeout)
+        except BaseException:
+            self.terminate()
+            raise
+        cache_keys = result.pop(_WORKER_TOOLSET_CACHE_KEYS, ())
+        if result.pop(_WORKER_STATE_POLLUTED, False):
+            self.terminate()
+        else:
+            self.cached_keys = set(cache_keys)
+        return result
+
     def _terminate_locked(self) -> None:
+        self.cached_keys.clear()
         executor, self.executor = self.executor, None
         if executor is None:
             return
@@ -172,6 +267,7 @@ class LocalMCPProcessPool:
         configured_value = os.environ.get("SLIME_LOCAL_MCP_PROCESS_WORKERS", "").strip()
         configured = workers if workers is not None else (int(configured_value) if configured_value else _default_workers())
         self.workers = max(1, configured)
+        self.toolset_cache_size = max(1, int(os.environ.get("SLIME_LOCAL_MCP_TOOLSET_CACHE_SIZE", "64")))
         self.shards = [_ProcessShard(index) for index in range(self.workers)]
         self._condition = threading.Condition()
         self._free = deque(range(self.workers))
@@ -180,7 +276,7 @@ class LocalMCPProcessPool:
         self._describe_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self._describe_inflight: dict[tuple[Any, ...], concurrent.futures.Future] = {}
 
-    def _acquire(self, timeout: float | None = None) -> int:
+    def _acquire(self, timeout: float | None = None, cache_key: tuple[Any, ...] | None = None) -> int:
         with self._condition:
             if self._closed:
                 raise RuntimeError("Local MCP process pool is closed")
@@ -192,18 +288,21 @@ class LocalMCPProcessPool:
                 self._condition.wait(timeout=remaining)
             if self._closed:
                 raise RuntimeError("Local MCP process pool is closed")
+            if cache_key is not None:
+                preferred = next(
+                    (index for index in self._free if cache_key in self.shards[index].cached_keys),
+                    None,
+                )
+                if preferred is not None:
+                    self._free.remove(preferred)
+                    return preferred
             return self._free.popleft()
 
     def _release(self, index: int) -> None:
-        try:
-            # Generated modules and verifiers may mutate arbitrary globals.
-            # End the operation process before making its shard available again.
-            self.shards[index].terminate()
-        finally:
-            with self._condition:
-                if not self._closed:
-                    self._free.append(index)
-                self._condition.notify_all()
+        with self._condition:
+            if not self._closed:
+                self._free.append(index)
+            self._condition.notify_all()
 
     def warm(self) -> list[int]:
         futures = [shard.submit(_worker_ping) for shard in self.shards]
@@ -227,35 +326,30 @@ class LocalMCPProcessPool:
     ) -> dict[str, Any]:
         timeout = max(1.0, float(os.environ.get("SLIME_LOCAL_MCP_PROCESS_TIMEOUT", "120")))
         lease_timeout = max(0.1, float(os.environ.get("SLIME_LOCAL_MCP_LEASE_TIMEOUT", str(timeout))))
-        shard_index = self._acquire(timeout=lease_timeout)
+        shard_index = self._acquire(timeout=lease_timeout, cache_key=_toolset_cache_key(task))
         try:
-            return self.shards[shard_index].call(task, name, arguments, relax_empty, timeout)
+            return self.shards[shard_index].call(
+                task,
+                name,
+                arguments,
+                relax_empty,
+                timeout,
+                self.toolset_cache_size,
+            )
         finally:
             self._release(shard_index)
 
     @staticmethod
     def _describe_cache_key(task: dict[str, Any]) -> tuple[Any, ...]:
-        tools_value = task.get("tools_py")
-        data_root_value = task.get("data_root")
-        tools_path = Path(str(tools_value)).resolve() if tools_value else None
-        data_root = Path(str(data_root_value)).resolve() if data_root_value else None
-        try:
-            stat = tools_path.stat() if tools_path is not None else None
-        except OSError:
-            stat = None
-        return (
-            str(data_root) if data_root is not None else None,
-            str(tools_path) if tools_path is not None else None,
-            stat.st_mtime_ns if stat is not None else None,
-            stat.st_size if stat is not None else None,
-        )
+        return _toolset_cache_key(task)
 
     def _describe_uncached(self, task: dict[str, Any]) -> dict[str, Any]:
         timeout = max(1.0, float(os.environ.get("SLIME_LOCAL_MCP_PROCESS_TIMEOUT", "120")))
         lease_timeout = max(0.1, float(os.environ.get("SLIME_LOCAL_MCP_LEASE_TIMEOUT", str(timeout))))
-        shard_index = self._acquire(timeout=lease_timeout)
+        shard_index = self._acquire(timeout=lease_timeout, cache_key=_toolset_cache_key(task))
         try:
-            return self.shards[shard_index].submit(_worker_describe, task).result(timeout=timeout)
+            shard = self.shards[shard_index]
+            return shard.result(shard.submit(_worker_describe, task, self.toolset_cache_size), timeout)
         finally:
             self._release(shard_index)
 
@@ -299,14 +393,17 @@ class LocalMCPProcessPool:
     def verify(self, task: dict[str, Any], verification_code: str, answer: Any) -> dict[str, Any]:
         timeout = max(1.0, float(os.environ.get("SLIME_LOCAL_MCP_PROCESS_TIMEOUT", "120")))
         lease_timeout = max(0.1, float(os.environ.get("SLIME_LOCAL_MCP_LEASE_TIMEOUT", str(timeout))))
-        shard_index = self._acquire(timeout=lease_timeout)
+        shard_index = self._acquire(timeout=lease_timeout, cache_key=_toolset_cache_key(task))
         try:
-            return self.shards[shard_index].submit(
+            shard = self.shards[shard_index]
+            future = shard.submit(
                 _worker_verify,
                 task,
                 verification_code,
                 answer,
-            ).result(timeout=timeout)
+                self.toolset_cache_size,
+            )
+            return shard.result(future, timeout)
         finally:
             self._release(shard_index)
 

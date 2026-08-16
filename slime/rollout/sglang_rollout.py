@@ -21,7 +21,11 @@ import sglang_router
 from packaging.version import parse
 from tqdm import tqdm
 
-from slime.backends.sglang_utils.server_control import abort_servers_until_idle
+from slime.backends.sglang_utils.server_control import (
+    ABORT_HTTP_TIMEOUT_SECONDS,
+    ABORT_TIMEOUT_SECONDS,
+    abort_servers_until_idle,
+)
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput, MetricGatherer, call_dynamic_filter
 from slime.rollout.failure_types import FailureClass
@@ -29,7 +33,9 @@ from slime.rollout.filter_hub.dynamic_sampling_filters import group_failure_clas
 from slime.rollout.task_family import (
     has_task_family_quota_candidates,
     parse_task_family_quotas,
+    sample_group_mean_steps,
     sample_group_task_family,
+    sample_task_family,
     select_task_family_quota_groups,
     task_family_quota_counts,
 )
@@ -299,19 +305,23 @@ def _append_rollout_top_p_token_data(
     )
 
 
-def _should_use_grm_eval(args: Namespace, evaluation: bool) -> bool:
-    return evaluation and bool(getattr(args, "enable_use_grm_evals", False))
+def _should_use_grm(args: Namespace, sample: Sample, evaluation: bool) -> bool:
+    flag = "enable_use_grm_evals" if evaluation else "enable_use_grm_train"
+    if not bool(getattr(args, flag, False)):
+        return False
+    return sample_task_family(sample) == "webqa"
 
 
-async def _score_eval_samples_with_grm(args: Namespace, samples: list[Sample]) -> None:
+async def _score_samples_with_grm(args: Namespace, samples: list[Sample], *, evaluation: bool) -> None:
     if not samples:
         return
     grm_path = getattr(args, "grm_custom_rm_path", None)
     for sample in samples:
         sample.custom_rm_path = grm_path
         sample.reward = None
-    with trace_span(samples, "grm_eval_reward_model"):
-        rewards = await batched_async_rm(args, samples, evaluation=True)
+    trace_name = "grm_eval_reward_model" if evaluation else "grm_train_reward_model"
+    with trace_span(samples, trace_name):
+        rewards = await batched_async_rm(args, samples, evaluation=evaluation)
     for sample, reward in zip(samples, rewards, strict=False):
         sample.reward = reward
 
@@ -453,7 +463,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             headers = {"X-SMG-Routing-Key": sample.session_id}
 
     with trace_span(sample, "sglang_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}) as span:
-        output = await post(url, payload, headers=headers)
+        output = await post(url, payload, max_retries=1, headers=headers)
         span.update(build_sglang_meta_trace_attrs(output["meta_info"]))
 
     if "output_token_logprobs" in output["meta_info"]:
@@ -485,8 +495,10 @@ async def generate_and_rm(
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
-    if _should_use_grm_eval(args, evaluation) and (sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED):
-        await _score_eval_samples_with_grm(args, [sample])
+    if _should_use_grm(args, sample, evaluation) and (
+        sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED
+    ):
+        await _score_samples_with_grm(args, [sample], evaluation=evaluation)
         return sample
 
     # For samples with existing response, check if they're complete
@@ -571,14 +583,14 @@ async def generate_and_rm(
         if any(sample.status == Sample.Status.ABORTED for sample in samples):
             return samples
 
-        if _should_use_grm_eval(args, evaluation):
-            await _score_eval_samples_with_grm(args, samples)
-            return samples
+        grm_samples = [sample for sample in samples if _should_use_grm(args, sample, evaluation)]
+        non_grm_samples = [sample for sample in samples if not _should_use_grm(args, sample, evaluation)]
+        await _score_samples_with_grm(args, grm_samples, evaluation=evaluation)
 
-        for sample in samples:
+        for sample in non_grm_samples:
             if _should_rescore_eval_sample(args, sample, evaluation):
                 sample.reward = None
-        samples_need_reward = [sample for sample in samples if sample.reward is None]
+        samples_need_reward = [sample for sample in non_grm_samples if sample.reward is None]
         with trace_span(samples_need_reward, "reward_model"):
             rewards = await batched_async_rm(args, samples_need_reward, evaluation=evaluation)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
@@ -587,8 +599,8 @@ async def generate_and_rm(
     else:
         if sample.status == Sample.Status.ABORTED:
             return sample
-        if _should_use_grm_eval(args, evaluation):
-            await _score_eval_samples_with_grm(args, [sample])
+        if _should_use_grm(args, sample, evaluation):
+            await _score_samples_with_grm(args, [sample], evaluation=evaluation)
             return sample
         if _should_rescore_eval_sample(args, sample, evaluation):
             sample.reward = None
@@ -680,7 +692,17 @@ async def generate_and_rm_group(args: Namespace, group: list[Sample], sampling_p
             )
             tasks[task] = (slot, sample)
 
-        done, unfinished = await asyncio.wait(tasks, timeout=group_timeout)
+        try:
+            done, unfinished = await asyncio.wait(tasks, timeout=group_timeout)
+        except asyncio.CancelledError:
+            # asyncio.wait does not propagate cancellation to the tasks it is
+            # watching. Without this cleanup, per-sample producers survive a
+            # cancelled group and can submit new SGLang requests after rollout
+            # offload has started.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         if unfinished:
             logger.warning(
                 "Rollout group attempt timed out after %.1fs; completed=%d unfinished=%d; cancelling unfinished slots.",
@@ -842,36 +864,63 @@ def _group_has_trainable_response(group: list[Sample] | list[list[Sample]]) -> b
 
 async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     aborted_samples = []
+    count = 0
 
     state = GenerateState(args)
     assert not state.aborted
     state.aborted = True
 
-    if parse(sglang_router.__version__) <= parse("0.2.1"):
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
+    # Stop multi-turn producers before aborting the servers. Otherwise an
+    # aborted generate call can return to the agent, which immediately submits
+    # its next turn and prevents the server from ever becoming idle.
+    if state.pendings:
+        stale_tasks = tuple(state.pendings)
+        logger.info("Cancelling %d remaining rollout tasks before SGLang abort", len(stale_tasks))
+        for task in stale_tasks:
+            task.cancel()
+        cancellation_done, cancellation_pending = await asyncio.wait(
+            stale_tasks,
+            timeout=ABORT_TIMEOUT_SECONDS,
+        )
+        if cancellation_done:
+            await asyncio.gather(*cancellation_done, return_exceptions=True)
+        if cancellation_pending:
+            logger.error("%d stale rollout tasks ignored cancellation; detaching them", len(cancellation_pending))
+        if args.partial_rollout:
+            for task in stale_tasks:
+                group = state.pending_groups.get(task)
+                if group is None:
+                    continue
+                for sample in group:
+                    if sample.response and "start_rollout_id" not in sample.metadata:
+                        sample.metadata["start_rollout_id"] = rollout_id
+                aborted_samples.append(group)
+                count += len(group)
+        state.pendings.clear()
+        state.pending_groups.clear()
+
+    urls = [url for url in getattr(args, "sglang_engine_urls", []) if url]
+    if not urls:
+        try:
+            if parse(sglang_router.__version__) <= parse("0.2.1"):
+                response = await asyncio.wait_for(
+                    get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers"),
+                    timeout=ABORT_HTTP_TIMEOUT_SECONDS,
+                )
+                urls = response["urls"]
+            else:
+                response = await asyncio.wait_for(
+                    get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers"),
+                    timeout=ABORT_HTTP_TIMEOUT_SECONDS,
+                )
+                urls = [worker["url"] for worker in response["workers"]]
+        except Exception:
+            logger.exception("Failed to discover SGLang workers from the router during abort")
+
+    if urls:
+        await abort_servers_until_idle(urls)
     else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
-
-    await abort_servers_until_idle(urls)
-
-    # make sure all the pending tasks are finished
-    count = 0
-    while state.pendings:
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
-
-        if not args.partial_rollout:
-            continue
-
-        # for partial rollout, collect the partial samples into the data buffer
-        for task in done:
-            group = task.result()
-            for sample in group:
-                if sample.response and "start_rollout_id" not in sample.metadata:
-                    sample.metadata["start_rollout_id"] = rollout_id
-            aborted_samples.append(group)
-            count += len(group)
+        logger.error("No SGLang engine URLs are available during abort; local rollout tasks were cancelled")
 
     if args.partial_rollout:
         logger.info(f"Collected {count} partial samples into the data buffer")
@@ -905,6 +954,13 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) 
     target_data_size = args.rollout_batch_size
     quota_spec = getattr(args, "rollout_task_family_quotas", None)
     task_family_quotas = parse_task_family_quotas(quota_spec)
+    admission_only_quotas = bool(
+        task_family_quotas and getattr(args, "rollout_task_family_admission_only", False)
+    )
+    enforce_post_filter_quotas = bool(task_family_quotas and not admission_only_quotas)
+    prefer_higher_mean_steps = bool(
+        enforce_post_filter_quotas and getattr(args, "rollout_task_family_top_mean_steps", False)
+    )
 
     data = []
     all_data = [] if args.rollout_all_samples_process_path is not None else None
@@ -912,6 +968,7 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) 
     filter_relax_after = int(getattr(args, "fully_async_filter_relax_after_groups", 0) or 0)
     completed_groups = 0
     dropped_groups = 0
+    dropped_family_counts: Counter[str] = Counter()
     drop_reasons: Counter[str] = Counter()
     dropped_terminations: Counter[str] = Counter()
     dropped_rewards: Counter[str] = Counter()
@@ -922,7 +979,7 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) 
     last_log = started
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Trace collection")
     while len(data) < target_data_size or (
-        task_family_quotas
+        enforce_post_filter_quotas
         and not has_task_family_quota_candidates(data, target_data_size, task_family_quotas)
     ):
         if task_family_quotas:
@@ -934,15 +991,33 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) 
                 args.over_sampling_batch_size,
                 max(0, int(os.environ.get("SLIME_SYNC_MIN_PENDING_GROUPS", "0"))),
             )
-            family_plan = _task_family_submission_plan(
-                submit_limit,
-                target_data_size,
-                task_family_quotas,
-                accepted_family_counts,
-                completed_family_counts,
-                pending_family_counts,
+            mcp_only_min_pending_groups = min(
                 min_pending_groups,
+                max(
+                    0,
+                    int(os.environ.get("SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS", str(min_pending_groups))),
+                ),
             )
+            if admission_only_quotas:
+                family_plan = _task_family_admission_plan(
+                    submit_limit,
+                    target_data_size - len(data),
+                    task_family_quotas,
+                    submitted_family_counts,
+                    len(state.pendings),
+                    min_pending_groups,
+                )
+            else:
+                family_plan = _task_family_submission_plan(
+                    submit_limit,
+                    target_data_size,
+                    task_family_quotas,
+                    accepted_family_counts,
+                    completed_family_counts,
+                    pending_family_counts,
+                    min_pending_groups,
+                    mcp_only_min_pending_groups,
+                )
             if family_plan:
                 if hasattr(data_source, "get_samples_by_family"):
                     samples = data_source.get_samples_by_family(family_plan)
@@ -1045,6 +1120,7 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) 
                     dropped_rewards[str(dropped_sample.reward)] += 1
                 del dropped_sample
                 dropped_groups += 1
+                dropped_family_counts[family] += 1
                 state.remaining_batch_size -= 1
                 del source_group
                 del task
@@ -1057,7 +1133,7 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) 
 
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
-            if len(data) < target_data_size or task_family_quotas:
+            if len(data) < target_data_size or enforce_post_filter_quotas:
                 # Rich-rendering a full episode (up to 128 step panels plus
                 # per-token mask views) is seconds of pure-Python work; keep it
                 # off the event loop so it cannot stall request dispatch for
@@ -1068,40 +1144,46 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) 
                     pbar.update(args.n_samples_per_prompt)
         now = time.time()
         if now - last_log > 30.0:
-            # logger.info(
-                # "sync rollout %d: collected %d/%d, dropped=%d/%d, pending=%d, elapsed=%.1fs, "
-                # "drop_reasons=%s, terminations=%s, rewards=%s",
-                # rollout_id,
-                # len(data),
-                # target_data_size,
-                # dropped_groups,
-                # completed_groups,
-                # len(state.pendings),
-                # now - started,
-                # json.dumps(dict(drop_reasons.most_common(5))),
-                # json.dumps(dict(dropped_terminations.most_common(5))),
-                # "["
-                # + ", ".join(
-                    # f"({json.dumps(reward)}, {count})" for reward, count in dropped_rewards.most_common(5)
-                # )
-                # + "]",
-            # )
+            valid_family_counts = Counter(sample_group_task_family(group) for group in data)
+            reported_families = [
+                family
+                for family in ("webqa", "mcp")
+                if family in task_family_quotas
+                or valid_family_counts[family] > 0
+                or dropped_family_counts[family] > 0
+            ]
+            reported_families.extend(
+                sorted((valid_family_counts.keys() | dropped_family_counts.keys()) - set(reported_families))
+            )
+            valid_family_summary = ", ".join(
+                f"{family}:{valid_family_counts[family]}" for family in reported_families
+            )
+            dropped_family_summary = ", ".join(
+                f"{family}:{dropped_family_counts[family]}" for family in reported_families
+            )
             logger.info(
-                "sync rollout %d: collected %d/%d, dropped=%d/%d, pending=%d, elapsed=%.1fs",
+                "rollout %d: valid=%d/%d (%s), dropped=%d/%d (%s), pending=%d, elapsed=%ds",
                 rollout_id,
                 len(data),
                 target_data_size,
+                valid_family_summary,
                 dropped_groups,
                 completed_groups,
+                dropped_family_summary,
                 len(state.pendings),
-                now - started,
+                int(now - started),
             )
             last_log = now
 
     pbar.close()
     candidate_family_counts = Counter(sample_group_task_family(group) for group in data)
-    if task_family_quotas:
-        data = select_task_family_quota_groups(data, target_data_size, quota_spec)
+    if enforce_post_filter_quotas:
+        data = select_task_family_quota_groups(
+            data,
+            target_data_size,
+            quota_spec,
+            prefer_higher_mean_steps=prefer_higher_mean_steps,
+        )
         required_family_counts = task_family_quota_counts(target_data_size, task_family_quotas)
         selected_family_counts = Counter(sample_group_task_family(group) for group in data)
         missing = {
@@ -1114,6 +1196,16 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) 
                 "Synchronous rollout could not satisfy task family quotas: "
                 f"missing={missing}, candidates={dict(candidate_family_counts)}"
             )
+        if prefer_higher_mean_steps:
+            selected_step_summary = {
+                family: [
+                    round(sample_group_mean_steps(group), 2)
+                    for group in data
+                    if sample_group_task_family(group) == family
+                ]
+                for family in task_family_quotas
+            }
+            logger.info("rollout %d: selected top mean-step groups=%s", rollout_id, selected_step_summary)
     else:
         data = data[:target_data_size]
         selected_family_counts = candidate_family_counts
@@ -1145,6 +1237,7 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) 
         process_func(args, all_samples, data_source)
 
     metrics = metric_gatherer.collect()
+    metrics.update(await _diagnose_sglang_prefill_logprobs(args, data, rollout_id))
     metrics["rollout/dynamic_filter/completed_groups"] = completed_groups
     metrics["rollout/dynamic_filter/dropped_groups"] = dropped_groups
     metrics["rollout/dynamic_filter/kept_groups"] = len(data)
@@ -1152,15 +1245,280 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) 
         args.over_sampling_batch_size,
         max(0, int(os.environ.get("SLIME_SYNC_MIN_PENDING_GROUPS", "0"))),
     )
+    metrics["rollout/config/sync_mcp_only_min_pending_groups"] = min(
+        metrics["rollout/config/sync_min_pending_groups"],
+        max(
+            0,
+            int(
+                os.environ.get(
+                    "SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS",
+                    str(metrics["rollout/config/sync_min_pending_groups"]),
+                )
+            ),
+        ),
+    )
+    metrics["rollout/config/task_family_admission_only"] = int(admission_only_quotas)
+    metrics["rollout/config/task_family_top_mean_steps"] = int(prefer_higher_mean_steps)
     for family, count in candidate_family_counts.items():
         metrics[f"rollout/task_family_candidates/{family}"] = count
     for family, count in selected_family_counts.items():
         metrics[f"rollout/task_family_selected/{family}"] = count
+        family_groups = [group for group in data if sample_group_task_family(group) == family]
+        metrics[f"rollout/task_family_selected_mean_steps/{family}"] = sum(
+            sample_group_mean_steps(group) for group in family_groups
+        ) / len(family_groups)
     for family, count in submitted_family_counts.items():
         metrics[f"rollout/task_family_submitted/{family}"] = count
     for family, count in completed_family_counts.items():
         metrics[f"rollout/task_family_roi/{family}"] = accepted_family_counts[family] / count
     return RolloutFnTrainOutput(samples=data, metrics=metrics), aborted_samples
+
+
+async def _diagnose_sglang_prefill_logprobs(
+    args: Namespace,
+    data: list[list[Sample]] | list[list[list[Sample]]],
+    rollout_id: int,
+) -> dict[str, float]:
+    sample_limit = max(0, int(os.environ.get("SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS", "0")))
+    recompute_rollout_logprobs = os.environ.get("SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS", "0") == "1"
+    if sample_limit == 0 and not recompute_rollout_logprobs:
+        return {}
+    diagnose_first_divergence = os.environ.get("SLIME_DIAGNOSE_SGLANG_FIRST_DIVERGENCE", "0") == "1"
+    diagnose_hidden_states = (
+        os.environ.get("SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES", "0") == "1" or diagnose_first_divergence
+    )
+
+    candidates = [
+        sample
+        for sample in _flatten_samples(data)
+        if sample.response_length > 0 and sample.rollout_log_probs is not None
+    ]
+    # Cover distinct task families before filling the remaining slots. This
+    # keeps a small diagnostic budget informative for mixed WebQA/MCP batches.
+    diagnostic_samples: list[Sample] = []
+    selected_ids: set[int] = set()
+    if sample_limit:
+        for sample in candidates:
+            family = sample_task_family(sample)
+            if any(sample_task_family(existing) == family for existing in diagnostic_samples):
+                continue
+            diagnostic_samples.append(sample)
+            selected_ids.add(id(sample))
+            if len(diagnostic_samples) == sample_limit:
+                break
+    if len(diagnostic_samples) < sample_limit:
+        for sample in candidates:
+            if id(sample) in selected_ids:
+                continue
+            diagnostic_samples.append(sample)
+            if len(diagnostic_samples) == sample_limit:
+                break
+    selected = candidates if recompute_rollout_logprobs else diagnostic_samples
+    diagnostic_sample_ids = {id(sample) for sample in diagnostic_samples}
+    request_semaphore = asyncio.Semaphore(
+        max(1, int(os.environ.get("SLIME_SGLANG_RECOMPUTE_CONCURRENCY", "8")))
+    )
+
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+
+    async def diagnose_sample(sample: Sample) -> tuple[int, float, Sample, list[float]] | None:
+        return_hidden_states = diagnose_hidden_states and id(sample) in diagnostic_sample_ids
+        if sample.metadata is None:
+            sample.metadata = {}
+        diagnostic = {
+            "status": "pending",
+            "rollout_id": rollout_id,
+            "task_family": sample_task_family(sample),
+            "response_length": sample.response_length,
+        }
+        sample.metadata["sglang_prefill_diagnostic"] = diagnostic
+        expected_version = sample.metadata.get("rollout_weight_version")
+        diagnostic["expected_weight_version"] = expected_version
+        if expected_version is None:
+            diagnostic["status"] = "missing_rollout_weight_version"
+            logger.warning(
+                "SGLang prefill diagnostic skipped sample %s: rollout weight version is missing",
+                sample.index,
+            )
+            return None
+
+        try:
+            response_start = len(sample.tokens) - sample.response_length
+            if response_start <= 0:
+                raise ValueError(
+                    "SGLang prefill log-prob recomputation requires at least one prompt token: "
+                    f"tokens={len(sample.tokens)}, response_length={sample.response_length}"
+                )
+            # The hidden state at response_start - 1 predicts the first response
+            # token. Starting there avoids materializing prompt-wide vocabulary
+            # logits while retaining every response-token log probability.
+            logprob_start_len = response_start - 1
+            payload = {
+                "input_ids": sample.tokens,
+                "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
+                "return_logprob": True,
+                "logprob_start_len": logprob_start_len,
+                "top_logprobs_num": 0,
+                # Prevent the trajectory's generation-time radix entry from
+                # turning this full-sequence comparison into a paged-KV extend.
+                "extra_key": f"slime-first-divergence-{rollout_id}-{sample.index}",
+            }
+            if return_hidden_states:
+                payload["return_hidden_states"] = True
+            async with request_semaphore:
+                output = await post(url, payload, max_retries=1)
+            meta_info = output["meta_info"]
+            observed_version = meta_info.get("weight_version")
+            diagnostic["observed_weight_version"] = observed_version
+            if str(observed_version) != str(expected_version):
+                diagnostic["status"] = "weight_version_mismatch"
+                logger.error(
+                    "SGLang prefill diagnostic rejected sample %s: expected weight version %r, observed %r",
+                    sample.index,
+                    expected_version,
+                    observed_version,
+                )
+                return None
+
+            input_token_logprobs = meta_info["input_token_logprobs"]
+            prefill_log_probs = [float(item[0]) for item in input_token_logprobs[1:]]
+            if len(prefill_log_probs) != sample.response_length:
+                raise ValueError(
+                    "SGLang prefill response log-prob length mismatch: "
+                    f"got={len(prefill_log_probs)}, expected={sample.response_length}"
+                )
+            if return_hidden_states:
+                hidden_state_chunks = meta_info.get("hidden_states")
+                if not hidden_state_chunks:
+                    raise ValueError("SGLang prefill response did not include hidden states")
+                prefill_hidden_states = hidden_state_chunks[0]
+                prediction_rows = prefill_hidden_states[-sample.response_length - 1 : -1]
+                if len(prediction_rows) != sample.response_length:
+                    raise ValueError(
+                        "SGLang prefill response hidden-state length mismatch: "
+                        f"got={len(prediction_rows)}, expected={sample.response_length}"
+                    )
+                hidden_size = len(prediction_rows[0]) if prediction_rows else 0
+                probe_columns = [0, 1, 2, 3, 7, 15, 31, 63, 127]
+                if diagnose_first_divergence:
+                    stage_names = [
+                        "embedding",
+                        "layer_0_pre_norm",
+                        "layer_0_q_pre_norm",
+                        "layer_0_q_post_norm",
+                        "layer_0_k_pre_norm",
+                        "layer_0_k_post_norm",
+                        "layer_0_q_post_rope",
+                        "layer_0_k_post_rope",
+                        "layer_0_value",
+                        "layer_0_attention_context",
+                        "layer_0_attention_output",
+                        "layer_0_attention_residual",
+                        "layer_0_pre_mlp_norm",
+                        "layer_0_mlp_output",
+                        "layer_0_mlp_residual",
+                        "layer_1_pre_norm",
+                        "layer_34_mlp_residual",
+                        "layer_35_mlp_residual",
+                        "final_norm",
+                    ]
+                    expected_hidden_size = len(stage_names) * len(probe_columns)
+                    if hidden_size != expected_hidden_size:
+                        raise ValueError(
+                            "SGLang first-divergence hidden width mismatch: "
+                            f"got={hidden_size}, expected={expected_hidden_size}"
+                        )
+                    stage_probes = {
+                        stage: [
+                            [float(value) for value in row[offset : offset + len(probe_columns)]]
+                            for row in prediction_rows
+                        ]
+                        for stage, offset in zip(
+                            stage_names,
+                            range(0, expected_hidden_size, len(probe_columns)),
+                            strict=True,
+                        )
+                    }
+                    diagnostic["sglang_first_divergence_probe"] = stage_probes
+                    diagnostic["sglang_final_hidden_probe"] = stage_probes["final_norm"]
+                else:
+                    probe_columns = [column for column in probe_columns if column < hidden_size]
+                    diagnostic["sglang_final_hidden_probe"] = [
+                        [float(row[column]) for column in probe_columns] for row in prediction_rows
+                    ]
+                diagnostic["hidden_probe_columns"] = probe_columns
+            rollout_log_probs = [float(value) for value in sample.rollout_log_probs]
+            policy_mask = sample.policy_loss_mask if sample.policy_loss_mask is not None else sample.loss_mask
+            if policy_mask is None:
+                policy_mask = [1] * sample.response_length
+            if len(policy_mask) != sample.response_length:
+                raise ValueError(
+                    "SGLang prefill policy mask length mismatch: "
+                    f"got={len(policy_mask)}, expected={sample.response_length}"
+                )
+            absolute_diffs = [
+                abs(prefill - decode)
+                for prefill, decode, keep in zip(prefill_log_probs, rollout_log_probs, policy_mask, strict=True)
+                if keep
+            ]
+            diagnostic.update(
+                status="ok",
+                compared_tokens=len(absolute_diffs),
+                decode_prefill_abs_diff=(sum(absolute_diffs) / len(absolute_diffs) if absolute_diffs else 0.0),
+            )
+            if id(sample) in diagnostic_sample_ids:
+                diagnostic["prefill_log_probs"] = prefill_log_probs
+            if id(sample) in diagnostic_sample_ids:
+                logger.info(
+                    "SGLang same-weight decode/prefill diagnostic rollout=%d sample=%s family=%s version=%s "
+                    "tokens=%d abs_diff=%.8f",
+                    rollout_id,
+                    sample.index,
+                    diagnostic["task_family"],
+                    observed_version,
+                    len(absolute_diffs),
+                    diagnostic["decode_prefill_abs_diff"],
+                )
+            return len(absolute_diffs), sum(absolute_diffs), sample, prefill_log_probs
+        except Exception as exc:
+            diagnostic["status"] = "error"
+            diagnostic["error"] = f"{type(exc).__name__}: {exc}"
+            logger.exception("SGLang prefill diagnostic failed for sample %s", sample.index)
+            return None
+
+    # Hidden-state probes are large and SGLang may chunk them when they compete
+    # with the bulk pass. Run the small diagnostic set serially first, then use
+    # bounded concurrency for log-prob-only recomputation.
+    diagnostic_selected = [sample for sample in selected if id(sample) in diagnostic_sample_ids]
+    bulk_selected = [sample for sample in selected if id(sample) not in diagnostic_sample_ids]
+    results = []
+    for sample in diagnostic_selected:
+        results.append(await diagnose_sample(sample))
+    results.extend(await asyncio.gather(*(diagnose_sample(sample) for sample in bulk_selected)))
+    compared_tokens = sum(result[0] for result in results if result is not None)
+    absolute_diff_sum = sum(result[1] for result in results if result is not None)
+    successful_samples = sum(result is not None for result in results)
+    if recompute_rollout_logprobs and successful_samples != len(selected):
+        raise RuntimeError(
+            "SGLang rollout log-prob recomputation failed: "
+            f"successful={successful_samples}, requested={len(selected)}"
+        )
+    if recompute_rollout_logprobs:
+        for result in results:
+            assert result is not None
+            _, _, sample, prefill_log_probs = result
+            sample.rollout_log_probs = prefill_log_probs
+    return {
+        "rollout/diagnostic/sglang_prefill_requested_samples": float(len(selected)),
+        "rollout/diagnostic/sglang_prefill_successful_samples": float(successful_samples),
+        "rollout/diagnostic/sglang_recomputed_samples": float(
+            successful_samples if recompute_rollout_logprobs else 0
+        ),
+        "rollout/diagnostic/sglang_decode_prefill_compared_tokens": float(compared_tokens),
+        "rollout/diagnostic/sglang_decode_prefill_abs_diff": (
+            absolute_diff_sum / compared_tokens if compared_tokens else 0.0
+        ),
+    }
 
 
 def _task_family_submission_plan(
@@ -1171,6 +1529,7 @@ def _task_family_submission_plan(
     completed: Counter[str],
     pending: Counter[str] | None = None,
     min_pending_groups: int = 0,
+    mcp_only_min_pending_groups: int | None = None,
 ) -> dict[str, int]:
     """Size a quota-aware wave from expected yield and a GPU-work reservoir."""
     if not quotas or submit_limit <= 0:
@@ -1200,6 +1559,9 @@ def _task_family_submission_plan(
     if not weights:
         return {}
 
+    if set(weights) == {"mcp"} and mcp_only_min_pending_groups is not None:
+        min_pending_groups = min(min_pending_groups, max(0, mcp_only_min_pending_groups))
+
     total_weight = sum(weights.values())
     roi_submit_count = math.ceil(sum(roi_candidate_counts.values()))
     eligible_pending_count = sum(pending[family] for family in weights)
@@ -1216,6 +1578,33 @@ def _task_family_submission_plan(
         plan[family] += 1
         remaining -= 1
     return {family: count for family, count in plan.items() if count > 0}
+
+
+def _task_family_admission_plan(
+    submit_limit: int,
+    accepted_deficit: int,
+    quotas: dict[str, float],
+    submitted: Counter[str],
+    pending_count: int,
+    min_pending_groups: int,
+) -> dict[str, int]:
+    """Keep the cumulative admitted prompt stream at the requested family mix."""
+    if not quotas or submit_limit <= 0:
+        return {}
+
+    reservoir_deficit = max(0, min_pending_groups - pending_count)
+    submit_count = min(submit_limit, max(accepted_deficit, reservoir_deficit))
+    if submit_count <= 0:
+        return {}
+
+    projected = Counter({family: submitted[family] for family in quotas})
+    plan: Counter[str] = Counter()
+    for _ in range(submit_count):
+        desired = task_family_quota_counts(sum(projected.values()) + 1, quotas)
+        family = max(quotas, key=lambda name: desired[name] - projected[name])
+        projected[family] += 1
+        plan[family] += 1
+    return dict(plan)
 
 
 EVAL_PROMPT_DATASET = {}

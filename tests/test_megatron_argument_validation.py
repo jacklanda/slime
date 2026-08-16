@@ -111,6 +111,29 @@ def make_allgather_cp_args(**overrides):
 
 
 @pytest.mark.unit
+def test_transformer_engine_fp32_residual_enables_parameter_dtype_autocast(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    params_dtype = object()
+    args = types.SimpleNamespace(
+        transformer_impl="transformer_engine",
+        fp32_residual_connection=True,
+        params_dtype=params_dtype,
+        enable_autocast=False,
+        autocast_dtype=None,
+        use_yarn_rope=False,
+        moe_token_dispatcher_type="alltoall",
+        pipeline_model_parallel_size=1,
+        decoder_first_pipeline_num_layers=None,
+        decoder_last_pipeline_num_layers=None,
+    )
+
+    module.validate_args(args)
+
+    assert args.enable_autocast is True
+    assert args.autocast_dtype is params_dtype
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("factor", "original_context", "message"),
     [

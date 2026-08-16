@@ -62,6 +62,7 @@ DEFAULT_SGLANG_CONTEXT_LENGTH_MARGIN = 256
 _LAST_SGLANG_REQUEST_LOG_TS = 0.0
 _EVAL_ENGINE_POOL_LOOP: asyncio.AbstractEventLoop | None = None
 _EVAL_ENGINE_POOL: EvalSessionEnginePool | None = None
+_RETRYABLE_SGLANG_TRANSPORT_ERRORS = (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError)
 
 
 class SGLangContextLengthExceededError(ValueError):
@@ -569,7 +570,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             retrieved_context=retrieved_context,
         )
     )
-    render_tools = None if deepsearch_world or cut_bill or agentcpm_explore else tools
+    # Keep the first-turn declaration block immutable. Lazy MCP tool groups are
+    # appended as tool observations so TiTO remains prefix-exact.
+    render_tools = None if deepsearch_world or cut_bill or agentcpm_explore else list(tools)
     max_steps = (
         base_max_steps + 2
         if deepsearch_world
@@ -606,6 +609,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     env_time = 0.0
     retrieval_time = 0.0
     mcp_tool_time = 0.0
+    prefix_cache_info = copy.deepcopy(base_sample.prefix_cache_info)
     pending_turns: list[dict[str, Any]] = []
     tito_prefix_ids: list[int] = []
     tito_messages_snapshot: list[dict[str, Any]] | None = None
@@ -889,6 +893,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 break
             step_llm_time = time.time() - llm_start
             llm_time += step_llm_time
+            prefix_cache_info.add(
+                {
+                    "prompt_tokens": int(output.get("prompt_tokens", len(request_prompt_ids))),
+                    "cached_tokens": int(output.get("cached_tokens", 0)),
+                }
+            )
             if evaluation:
                 output_ids = []
                 output_logprobs = []
@@ -1749,6 +1759,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         used_non_finish_tool = True
                     base_sample.metadata["rollout_stage"] = "verifier" if action.name == "finish" else "tool_operation"
                     obs, reward, done, env_info = await env.step(action)
+                    lazy_tool_declarations = _refresh_lazy_mcp_tools(env, tools, parser, env_info or {})
+                    if lazy_tool_declarations:
+                        obs = str(obs) + lazy_tool_declarations
                     executed_actions.append(action)
                     raw_observations.append(obs)
                     formatted_observations.append(_format_tool_observation(parser, action.name, obs))
@@ -1810,6 +1823,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             env_start = time.time()
             base_sample.metadata["rollout_stage"] = "verifier" if action.name == "finish" else "tool_operation"
             obs, reward, done, env_info = await env.step(action)
+            lazy_tool_declarations = _refresh_lazy_mcp_tools(env, tools, parser, env_info or {})
+            if lazy_tool_declarations:
+                obs = str(obs) + lazy_tool_declarations
             step_env_time = time.time() - env_start
             env_time += step_env_time
             formatted_obs = _format_tool_observation(parser, action.name, obs)
@@ -2028,6 +2044,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             "parser_error_count": int(last_info.get("tool_parser_error_count", 0) or 0),
             "termination_reason": termination_reason,
             "response_tokens": total_completion_tokens,
+            "prefix_cached_tokens": prefix_cache_info.cached_tokens,
+            "prefix_prompt_tokens": prefix_cache_info.total_prompt_tokens,
+            "prefix_cache_hit_rate": prefix_cache_info.prefix_cache_hit_rate,
             "accepted": None,
         },
     }
@@ -2109,6 +2128,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 status=Sample.Status.TRUNCATED if last_finish_reason == "length" else Sample.Status.COMPLETED,
                 metadata=common_metadata,
                 session_id=session_id,
+                prefix_cache_info=copy.deepcopy(prefix_cache_info),
             )
         ]
 
@@ -2144,6 +2164,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 status=Sample.Status.TRUNCATED if last_finish_reason == "length" else Sample.Status.COMPLETED,
                 metadata={**common_metadata, "segment_count": 1, "rllm_episode": episode_dict},
                 session_id=session_id,
+                prefix_cache_info=copy.deepcopy(prefix_cache_info),
             )
         ]
 
@@ -2211,6 +2232,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 **mcp_metadata,
                 **last_info,
             },
+            prefix_cache_info=copy.deepcopy(prefix_cache_info),
         )
         return failed
     segment_count = len(samples)
@@ -2249,6 +2271,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         sample.status = Sample.Status.COMPLETED
         if sample.rollout_log_probs is None:
             raise ValueError("fused training sample omitted rollout_log_probs")
+    samples[0].prefix_cache_info = prefix_cache_info
     return samples
 
 
@@ -2455,6 +2478,21 @@ def _valid_tool_names(tools: list[dict]) -> set[str]:
     return names
 
 
+def _refresh_lazy_mcp_tools(env, tools: list[dict], parser, info: dict[str, Any]) -> str:
+    if env.mode != "mcp" or not info.get("tools/schema_changed"):
+        return ""
+    current_tools = env.tools()
+    tools[:] = current_tools
+    parser.valid_tools = _valid_tool_names(current_tools)
+    schemas_json = "\n".join(json.dumps(schema, ensure_ascii=False) for schema in current_tools)
+    declarations = parser.get_tool_prompt(schemas_json)
+    return (
+        "\n\nThe requested tool group is now loaded. The following tool declarations are available "
+        "for every later turn:\n"
+        + declarations
+    )
+
+
 def _requires_non_finish_tool(tools: list[dict]) -> bool:
     return any(name not in {"finish", "submit"} for name in _declared_tool_names(tools))
 
@@ -2503,11 +2541,20 @@ def _record_tool_parser_errors(
     evaluation: bool,
     fallback_errors: list[str] | None = None,
 ) -> None:
-    """Append every parser error to the current run's post-hoc debug log.
+    """Append parser errors to the post-hoc debug log when logging is enabled.
 
     Rollout workers are separate Ray processes, so use one O_APPEND write per
     JSON record rather than a process-local logger or shared file handle.
     """
+    if os.environ.get("SLIME_TOOL_PARSER_ERROR_LOG_ENABLED", "true").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }:
+        return
+
     parser_errors = list(getattr(parser, "last_schema_errors", ()) or ())
     # Schema failures are recorded immediately after parsing.  The later
     # abnormal-termination branches pass fallback_errors for responses where
@@ -3022,7 +3069,13 @@ def _credit_assignment_loss_mask(
         if action_span is not None:
             start, end = action_span
             if 0 <= start < end <= output_len:
-                return apply_base([0] * start + [1] * (end - start) + [0] * (output_len - end))
+                penalized_len = max(0, min(end - start, parser_error_token_window))
+                if penalized_len == 0:
+                    return apply_base([0] * output_len)
+                penalized_start = end - penalized_len
+                return apply_base(
+                    [0] * penalized_start + [1] * penalized_len + [0] * (output_len - end)
+                )
         # Missing delimiters and truncated calls do not always expose a precise
         # span. Penalize a bounded suffix of the failing turn so format errors
         # retain a learning signal without blaming prior tool/reasoning turns.
@@ -3910,18 +3963,49 @@ async def _call_sglang(
             max_new_tokens,
             url,
         )
-    try:
-        post_kwargs = {"headers": headers}
-        if session_params is not None:
-            post_kwargs["max_retries"] = 1
-        if request_semaphore is None:
-            output = await http_utils.post(url, payload, **post_kwargs)
-        else:
-            async with request_semaphore:
+    transport_retry_limit = (
+        0
+        if session_params is not None
+        else max(0, int(os.environ.get("SLIME_SGLANG_TRANSPORT_RETRY_TIMES", "2")))
+    )
+    transport_retries = 0
+    while True:
+        try:
+            # Keep the HTTP helper to one attempt so every ambiguous transport
+            # failure is aborted before a new request id is submitted.
+            post_kwargs = {"headers": headers, "max_retries": 1}
+            if request_semaphore is None:
                 output = await http_utils.post(url, payload, **post_kwargs)
-    except (asyncio.CancelledError, httpx.TransportError):
-        await _abort_sglang_request(args, rid, server_url=server_url)
-        raise
+            else:
+                async with request_semaphore:
+                    output = await http_utils.post(url, payload, **post_kwargs)
+            break
+        except _RETRYABLE_SGLANG_TRANSPORT_ERRORS as exc:
+            failed_rid = rid
+            await _abort_sglang_request(args, failed_rid, server_url=server_url)
+            if transport_retries >= transport_retry_limit:
+                raise
+            transport_retries += 1
+            rid = uuid.uuid4().hex
+            payload["rid"] = rid
+            backoff = max(
+                0.0,
+                float(os.environ.get("SLIME_SGLANG_TRANSPORT_RETRY_BACKOFF_SECONDS", "0.25")),
+            ) * (2 ** (transport_retries - 1))
+            logger.warning(
+                "SGLang transport %s for rid=%s; retrying with rid=%s (%d/%d) after %.2fs",
+                type(exc).__name__,
+                failed_rid,
+                rid,
+                transport_retries,
+                transport_retry_limit,
+                backoff,
+            )
+            if backoff:
+                await asyncio.sleep(backoff)
+        except (asyncio.CancelledError, httpx.HTTPStatusError, httpx.TransportError):
+            await _abort_sglang_request(args, rid, server_url=server_url)
+            raise
     meta = output.get("meta_info") or {}
     observed_weight_version = meta.get("weight_version")
     if observed_weight_version is not None:
@@ -3942,6 +4026,7 @@ async def _call_sglang(
             "text": output.get("text") or "",
             "finish_reason": finish_reason,
             "prompt_tokens": int(meta.get("prompt_tokens", effective_prompt_tokens)),
+            "cached_tokens": int(meta.get("cached_tokens", 0)),
             "completion_tokens": int(completion_tokens) if completion_tokens is not None else None,
             "output_ids": output.get("output_ids") or [],
             "rid": meta.get("id") or output.get("rid") or rid,
@@ -3958,6 +4043,7 @@ async def _call_sglang(
             "finish_reason": finish_reason,
             "weight_version": observed_weight_version,
             "prompt_tokens": int(meta.get("prompt_tokens", effective_prompt_tokens)),
+            "cached_tokens": int(meta.get("cached_tokens", 0)),
             "completion_tokens": int(completion_tokens) if completion_tokens is not None else len(output_ids),
         }
     token_logprobs = meta.get("output_token_logprobs") or []
@@ -3974,12 +4060,16 @@ async def _call_sglang(
     invalid_logprobs = [index for index, value in enumerate(output_logprobs) if not math.isfinite(value)]
     if invalid_logprobs:
         raise ValueError(f"SGLang returned non-finite output logprobs at indices {invalid_logprobs[:8]}")
+    completion_tokens = meta.get("completion_tokens")
     result = {
         "text": output.get("text") or "",
         "output_ids": output_ids,
         "output_logprobs": output_logprobs,
         "finish_reason": finish_reason,
         "weight_version": observed_weight_version,
+        "prompt_tokens": int(meta.get("prompt_tokens", effective_prompt_tokens)),
+        "cached_tokens": int(meta.get("cached_tokens", 0)),
+        "completion_tokens": int(completion_tokens) if completion_tokens is not None else len(output_ids),
     }
     if top_p_data is not None:
         result["rollout_top_p_token_ids"], result["rollout_top_p_token_offsets"] = top_p_data
@@ -4032,7 +4122,7 @@ async def _abort_sglang_request(args, rid: str, *, server_url: str | None = None
                 else f"http://{args.sglang_router_ip}:{args.sglang_router_port}/abort_request"
             ),
             json={"rid": rid},
-            timeout=5.0,
+            timeout=float(os.environ.get("SLIME_SGLANG_ABORT_HTTP_TIMEOUT_SECONDS", "5")),
         )
     except Exception:
         pass

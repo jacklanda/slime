@@ -64,7 +64,7 @@ Fused-agent options, aligned with train_qwen3_fused_agent_sync.sh:
 
 Rollout/system options:
   --model-config NAME                scripts/models config. Default: qwen3-8B
-  --rollout-batch-size N             Task groups per persisted shard. Default: 2048
+  --rollout-batch-size N             Task groups per persisted shard. Default: 4096
   --max-prompt-length N              Max prompt tokens. Default: 15472
   --max-response-length N            Max response tokens. Default: 24576
   --rollout-gpus N                   Rollout GPUs. Default: 8
@@ -129,11 +129,11 @@ else
    PROMPT_DATA="${OUTPUT_DIR}/fused_train.parquet"
 fi
 
-#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
-MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
+MODEL_CONFIG="${MODEL_CONFIG:-qwen3-4B}"
+#MODEL_CONFIG="${MODEL_CONFIG:-qwen3-8B}"
 #MODEL_CONFIG="${MODEL_CONFIG:-qwen3-14B}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-14B}"
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
 
@@ -141,7 +141,7 @@ SAMPLE_N="${SAMPLE_N:-32}"
 MAX_TRAJECTORY_PER_PROBLEM="${MAX_TRAJECTORY_PER_PROBLEM:-32}"
 MIN_SAMPLE_TRIAL="${MIN_SAMPLE_TRIAL:-1}"
 REWARD_THRESHOLD="${REWARD_THRESHOLD:-1.0}"
-MIN_STEPS="${MIN_STEPS:-2}"
+MIN_STEPS="${MIN_STEPS:-3}"
 CERTAINTY_FILTER="${CERTAINTY_FILTER:-False}"
 VALID_GROUPS_PER_SHARD="${VALID_GROUPS_PER_SHARD:-}"
 MAX_CANDIDATE_GROUPS_PER_SHARD="${MAX_CANDIDATE_GROUPS_PER_SHARD:-}"
@@ -157,7 +157,7 @@ TRAIN_FILE_PATHS=("${DEFAULT_TRAIN_FILES[@]}")
 SHUFFLE_TRAIN_DATA="${SHUFFLE_TRAIN_DATA:-1}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 
-UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
+UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-false}"
 DISABLE_THINKING="${DISABLE_THINKING:-false}"
 DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
 FUSED_HARNESS="${FUSED_HARNESS:-gem}"
@@ -386,6 +386,9 @@ done
 
 mkdir -p "${OUTPUT_DIR}" "$(dirname "${PROMPT_DATA}")" "${DUMP_DETAILS}" "${MCP_ENV_ROOT}"
 python3 - "${PROMPT_DATA}" "${SHUFFLE_TRAIN_DATA}" "${SHUFFLE_SEED}" "${RESOLVED_TRAIN_FILES[@]}" <<'PY'
+import hashlib
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -397,6 +400,32 @@ output = Path(sys.argv[1])
 shuffle = sys.argv[2].lower() in {"1", "true", "yes", "on"}
 seed = int(sys.argv[3])
 paths = [Path(p) for p in sys.argv[4:]]
+
+fingerprint_path = output.with_suffix(output.suffix + ".fingerprint.json")
+fingerprint = {
+    "version": 1,
+    "shuffle": shuffle,
+    "seed": seed,
+    "inputs": [
+        {
+            "path": str(path.resolve()),
+            "size": path.stat().st_size,
+            "mtime_ns": path.stat().st_mtime_ns,
+        }
+        for path in paths
+    ],
+}
+fingerprint["digest"] = hashlib.sha256(
+    json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode("utf-8")
+).hexdigest()
+if output.is_file() and fingerprint_path.is_file():
+    try:
+        cached_fingerprint = json.loads(fingerprint_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cached_fingerprint = None
+    if cached_fingerprint == fingerprint:
+        print(f"Reusing cached fused train parquet: {output}")
+        raise SystemExit(0)
 
 tables = [pq.read_table(path) for path in paths]
 schema = pa.unify_schemas([table.schema for table in tables], promote_options="permissive")
@@ -421,7 +450,15 @@ if shuffle and combined.num_rows:
     indices = pa.array(np.random.default_rng(seed).permutation(combined.num_rows), type=pa.int64())
     combined = combined.take(indices)
 
-pq.write_table(combined, output)
+temporary_output = output.with_suffix(output.suffix + ".tmp")
+pq.write_table(combined, temporary_output)
+os.replace(temporary_output, output)
+temporary_fingerprint = fingerprint_path.with_suffix(fingerprint_path.suffix + ".tmp")
+temporary_fingerprint.write_text(
+    json.dumps(fingerprint, ensure_ascii=False, indent=4, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+os.replace(temporary_fingerprint, fingerprint_path)
 print(f"Wrote fused train parquet: {output}")
 print(f"Rows: {combined.num_rows}")
 for path, table in zip(paths, tables):
@@ -463,47 +500,26 @@ esac
 mkdir -p "${EPISODE_LOG_DIR}" "$(dirname "${OFFLINE_RS_CHECKPOINT_PATH}")"
 RESUME_START_ROLLOUT_ID=0
 if is_truthy "${OFFLINE_RS_RESUME}"; then
-   RESUME_START_ROLLOUT_ID=$(python3 - "${OFFLINE_RS_CHECKPOINT_PATH}" "${EPISODE_LOG_DIR}" "${DUMP_DETAILS}/rollout_data" "${NUM_ROLLOUT}" <<'PY'
-import json
-import re
+   RESUME_START_ROLLOUT_ID=$(python3 - "${DUMP_DETAILS}/rollout_data" "${NUM_ROLLOUT}" <<'PY'
 import sys
 from pathlib import Path
 
-checkpoint_path = Path(sys.argv[1])
-episodes_dir = Path(sys.argv[2])
-rollout_dir = Path(sys.argv[3])
-num_rollout = int(sys.argv[4])
-
-checkpoint_next = 0
-if checkpoint_path.exists():
-    try:
-        data = json.loads(checkpoint_path.read_text())
-        checkpoint_next = int(data.get("next_rollout_id", 0) or 0)
-    except Exception:
-        checkpoint_next = 0
+rollout_dir = Path(sys.argv[1])
+num_rollout = int(sys.argv[2])
 
 finished = set()
-pattern = re.compile(r"global_steps_(\d+)\.json$")
-if episodes_dir.exists():
-    for path in episodes_dir.glob("global_steps_*.json"):
-        match = pattern.match(path.name)
-        if match and path.stat().st_size > 0:
-            finished.add(int(match.group(1)))
 if rollout_dir.exists():
     for path in rollout_dir.glob("*.pt"):
         try:
-            finished.add(int(path.stem))
+            if path.stat().st_size > 0:
+                finished.add(int(path.stem))
         except ValueError:
             pass
 
 continuous_next = 0
 while continuous_next < num_rollout and continuous_next in finished:
     continuous_next += 1
-
-if checkpoint_next > continuous_next:
-    print(continuous_next)
-else:
-    print(min(num_rollout, continuous_next))
+print(min(num_rollout, continuous_next))
 PY
 )
 fi
@@ -597,6 +613,7 @@ export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE}"
 export SLIME_FUSED_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS}"
 export SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS="${ACCEPTED_GROUP_UPDATE_MAX_GROUPS}"
+export SLIME_TOOL_PARSER_ERROR_LOG_ENABLED="${SLIME_TOOL_PARSER_ERROR_LOG_ENABLED:-false}"
 export SLIME_FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY}"
 export SLIME_FULLY_ASYNC_INITIAL_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY}"
 export SLIME_FULLY_ASYNC_MAX_CONCURRENCY="${FULLY_ASYNC_MAX_GROUP_CONCURRENCY}"
@@ -655,6 +672,7 @@ keys = (
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "PER_STEP_MAX_TOKENS",
     "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH", "SLIME_FUSED_TERMINAL_LOG_STYLE",
     "SLIME_FUSED_PROGRESS_LOGS", "SLIME_FUSED_ACCEPTED_GROUP_UPDATE_MAX_GROUPS", "SLIME_FUSED_TAIL_GUARD",
+    "SLIME_TOOL_PARSER_ERROR_LOG_ENABLED",
     "SLIME_FULLY_ASYNC_ADAPTIVE_CONCURRENCY", "SLIME_FULLY_ASYNC_INITIAL_CONCURRENCY",
     "SLIME_FULLY_ASYNC_MAX_CONCURRENCY", "SLIME_FULLY_ASYNC_CONCURRENCY_STEP",
     "SLIME_FULLY_ASYNC_CONCURRENCY_POLL_INTERVAL", "SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS",
@@ -767,101 +785,6 @@ echo "Per-batch trajectory shards: ${EPISODE_LOG_DIR}/global_steps_{rollout_id}.
 echo "Checkpoint: ${OFFLINE_RS_CHECKPOINT_PATH}"
 echo "Results mode: ${RESOLVED_RESULTS_MODE}"
 
-EPISODE_WATCHER_PID=""
-stop_episode_watcher() {
-   if [ -n "${EPISODE_WATCHER_PID}" ] && kill -0 "${EPISODE_WATCHER_PID}" 2>/dev/null; then
-      kill "${EPISODE_WATCHER_PID}" 2>/dev/null || true
-      wait "${EPISODE_WATCHER_PID}" 2>/dev/null || true
-   fi
-   EPISODE_WATCHER_PID=""
-}
-
-start_episode_watcher() {
-   python3 -u - "${DUMP_DETAILS}/rollout_data" "${EPISODE_LOG_DIR}" \
-      "${RESUME_START_ROLLOUT_ID}" "${NUM_ROLLOUT}" <<'PY' &
-import json
-import os
-import signal
-import sys
-import time
-from pathlib import Path
-
-import torch
-from slime.utils.episode_dump import _episode_to_batch_dict
-
-rollout_dir = Path(sys.argv[1])
-episodes_dir = Path(sys.argv[2])
-next_rollout_id = int(sys.argv[3])
-num_rollout = int(sys.argv[4])
-running = True
-
-
-def stop(_signum, _frame):
-    global running
-    running = False
-
-
-signal.signal(signal.SIGTERM, stop)
-signal.signal(signal.SIGINT, stop)
-episodes_dir.mkdir(parents=True, exist_ok=True)
-
-while running and next_rollout_id < num_rollout:
-    rollout_path = rollout_dir / f"{next_rollout_id}.pt"
-    if not rollout_path.is_file():
-        time.sleep(0.5)
-        continue
-    try:
-        payload = torch.load(rollout_path, map_location="cpu", weights_only=False)
-    except (EOFError, OSError, RuntimeError):
-        time.sleep(0.5)
-        continue
-    trajectories = []
-    seen = set()
-    for sample in payload.get("samples", []):
-        metadata = sample.get("metadata") if isinstance(sample, dict) else getattr(sample, "metadata", None)
-        metadata = metadata if isinstance(metadata, dict) else {}
-        episode = metadata.get("rllm_episode")
-        if not isinstance(episode, dict):
-            continue
-        episode_id = str(episode.get("id") or f"sample:{len(trajectories)}")
-        if episode_id in seen:
-            continue
-        seen.add(episode_id)
-        trajectories.append(
-            _episode_to_batch_dict(
-                episode,
-                next_rollout_id,
-                "train",
-                0,
-                args=None,
-                sample_metadata=metadata,
-                eval_reward=None,
-            )
-        )
-    destination = episodes_dir / f"global_steps_{next_rollout_id}.json"
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(
-            {
-                "training_step": next_rollout_id,
-                "epoch": 0,
-                "mode": "train",
-                "num_episodes": len(trajectories),
-                "trajectories": trajectories,
-            },
-            stream,
-            ensure_ascii=False,
-            indent=4,
-            default=str,
-        )
-        stream.write("\n")
-    os.replace(temporary, destination)
-    print(f"Persisted fixed-batch episode shard: {destination} ({len(trajectories)} episodes)", flush=True)
-    next_rollout_id += 1
-PY
-   EPISODE_WATCHER_PID=$!
-}
-
 if [ "${SKIP_RAY_ROLLOUT}" != "1" ]; then
    RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
    if ray job list --address="${RAY_DASHBOARD_ADDRESS}" >/dev/null 2>&1; then
@@ -882,11 +805,6 @@ if [ "${SKIP_RAY_ROLLOUT}" != "1" ]; then
 
    echo "Ray submission id: ${RAY_SUBMISSION_ID}"
 
-   if [ "${RAY_JOB_WAIT}" = "1" ]; then
-      start_episode_watcher
-      trap stop_episode_watcher EXIT INT TERM
-   fi
-
    ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
       --submission-id="${RAY_SUBMISSION_ID}" \
       --runtime-env-json="${RUNTIME_ENV_JSON}" \
@@ -897,9 +815,6 @@ if [ "${SKIP_RAY_ROLLOUT}" != "1" ]; then
       "${CKPT_ARGS[@]}" \
       "${ROLLOUT_ARGS[@]}" \
       "${SGLANG_ARGS[@]}"
-
-   stop_episode_watcher
-   trap - EXIT INT TERM
 
    if [ "${RAY_JOB_WAIT}" != "1" ]; then
       echo "Ray job submitted without waiting. Run the script again with --ray-job-wait 1 to checkpoint and merge after it finishes."
@@ -1079,6 +994,37 @@ if results_mode == "manifest":
     rollout_files = []
     num_samples = 0
     num_episodes = 0
+    recovered_shards = {}
+
+    if checkpointing and checkpoint_path.is_file():
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            checkpoint = {}
+        if checkpoint.get("results_mode") == "manifest":
+            for shard in checkpoint.get("completed_shards", []):
+                if not isinstance(shard, dict):
+                    continue
+                try:
+                    rollout_id = int(shard["rollout_id"])
+                    episode_path = Path(shard["episode_path"])
+                    accepted_episode_path = Path(shard["accepted_episode_path"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not episode_path.is_file() or not accepted_episode_path.is_file():
+                    continue
+                try:
+                    accepted_payload = json.loads(accepted_episode_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                recovered_keys = accepted_payload.get("accepted_sample_keys")
+                if not isinstance(recovered_keys, list):
+                    recovered_keys = [
+                        row.get("episode_id")
+                        for row in accepted_payload.get("trajectories", [])
+                        if isinstance(row, dict) and row.get("episode_id") is not None
+                    ]
+                recovered_shards[rollout_id] = (shard, {str(key) for key in recovered_keys})
 
     def annotate_episode(ep, accepted):
         value = json.loads(json.dumps(ep, ensure_ascii=False, default=str))
@@ -1147,6 +1093,11 @@ if results_mode == "manifest":
                 )
             seen_problem_ids.update(groups)
 
+            recovered_shard = recovered_shards.get(rollout_id)
+            recovered_keys = recovered_shard[1] if recovered_shard is not None else None
+            batch_keys = {sample_key(sample) for sample in batch}
+            if recovered_keys is not None and not recovered_keys.issubset(batch_keys):
+                raise RuntimeError(f"Accepted episode shard {rollout_id} does not match its rollout .pt shard")
             batch_accepted_keys = set()
             for pid, items in sorted(groups.items()):
                 trials = len(items)
@@ -1155,18 +1106,21 @@ if results_mode == "manifest":
                     if reward_value(item) >= reward_threshold and step_count(item) >= min_steps
                 ]
                 pass_rate = len(good) / trials if trials else 0.0
-                kept = []
-                if trials >= min_trials and (not certainty_filter or (0.0 < pass_rate < 1.0)):
-                    good.sort(
-                        key=lambda item: (
-                            reward_value(item),
-                            step_count(item),
-                            -len(str(item.get("response", ""))),
-                        ),
-                        reverse=True,
-                    )
-                    kept = good[:max_keep]
-                selected = {sample_key(item) for item in kept}
+                if recovered_keys is None:
+                    kept = []
+                    if trials >= min_trials and (not certainty_filter or (0.0 < pass_rate < 1.0)):
+                        good.sort(
+                            key=lambda item: (
+                                reward_value(item),
+                                step_count(item),
+                                -len(str(item.get("response", ""))),
+                            ),
+                            reverse=True,
+                        )
+                        kept = good[:max_keep]
+                    selected = {sample_key(item) for item in kept}
+                else:
+                    selected = {sample_key(item) for item in items if sample_key(item) in recovered_keys}
                 batch_accepted_keys.update(selected)
                 accepted_keys.update(selected)
                 if selected:
@@ -1184,30 +1138,35 @@ if results_mode == "manifest":
                     }
                 )
 
-            all_episode_rows = episode_rows(batch, rollout_id, batch_accepted_keys, accepted_only=False)
-            accepted_episode_rows = episode_rows(batch, rollout_id, batch_accepted_keys, accepted_only=True)
             episode_path = episodes_dir / f"global_steps_{rollout_id}.json"
             accepted_episode_path = accepted_episodes_dir / f"global_steps_{rollout_id}.json"
-            atomic_json_dump(
-                episode_path,
-                {
-                    "training_step": rollout_id,
-                    "epoch": 0,
-                    "mode": "train",
-                    "num_episodes": len(all_episode_rows),
-                    "trajectories": all_episode_rows,
-                },
-            )
-            atomic_json_dump(
-                accepted_episode_path,
-                {
-                    "training_step": rollout_id,
-                    "epoch": 0,
-                    "mode": "train",
-                    "num_episodes": len(accepted_episode_rows),
-                    "trajectories": accepted_episode_rows,
-                },
-            )
+            if recovered_shard is None:
+                all_episode_rows = episode_rows(batch, rollout_id, batch_accepted_keys, accepted_only=False)
+                accepted_episode_rows = episode_rows(batch, rollout_id, batch_accepted_keys, accepted_only=True)
+                atomic_json_dump(
+                    episode_path,
+                    {
+                        "training_step": rollout_id,
+                        "epoch": 0,
+                        "mode": "train",
+                        "num_episodes": len(all_episode_rows),
+                        "trajectories": all_episode_rows,
+                    },
+                )
+                atomic_json_dump(
+                    accepted_episode_path,
+                    {
+                        "training_step": rollout_id,
+                        "epoch": 0,
+                        "mode": "train",
+                        "num_episodes": len(accepted_episode_rows),
+                        "accepted_sample_keys": sorted(batch_accepted_keys),
+                        "trajectories": accepted_episode_rows,
+                    },
+                )
+                batch_episode_count = len(all_episode_rows)
+            else:
+                batch_episode_count = int(recovered_shard[0].get("num_episodes", len(batch)))
 
             for row_index, sample in enumerate(batch):
                 key = sample_key(sample)
@@ -1240,7 +1199,7 @@ if results_mode == "manifest":
                     accepted_refs.append(item)
 
             num_samples += len(batch)
-            num_episodes += len(all_episode_rows)
+            num_episodes += batch_episode_count
             rollout_files.append(str(rollout_path))
             batch_summaries.append(
                 {
@@ -1249,7 +1208,7 @@ if results_mode == "manifest":
                     "episode_path": str(episode_path),
                     "accepted_episode_path": str(accepted_episode_path),
                     "num_samples": len(batch),
-                    "num_episodes": len(all_episode_rows),
+                    "num_episodes": batch_episode_count,
                     "num_accepted": len(batch_accepted_keys),
                 }
             )
@@ -1264,13 +1223,11 @@ if results_mode == "manifest":
                     checkpoint_path,
                     {
                         "next_rollout_id": next_rollout_id,
-                        "completed_rollout_ids": completed,
+                        "completed_shards": batch_summaries,
                         "num_rollout": num_rollout,
                         "num_samples": num_samples,
+                        "num_episodes": num_episodes,
                         "num_accepted": len(accepted_keys),
-                        "accepted_sample_keys": sorted(accepted_keys),
-                        "accepted_problem_ids": sorted(accepted_problem_ids),
-                        "rejected_problem_ids": sorted(rejected_problem_ids),
                         "results": str(results_path),
                         "episodes_dir": str(episodes_dir),
                         "results_mode": "manifest",
@@ -1278,7 +1235,7 @@ if results_mode == "manifest":
                     sort_keys=True,
                 )
 
-            del batch, all_episode_rows, accepted_episode_rows
+            del batch
 
         index_file.write("\n]\n")
 
@@ -1451,11 +1408,10 @@ def write_batch_shard(rollout_id, batch):
         "epoch": 0,
         "mode": "train",
         "num_episodes": len(trajectories),
+        "accepted_sample_keys": sorted(sample_key(sample) for sample in batch if sample_key(sample) in accepted_keys),
         "trajectories": trajectories,
     }
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=4, default=str)
-        f.write("\n")
+    atomic_json_dump(path, payload)
     return path, len(trajectories)
 
 accepted_samples = [annotate_sample(sample) for sample in accepted]
@@ -1492,20 +1448,16 @@ for rollout_id in sorted(samples_by_rollout):
             next_rollout_id += 1
         checkpoint = {
             "next_rollout_id": next_rollout_id,
-            "completed_rollout_ids": completed,
+            "completed_shards": batch_summaries,
             "num_rollout": num_rollout,
             "num_samples": len(samples),
+            "num_episodes": sum(item["num_episodes"] for item in batch_summaries),
             "num_accepted": len(accepted_keys),
-            "accepted_sample_keys": sorted(accepted_keys),
-            "rejected_sample_keys": sorted(sample_key(sample) for sample in samples if sample_key(sample) not in accepted_keys),
-            "accepted_problem_ids": accepted_problem_ids,
-            "rejected_problem_ids": rejected_problem_ids,
             "results": str(results_path),
             "episodes_dir": str(episodes_dir),
+            "results_mode": "full",
         }
-        with checkpoint_path.open("w", encoding="utf-8") as f:
-            json.dump(checkpoint, f, ensure_ascii=False, indent=4, sort_keys=True)
-            f.write("\n")
+        atomic_json_dump(checkpoint_path, checkpoint, sort_keys=True)
 
 combined_trajectories = []
 pattern = re.compile(r"global_steps_(\d+)\.json$")

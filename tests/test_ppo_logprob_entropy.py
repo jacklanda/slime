@@ -249,6 +249,66 @@ def test_gemma4_batch_invariant_logprob_uses_log_softmax_semantics(monkeypatch):
     torch.testing.assert_close(logits.grad, expected_logits.grad, rtol=0.0, atol=2e-3)
 
 
+def test_sglang_batch_invariant_logprob_uses_log_softmax_semantics(monkeypatch):
+    monkeypatch.setenv("SLIME_SGLANG_BATCH_INVARIANT_LOGPROB", "1")
+    torch.manual_seed(13)
+    logits = torch.randn(7, 96).bfloat16().requires_grad_()
+    tokens = torch.tensor([0, 7, 19, 37, 51, 73, 95])
+
+    log_probs, _ = calculate_log_probs_and_entropy(
+        logits,
+        tokens,
+        tp_group=None,
+        with_entropy=False,
+    )
+    expected_logits = logits.detach().clone().requires_grad_()
+    expected = torch.log_softmax(expected_logits, dim=-1)[torch.arange(tokens.numel()), tokens]
+
+    torch.testing.assert_close(log_probs.squeeze(-1), expected, rtol=0.0, atol=0.0)
+
+    weights = torch.tensor([0.5, -0.25, 1.0, -1.5, 0.125, 0.75, -0.5], dtype=torch.bfloat16)
+    (log_probs.squeeze(-1) * weights).sum().backward()
+    (expected * weights).sum().backward()
+    torch.testing.assert_close(logits.grad, expected_logits.grad, rtol=0.0, atol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton kernels")
+def test_sglang_selective_logprob_avoids_full_softmax_buffer(monkeypatch):
+    from sglang.srt.batch_invariant_ops import log_softmax
+
+    monkeypatch.setenv("SLIME_SGLANG_BATCH_INVARIANT_LOGPROB", "1")
+    torch.manual_seed(17)
+    original = torch.randn(9, 1536, device="cuda", dtype=torch.bfloat16)
+    logits = original.clone().requires_grad_()
+    tokens = torch.tensor([0, 7, 511, 1023, 1024, 1201, 1400, 1500, 1535], device="cuda")
+    weights = torch.tensor(
+        [0.5, -0.25, 1.0, -1.5, 0.125, 0.75, -0.5, 0.375, -0.625],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    expected_matrix = log_softmax(original)
+    expected = expected_matrix[torch.arange(tokens.numel(), device="cuda"), tokens]
+    expected_grad = expected_matrix.exp().neg_()
+    expected_grad[torch.arange(tokens.numel(), device="cuda"), tokens] += 1
+    expected_grad.mul_(weights.unsqueeze(-1))
+
+    log_probs, _ = calculate_log_probs_and_entropy(
+        logits,
+        tokens,
+        tp_group=None,
+        with_entropy=False,
+    )
+    torch.testing.assert_close(log_probs.squeeze(-1), expected, rtol=0.0, atol=0.0)
+
+    (log_probs.squeeze(-1) * weights).sum().backward()
+
+    # Backward deliberately consumes the no-longer-needed logits allocation
+    # instead of allocating a second [tokens, vocab] softmax tensor.
+    assert not torch.equal(logits.detach(), original)
+    torch.testing.assert_close(logits.grad, expected_grad, rtol=0.0, atol=2e-3)
+
+
 @pytest.mark.parametrize("chunk_size", [-1, 1, 2, 8])
 @pytest.mark.parametrize("with_mask", [False, True])
 @pytest.mark.parametrize("with_entropy", [False, True])

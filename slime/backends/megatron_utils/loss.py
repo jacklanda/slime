@@ -1115,6 +1115,25 @@ def policy_loss_function(
         log_probs_and_entropy = precomputed_log_probs_and_entropy
 
     log_probs = log_probs_and_entropy["log_probs"]
+    debug_sink = batch.get("_debug_train_log_probs_sink")
+    if debug_sink is not None:
+        debug_log_probs = [
+            all_gather_with_cp(log_prob.detach(), total_length, response_length).float().cpu()
+            for log_prob, total_length, response_length in zip(
+                log_probs,
+                total_lengths,
+                response_lengths,
+                strict=True,
+            )
+        ]
+        if mpu.get_tensor_model_parallel_rank() == 0:
+            rollout_data, sample_indices = debug_sink
+            stored_log_probs = rollout_data.setdefault(
+                "train_log_probs",
+                [None] * len(rollout_data["tokens"]),
+            )
+            for sample_index, train_log_prob in zip(sample_indices, debug_log_probs, strict=True):
+                stored_log_probs[sample_index] = train_log_prob
     local_log_prob_templates = list(log_probs)
     if not args.use_rollout_logprobs and not old_log_probs:
         old_log_probs = [log_prob.detach() for log_prob in log_probs]

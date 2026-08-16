@@ -510,6 +510,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "filtering by both synchronous and fully-async rollout collectors."
                 ),
             )
+            parser.add_argument(
+                "--rollout-task-family-admission-only",
+                action="store_true",
+                default=False,
+                help=(
+                    "For synchronous rollout, apply --rollout-task-family-quotas only when admitting prompts. "
+                    "Stop after rollout_batch_size accepted groups without enforcing family quotas after filtering."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-task-family-top-mean-steps",
+                action="store_true",
+                default=False,
+                help=(
+                    "Within each post-filter task-family quota, select groups with the highest "
+                    "mean fused trajectory step count."
+                ),
+            )
 
             # partial rollout
             parser.add_argument(
@@ -1618,19 +1636,43 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--enable-use-grm-train",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help=(
+                    "Whether WebQA training rollouts should use OpenRouter GRM with rule-based fallback. "
+                    "Other task families retain their existing rewards."
+                ),
+            )
+            parser.add_argument(
                 "--enable-use-grm-evals",
                 action=argparse.BooleanOptionalAction,
                 default=False,
-                help="Whether interval eval rollouts should use OpenRouter GRM before rule-based fallback.",
+                help=(
+                    "Whether WebQA interval eval rollouts should use OpenRouter GRM before rule-based fallback. "
+                    "Other task families retain their dataset verifiers."
+                ),
             )
             parser.add_argument(
                 "--grm-custom-rm-path",
                 type=str,
                 default="slime.rollout.rm_hub.openrouter_grm.reward_func",
-                help="Custom RM path used for eval samples when --enable-use-grm-evals is enabled.",
+                help="Custom RM path used when GRM train or eval scoring is enabled.",
             )
             parser.add_argument("--grm-base-url", type=str, default="https://openrouter.ai/api/v1")
             parser.add_argument("--grm-model", type=str, default="deepseek/deepseek-v4-flash")
+            parser.add_argument(
+                "--train-grm-model",
+                type=str,
+                default=None,
+                help="Training GRM model. Defaults to --grm-model for compatibility.",
+            )
+            parser.add_argument(
+                "--eval-grm-model",
+                type=str,
+                default=None,
+                help="Evaluation GRM model. Defaults to --grm-model for compatibility.",
+            )
             parser.add_argument(
                 "--grm-mode",
                 type=str,

@@ -219,7 +219,10 @@ def build_policy_loss_mask(
     )
     if event == "tool_parser_error":
         if start is not None and end is not None and 0 <= start < end <= len(loss_mask):
-            return mask_only_action_span(loss_mask, start, end), event
+            penalized_len = max(0, min(end - start, parser_error_token_window))
+            if penalized_len == 0:
+                return [0] * len(loss_mask), event
+            return mask_only_action_span(loss_mask, end - penalized_len, end), event
         penalized_len = max(0, min(len(loss_mask), parser_error_token_window))
         if penalized_len == 0:
             return [0] * len(loss_mask), event

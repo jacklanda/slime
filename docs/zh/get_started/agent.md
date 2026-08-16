@@ -26,6 +26,42 @@ agent workflow 本身可以使用字符串、chat messages、tool calls、环境
 
 只有当你需要替换整个 rollout 编排时，才优先考虑 `--rollout-function-path`。典型场景包括：自定义数据源调度、跨 rollout 的后台队列、完全异步生成，或者默认 `sglang_rollout` 的 prompt × sample 结构已经无法表达你的 workflow。
 
+## 约束 Local MCP 工具范围
+
+Local MCP 任务可以逐任务限制模型可见、可调用的工具。若任务元数据能确定一个完备的工具超集，优先使用静态 allowlist：
+
+```json
+{
+  "enabled_tools": ["list_items", "get_item", "get_grading_guide"],
+  "mcp_compact_finish_schema": true
+}
+```
+
+`enabled_tools` 同时约束 schema 暴露和模型发起的调用；verifier 仍可使用隐藏的证据工具。工具名不存在时，环境会在初始化阶段失败，避免生成不可完成的轨迹。allowlist 必须根据任务和资产元数据生成，不能读取成功轨迹、参考答案或 verifier 实现。
+
+若 rollout 开始前无法可靠选择工具子集，可以把工具分组，并选择少量初始工具：
+
+```json
+{
+  "enabled_tools": ["list_items", "get_item", "get_grading_guide"],
+  "initial_tools": ["list_items"],
+  "tool_groups": {
+    "item_details": {
+      "description": "读取完整物品记录",
+      "tools": ["get_item"]
+    },
+    "grading": {
+      "description": "读取评级标准",
+      "tools": ["get_grading_guide"]
+    }
+  }
+}
+```
+
+初始 prompt 只暴露 `load_tool_group`、`initial_tools` 和 `finish`。加载是单调的：新声明追加到 tool observation，之后持续可用，从而保持 rollout token prefix 的 append-only 性质。
+
+`answer_schema` 始终是服务端权威校验 schema。启用 `mcp_compact_finish_schema` 后，模型侧 schema 会删除仅用于注解的 JSON Schema 字段和冗余的 `command: "submit"` 参数。需要人工精简时，可单独提供 `model_answer_schema`；环境仍按完整 `answer_schema` 校验，失败时向模型返回带 JSON path 的修复错误。
+
 ## Agent Runtime Adapters
 
 slime 提供已有 agent runtime 可用的协议 adapter：

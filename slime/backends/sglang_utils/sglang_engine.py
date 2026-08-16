@@ -512,9 +512,10 @@ class SGLangEngine(RayActor):
             payload,
         )
 
-    def pause_generation(self):
+    def pause_generation(self, mode: str = "abort"):
         return self._make_request(
             "pause_generation",
+            {"mode": mode},
             timeout=self._generation_control_timeout(),
         )
 

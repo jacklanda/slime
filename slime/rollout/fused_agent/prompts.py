@@ -135,6 +135,7 @@ def finish_schema(
     *,
     structured_result: bool = False,
     result_schema: dict | None = None,
+    require_command: bool = True,
 ) -> dict:
     if result_schema is not None:
         result_schema = dict(result_schema)
@@ -156,14 +157,19 @@ def finish_schema(
             "type": "string",
             "description": "Final answer or JSON value.",
         }
+    properties = {"result": result_schema}
+    required = ["result"]
+    if require_command:
+        properties = {
+            "command": {"type": "string", "enum": ["submit"], "description": "Use submit."},
+            **properties,
+        }
+        required.insert(0, "command")
     return tool_schema(
         "finish",
         "Finish the task and submit the final result.",
-        {
-            "command": {"type": "string", "description": "Use submit."},
-            "result": result_schema,
-        },
-        ["command", "result"],
+        properties,
+        required,
     )
 
 

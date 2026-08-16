@@ -230,6 +230,17 @@ async def _post(client, url, payload, max_retries=60, headers=None):
             else:
                 response_text = None
 
+            if retry_count >= max_retries:
+                logger.warning(
+                    "HTTP %s: %r, failed (attempt %d/%d, url=%s, response=%s)",
+                    type(e).__name__,
+                    e,
+                    retry_count,
+                    max_retries,
+                    url,
+                    response_text,
+                )
+                raise
             logger.info(
                 "HTTP %s: %r, retrying... (attempt %d/%d, url=%s, response=%s)",
                 type(e).__name__,
@@ -239,9 +250,6 @@ async def _post(client, url, payload, max_retries=60, headers=None):
                 url,
                 response_text,
             )
-            if retry_count >= max_retries:
-                logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
-                raise e
             await asyncio.sleep(1)
             continue
         finally:

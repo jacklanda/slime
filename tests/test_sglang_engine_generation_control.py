@@ -86,10 +86,12 @@ def test_pause_and_continue_generation_use_control_timeout(monkeypatch):
     engine = _engine(Namespace(rollout_health_check_timeout=7.0, rollout_generation_control_timeout=123.0))
 
     assert engine.pause_generation() == {"status": "ok"}
+    assert engine.pause_generation(mode="in_place") == {"status": "ok"}
     assert engine.continue_generation() == {"status": "ok"}
 
     assert calls == [
-        ("http://127.0.0.1:15000/pause_generation", {}, 123.0),
+        ("http://127.0.0.1:15000/pause_generation", {"mode": "abort"}, 123.0),
+        ("http://127.0.0.1:15000/pause_generation", {"mode": "in_place"}, 123.0),
         ("http://127.0.0.1:15000/continue_generation", {}, 123.0),
     ]
 

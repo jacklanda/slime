@@ -186,7 +186,10 @@ class UpdateWeightFromTensor:
                     post_process_quantization=True,
                     rollout_engines=self.rollout_engines,
                 )
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            # With rollout offload, KV/cache tensors are still on CPU here.
+            # RolloutManager.onload_kv owns the matching generation resume.
+            if not self.args.offload_rollout:
+                ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:

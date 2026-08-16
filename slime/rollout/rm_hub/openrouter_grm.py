@@ -22,7 +22,7 @@ import tiktoken
 
 from slime.rollout.rm_hub import benchmark_verifier
 from slime.rollout.rm_hub.deepscaler import get_deepscaler_rule_based_reward
-from slime.rollout.rm_hub.f1 import f1_score
+from slime.rollout.rm_hub.f1 import f1_score, normalize_answer
 from slime.rollout.rm_hub.gpqa import compute_gpqa_reward
 from slime.rollout.rm_hub.math_dapo_utils import compute_score as compute_score_dapo
 from slime.rollout.rm_hub.math_utils import extract_answer as extract_boxed_answer
@@ -126,6 +126,7 @@ async def reward_func(args, sample_or_samples: Sample | list[Sample], **kwargs):
 
 
 async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
+    model = _grm_model(args, evaluation=evaluation)
     if evaluation and _is_mcp_atlas_sample(sample):
         return await _score_mcp_atlas_sample(args, sample)
 
@@ -157,12 +158,18 @@ async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
                 sample,
                 score=reward,
                 verifier="model",
-                model=getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+                model=model,
             )
         return reward
 
     async with _get_semaphore(args):
-        payload = _build_payload(args, sample, final_answer_step=final_answer_step, include_question=benchmark_eval)
+        payload = _build_payload(
+            args,
+            sample,
+            final_answer_step=final_answer_step,
+            include_question=benchmark_eval,
+            evaluation=evaluation,
+        )
         max_retries = max(1, int(getattr(args, "grm_max_retries", 3)))
         for attempt in range(max_retries):
             try:
@@ -178,7 +185,7 @@ async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
                 sample.metadata.setdefault("grm", {})
                 sample.metadata["grm"].update(
                     {
-                        "model": getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+                        "model": model,
                         "judge": "grm",
                         "mode": _grm_mode(args),
                         "judge_json": judge_json,
@@ -191,7 +198,7 @@ async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
                     sample,
                     score=reward,
                     verifier="model",
-                    model=getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+                    model=model,
                     judge_json=judge_json,
                 )
                 return reward
@@ -208,7 +215,7 @@ async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
                         sample.metadata.setdefault("grm", {})
                         sample.metadata["grm"].update(
                             {
-                                "model": getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+                                "model": model,
                                 "judge": "grm",
                                 "mode": _grm_mode(args),
                                 "score": reward,
@@ -222,7 +229,7 @@ async def _score_one(args, sample: Sample, *, evaluation: bool) -> float:
                             sample,
                             score=reward,
                             verifier="model",
-                            model=getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+                            model=model,
                         )
                         return reward
                     return await _fallback_rule_based_reward(args, sample, evaluation=evaluation, error=exc)
@@ -278,7 +285,7 @@ async def _evaluate_mcp_atlas_claim(args, claim: str, response: str) -> dict[str
 
 
 def _build_mcp_atlas_payload(args, claim: str, response: str) -> dict[str, Any]:
-    model = getattr(args, "grm_model", "deepseek/deepseek-v4-flash")
+    model = _grm_model(args, evaluation=True)
     prompt = _fit_mcp_atlas_prompt(args, claim, response)
     payload = {
         "model": model,
@@ -357,7 +364,7 @@ def _record_mcp_atlas_result(
     fully_covered = sum(result.get("score") == 1.0 for result in results)
     partially_covered = sum(result.get("score") == 0.5 for result in results)
     details = {
-        "model": getattr(args, "grm_model", "deepseek/deepseek-v4-flash"),
+        "model": _grm_model(args, evaluation=True),
         "judge": "mcp_atlas_claims",
         "mode": "claim_coverage",
         "score": score,
@@ -473,8 +480,9 @@ def _build_payload(
     *,
     final_answer_step: str | None = None,
     include_question: bool = False,
+    evaluation: bool = False,
 ) -> dict[str, Any]:
-    model = getattr(args, "grm_model", "deepseek/deepseek-v4-flash")
+    model = _grm_model(args, evaluation=evaluation)
     system_prompt = getattr(args, "grm_system_prompt", None) or (
         _EQUIVALENCE_SYSTEM_PROMPT if _grm_mode(args) == "equivalence" else _DEFAULT_SYSTEM_PROMPT
     )
@@ -732,6 +740,11 @@ def _grm_mode(args) -> str:
     return mode
 
 
+def _grm_model(args, *, evaluation: bool) -> str:
+    model_attr = "eval_grm_model" if evaluation else "train_grm_model"
+    return getattr(args, model_attr, None) or getattr(args, "grm_model", None) or "deepseek/deepseek-v4-flash"
+
+
 def _response_content(payload: dict[str, Any]) -> str:
     message = payload["choices"][0]["message"]
     content = message.get("content")
@@ -829,6 +842,20 @@ def _stringify(value: Any) -> str:
 
 async def _fallback_rule_based_reward(args, sample: Sample, *, evaluation: bool = False, error: Exception | None = None) -> float:
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    if not evaluation:
+        reward = _training_exact_match_reward(sample)
+        sample.metadata.setdefault("grm", {})
+        sample.metadata["grm"].update(
+            {
+                "score": reward,
+                "evaluation": False,
+                "fallback": True,
+                "fallback_rm_type": "exact_match",
+                **({"error": repr(error)} if error is not None else {}),
+            }
+        )
+        return reward
+
     rm_type = (metadata.get("rm_type") or getattr(args, "rm_type", None) or "").strip()
     if rm_type == "benchmark_verifier" or metadata.get("benchmark_eval"):
         reward = float(await benchmark_verifier.reward_func(args, sample))
@@ -879,3 +906,56 @@ async def _fallback_rule_based_reward(args, sample: Sample, *, evaluation: bool 
         }
     )
     return reward
+
+
+def _training_exact_match_reward(sample: Sample) -> float:
+    prediction = _training_fallback_prediction(sample)
+    ground_truth = _training_fallback_ground_truth(sample)
+    if prediction is None or ground_truth is None:
+        return 0.0
+
+    targets = ground_truth if isinstance(ground_truth, (list, tuple, set)) else [ground_truth]
+    normalized_prediction = normalize_answer(str(prediction))
+    return float(any(normalize_answer(str(target)) == normalized_prediction for target in targets))
+
+
+def _training_fallback_prediction(sample: Sample) -> Any:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    reward_debug = metadata.get("fused_reward_debug")
+    if isinstance(reward_debug, dict) and reward_debug.get("prediction") is not None:
+        return reward_debug["prediction"]
+
+    response = _stringify(sample.response)
+    for call in reversed(_FINISH_PARSER.get().parse(response)):
+        if call.name in {"finish", "submit"}:
+            result = call.arguments.get("result")
+            if result is None:
+                result = call.arguments.get("answer")
+            if result is not None:
+                return result
+
+    boxed, _, _ = _extract_boxed(response)
+    return boxed or _last_nonempty_response_chunk(response)
+
+
+def _training_fallback_ground_truth(sample: Sample) -> Any:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    extra_info = metadata.get("extra_info")
+    sources = []
+    if isinstance(extra_info, dict):
+        sources.extend(extra_info.get(key) for key in ("ground_truth", "target", "answer", "answers"))
+    sources.extend(metadata.get(key) for key in ("ground_truth", "target", "answer", "answers"))
+
+    label = sample.label
+    if isinstance(label, dict):
+        sources.extend(label.get(key) for key in ("ground_truth", "target", "answer", "answers"))
+    else:
+        sources.append(label)
+
+    for value in sources:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        if isinstance(value, (list, tuple, set, dict)) and not value:
+            continue
+        return value
+    return None

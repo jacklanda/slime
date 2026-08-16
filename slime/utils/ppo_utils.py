@@ -199,14 +199,29 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
         with_entropy_grad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with_entropy_grad = with_entropy and with_entropy_grad
-        # Gemma4 E4B has a 262k vocabulary.  FP32 promotion of an 8192-row
-        # chunk allocates another ~6.6 GiB during checkpoint recomputation.
-        # The Gemma4 launcher opts into native BF16 softmax buffers; all other
-        # models retain the original FP32-stable path.
-        if os.environ.get("SLIME_GEMMA4_LOGPROB_BF16") != "1":
-            vocab_parallel_logits = vocab_parallel_logits.float()
         seq_len, vocab_parallel_size = vocab_parallel_logits.shape
         rank, world_size = _get_vocab_parallel_rank_size(process_group)
+        use_sglang_batch_invariant_log_softmax = (
+            (
+                os.environ.get("SLIME_SGLANG_BATCH_INVARIANT_LOGPROB") == "1"
+                or (
+                    os.environ.get("SLIME_GEMMA4_LOGPROB_BF16") == "1"
+                    and os.environ.get("SLIME_GEMMA4_BATCH_INVARIANT") == "1"
+                )
+            )
+            and world_size == 1
+            and log_prob_keep_mask is None
+            and vocab_parallel_logits.dtype == torch.bfloat16
+        )
+        # Gemma4 E4B has a 262k vocabulary. FP32 promotion of an 8192-row
+        # chunk allocates another ~6.6 GiB during checkpoint recomputation.
+        # The exact SGLang path must also retain its BF16 input because dtype
+        # is part of the rollout kernel's numerical semantics.
+        if (
+            os.environ.get("SLIME_GEMMA4_LOGPROB_BF16") != "1"
+            and not use_sglang_batch_invariant_log_softmax
+        ):
+            vocab_parallel_logits = vocab_parallel_logits.float()
         vocab_start_index = rank * vocab_parallel_size
         vocab_end_index = vocab_start_index + vocab_parallel_size
 
@@ -262,14 +277,28 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
                 return torch.einsum("ij,ij->i", softmax, logits).unsqueeze(-1)
             return (softmax * logits).sum(dim=-1, keepdim=True)
 
-        use_gemma4_sglang_log_softmax = (
-            os.environ.get("SLIME_GEMMA4_LOGPROB_BF16") == "1"
-            and os.environ.get("SLIME_GEMMA4_BATCH_INVARIANT") == "1"
-            and world_size == 1
-            and log_prob_keep_mask is None
-            and vocab_parallel_logits.dtype == torch.bfloat16
+        use_inplace_selective_log_softmax = (
+            use_sglang_batch_invariant_log_softmax
+            and vocab_parallel_logits.is_cuda
+            and not with_entropy
         )
-        if use_gemma4_sglang_log_softmax:
+        if use_inplace_selective_log_softmax:
+            if vocab_parallel_logits.is_cuda:
+                from sglang.srt.batch_invariant_ops import selective_log_softmax
+
+                log_prob = selective_log_softmax(
+                    vocab_parallel_logits, masked_target_1d
+                ).unsqueeze(-1)
+            else:
+                log_prob = torch.gather(
+                    torch.log_softmax(vocab_parallel_logits, dim=-1),
+                    dim=-1,
+                    index=masked_target_1d.reshape(-1, 1),
+                )
+            # Backward consumes this tensor in place, avoiding a second
+            # [tokens, vocab] allocation during checkpoint recomputation.
+            log_prob_softmax = vocab_parallel_logits
+        elif use_sglang_batch_invariant_log_softmax:
             # Use the exact kernel that produced rollout log-probs. Reuse its
             # full-vocabulary output as the backward softmax buffer, so this is
             # both lower-kernel-count and no larger than the previous BF16 path.
@@ -327,7 +356,7 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
                 log_prob_logits, inplace=True
             )
 
-        if not use_gemma4_sglang_log_softmax:
+        if not use_sglang_batch_invariant_log_softmax:
             predicted_logits = predicted_logits.masked_fill_(target_mask, 0.0).unsqueeze(-1)
             _maybe_all_reduce(predicted_logits, dist.ReduceOp.SUM, process_group)
             log_prob = predicted_logits - log_prob_sum_exp_logits.log()
@@ -336,6 +365,7 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
             ctx.mark_non_differentiable(entropy)
 
         ctx.with_entropy_grad = with_entropy_grad
+        ctx.use_inplace_selective_log_softmax = use_inplace_selective_log_softmax
         # Metric-only entropy still returns values, but does not need the
         # full-vocab entropy tensors kept alive for backward.
         saved_entropy_softmax = entropy_softmax if with_entropy_grad else vocab_parallel_logits.new_empty((0,))
@@ -371,6 +401,16 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
                 "_VocabParallelLogProbEntropy expected a materialized grad_log_prob. "
                 "Do not call ctx.set_materialize_grads(False)."
             )
+
+        if ctx.use_inplace_selective_log_softmax:
+            from sglang.srt.batch_invariant_ops import (
+                selective_log_softmax_backward_inplace,
+            )
+
+            grad_input = selective_log_softmax_backward_inplace(
+                log_prob_softmax, masked_target_1d, grad_log_prob
+            )
+            return grad_input, None, None, None, None, None
 
         grad_entropy_input = None
         if ctx.with_entropy_grad and grad_entropy is not None and grad_entropy.numel() > 0:

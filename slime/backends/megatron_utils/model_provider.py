@@ -1,6 +1,7 @@
 # Adapt from https://github.com/NVIDIA/Megatron-LM/blob/b1efb3c7126ef7615e8c333432d76e08038e17ff/pretrain_gpt.py
 import argparse
 import inspect
+import os
 import re
 from contextlib import nullcontext
 from typing import Literal
@@ -139,6 +140,17 @@ def _get_model_provider_func(
 
         # Experimental loading arguments from yaml
         config: TransformerConfig = core_transformer_config_from_args(args)
+        if (
+            config.batch_invariant_mode
+            and os.environ.get("SLIME_SGLANG_EXACT_RMSNORM") == "1"
+            and config.gated_linear_unit
+            and config.activation_func is torch.nn.functional.silu
+        ):
+            # SGLang's on-policy Qwen path forces SiluAndMul.forward_native.
+            # Megatron's JIT-fused SwiGLU is mathematically equivalent but not
+            # elementwise equal in BF16, and the discrepancy accumulates over
+            # every decoder layer.
+            config.bias_activation_fusion = False
         if args.use_yarn_rope:
             config.yarn_rotary_scaling_factor = args.yarn_rope_scaling_factor
             config.yarn_original_max_position_embeddings = args.yarn_original_max_position_embeddings
@@ -164,7 +176,12 @@ def _get_model_provider_func(
                     return model
                 transformer_layer_spec = result
         else:
-            if args.num_experts:
+            use_sglang_decoder_norm = (
+                use_te
+                and args.batch_invariant_mode
+                and os.environ.get("SLIME_SGLANG_EXACT_RMSNORM") == "1"
+            )
+            if args.num_experts or use_sglang_decoder_norm:
                 # Define the decoder block spec
                 kwargs = {
                     "use_transformer_engine": use_te,
@@ -181,6 +198,9 @@ def _get_model_provider_func(
                         qk_layernorm=args.qk_layernorm,
                         multi_latent_attention=args.multi_latent_attention,
                         moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
+                        layernorm_and_linear_fusion=(
+                            not args.batch_invariant_mode or args.multi_latent_attention
+                        ),
                     )
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(

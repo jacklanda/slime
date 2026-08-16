@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 from collections import OrderedDict
 import enum
 import functools
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Union, get_args, get_origin
 
 import aiohttp
+import jsonschema
 
 from slime.rollout.rm_hub.f1 import normalize_answer
 
@@ -372,7 +374,7 @@ def _is_atlas_mcp_task(task: dict[str, Any]) -> bool:
     return transport == "atlas" or normalized_source == "mcp_atlas" or bool(task.get("mcp_atlas_eval"))
 
 
-def _atlas_enabled_tool_names(task: dict[str, Any]) -> list[str]:
+def _mcp_enabled_tool_names(task: dict[str, Any]) -> list[str]:
     raw_tools = task.get("enabled_tools")
     if raw_tools is None:
         raw_tools = task.get("ENABLED_TOOLS")
@@ -393,6 +395,58 @@ def _atlas_enabled_tool_names(task: dict[str, Any]) -> list[str]:
         if name and str(name) not in names:
             names.append(str(name))
     return names
+
+
+def _task_has_enabled_tools(task: dict[str, Any]) -> bool:
+    return "enabled_tools" in task or "ENABLED_TOOLS" in task
+
+
+def _task_bool(task: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = task.get(key)
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _mcp_tool_groups(task: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    raw_groups = task.get("tool_groups") or task.get("mcp_tool_groups") or {}
+    if isinstance(raw_groups, str):
+        raw_groups = json.loads(raw_groups)
+    if not isinstance(raw_groups, dict):
+        raise TypeError("MCP tool_groups must be a JSON object")
+
+    groups: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_config in raw_groups.items():
+        name = str(raw_name).strip()
+        if not name:
+            raise ValueError("MCP tool_groups cannot contain an empty group name")
+        if isinstance(raw_config, dict):
+            raw_tools = raw_config.get("tools") or []
+            description = str(raw_config.get("description") or "").strip()
+        else:
+            raw_tools = raw_config
+            description = ""
+        if isinstance(raw_tools, str):
+            raw_tools = [raw_tools]
+        if not isinstance(raw_tools, (list, tuple)):
+            raise TypeError(f"MCP tool group {name!r} tools must be a list")
+        tools = list(dict.fromkeys(str(tool).strip() for tool in raw_tools if str(tool).strip()))
+        if not tools:
+            raise ValueError(f"MCP tool group {name!r} does not contain any tools")
+        groups[name] = {"description": description, "tools": tools}
+
+    raw_initial = task.get("initial_tools") or task.get("mcp_initial_tools") or []
+    if isinstance(raw_initial, str):
+        try:
+            raw_initial = json.loads(raw_initial)
+        except json.JSONDecodeError:
+            raw_initial = [raw_initial]
+    if not isinstance(raw_initial, (list, tuple)):
+        raise TypeError("MCP initial_tools must be a list")
+    initial_tools = list(dict.fromkeys(str(tool).strip() for tool in raw_initial if str(tool).strip()))
+    return groups, initial_tools
 
 
 def _load_atlas_tool_schemas(base_url: str) -> list[dict[str, Any]]:
@@ -448,6 +502,70 @@ def _mcp_finish_result_schema(
     return next(iter(candidates.values())) if len(unique_candidates) == 1 else None
 
 
+_JSON_SCHEMA_ANNOTATION_KEYS = {"$comment", "default", "description", "examples", "title"}
+
+
+def _compact_json_schema(schema: Any) -> Any:
+    if isinstance(schema, dict):
+        return {
+            key: _compact_json_schema(value)
+            for key, value in schema.items()
+            if key not in _JSON_SCHEMA_ANNOTATION_KEYS
+        }
+    if isinstance(schema, list):
+        return [_compact_json_schema(value) for value in schema]
+    return copy.deepcopy(schema)
+
+
+def _mcp_model_finish_result_schema(task: dict[str, Any], full_schema: dict | None) -> dict | None:
+    model_schema = task.get("model_answer_schema")
+    if model_schema is None:
+        model_schema = task.get("model_answer_schema_json")
+    if isinstance(model_schema, str) and model_schema.strip():
+        model_schema = json.loads(model_schema)
+    if model_schema is not None:
+        if not isinstance(model_schema, dict):
+            raise TypeError("MCP model_answer_schema must be a JSON object")
+        return model_schema
+    if full_schema is not None and _task_bool(task, "mcp_compact_finish_schema"):
+        return _compact_json_schema(full_schema)
+    return full_schema
+
+
+def _mcp_finish_requires_command(task: dict[str, Any]) -> bool:
+    return _task_bool(
+        task,
+        "mcp_finish_requires_command",
+        default=not _task_bool(task, "mcp_compact_finish_schema"),
+    )
+
+
+def _validate_mcp_finish_result(result: Any, schema: dict | None) -> list[str]:
+    if schema is None:
+        return []
+    validator_type = jsonschema.validators.validator_for(schema)
+    validator_type.check_schema(schema)
+    validator = validator_type(schema)
+    errors = sorted(validator.iter_errors(result), key=lambda error: tuple(map(str, error.absolute_path)))
+    messages = []
+    for error in errors[:8]:
+        path = "result" + "".join(
+            f"[{part}]" if isinstance(part, int) else f".{part}" for part in error.absolute_path
+        )
+        messages.append(f"{path}: {error.message}")
+    if len(errors) > len(messages):
+        messages.append(f"... and {len(errors) - len(messages)} more validation errors")
+    return messages
+
+
+def _check_mcp_finish_schemas(*schemas: dict | None) -> None:
+    for schema in schemas:
+        if schema is None:
+            continue
+        validator_type = jsonschema.validators.validator_for(schema)
+        validator_type.check_schema(schema)
+
+
 class AtlasMCPToolset:
     def __init__(self, task: dict[str, Any]):
         self.task = task
@@ -456,13 +574,14 @@ class AtlasMCPToolset:
             or os.environ.get("MCP_SANDBOX_URL")
             or "http://127.0.0.1:1984"
         ).rstrip("/")
-        self.enabled_tools = _atlas_enabled_tool_names(task)
+        self.enabled_tools = _mcp_enabled_tool_names(task)
         self._schemas: dict[str, dict[str, Any]] = {}
         self._dirty_servers: set[str] = set()
         self.load_error = ""
         self.load_warning = ""
         self.load_failure_class = ""
         self.last_infra_failure = ""
+        self.finish_result_schema: dict[str, Any] | None = None
         try:
             all_tools = _load_atlas_tool_schemas(self.base_url)
             by_name = {str(tool.get("name")): tool for tool in all_tools if tool.get("name")}
@@ -516,10 +635,14 @@ class AtlasMCPToolset:
                     submission_schemas[name] = candidate
                 continue
             schemas.append(schema)
+        self.finish_result_schema = _mcp_finish_result_schema(self.task, submission_schemas)
+        model_finish_result_schema = _mcp_model_finish_result_schema(self.task, self.finish_result_schema)
+        _check_mcp_finish_schemas(self.finish_result_schema, model_finish_result_schema)
         schemas.append(
             finish_schema(
                 structured_result=True,
-                result_schema=_mcp_finish_result_schema(self.task, submission_schemas),
+                result_schema=model_finish_result_schema,
+                require_command=_mcp_finish_requires_command(self.task),
             )
         )
         return schemas
@@ -581,6 +704,20 @@ def _cap_atlas_tool_result(result: str) -> str:
     return result[:limit] + f"\n\n[MCP-Atlas tool output truncated to {limit} characters; original length: {len(result)}]"
 
 
+def _local_evidence_text(payload: Any) -> str:
+    values = []
+    pending = [payload]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            pending.extend(reversed(list(value.values())))
+        elif isinstance(value, list):
+            pending.extend(reversed(value))
+        elif isinstance(value, str):
+            values.append(value)
+    return "\n".join(values)
+
+
 class LocalMCPToolset:
     def __init__(self, task: dict[str, Any]):
         self.task = task
@@ -592,11 +729,22 @@ class LocalMCPToolset:
         self.load_error = ""
         self.load_warning = ""
         self.last_call_info: dict[str, Any] = {}
+        self.verifier_calls: list[dict[str, Any]] = []
+        self._local_evidence_corpus: str | None = None
+        self._schema_literal_strings: set[str] | None = None
         self.last_infra_failure = ""
         self.load_failure_class = ""
         self._isolated_schemas: list[dict[str, Any]] | None = None
+        self._isolated_all_schemas: list[dict[str, Any]] | None = None
+        self.enabled_tools = _mcp_enabled_tool_names(task)
+        self.enabled_tools_configured = _task_has_enabled_tools(task)
+        self.tool_groups: dict[str, dict[str, Any]] = {}
+        self.initial_tools: list[str] = []
+        self.loaded_tool_groups: set[str] = set()
+        self.finish_result_schema: dict[str, Any] | None = None
         if self.tools_py:
             try:
+                self.tool_groups, self.initial_tools = _mcp_tool_groups(task)
                 if (
                     os.environ.get("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "true").lower()
                     in {"1", "true", "yes", "on"}
@@ -606,6 +754,8 @@ class LocalMCPToolset:
 
                     description = get_local_mcp_process_pool().describe(task)
                     self._isolated_schemas = description["schemas"]
+                    self._isolated_all_schemas = description.get("all_schemas", self._isolated_schemas)
+                    self.finish_result_schema = description.get("finish_result_schema")
                     self.load_error = description["load_error"]
                     self.load_warning = description["load_warning"]
                     if self.load_warning and self.tools_py not in _warned_partial_mcp_modules:
@@ -623,6 +773,7 @@ class LocalMCPToolset:
                 else:
                     self._load_tools(self.tools_py)
                     self._build_tool_aliases()
+                self._validate_tool_policy()
             except Exception as e:
                 self.load_error = f"{type(e).__name__}: {e}"
                 self.load_failure_class = (
@@ -632,6 +783,67 @@ class LocalMCPToolset:
                 )
                 if self.load_failure_class == "retryable_infra":
                     self.last_infra_failure = f"local_mcp_describe_{type(e).__name__}"
+
+    def _resolve_configured_name(self, name: str) -> str:
+        if name in self.tools:
+            return name
+        return self.tool_aliases.get(name, name)
+
+    def _validate_tool_policy(self) -> None:
+        configured_names = set(self.enabled_tools) | set(self.initial_tools)
+        for group in self.tool_groups.values():
+            configured_names.update(group["tools"])
+        missing = sorted(
+            name for name in configured_names if self._resolve_configured_name(name) not in self.tools
+        )
+        if missing:
+            raise ValueError("MCP task enables tools not exposed by tools.py: " + ", ".join(missing))
+
+        if self.enabled_tools_configured:
+            enabled = {self._resolve_configured_name(name) for name in self.enabled_tools}
+            grouped = {
+                self._resolve_configured_name(name)
+                for group in self.tool_groups.values()
+                for name in group["tools"]
+            }
+            initial = {self._resolve_configured_name(name) for name in self.initial_tools}
+            outside_allowlist = sorted((grouped | initial) - enabled)
+            if outside_allowlist:
+                raise ValueError(
+                    "MCP tool_groups/initial_tools contain tools outside enabled_tools: "
+                    + ", ".join(outside_allowlist)
+                )
+            unassigned = sorted(
+                name
+                for name in enabled - grouped - initial
+                if not _is_mcp_submission_tool(name) and not name.startswith("_slime_")
+            )
+            if self.tool_groups and unassigned:
+                raise ValueError(
+                    "MCP enabled_tools are unreachable because they are in neither initial_tools nor tool_groups: "
+                    + ", ".join(unassigned)
+                )
+
+    def _policy_tool_names(self) -> set[str]:
+        if self.tool_groups:
+            names = {self._resolve_configured_name(name) for name in self.initial_tools}
+            for group_name in self.loaded_tool_groups:
+                names.update(
+                    self._resolve_configured_name(name)
+                    for name in self.tool_groups[group_name]["tools"]
+                )
+            return names
+        if self.enabled_tools_configured:
+            return {self._resolve_configured_name(name) for name in self.enabled_tools}
+        return set(self.tools)
+
+    def _is_model_tool_enabled(self, name: str) -> bool:
+        actual_name = self._resolve_configured_name(name)
+        return (
+            actual_name in self._policy_tool_names()
+            and not actual_name.startswith("_slime_")
+            and not _is_mcp_submission_tool(actual_name)
+        )
 
     def _isolated_tool_proxy(self, name: str) -> Callable[..., Any]:
         def call(*args, **kwargs):
@@ -784,7 +996,7 @@ class LocalMCPToolset:
                 if str(payload.get("title") or "") != str(source_document or ""):
                     continue
                 source_found = True
-                document = "\n".join(str(payload.get(key) or "") for key in ("title", "summary", "content"))
+                document = _local_evidence_text(payload)
                 normalized_document = " ".join(document.split()).casefold()
                 if len(normalized_quote) >= 20 and normalized_quote in normalized_document:
                     return {"source_found": True, "matched": True}
@@ -813,9 +1025,9 @@ class LocalMCPToolset:
 
         return wrapped
 
-    def schemas(self) -> list[dict]:
-        if self._isolated_schemas is not None:
-            return self._isolated_schemas
+    def _all_schemas(self) -> list[dict]:
+        if self._isolated_all_schemas is not None:
+            return self._isolated_all_schemas
         schemas = []
         submission_schemas = {}
         for name, fn in sorted(self.tools.items()):
@@ -863,19 +1075,63 @@ class LocalMCPToolset:
                     required,
                 )
             )
+        self.finish_result_schema = _mcp_finish_result_schema(self.task, submission_schemas)
+        model_finish_result_schema = _mcp_model_finish_result_schema(self.task, self.finish_result_schema)
+        _check_mcp_finish_schemas(self.finish_result_schema, model_finish_result_schema)
         schemas.append(
             finish_schema(
                 structured_result=True,
-                result_schema=_mcp_finish_result_schema(self.task, submission_schemas),
+                result_schema=model_finish_result_schema,
+                require_command=_mcp_finish_requires_command(self.task),
             )
         )
+        return schemas
+
+    def schemas(self) -> list[dict]:
+        schemas = []
+        if self.tool_groups:
+            catalog = "; ".join(
+                f"{name}: {config['description']}" if config["description"] else name
+                for name, config in self.tool_groups.items()
+            )
+            schemas.append(
+                tool_schema(
+                    "load_tool_group",
+                    "Load one tool group. Loaded groups remain available for the rest of the task. "
+                    f"Groups: {catalog}",
+                    {
+                        "group": {
+                            "type": "string",
+                            "enum": list(self.tool_groups),
+                            "description": "Tool group to load.",
+                        }
+                    },
+                    ["group"],
+                )
+            )
+        enabled_names = self._policy_tool_names()
+        for schema in self._all_schemas():
+            function = schema.get("function") or {}
+            exposed_name = str(function.get("name") or "")
+            if exposed_name == "finish":
+                schemas.append(schema)
+                continue
+            actual_name = self._resolve_configured_name(exposed_name)
+            if actual_name in enabled_names:
+                schemas.append(schema)
         return schemas
 
     def __contains__(self, name: str) -> bool:
         return name in self.tools or name in self.tool_aliases
 
+    def __iter__(self):
+        return iter(self.tools)
+
     def __getitem__(self, name: str) -> Callable[..., Any]:
         return self._verifier_callable(self.tool_aliases.get(name, name))
+
+    def get(self, name: str, default: Any = None) -> Callable[..., Any] | Any:
+        return self[name] if name in self else default
 
     def __getattr__(self, name: str) -> Any:
         resolved_name = self.tool_aliases.get(name, name)
@@ -890,11 +1146,71 @@ class LocalMCPToolset:
         def call(*args, **kwargs):
             bound = inspect.signature(fn).bind_partial(*args)
             result = self.call_raw(name, {**bound.arguments, **kwargs}, relax_empty=False)
+            self.verifier_calls.append(
+                {
+                    "name": name,
+                    "empty_result": _is_empty_mcp_result(result),
+                    "error": isinstance(result, str) and result.startswith("Error calling "),
+                }
+            )
             return _verifier_result_compat(result)
 
         return call
 
+    def begin_verification(self) -> None:
+        self.verifier_calls.clear()
+
+    def answer_has_local_evidence(self, answer: Any) -> bool | None:
+        if self.tools_py is None:
+            return None
+        if self._local_evidence_corpus is None:
+            evidence_values = []
+            for path in (self.tools_py.parent / "data").glob("*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                evidence_values.extend(_local_evidence_text(payload).splitlines())
+            self._local_evidence_corpus = "\n".join(
+                " ".join(value.split()).casefold() for value in evidence_values if value.strip()
+            )
+        if not self._local_evidence_corpus:
+            return None
+        if self._schema_literal_strings is None:
+            self._schema_literal_strings = set()
+            raw_schema = self.task.get("answer_schema") or self.task.get("answer_schema_json")
+            if isinstance(raw_schema, str) and raw_schema.strip():
+                try:
+                    raw_schema = json.loads(raw_schema)
+                except json.JSONDecodeError:
+                    raw_schema = None
+            pending = [raw_schema]
+            while pending:
+                value = pending.pop()
+                if isinstance(value, dict):
+                    literal_values = [value.get("const"), *(value.get("enum") or [])]
+                    self._schema_literal_strings.update(
+                        " ".join(item.split()).casefold()
+                        for item in literal_values
+                        if isinstance(item, str)
+                    )
+                    pending.extend(value.values())
+                elif isinstance(value, list):
+                    pending.extend(value)
+        answer_values = _local_evidence_text(answer).splitlines()
+        return any(
+            len(normalized) >= 20
+            and normalized not in self._schema_literal_strings
+            and normalized in self._local_evidence_corpus
+            for value in answer_values
+            if (normalized := " ".join(value.split()).casefold())
+        )
+
     def call(self, name: str, arguments: dict[str, Any]) -> str:
+        if name == "load_tool_group" and self.tool_groups:
+            return self._load_tool_group(arguments)
+        if not self._is_model_tool_enabled(name):
+            return f"Error: local MCP tool {name} is not enabled for this task"
         result = self.call_raw(name, arguments, relax_empty=True)
         if isinstance(result, str) and result.startswith("Error:"):
             return result
@@ -904,6 +1220,37 @@ class LocalMCPToolset:
                 "result": result,
             }
         return json.dumps(result, ensure_ascii=False, default=str)
+
+    def _load_tool_group(self, arguments: dict[str, Any]) -> str:
+        group_name = str(arguments.get("group") or "").strip()
+        if group_name not in self.tool_groups:
+            available = ", ".join(self.tool_groups)
+            return f"Error: unknown MCP tool group {group_name!r}; available groups: {available}"
+        before = self._policy_tool_names()
+        self.loaded_tool_groups.add(group_name)
+        after = self._policy_tool_names()
+        loaded_names = after - before
+        loaded_schemas = [
+            schema
+            for schema in self.schemas()
+            if str((schema.get("function") or {}).get("name") or "")
+            in {self.exposed_tool_names.get(name, name) for name in loaded_names}
+        ]
+        self.last_call_info = {
+            "empty_result": False,
+            "fallback_attempted": False,
+            "fallback_used": False,
+            "schema_changed": bool(loaded_schemas),
+            "loaded_tool_group": group_name,
+            "loaded_tool_count": len(loaded_schemas),
+        }
+        return json.dumps(
+            {
+                "loaded_group": group_name,
+                "loaded_tools": [schema["function"]["name"] for schema in loaded_schemas],
+            },
+            ensure_ascii=False,
+        )
 
     def call_raw(self, name: str, arguments: dict[str, Any], *, relax_empty: bool = True) -> Any:
         self.last_infra_failure = ""
@@ -1141,6 +1488,7 @@ class FusedEnvironment:
         self.rag = rag
         self.answer = ""
         self.tool_calls = 0
+        self.mcp_tool_loader_calls = 0
         self.mcp_empty_tool_results = 0
         self.mcp_nonempty_tool_results = 0
         self.mcp_tool_fallbacks = 0
@@ -1220,6 +1568,24 @@ class FusedEnvironment:
         args = action.arguments or {}
         if name in {"finish", "submit"}:
             result = args["result"] if "result" in args else args.get("answer", "")
+            if self.mode == "mcp" and self.mcp_tools is not None:
+                validation_errors = await asyncio.to_thread(
+                    _validate_mcp_finish_result,
+                    result,
+                    getattr(self.mcp_tools, "finish_result_schema", None),
+                )
+                if validation_errors:
+                    return (
+                        "Error: finish.result does not match the required answer schema:\n- "
+                        + "\n- ".join(validation_errors)
+                        + "\nCorrect the result and call finish again.",
+                        0.0,
+                        False,
+                        {
+                            "tools/finish_validation_error": 1,
+                            "tools/finish_validation_error_count": len(validation_errors),
+                        },
+                    )
             self.answer = _serialize_answer_payload(result)
             if self.mode == "mcp" and _contains_nested_tool_call(self.answer):
                 self.reward_debug = {
@@ -1240,6 +1606,8 @@ class FusedEnvironment:
             reward = await asyncio.to_thread(self.compute_final_reward)
             return "Submitted.", reward, True, {"reward_debug": self.reward_debug}
         self.tool_calls += 1
+        if self.mode == "mcp" and name == "load_tool_group":
+            self.mcp_tool_loader_calls += 1
         if self.mode == "web_search" and name in {"web_search", "search", "web_search_wiki"}:
             if self.agentcpm_explore:
                 return await self._step_agentcpm_search(args)
@@ -1276,6 +1644,14 @@ class FusedEnvironment:
                 "tools/mcp_query_fallback_attempted": int(bool(call_info.get("fallback_attempted"))),
                 "tools/mcp_query_fallback_used": int(bool(call_info.get("fallback_used"))),
             }
+            if call_info.get("schema_changed"):
+                info.update(
+                    {
+                        "tools/schema_changed": 1,
+                        "tools/loaded_tool_group": call_info.get("loaded_tool_group"),
+                        "tools/loaded_tool_count": int(call_info.get("loaded_tool_count", 0)),
+                    }
+                )
             if infra_failure:
                 info.update({"infra_failure": True, "infra_failure_reason": infra_failure})
             return (
@@ -1535,12 +1911,14 @@ class FusedEnvironment:
         verifier = self.task.get("verifier")
         if not isinstance(verifier, dict) or not verifier.get("verification_code"):
             return None
-        if require_tool_evidence and self.mode == "mcp" and self.tool_calls <= 0:
+        evidence_tool_calls = self.tool_calls - self.mcp_tool_loader_calls
+        if require_tool_evidence and self.mode == "mcp" and evidence_tool_calls <= 0:
             self.reward_debug = {
                 "type": self.mode,
                 "reward": 0.0,
                 "verifier_skipped": "no_tool_calls",
                 "tool_calls": self.tool_calls,
+                "evidence_tool_calls": evidence_tool_calls,
             }
             return 0.0
         answer = _parse_answer_payload(self.answer)
@@ -1557,6 +1935,8 @@ class FusedEnvironment:
             return 0.0
         namespace: dict[str, Any] = {}
         try:
+            verifier_calls: list[dict[str, Any]] = []
+            local_evidence_overlap: bool | None = None
             if isinstance(self.mcp_tools, LocalMCPToolset) and (
                 os.environ.get("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "true").lower()
                 in {"1", "true", "yes", "on"}
@@ -1572,26 +1952,36 @@ class FusedEnvironment:
                 if not verified["has_verifier"]:
                     return None
                 result = verified["result"]
+                verifier_calls = verified.get("verifier_calls") or []
+                local_evidence_overlap = verified.get("local_evidence_overlap")
             else:
                 exec(str(verifier["verification_code"]), namespace)
                 verify = namespace.get("verify")
                 if not callable(verify):
                     return None
+                if isinstance(self.mcp_tools, LocalMCPToolset):
+                    self.mcp_tools.begin_verification()
                 result = verify(self.mcp_tools, answer)
+                if isinstance(self.mcp_tools, LocalMCPToolset):
+                    verifier_calls = list(self.mcp_tools.verifier_calls)
+                    local_evidence_overlap = self.mcp_tools.answer_has_local_evidence(answer)
             if isinstance(result, dict):
                 passed = bool(result.get("passed") or result.get("success"))
-                strict_verifier = os.environ.get("SLIME_MCP_STRICT_VERIFIER", "false").lower() in {
+                strict_verifier = os.environ.get("SLIME_MCP_STRICT_VERIFIER", "true").lower() in {
                     "1",
                     "true",
                     "yes",
                     "on",
                 }
                 if passed and strict_verifier:
-                    if _verifier_reports_error(result):
-                        result = {**result, "passed": False, "rejected_verifier_error": True}
-                        passed = False
-                    elif _verifier_reports_no_verified_evidence(result):
-                        result = {**result, "passed": False, "rejected_unverified_success": True}
+                    rejection = strict_mcp_verifier_rejection(
+                        result,
+                        verifier_calls,
+                        answer=answer,
+                        local_evidence_overlap=local_evidence_overlap,
+                    )
+                    if rejection is not None:
+                        result = {**result, "passed": False, rejection: True}
                         passed = False
                 if passed and not allow_empty_answer and _verifier_reports_missing_evidence(result):
                     passed = False
@@ -1603,6 +1993,8 @@ class FusedEnvironment:
                     "reward": reward,
                     "verifier_passed": passed,
                     "verifier": result,
+                    "verifier_calls": verifier_calls,
+                    "local_evidence_overlap": local_evidence_overlap,
                     "tool_calls": self.tool_calls,
                     "empty_tool_results": self.mcp_empty_tool_results,
                     "nonempty_tool_results": self.mcp_nonempty_tool_results,
@@ -1610,7 +2002,31 @@ class FusedEnvironment:
                 }
                 return reward
             reward = float(result)
-            self.reward_debug = {"type": self.mode, "reward": reward, "verifier": result, "tool_calls": self.tool_calls}
+            strict_verifier = os.environ.get("SLIME_MCP_STRICT_VERIFIER", "true").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            rejection = None
+            if reward > 0 and strict_verifier:
+                rejection = strict_mcp_verifier_rejection(
+                    {"passed": True},
+                    verifier_calls,
+                    answer=answer,
+                    local_evidence_overlap=local_evidence_overlap,
+                )
+                if rejection is not None:
+                    reward = 0.0
+            self.reward_debug = {
+                "type": self.mode,
+                "reward": reward,
+                "verifier": result,
+                "verifier_calls": verifier_calls,
+                "local_evidence_overlap": local_evidence_overlap,
+                "strict_rejection": rejection,
+                "tool_calls": self.tool_calls,
+            }
             return reward
         except Exception as e:
             self.reward_debug = {
@@ -1700,6 +2116,37 @@ def _verifier_reports_no_verified_evidence(result: dict[str, Any]) -> bool:
         if evidence_flags and not any(flag is True for flag in evidence_flags):
             return True
     return False
+
+
+def strict_mcp_verifier_rejection(
+    result: dict[str, Any],
+    verifier_calls: list[dict[str, Any]],
+    *,
+    answer: Any = None,
+    local_evidence_overlap: bool | None = None,
+) -> str | None:
+    if _verifier_reports_error(result):
+        return "rejected_verifier_error"
+    if _verifier_reports_no_verified_evidence(result):
+        return "rejected_unverified_success"
+    successful_evidence_calls = [
+        call
+        for call in verifier_calls
+        if not call.get("error") and not call.get("empty_result")
+    ]
+    if not successful_evidence_calls:
+        return "rejected_missing_tool_evidence"
+    if any(call.get("error") for call in verifier_calls):
+        return "rejected_verifier_tool_error"
+    if local_evidence_overlap is False:
+        return "rejected_missing_local_evidence_anchor"
+    if isinstance(answer, list) and any(
+        item == previous
+        for index, item in enumerate(answer)
+        for previous in answer[:index]
+    ):
+        return "rejected_duplicate_collection_item"
+    return None
 
 
 def _extract_ground_truth(label: Any) -> Any:

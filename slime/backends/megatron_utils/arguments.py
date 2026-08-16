@@ -77,6 +77,15 @@ def validate_args(args):
 
     _megatron_validate_args(args)
 
+    # TransformerEngine requires autocast when FP32 residual activations flow
+    # through modules whose parameters remain in BF16/FP16.
+    if (
+        getattr(args, "transformer_impl", None) == "transformer_engine"
+        and getattr(args, "fp32_residual_connection", False)
+    ):
+        args.enable_autocast = True
+        args.autocast_dtype = args.params_dtype
+
     if getattr(args, "use_yarn_rope", False):
         if not math.isfinite(args.yarn_rope_scaling_factor) or args.yarn_rope_scaling_factor <= 1:
             raise ValueError("--yarn-rope-scaling-factor must be finite and greater than 1")

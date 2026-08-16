@@ -26,6 +26,42 @@ If one prompt rollout corresponds to one training sample, return a single `Sampl
 
 Reach for `--rollout-function-path` only when you need to replace the whole rollout orchestration. Common reasons include custom data-source scheduling, cross-rollout background queues, fully asynchronous generation, or workflows that cannot fit the default `sglang_rollout` prompt-by-sample structure.
 
+## Scoping Local MCP Tools
+
+Local MCP tasks can limit the schemas and calls available to the model. Prefer a static allowlist when task metadata can identify a sound superset of the required tools:
+
+```json
+{
+  "enabled_tools": ["list_items", "get_item", "get_grading_guide"],
+  "mcp_compact_finish_schema": true
+}
+```
+
+`enabled_tools` is enforced for both schema exposure and model-originated calls. Verifier code can still use hidden evidence helpers. Missing tools fail during environment setup instead of producing an impossible rollout. Build allowlists from task and asset metadata, never from a successful trajectory, reference answer, or verifier implementation.
+
+For environments whose relevant subset cannot be selected before rollout, group tools and optionally expose a small initial set:
+
+```json
+{
+  "enabled_tools": ["list_items", "get_item", "get_grading_guide"],
+  "initial_tools": ["list_items"],
+  "tool_groups": {
+    "item_details": {
+      "description": "Retrieve full item records",
+      "tools": ["get_item"]
+    },
+    "grading": {
+      "description": "Retrieve grading criteria",
+      "tools": ["get_grading_guide"]
+    }
+  }
+}
+```
+
+The initial prompt exposes `load_tool_group`, `initial_tools`, and `finish`. Loading is monotonic: new declarations are appended to the tool observation and remain available, preserving the rollout's append-only token prefix.
+
+`answer_schema` remains the authoritative server-side validation schema. Set `mcp_compact_finish_schema` to remove annotation-only JSON Schema fields and the redundant `command: "submit"` argument from the model-facing schema. For hand-tuned compression, provide `model_answer_schema` separately; invalid results are checked against the full `answer_schema` and returned to the model with JSON-path repair errors.
+
 ## Agent Runtime Adapters
 
 slime includes protocol adapters for existing agent runtimes:

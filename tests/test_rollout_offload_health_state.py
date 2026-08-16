@@ -24,6 +24,7 @@ class _FakeEngine:
         self.calls = []
         self.pause_generation = _RemoteMethod("pause_generation", self.calls)
         self.continue_generation = _RemoteMethod("continue_generation", self.calls)
+        self.flush_cache = _RemoteMethod("flush_cache", self.calls)
         self.release_memory_occupation = _RemoteMethod("release_memory_occupation", self.calls)
         self.resume_memory_occupation = _RemoteMethod("resume_memory_occupation", self.calls)
         self.health_generate = _RemoteMethod("health_generate", self.calls)
@@ -57,6 +58,14 @@ def test_recover_skips_generation_health_check_until_kv_is_onloaded(monkeypatch)
 
     server.offload()
     assert group.generation_health_check_enabled is False
+    assert [name for name, _args, _kwargs in engine.calls[:4]] == [
+        "pause_generation",
+        "flush_cache",
+        "pause_generation",
+        "release_memory_occupation",
+    ]
+    assert engine.calls[0][2] == {}
+    assert engine.calls[2][2] == {"mode": "in_place"}
 
     server.onload_weights()
     assert group.generation_health_check_enabled is False

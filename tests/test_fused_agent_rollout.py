@@ -65,6 +65,55 @@ from slime.utils.types import Sample
 NUM_GPUS = 0
 
 
+def test_parser_error_log_can_be_disabled_without_changing_parser_state(monkeypatch):
+    monkeypatch.setenv("SLIME_TOOL_PARSER_ERROR_LOG_ENABLED", "false")
+    monkeypatch.setattr(os, "open", lambda *_args, **_kwargs: pytest.fail("parser log should stay disabled"))
+    parser = SimpleNamespace(last_schema_errors=["invalid tool call"])
+
+    fused_generate._record_tool_parser_errors(
+        args=SimpleNamespace(dump_details=None),
+        base_sample=Sample(index=1, group_index=2, rollout_id=3),
+        session_id="session",
+        rollout_step=0,
+        model_name="qwen3",
+        response="bad response",
+        parser=parser,
+        prompt_ids=[1, 2],
+        evaluation=False,
+    )
+
+    assert parser.last_schema_errors == ["invalid tool call"]
+
+
+def test_parser_error_log_remains_available_outside_rejection_sampling(tmp_path, monkeypatch):
+    log_path = tmp_path / "parser-errors.jsonl"
+    monkeypatch.setenv("SLIME_TOOL_PARSER_ERROR_LOG_ENABLED", "true")
+    monkeypatch.setenv("SLIME_TOOL_PARSER_ERROR_LOG", str(log_path))
+    parser = SimpleNamespace(
+        last_schema_errors=["invalid tool call"],
+        last_schema_error_kinds=["invalid_json"],
+        last_schema_error_spans=[[1, 4]],
+    )
+
+    fused_generate._record_tool_parser_errors(
+        args=SimpleNamespace(dump_details=None),
+        base_sample=Sample(index=1, group_index=2, rollout_id=3),
+        session_id="session",
+        rollout_step=4,
+        model_name="qwen3",
+        response="bad response",
+        parser=parser,
+        prompt_ids=[1, 2],
+        evaluation=False,
+    )
+
+    record = json.loads(log_path.read_text())
+    assert record["rollout_id"] == 3
+    assert record["errors"] == ["invalid tool call"]
+    assert record["error_kinds"] == ["invalid_json"]
+    assert record["response"] == "bad response"
+
+
 class FakeTokenizer:
     def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True):
         text = "\n".join(m["role"] + ":" + m["content"] for m in messages)
@@ -227,7 +276,8 @@ def _run_generate_with_fake_sglang(
             "output_ids": [ord(c) for c in text],
             "output_logprobs": [-0.1] * len(text),
             "finish_reason": item.get("finish_reason", "stop"),
-            "prompt_tokens": len(prompt_ids),
+            "prompt_tokens": item.get("prompt_tokens", len(prompt_ids)),
+            "cached_tokens": item.get("cached_tokens", 0),
             "completion_tokens": len(text),
         }
 
@@ -328,7 +378,14 @@ def echo(value: str) -> dict:
             "verifier": {
                 "verification_code": """
 def verify(tools, answer):
-    return {"passed": isinstance(answer, dict) and answer.get("done") is True}
+    evidence = tools["echo"](value="verification")
+    return {
+        "passed": (
+            isinstance(answer, dict)
+            and answer.get("done") is True
+            and evidence.get("echo") == "verification"
+        )
+    }
 """
             },
         },
@@ -349,6 +406,22 @@ def _gemma4_echo_call(value: str) -> str:
 
 def _gemma4_finish_call(payload: str = '{"done":true}') -> str:
     return f'<|tool_call>call:finish{{command:<|"|>submit<|"|>,result:<|"|>{payload}<|"|>}}<tool_call|>'
+
+
+def test_fused_training_accumulates_real_prefix_cache_metrics_once(tmp_path: Path):
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path),
+        [
+            {"text": _echo_call("first"), "prompt_tokens": 100, "cached_tokens": 0},
+            {"text": _finish_call(), "prompt_tokens": 180, "cached_tokens": 96},
+        ],
+        {"SLIME_LOCAL_MCP_PROCESS_ISOLATION": "false"},
+    )
+    samples = result if isinstance(result, list) else [result]
+
+    assert sum(sample.prefix_cache_info.cached_tokens for sample in samples) == 96
+    assert sum(sample.prefix_cache_info.total_prompt_tokens for sample in samples) == 280
+    assert samples[0].metadata["fused_profile"]["prefix_cache_hit_rate"] == pytest.approx(96 / 280)
 
 
 def _search_call(query: str) -> str:
@@ -2053,7 +2126,8 @@ def get_value() -> dict:
         "verifier": {
             "verification_code": """
 def verify(tools, answer):
-    return {"passed": isinstance(answer, dict) and answer.get("answer") == 3}
+    evidence = tools["get_value"]()
+    return {"passed": answer == evidence}
 """
         },
     }
@@ -2104,6 +2178,260 @@ def submit_result_difficulty_2(result: dict) -> dict:
     env.close()
 
 
+def test_local_mcp_enabled_tools_limits_schema_and_model_execution(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "false")
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    (asset / "tools.py").write_text(
+        """
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("Tools")
+
+@mcp.tool()
+def public_lookup() -> dict:
+    return {"value": "public"}
+
+@mcp.tool()
+def verifier_only_lookup() -> dict:
+    return {"value": "private"}
+""",
+        encoding="utf-8",
+    )
+    env = FusedEnvironment(
+        {
+            "question": "Use the public lookup",
+            "tools_py": str(asset / "tools.py"),
+            "enabled_tools": ["public_lookup"],
+        }
+    )
+
+    assert _valid_tool_names(env.tools()) == {"public_lookup", "finish"}
+    assert json.loads(env.mcp_tools.call("public_lookup", {})) == {"value": "public"}
+    assert env.mcp_tools.call("verifier_only_lookup", {}) == (
+        "Error: local MCP tool verifier_only_lookup is not enabled for this task"
+    )
+    # Verifiers retain access to hidden evidence helpers without exposing them to the model.
+    assert env.mcp_tools["verifier_only_lookup"]() == {"value": "private"}
+
+
+def test_local_mcp_invalid_enabled_tool_fails_fast(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "false")
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    (asset / "tools.py").write_text(
+        "from mcp.server.fastmcp import FastMCP\n"
+        "mcp = FastMCP('Tools')\n"
+        "@mcp.tool()\n"
+        "def lookup(): return {'ok': True}\n",
+        encoding="utf-8",
+    )
+    env = FusedEnvironment(
+        {"question": "Lookup", "tools_py": str(asset / "tools.py"), "enabled_tools": ["missing"]}
+    )
+
+    _observation, info = env.reset()
+
+    assert "env_error" in info
+    assert "missing" in info["env_error"]
+
+
+def test_local_mcp_compact_finish_keeps_full_validation_and_allows_repair(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "false")
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    (asset / "tools.py").write_text(
+        "from mcp.server.fastmcp import FastMCP\n"
+        "mcp = FastMCP('Tools')\n"
+        "@mcp.tool()\n"
+        "def lookup(): return {'ok': True}\n",
+        encoding="utf-8",
+    )
+    answer_schema = {
+        "type": "object",
+        "description": "Verbose top-level annotation",
+        "properties": {
+            "grade": {
+                "type": "string",
+                "enum": ["C-10", "C-9"],
+                "description": "Verbose field annotation",
+            }
+        },
+        "required": ["grade"],
+    }
+    env = FusedEnvironment(
+        {
+            "question": "Grade the item",
+            "tools_py": str(asset / "tools.py"),
+            "answer_schema": answer_schema,
+            "mcp_compact_finish_schema": True,
+        }
+    )
+    finish = next(schema for schema in env.tools() if schema["function"]["name"] == "finish")
+    parameters = finish["function"]["parameters"]
+
+    assert parameters["required"] == ["result"]
+    assert "command" not in parameters["properties"]
+    assert parameters["properties"]["result"] == {
+        "type": "object",
+        "properties": {"grade": {"type": "string", "enum": ["C-10", "C-9"]}},
+        "required": ["grade"],
+        "description": "Final answer or JSON value.",
+    }
+
+    error, reward, done, info = asyncio.run(env.step(ToolCall("finish", {"result": {"grade": "C-6"}})))
+    assert done is False
+    assert reward == 0.0
+    assert "result.grade" in error
+    assert info["tools/finish_validation_error"] == 1
+
+    _observation, _reward, done, _info = asyncio.run(
+        env.step(ToolCall("finish", {"result": {"grade": "C-10"}}))
+    )
+    assert done is True
+
+
+def test_local_mcp_tool_groups_load_monotonically_and_refresh_parser(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "false")
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    (asset / "tools.py").write_text(
+        """
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("Tools")
+
+@mcp.tool()
+def catalog() -> list:
+    return ["item"]
+
+@mcp.tool()
+def inspect_item() -> dict:
+    return {"condition": "good"}
+""",
+        encoding="utf-8",
+    )
+    env = FusedEnvironment(
+        {
+            "question": "Inspect the item",
+            "tools_py": str(asset / "tools.py"),
+            "enabled_tools": ["catalog", "inspect_item"],
+            "initial_tools": ["catalog"],
+            "tool_groups": {
+                "inspection": {
+                    "description": "Inspect item condition",
+                    "tools": ["inspect_item"],
+                }
+            },
+        }
+    )
+    tools = env.tools()
+    parser = QwenToolParser(valid_tools=_valid_tool_names(tools))
+
+    assert _valid_tool_names(tools) == {"catalog", "load_tool_group", "finish"}
+    assert env.mcp_tools.call("inspect_item", {}) == (
+        "Error: local MCP tool inspect_item is not enabled for this task"
+    )
+
+    observation, _reward, done, info = asyncio.run(
+        env.step(ToolCall("load_tool_group", {"group": "inspection"}))
+    )
+    declarations = fused_generate._refresh_lazy_mcp_tools(env, tools, parser, info)
+
+    assert done is False
+    assert info["tools/schema_changed"] == 1
+    assert "inspect_item" in observation
+    assert "inspect_item" in declarations
+    assert "inspect_item" in _valid_tool_names(tools)
+    assert "inspect_item" in parser.valid_tools
+    assert json.loads(env.mcp_tools.call("inspect_item", {})) == {"condition": "good"}
+
+
+def test_local_mcp_lazy_group_executes_new_tool_in_next_rollout_turn(tmp_path: Path):
+    sample = _local_mcp_sample(tmp_path, question="Load and call echo")
+    sample.metadata.update(
+        {
+            "enabled_tools": ["echo"],
+            "tool_groups": {"echo_tools": {"description": "Echo a value", "tools": ["echo"]}},
+        }
+    )
+    load = '<tool_call>{"name":"load_tool_group","arguments":{"group":"echo_tools"}}</tool_call>'
+
+    result = _run_generate_with_fake_sglang(
+        sample,
+        [{"text": load}, {"text": _echo_call("loaded")}, {"text": _finish_call()}],
+        {
+            "SLIME_LOCAL_MCP_PROCESS_ISOLATION": "false",
+            "FUSED_DISABLE_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
+    )
+    samples = result if isinstance(result, list) else [result]
+
+    assert samples[-1].reward == 1.0
+    assert samples[-1].metadata["fused_termination"] == "env_done"
+    assert samples[-1].metadata["fused_tool_call_turns"] == 2
+
+
+def test_local_mcp_loading_group_does_not_satisfy_evidence_requirement(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "false")
+    sample = _local_mcp_sample(tmp_path, question="Load without retrieving")
+    sample.metadata.update(
+        {
+            "enabled_tools": ["echo"],
+            "tool_groups": {"echo_tools": ["echo"]},
+        }
+    )
+    env = FusedEnvironment(sample.metadata)
+
+    asyncio.run(env.step(ToolCall("load_tool_group", {"group": "echo_tools"})))
+    _observation, reward, done, info = asyncio.run(
+        env.step(ToolCall("finish", {"result": {"done": True}}))
+    )
+
+    assert done is True
+    assert reward == 0.0
+    assert info["reward_debug"]["verifier_skipped"] == "no_tool_calls"
+    assert info["reward_debug"]["tool_calls"] == 1
+    assert info["reward_debug"]["evidence_tool_calls"] == 0
+
+
+def test_local_mcp_process_cache_key_includes_tool_policy(tmp_path: Path):
+    from slime.rollout.fused_agent.mcp_process_pool import _toolset_cache_key
+
+    tools_py = tmp_path / "tools.py"
+    tools_py.write_text("# tool asset\n", encoding="utf-8")
+    first = _toolset_cache_key({"tools_py": str(tools_py), "enabled_tools": ["first"]})
+    second = _toolset_cache_key({"tools_py": str(tools_py), "enabled_tools": ["second"]})
+
+    assert first != second
+
+
+def test_local_mcp_process_describe_does_not_reuse_another_allowlist(tmp_path: Path):
+    from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
+
+    tools_py = tmp_path / "tools.py"
+    tools_py.write_text(
+        "from mcp.server.fastmcp import FastMCP\n"
+        "mcp = FastMCP('Tools')\n"
+        "@mcp.tool()\n"
+        "def first(): return 1\n"
+        "@mcp.tool()\n"
+        "def second(): return 2\n",
+        encoding="utf-8",
+    )
+    pool = LocalMCPProcessPool(workers=1)
+    try:
+        first = pool.describe({"tools_py": str(tools_py), "enabled_tools": ["first"]})
+        second = pool.describe({"tools_py": str(tools_py), "enabled_tools": ["second"]})
+    finally:
+        pool.close()
+
+    schema_names = lambda description: {
+        schema["function"]["name"] for schema in description["schemas"]
+    }
+    assert schema_names(first) == {"first", "finish"}
+    assert schema_names(second) == {"second", "finish"}
+
+
 def test_local_mcp_verifier_results_support_raw_and_legacy_wrapped_access(tmp_path: Path):
     asset = tmp_path / "asset"
     asset.mkdir()
@@ -2132,7 +2460,27 @@ def get_summary() -> dict:
     assert isinstance(summary, dict) and summary["title"] == "Evidence"
     assert summary["result"] is summary
     assert summary.get("result") is summary
-    env.close()
+
+
+def test_local_mcp_verifier_toolset_supports_mapping_get(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "false")
+    asset = tmp_path / "asset"
+    asset.mkdir()
+    (asset / "tools.py").write_text(
+        "from mcp.server.fastmcp import FastMCP\n"
+        "mcp = FastMCP('Tools')\n"
+        "@mcp.tool()\n"
+        "def lookup(): return {'value': 3}\n",
+        encoding="utf-8",
+    )
+    toolset = FusedEnvironment({"question": "Lookup", "tools_py": str(asset / "tools.py")}).mcp_tools
+
+    assert callable(toolset.get("lookup"))
+    assert toolset.get("lookup")() == {"value": 3}
+    assert toolset.get("missing") is None
+    assert toolset.get("missing", "fallback") == "fallback"
+    assert "lookup" in list(toolset)
+    toolset.close()
 
 
 def test_local_mcp_verifier_can_validate_quotes_without_exposing_internal_tool(tmp_path: Path):
@@ -2142,8 +2490,15 @@ def test_local_mcp_verifier_can_validate_quotes_without_exposing_internal_tool(t
         json.dumps(
             {
                 "title": "Source title",
-                "summary": "The documented requirement is supported by this exact evidence sentence.",
+                "summary": "Document summary.",
                 "content": "",
+                "sections": [
+                    {
+                        "heading": "Nested evidence",
+                        "text": "The documented requirement is supported by this exact evidence sentence.",
+                        "bullets": ["A second nested evidence statement is also available."],
+                    }
+                ],
             }
         ),
         encoding="utf-8",
@@ -2188,6 +2543,12 @@ def list_sources() -> list[str]:
     )
     assert invented == {"source_found": True, "matched": False}
     assert unknown_source == {"source_found": False, "matched": False}
+    assert env.mcp_tools.answer_has_local_evidence(
+        {"claim": "The documented requirement is supported by this exact evidence sentence."}
+    )
+    assert not env.mcp_tools.answer_has_local_evidence(
+        {"claim": "This fabricated unsupported claim does not occur in the local snapshot."}
+    )
     env.close()
 
 
@@ -2352,6 +2713,142 @@ def test_local_mcp_process_pool_runs_workspaces_in_parallel(tmp_path: Path, monk
     assert {output["result"]["cwd"] for output in outputs} == {str(root)}
 
 
+def test_local_mcp_process_pool_matches_odyssey_shard_and_task_load(tmp_path: Path, monkeypatch):
+    import concurrent.futures
+
+    from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
+
+    tasks = []
+    for root_index in range(4):
+        root = tmp_path / f"task-{root_index}"
+        root.mkdir()
+        (root / "tools.py").write_text(
+            "import os, uuid\n"
+            "from mcp.server.fastmcp import FastMCP\n"
+            f"ROOT_INDEX = {root_index}\n"
+            "INSTANCE_ID = uuid.uuid4().hex\n"
+            "mcp = FastMCP('Tools')\n"
+            "@mcp.tool()\n"
+            "def inspect(trajectory):\n"
+            "    return {\n"
+            "        'root': ROOT_INDEX,\n"
+            "        'trajectory': trajectory,\n"
+            "        'pid': os.getpid(),\n"
+            "        'instance_id': INSTANCE_ID,\n"
+            "    }\n",
+            encoding="utf-8",
+        )
+        tasks.append({"data_root": str(root), "tools_py": str(root / "tools.py")})
+
+    monkeypatch.setenv("SLIME_LOCAL_MCP_TOOLSET_CACHE_SIZE", "2")
+    pool = LocalMCPProcessPool(workers=32)
+
+    def run_trajectory(trajectory: int) -> tuple[dict, dict]:
+        root_index = trajectory % len(tasks)
+        task = tasks[root_index]
+        description = pool.describe(task)
+        assert description["load_error"] == ""
+        assert "inspect" in description["tool_names"]
+        called = pool.call(task, "inspect", {"trajectory": trajectory}, relax_empty=False)["result"]
+        verified = pool.verify(
+            task,
+            f"def verify(tools, answer):\n    return tools.inspect({trajectory})\n",
+            None,
+        )["result"]
+        return called, verified
+
+    try:
+        initial_pids = pool.warm()
+        assert len(set(initial_pids)) == 32
+        with concurrent.futures.ThreadPoolExecutor(max_workers=128) as threads:
+            outputs = list(threads.map(run_trajectory, range(128)))
+        final_pids = pool.warm()
+        cached_key_counts = [len(shard.cached_keys) for shard in pool.shards]
+    finally:
+        pool.close()
+
+    assert final_pids == initial_pids
+    assert all(count <= 2 for count in cached_key_counts)
+    for trajectory, (called, verified) in enumerate(outputs):
+        expected_root = trajectory % len(tasks)
+        assert called["root"] == expected_root
+        assert called["trajectory"] == trajectory
+        assert called["pid"] in initial_pids
+        assert verified["root"] == expected_root
+        assert verified["trajectory"] == trajectory
+        assert verified["pid"] in initial_pids
+
+
+def test_local_mcp_process_pool_restarts_only_polluted_shard(tmp_path: Path):
+    from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
+
+    root = tmp_path / "pollution-task"
+    root.mkdir()
+    (root / "tools.py").write_text(
+        "import os\n"
+        "from mcp.server.fastmcp import FastMCP\n"
+        "mcp = FastMCP('Tools')\n"
+        "@mcp.tool()\n"
+        "def status():\n"
+        "    return {'pid': os.getpid(), 'polluted': 'MCP_TEST_POLLUTION' in os.environ}\n"
+        "@mcp.tool()\n"
+        "def pollute():\n"
+        "    os.environ['MCP_TEST_POLLUTION'] = '1'\n"
+        "    return {'pid': os.getpid()}\n",
+        encoding="utf-8",
+    )
+    task = {"data_root": str(root), "tools_py": str(root / "tools.py")}
+    pool = LocalMCPProcessPool(workers=2)
+    try:
+        initial_pids = pool.warm()
+        healthy = pool.call(task, "status", {}, relax_empty=False)["result"]
+        repeated = pool.call(task, "status", {}, relax_empty=False)["result"]
+        polluted = pool.call(task, "pollute", {}, relax_empty=False)["result"]
+        replacement_pids = pool.warm()
+        recovered = pool.call(task, "status", {}, relax_empty=False)["result"]
+    finally:
+        pool.close()
+
+    assert healthy == repeated
+    assert polluted["pid"] in initial_pids
+    assert len(set(initial_pids) - set(replacement_pids)) == 1
+    assert len(set(replacement_pids) - set(initial_pids)) == 1
+    assert polluted["pid"] not in replacement_pids
+    assert recovered["pid"] in replacement_pids
+    assert recovered["polluted"] is False
+
+
+def test_local_mcp_process_pool_restarts_only_timed_out_shard(tmp_path: Path, monkeypatch):
+    from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
+
+    root = tmp_path / "timeout-task"
+    root.mkdir()
+    (root / "tools.py").write_text(
+        "import time\n"
+        "from mcp.server.fastmcp import FastMCP\n"
+        "mcp = FastMCP('Tools')\n"
+        "@mcp.tool()\n"
+        "def stall(seconds):\n"
+        "    time.sleep(seconds)\n"
+        "    return {'completed': True}\n",
+        encoding="utf-8",
+    )
+    task = {"data_root": str(root), "tools_py": str(root / "tools.py")}
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_TIMEOUT", "1")
+    pool = LocalMCPProcessPool(workers=2)
+    try:
+        initial_pids = pool.warm()
+        with pytest.raises(TimeoutError):
+            pool.call(task, "stall", {"seconds": 2}, relax_empty=False)
+        replacement_pids = pool.warm()
+    finally:
+        pool.close()
+
+    assert len(set(initial_pids) & set(replacement_pids)) == 1
+    assert len(set(initial_pids) - set(replacement_pids)) == 1
+    assert len(set(replacement_pids) - set(initial_pids)) == 1
+
+
 def test_local_mcp_describe_cache_is_singleflight_versioned_and_copied(tmp_path: Path, monkeypatch):
     import concurrent.futures
     import threading
@@ -2422,19 +2919,114 @@ def test_local_mcp_describe_cache_does_not_cache_failures(tmp_path: Path, monkey
         pool.close()
 
 
-def test_local_mcp_process_pool_release_returns_capacity_on_terminate_failure(monkeypatch):
+def test_local_mcp_process_pool_release_reuses_worker(monkeypatch):
     from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
 
     pool = LocalMCPProcessPool(workers=1)
     shard = pool.shards[0]
     index = pool._acquire()
-    monkeypatch.setattr(shard, "terminate", lambda: (_ for _ in ()).throw(RuntimeError("terminate failed")))
+    terminate_calls = []
+    monkeypatch.setattr(shard, "terminate", lambda: terminate_calls.append(True))
 
-    with pytest.raises(RuntimeError, match="terminate failed"):
-        pool._release(index)
+    pool._release(index)
 
+    assert terminate_calls == []
     assert pool._acquire() == 0
+    pool._release(index)
     pool.close()
+
+
+def test_local_mcp_process_pool_prefers_free_cached_shard_without_waiting():
+    from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
+
+    pool = LocalMCPProcessPool(workers=2)
+    cache_key = ("task", "tools", None, None)
+    pool.shards[0].cached_keys.add(cache_key)
+    first = pool._acquire()
+    pool._release(first)
+
+    assert list(pool._free) == [1, 0]
+    assert pool._acquire(cache_key=cache_key) == 0
+    assert pool._acquire(cache_key=cache_key) == 1
+
+    pool._release(0)
+    pool._release(1)
+    pool.close()
+
+
+def test_local_mcp_process_shard_terminates_only_on_failure_or_pollution(monkeypatch):
+    import concurrent.futures
+
+    from slime.rollout.fused_agent.mcp_process_pool import _ProcessShard, _WORKER_STATE_POLLUTED
+
+    shard = _ProcessShard(0)
+    terminate_calls = []
+    monkeypatch.setattr(shard, "terminate", lambda: terminate_calls.append(True))
+
+    successful = concurrent.futures.Future()
+    successful.set_result({"result": "ok", _WORKER_STATE_POLLUTED: False})
+    assert shard.result(successful, 1.0) == {"result": "ok"}
+    assert terminate_calls == []
+
+    polluted = concurrent.futures.Future()
+    polluted.set_result({"result": "ok", _WORKER_STATE_POLLUTED: True})
+    assert shard.result(polluted, 1.0) == {"result": "ok"}
+    assert terminate_calls == [True]
+
+    failed = concurrent.futures.Future()
+    failed.set_exception(TimeoutError("worker stalled"))
+    with pytest.raises(TimeoutError, match="worker stalled"):
+        shard.result(failed, 1.0)
+    assert terminate_calls == [True, True]
+
+
+def test_local_mcp_process_pool_reuses_worker_and_bounds_toolset_cache(tmp_path: Path, monkeypatch):
+    from slime.rollout.fused_agent.mcp_process_pool import LocalMCPProcessPool
+
+    def make_task(root: Path, value: str) -> dict:
+        root.mkdir()
+        (root / "tools.py").write_text(
+            "import os, uuid\n"
+            "from mcp.server.fastmcp import FastMCP\n"
+            f"VALUE = {value!r}\n"
+            "INSTANCE_ID = uuid.uuid4().hex\n"
+            "mcp = FastMCP('Tools')\n"
+            "@mcp.tool()\n"
+            "def identity():\n"
+            "    return {'pid': os.getpid(), 'instance_id': INSTANCE_ID, 'value': VALUE}\n",
+            encoding="utf-8",
+        )
+        return {"data_root": str(root), "tools_py": str(root / "tools.py")}
+
+    first_task = make_task(tmp_path / "first", "first")
+    second_task = make_task(tmp_path / "second", "second")
+    monkeypatch.setenv("SLIME_LOCAL_MCP_TOOLSET_CACHE_SIZE", "1")
+    pool = LocalMCPProcessPool(workers=1)
+    try:
+        worker_pid = pool.warm()[0]
+        assert pool.describe(first_task)["load_error"] == ""
+        first = pool.call(first_task, "identity", {}, relax_empty=False)["result"]
+        repeated = pool.call(first_task, "identity", {}, relax_empty=False)["result"]
+        verified = pool.verify(
+            first_task,
+            "def verify(tools, answer):\n    return tools.identity()\n",
+            None,
+        )["result"]
+        after_verify = pool.call(first_task, "identity", {}, relax_empty=False)["result"]
+        second = pool.call(second_task, "identity", {}, relax_empty=False)["result"]
+        reloaded_first = pool.call(first_task, "identity", {}, relax_empty=False)["result"]
+    finally:
+        pool.close()
+
+    assert first["pid"] == worker_pid
+    assert repeated == first
+    assert verified == first
+    assert after_verify == first
+    assert second["pid"] == first["pid"]
+    assert second["instance_id"] != first["instance_id"]
+    assert second["value"] == "second"
+    assert reloaded_first["pid"] == first["pid"]
+    assert reloaded_first["instance_id"] != first["instance_id"]
 
 
 def test_local_mcp_process_pool_lease_acquire_times_out(monkeypatch):
@@ -2893,6 +3485,7 @@ def test_mcp_verifier_rejects_degenerate_success_message(tmp_path: Path):
     sample = _local_mcp_sample(tmp_path, question="Extract evidence")
     sample.metadata["verifier"]["verification_code"] = """
 def verify(tools, answer):
+    tools['echo'](value='checked')
     return {'passed': True, 'message': 'No requirements found in documents'}
 """
     env = FusedEnvironment(sample.metadata)
@@ -2904,7 +3497,7 @@ def verify(tools, answer):
     assert env.reward_debug["verifier"]["rejected_degenerate_success"] is True
 
 
-def test_mcp_strict_verifier_rejects_swallowed_tool_error(tmp_path: Path, monkeypatch):
+def test_mcp_verifier_rejects_swallowed_tool_error_by_default(tmp_path: Path, monkeypatch):
     sample = _local_mcp_sample(tmp_path, question="Reject verifier fallback")
     sample.metadata["verifier"]["verification_code"] = """
 def verify(tools, answer):
@@ -2914,7 +3507,7 @@ def verify(tools, answer):
         'details': "Tool error: 'list' object has no attribute 'get'",
     }
 """
-    monkeypatch.setenv("SLIME_MCP_STRICT_VERIFIER", "true")
+    monkeypatch.delenv("SLIME_MCP_STRICT_VERIFIER", raising=False)
     env = FusedEnvironment(sample.metadata)
     env.answer = json.dumps({"done": True})
     env.tool_calls = 1
@@ -2922,6 +3515,110 @@ def verify(tools, answer):
     assert env.compute_final_reward() == 0.0
     assert env.reward_debug["verifier_passed"] is False
     assert env.reward_debug["verifier"]["rejected_verifier_error"] is True
+
+
+def test_mcp_verifier_rejects_success_without_tool_evidence_by_default(tmp_path: Path, monkeypatch):
+    sample = _local_mcp_sample(tmp_path, question="Reject structural-only verifier")
+    sample.metadata["verifier"]["verification_code"] = """
+def verify(tools, answer):
+    return {'passed': True, 'message': 'All structural checks passed'}
+"""
+    monkeypatch.delenv("SLIME_MCP_STRICT_VERIFIER", raising=False)
+    env = FusedEnvironment(sample.metadata)
+    env.answer = json.dumps({"done": True})
+    env.tool_calls = 1
+
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["verifier_passed"] is False
+    assert env.reward_debug["verifier"]["rejected_missing_tool_evidence"] is True
+    assert env.reward_debug["verifier_calls"] == []
+
+
+def test_mcp_verifier_applies_strict_checks_to_boolean_success(tmp_path: Path, monkeypatch):
+    sample = _local_mcp_sample(tmp_path, question="Reject boolean verifier bypass")
+    sample.metadata["verifier"]["verification_code"] = """
+def verify(tools, answer):
+    return True
+"""
+    monkeypatch.delenv("SLIME_MCP_STRICT_VERIFIER", raising=False)
+    env = FusedEnvironment(sample.metadata)
+    env.answer = json.dumps({"done": True})
+    env.tool_calls = 1
+
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["verifier"] is True
+    assert env.reward_debug["strict_rejection"] == "rejected_missing_tool_evidence"
+
+
+def test_mcp_verifier_rejects_duplicate_top_level_collection_items(tmp_path: Path, monkeypatch):
+    sample = _local_mcp_sample(tmp_path, question="Return distinct evidence records")
+    sample.metadata["verifier"]["verification_code"] = """
+def verify(tools, answer):
+    evidence = tools['echo'](value='checked')
+    return {'passed': evidence.get('echo') == 'checked'}
+"""
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "false")
+    env = FusedEnvironment(sample.metadata)
+    env.tool_calls = 1
+    evidence = {"claim": "A supported evidence record"}
+    env.answer = json.dumps([evidence, evidence])
+
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["verifier"]["rejected_duplicate_collection_item"] is True
+
+    env.answer = json.dumps([evidence, {"claim": "A different supported evidence record"}])
+    assert env.compute_final_reward() == 1.0
+
+
+def test_mcp_verifier_requires_local_evidence_anchor_when_snapshot_exists(tmp_path: Path, monkeypatch):
+    sample = _local_mcp_sample(tmp_path, question="Ground the answer")
+    data = Path(sample.metadata["data_root"]) / "data"
+    data.mkdir()
+    (data / "source.json").write_text(
+        json.dumps(
+            {
+                "title": "Grounding source",
+                "sections": [
+                    {
+                        "heading": "Documented operational requirement",
+                        "text": "The source explicitly documents this supported operational requirement.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    sample.metadata["verifier"]["verification_code"] = """
+def verify(tools, answer):
+    evidence = tools['echo'](value='checked')
+    return {'passed': evidence.get('echo') == 'checked'}
+"""
+    sample.metadata["answer_schema_json"] = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "category": {"enum": ["Documented operational requirement"]},
+                "claim": {"type": "string"},
+            },
+        }
+    )
+    monkeypatch.setenv("SLIME_LOCAL_MCP_PROCESS_ISOLATION", "false")
+    env = FusedEnvironment(sample.metadata)
+    env.tool_calls = 1
+    env.answer = json.dumps({"claim": "A fabricated unsupported claim with no local evidence."})
+
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["verifier"]["rejected_missing_local_evidence_anchor"] is True
+
+    env.answer = json.dumps({"category": "Documented operational requirement"})
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["verifier"]["rejected_missing_local_evidence_anchor"] is True
+
+    env.answer = json.dumps(
+        {"claim": "The source explicitly documents this supported operational requirement."}
+    )
+    assert env.compute_final_reward() == 1.0
+    assert env.reward_debug["local_evidence_overlap"] is True
 
 
 @pytest.mark.parametrize(
@@ -2961,7 +3658,7 @@ def verify(tools, answer):
     assert env.reward_debug["verifier"]["rejected_unverified_success"] is True
 
 
-def test_mcp_unverified_success_remains_compatible_by_default(tmp_path: Path, monkeypatch):
+def test_mcp_unverified_success_can_be_explicitly_allowed(tmp_path: Path, monkeypatch):
     sample = _local_mcp_sample(tmp_path, question="Keep legacy unverified success")
     sample.metadata["verifier"]["verification_code"] = """
 def verify(tools, answer):
@@ -2971,7 +3668,7 @@ def verify(tools, answer):
         'details': {'total_entries': 2, 'verified_count': 0},
     }
 """
-    monkeypatch.delenv("SLIME_MCP_STRICT_VERIFIER", raising=False)
+    monkeypatch.setenv("SLIME_MCP_STRICT_VERIFIER", "false")
     env = FusedEnvironment(sample.metadata)
     env.answer = json.dumps([{"technology": "unsupported"}])
     env.tool_calls = 1
@@ -2980,13 +3677,13 @@ def verify(tools, answer):
     assert env.reward_debug["verifier_passed"] is True
 
 
-def test_mcp_verifier_error_fallback_remains_compatible_by_default(tmp_path: Path, monkeypatch):
+def test_mcp_verifier_error_fallback_can_be_explicitly_allowed(tmp_path: Path, monkeypatch):
     sample = _local_mcp_sample(tmp_path, question="Keep legacy verifier behavior")
     sample.metadata["verifier"]["verification_code"] = """
 def verify(tools, answer):
     return {'passed': True, 'message': 'Basic structure valid (tool verification failed)'}
 """
-    monkeypatch.delenv("SLIME_MCP_STRICT_VERIFIER", raising=False)
+    monkeypatch.setenv("SLIME_MCP_STRICT_VERIFIER", "false")
     env = FusedEnvironment(sample.metadata)
     env.answer = json.dumps({"done": True})
     env.tool_calls = 1
@@ -3000,6 +3697,7 @@ def test_mcp_verifier_allows_explicitly_valid_empty_answer(tmp_path: Path):
         "allow_empty_answer": True,
         "verification_code": """
 def verify(tools, answer):
+    tools['echo'](value='checked')
     return {'passed': answer == [], 'message': 'No requirements found in documents'}
 """,
     }
@@ -5080,8 +5778,8 @@ def test_exact_match_reward_accepts_any_list_target():
 def test_call_sglang_aborts_request_on_timeout(monkeypatch):
     calls = []
 
-    async def fake_post(url, payload, headers=None):
-        calls.append(("generate", url, payload, headers))
+    async def fake_post(url, payload, max_retries=60, headers=None):
+        calls.append(("generate", url, payload, max_retries, headers))
         raise httpx.ReadTimeout("timeout")
 
     class FakeClient:
@@ -5102,7 +5800,8 @@ def test_call_sglang_aborts_request_on_timeout(monkeypatch):
 
     assert calls[0][0] == "generate"
     assert calls[0][2]["rid"]
-    assert calls[0][3] == {"X-SMG-Routing-Key": "sid"}
+    assert calls[0][3] == 1
+    assert calls[0][4] == {"X-SMG-Routing-Key": "sid"}
     assert calls[1] == (
         "abort",
         "http://127.0.0.1:30000/abort_request",
@@ -5111,12 +5810,58 @@ def test_call_sglang_aborts_request_on_timeout(monkeypatch):
     )
 
 
+def test_call_sglang_retries_read_error_after_aborting_old_request(monkeypatch):
+    generate_calls = []
+    abort_calls = []
+
+    async def fake_post(url, payload, max_retries=60, headers=None):
+        generate_calls.append((url, dict(payload), max_retries, headers))
+        if len(generate_calls) == 1:
+            raise httpx.ReadError("connection closed")
+        return {
+            "text": "x",
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "output_token_logprobs": [[-0.25, 7, "x"]],
+            },
+        }
+
+    class FakeClient:
+        async def post(self, url, json=None, timeout=None):
+            abort_calls.append((url, json, timeout))
+
+    monkeypatch.setenv("SLIME_SGLANG_TRANSPORT_RETRY_TIMES", "1")
+    monkeypatch.setenv("SLIME_SGLANG_TRANSPORT_RETRY_BACKOFF_SECONDS", "0")
+    monkeypatch.setattr(fused_generate.http_utils, "post", fake_post)
+    monkeypatch.setattr(fused_generate.http_utils, "_http_client", FakeClient())
+    args = SimpleNamespace(
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        router_policy="consistent_hashing",
+        rollout_top_p=1.0,
+    )
+
+    result = asyncio.run(fused_generate._call_sglang(args, [1, 2], {"max_new_tokens": 4}, session_id="sid"))
+
+    assert result["output_ids"] == [7]
+    assert len(generate_calls) == 2
+    assert generate_calls[0][1]["rid"] != generate_calls[1][1]["rid"]
+    assert all(call[2] == 1 for call in generate_calls)
+    assert abort_calls == [
+        (
+            "http://127.0.0.1:30000/abort_request",
+            {"rid": generate_calls[0][1]["rid"]},
+            5.0,
+        )
+    ]
+
+
 def test_call_sglang_aborts_native_session_request_on_direct_engine(monkeypatch):
     calls = []
 
     async def fake_post(url, payload, max_retries=60, headers=None):
         calls.append(("generate", url, payload, headers))
-        raise httpx.ReadTimeout("timeout")
+        raise httpx.ReadError("connection closed")
 
     class FakeClient:
         async def post(self, url, json=None, timeout=None):
@@ -5130,7 +5875,7 @@ def test_call_sglang_aborts_native_session_request_on_direct_engine(monkeypatch)
         router_policy="manual",
     )
 
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(httpx.ReadError):
         asyncio.run(
             fused_generate._call_sglang(
                 args,
@@ -5142,6 +5887,7 @@ def test_call_sglang_aborts_native_session_request_on_direct_engine(monkeypatch)
             )
         )
 
+    assert len(calls) == 2
     assert calls[1] == (
         "abort",
         "http://engine-0/abort_request",
@@ -5153,13 +5899,14 @@ def test_call_sglang_aborts_native_session_request_on_direct_engine(monkeypatch)
 def test_call_sglang_eval_uses_text_without_logprobs(monkeypatch):
     requests = []
 
-    async def fake_post(url, payload, headers=None):
+    async def fake_post(url, payload, max_retries=60, headers=None):
         requests.append((url, payload, headers))
         return {
             "text": "final answer",
             "meta_info": {
                 "finish_reason": {"type": "stop"},
                 "prompt_tokens": 2,
+                "cached_tokens": 1,
                 "completion_tokens": 2,
             },
         }
@@ -5189,16 +5936,79 @@ def test_call_sglang_eval_uses_text_without_logprobs(monkeypatch):
         "text": "final answer",
         "finish_reason": "stop",
         "prompt_tokens": 2,
+        "cached_tokens": 1,
         "completion_tokens": 2,
         "output_ids": [],
         "rid": requests[0][1]["rid"],
     }
 
 
+def test_call_sglang_reuses_growing_prefixes_under_concurrent_multiturn_load(monkeypatch):
+    previous_prompts = {}
+    requests = []
+
+    async def fake_post(url, payload, max_retries=60, headers=None):
+        del url, max_retries
+        await asyncio.sleep(0)
+        routing_key = headers["X-SMG-Routing-Key"]
+        prompt = list(payload["input_ids"])
+        previous = previous_prompts.get(routing_key, [])
+        assert prompt[: len(previous)] == previous
+        previous_prompts[routing_key] = prompt
+        requests.append((routing_key, prompt))
+        return {
+            "text": "turn",
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": len(prompt),
+                "cached_tokens": len(previous),
+                "completion_tokens": 1,
+            },
+        }
+
+    monkeypatch.setattr(fused_generate.http_utils, "post", fake_post)
+    args = SimpleNamespace(
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        router_policy="consistent_hashing",
+        sglang_context_length=4096,
+        rollout_max_context_len=4096,
+    )
+
+    async def run_trajectory(trajectory: int):
+        prompt = [1000 + trajectory, *range(7)]
+        outputs = []
+        for turn in range(4):
+            if turn:
+                prompt.extend([trajectory, turn, 2000 + turn, 3000 + turn])
+            outputs.append(
+                await fused_generate._call_sglang(
+                    args,
+                    list(prompt),
+                    {"max_new_tokens": 8},
+                    session_id=f"trajectory-{trajectory}",
+                    evaluation=True,
+                )
+            )
+        return outputs
+
+    async def run_load():
+        return await asyncio.gather(*(run_trajectory(index) for index in range(32)))
+
+    outputs = asyncio.run(run_load())
+
+    assert len(requests) == 128
+    assert set(previous_prompts) == {f"trajectory-{index}" for index in range(32)}
+    for trajectory_outputs in outputs:
+        assert [output["prompt_tokens"] for output in trajectory_outputs] == [8, 12, 16, 20]
+        assert [output["cached_tokens"] for output in trajectory_outputs] == [0, 8, 12, 16]
+        assert sum(output["cached_tokens"] for output in trajectory_outputs) == 36
+
+
 def test_call_sglang_rollout_only_skips_training_replay_metadata(monkeypatch):
     requests = []
 
-    async def fake_post(url, payload, headers=None):
+    async def fake_post(url, payload, max_retries=60, headers=None):
         requests.append(payload)
         return {
             "text": "answer",
@@ -5206,6 +6016,7 @@ def test_call_sglang_rollout_only_skips_training_replay_metadata(monkeypatch):
             "meta_info": {
                 "finish_reason": {"type": "stop"},
                 "prompt_tokens": 3,
+                "cached_tokens": 2,
                 "completion_tokens": 2,
             },
         }
@@ -5238,6 +6049,7 @@ def test_call_sglang_rollout_only_skips_training_replay_metadata(monkeypatch):
         "finish_reason": "stop",
         "weight_version": None,
         "prompt_tokens": 3,
+        "cached_tokens": 2,
         "completion_tokens": 2,
     }
 
@@ -5245,7 +6057,7 @@ def test_call_sglang_rollout_only_skips_training_replay_metadata(monkeypatch):
 def test_call_sglang_debug_rollout_keeps_training_evidence_without_fast_path(monkeypatch):
     requests = []
 
-    async def fake_post(url, payload, headers=None):
+    async def fake_post(url, payload, max_retries=60, headers=None):
         requests.append(payload)
         return {
             "text": "x",
@@ -5274,7 +6086,7 @@ def test_call_sglang_debug_rollout_keeps_training_evidence_without_fast_path(mon
 
 
 def test_call_sglang_strict_weight_version_is_returned_and_pinned(monkeypatch):
-    async def fake_post(url, payload, headers=None):
+    async def fake_post(url, payload, max_retries=60, headers=None):
         return {
             "text": "x",
             "meta_info": {
@@ -5319,7 +6131,7 @@ def test_call_sglang_strict_weight_version_is_returned_and_pinned(monkeypatch):
 def test_call_sglang_training_requests_and_returns_top_p_replay(monkeypatch):
     requests = []
 
-    async def fake_post(url, payload, headers=None):
+    async def fake_post(url, payload, max_retries=60, headers=None):
         requests.append(payload)
         return {
             "text": "x",
@@ -5357,7 +6169,7 @@ def test_call_sglang_training_requests_and_returns_top_p_replay(monkeypatch):
 
 
 def test_call_sglang_training_rejects_missing_top_p_replay(monkeypatch):
-    async def fake_post(url, payload, headers=None):
+    async def fake_post(url, payload, max_retries=60, headers=None):
         return {
             "text": "x",
             "meta_info": {
@@ -5386,7 +6198,7 @@ def test_call_sglang_training_rejects_missing_top_p_replay(monkeypatch):
 
 
 def test_call_sglang_strict_weight_version_rejects_missing(monkeypatch):
-    async def fake_post(url, payload, headers=None):
+    async def fake_post(url, payload, max_retries=60, headers=None):
         return {
             "text": "x",
             "meta_info": {
@@ -5411,7 +6223,7 @@ def test_call_sglang_strict_weight_version_rejects_missing(monkeypatch):
 
 
 def test_call_sglang_training_rejects_text_without_token_logprobs(monkeypatch):
-    async def fake_post(url, payload, headers=None):
+    async def fake_post(url, payload, max_retries=60, headers=None):
         return {
             "text": "generated without evidence",
             "meta_info": {
@@ -5707,7 +6519,8 @@ def get_value() -> dict:
             "verifier": {
                 "verification_code": """
 def verify(tools, answer):
-    return {"passed": isinstance(answer, dict) and answer.get("answer") == 3}
+    evidence = tools["get_value"]()
+    return {"passed": answer == evidence}
 """
             },
         },
@@ -7286,6 +8099,18 @@ def test_credit_assignment_policy_mask_never_unmasks_base_loss_mask_tokens():
         action_span=(1, 6),
         base_loss_mask=base_loss_mask,
     ) == [0, 0, 1, 1, 0, 1, 0]
+
+
+def test_parser_error_action_span_is_capped_to_configured_tail_window():
+    assert fused_generate._credit_assignment_loss_mask(
+        output_len=12,
+        turn_index=0,
+        credit_event="tool_parser_error",
+        credit_step_index=0,
+        parser_error_token_window=4,
+        action_span=(1, 10),
+        base_loss_mask=[1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1],
+    ) == [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0]
 
 
 def test_record_pending_turns_credit_assignment_intersects_response_loss_mask():

@@ -90,8 +90,12 @@ Options:
   --enable-dynamic-sampling-filter BOOL  Enable DAPO-style non-zero reward variance dynamic filtering. Default: true.
   --normalize-advantages / --no-normalize-advantages
                                          Whiten advantages across the data-parallel batch. Default: enabled.
-  --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
-  --grm-model NAME                       OpenRouter judge model. Default: google/gemini-3-flash-preview.
+  --enable_use_grm_train BOOL            Use OpenRouter GRM with rule-based fallback for WebQA training rewards.
+                                         MCP retains environment verifier rewards. Default: true.
+  --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for WebQA interval evals.
+                                         MCP retains dataset verifier rewards. Default: true.
+  --train-grm-model NAME                 Training OpenRouter judge model. Default: deepseek/deepseek-v4-flash-0731.
+  --eval-grm-model NAME                  Evaluation OpenRouter judge model. Default: google/gemini-3.7-flash.
   --grm-base-url URL                     OpenRouter-compatible judge endpoint.
   --grm-openrouter-api-key KEY           GRM API key. Prefer the OPENROUTER_API_KEY environment variable.
   --grm-mode score|equivalence           GRM protocol. Default: score.
@@ -154,8 +158,12 @@ is_truthy() {
 }
 
 PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
+# Keep this multinode launcher on the synchronous collector for the
+# train/rollout mismatch baseline. Set FULLY_ASYNC=true explicitly only when
+# running the asynchronous collector as a separate experiment.
+FULLY_ASYNC="${FULLY_ASYNC:-false}"
 CKPT_STEP="${CKPT_STEP:-}"
-ROUTER_POLICY="${ROUTER_POLICY:-cache_aware}"
+ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 # Alternate training and rollout across all eight GPU slots on one node.
@@ -168,13 +176,14 @@ WORKER_ADDR="${WORKER_ADDR:-}"
 RAY_SSH_USER="${RAY_SSH_USER:-$(id -un)}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-enp225s0f0np0}}"
 RAY_BIN="${RAY_BIN:-$(command -v ray)}"
-UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-False}"
+UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-false}"
 DISABLE_THINKING="${DISABLE_THINKING:-false}"
 ENABLE_YARN="${ENABLE_YARN:-false}"
 YARN_FACTOR="${YARN_FACTOR:-1.0}"
 YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS:-32768}"
 DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-8}"
+TRAIN_MEMORY_MARGIN_BYTES="${TRAIN_MEMORY_MARGIN_BYTES:-536870912}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 TRAIN_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND:-${RETRIEVAL_BACKEND:-local}}"
@@ -209,13 +218,15 @@ CREDIT_ASSIGNMENT_MAX_TURNS="${CREDIT_ASSIGNMENT_MAX_TURNS:-True}"
 CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN:-True}"
 HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
-LR="${LR:-1e-6}"
+LR="${LR:-2e-6}"
+EPS_CLIP="${EPS_CLIP:-0.2}"
+EPS_CLIP_HIGH="${EPS_CLIP_HIGH:-0.28}"
 KL_COEF="${KL_COEF:-0.0}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
 # A zero-weight reference KL neither changes advantages nor the actor loss.
 # Keep the expensive reference-model forward opt-in for this Qwen3 workload.
 USE_KL_LOSS="${USE_KL_LOSS:-0}"
-USE_WANDB="${USE_WANDB:-1}"
+USE_WANDB="${USE_WANDB:-0}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
@@ -240,7 +251,7 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-128}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-128}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-20}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-50}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-}"
 EVAL_INCLUDE_BENCHMARKS="${EVAL_INCLUDE_BENCHMARKS:-asearcher}"
@@ -260,7 +271,7 @@ EVAL_TERMINATION_RETRY_TIMES="${EVAL_TERMINATION_RETRY_TIMES:-4}"
 EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE:-1}"
 EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES:-true}"
 NATIVE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION:-true}"
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-true}}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${val_before_train:-false}}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 EVAL_PROMPT_DATA=()
 # Resolve the offload default after CLI parsing so --colocate/--no-colocate also
@@ -271,9 +282,11 @@ OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-}}"
 # torch_memory_saver revision contains the CUDA VMM granularity fix needed by
 # repeated pause/resume cycles. RELEASE_TRAIN=true remains a disk-I/O fallback.
 RELEASE_TRAIN="${RELEASE_TRAIN:-false}"
+ENABLE_USE_GRM_TRAIN="${ENABLE_USE_GRM_TRAIN:-${enable_use_grm_train:-true}}"
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
-GRM_MODEL="${GRM_MODEL:-google/gemini-3-flash-preview}"
+TRAIN_GRM_MODEL="${TRAIN_GRM_MODEL:-deepseek/deepseek-v4-flash-0731}"
+EVAL_GRM_MODEL="${EVAL_GRM_MODEL:-google/gemini-3-flash-preview}"
 GRM_MODE="${GRM_MODE:-score}"
 GRM_CONCURRENCY="${GRM_CONCURRENCY:-128}"
 GRM_MAX_CONNECTIONS="${GRM_MAX_CONNECTIONS:-128}"
@@ -281,9 +294,9 @@ GRM_TIMEOUT="${GRM_TIMEOUT:-60}"
 GRM_MAX_RETRIES="${GRM_MAX_RETRIES:-32}"
 GRM_RETRY_BASE_DELAY="${GRM_RETRY_BASE_DELAY:-1}"
 GRM_RETRY_MAX_DELAY="${GRM_RETRY_MAX_DELAY:-16.0}"
-GRM_MAX_INPUT_TOKENS="${GRM_MAX_INPUT_TOKENS:-131072}"
-GRM_MAX_NEW_TOKENS="${GRM_MAX_NEW_TOKENS:-2048}"
-GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.0}"
+GRM_MAX_INPUT_TOKENS="${GRM_MAX_INPUT_TOKENS:-65536}"
+GRM_MAX_NEW_TOKENS="${GRM_MAX_NEW_TOKENS:-1024}"
+GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.6}"
 GRM_FAILURE_REWARD="${GRM_FAILURE_REWARD:-0.0}"
 harness_explicit=false
 
@@ -357,8 +370,10 @@ while [ "$#" -gt 0 ]; do
       --enable-dynamic-sampling-filter) ENABLE_DYNAMIC_SAMPLING_FILTER="${2:?Missing value for --enable-dynamic-sampling-filter}"; shift 2 ;;
       --normalize-advantages) NORMALIZE_ADVANTAGES=true; shift ;;
       --no-normalize-advantages) NORMALIZE_ADVANTAGES=false; shift ;;
+      --enable_use_grm_train|--enable-use-grm-train) ENABLE_USE_GRM_TRAIN="${2:?Missing value for --enable_use_grm_train}"; shift 2 ;;
       --enable_use_grm_evals|--enable-use-grm-evals) ENABLE_USE_GRM_EVALS="${2:?Missing value for --enable_use_grm_evals}"; shift 2 ;;
-      --grm-model) GRM_MODEL="${2:?Missing value for --grm-model}"; shift 2 ;;
+      --train-grm-model) TRAIN_GRM_MODEL="${2:?Missing value for --train-grm-model}"; shift 2 ;;
+      --eval-grm-model) EVAL_GRM_MODEL="${2:?Missing value for --eval-grm-model}"; shift 2 ;;
       --grm-base-url) GRM_BASE_URL="${2:?Missing value for --grm-base-url}"; shift 2 ;;
       --grm-openrouter-api-key)
          set +x
@@ -471,7 +486,7 @@ if is_truthy "${RELEASE_TRAIN}"; then
    OFFLOAD_TRAIN=false
 fi
 
-if is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTOM_RM_PATH}" ]; then
+if is_truthy "${ENABLE_USE_GRM_TRAIN}" || is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTOM_RM_PATH}" ]; then
    if [ -z "${OPENROUTER_API_KEY:-}" ] \
       && [ -n "${OPENAI_API_KEY:-}" ] \
       && [ -n "${GRM_BASE_URL:-${OPENAI_BASE_URL:-}}" ]; then
@@ -481,7 +496,7 @@ if is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTO
       GRM_BASE_URL="${GRM_BASE_URL:-${OPENAI_BASE_URL}}"
    fi
    if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-      echo "GRM evals require OPENROUTER_API_KEY (or OPENAI_API_KEY with GRM_BASE_URL/OPENAI_BASE_URL)." >&2
+      echo "GRM train/eval scoring requires OPENROUTER_API_KEY (or OPENAI_API_KEY with GRM_BASE_URL/OPENAI_BASE_URL)." >&2
       exit 2
    fi
 fi
@@ -521,25 +536,8 @@ EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks
 
 default_experiment_name() {
    local prefix="odyssey-q3-4b-local-dev"
-   #local prefix="odyssey-q3-8b-think-dev"
-   #local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
-   #local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
-   #local prefix="fused-dapo-q3-4b-dht-gem-sync-dev"  # w/o rft warmup
-   #local prefix="fused-dapo-q3-4b-think-gem-sync-dev"
-   #local prefix="fused-dapo-q3-4b-pet-gem-sync-dev"
-   #local prefix="webqa-dapo-q3-4b-think-pet-gem-sync-dev"
-   #local prefix="fused-dapo-q3-4b-no_think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3-4b-no_think-gem-sync-dev"
+   #local prefix="odyssey-q3-8b-local-dev"
    #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
-   #local prefix="webqa-dapo-q3-4b-no_think-gem-sync-dev"
-   #local prefix="webqa-dapo-q3-8b-no_think-gem-sync-dev"
-   #local prefix="webqa-dapo-q3.5-4b-no_think-gem-sync-dev"
-   #local prefix="mcp-dapo-q3-4b-think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3.5-4b-no_think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3-8b-no_think-gem-sync-dev"
-   #local prefix="asearcher-dapo-q3-8b-no_think-gem-async-dev"
-   #local prefix="webqa-dapo-q3-4b-no_think-gem-async-dev0"
    local max_dev=-1
    local root base suffix
    for root in "${RUNS_ROOT}" "${REPO_ROOT}/checkpoints/FusedRL" "${REPO_ROOT}/experiments/logs/FusedRL"; do
@@ -592,7 +590,11 @@ case "${MODEL_CONFIG,,}" in
    qwen3-4b|qwen3-4b-*) DEFAULT_TP_SIZE=1 ;;
    *) DEFAULT_TP_SIZE=2 ;;
 esac
-DEFAULT_CP_SIZE=2
+# Keep the synchronous train/rollout consistency baseline on the same CP=1
+# attention topology as the TP=1 SGLang engines.  CP remains overridable for
+# throughput or memory experiments, but CP>1 introduces a p2p attention
+# reduction that cannot be reproduced by the rollout engines.
+DEFAULT_CP_SIZE=1
 
 # In colocate mode both phases use the same eight GPU slots in alternation.
 # ACTOR_GPUS and ROLLOUT_GPUS are global counts.
@@ -650,9 +652,6 @@ fi
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
 MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
 #MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-8B}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3.5-4B}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/gem/Qwen3-4B-RFT-Warmup-v0}"  # init RL training with a self-distil wamrup ckpt
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
 RUN_ROOT="${RUN_ROOT:-${RUNS_ROOT}/${EXPERIMENT_NAME}}"
 SAVE_DIR="${SAVE_DIR:-${RUN_ROOT}/checkpoints}"
@@ -669,13 +668,16 @@ WANDB_DIR="${WANDB_DIR:-${LOG_ROOT}/wandb}"
 WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${RUN_ROOT}/cache/wandb}"
 HF_HOME="${HF_HOME:-${RUN_ROOT}/cache/huggingface}"
 TORCH_HOME="${TORCH_HOME:-${RUN_ROOT}/cache/torch}"
-# Triton launchers are compiled concurrently by every SGLang engine. Keeping
-# this cache on NFS can make os.replace() fail with EBUSY while another process
-# has the same launcher loaded, so use the node-local filesystem by default.
+# Compiler artifacts are produced concurrently by every SGLang engine. Keeping
+# these caches on NFS can make atomic replacements fail while another process
+# has the same artifact loaded, so use the node-local filesystem by default.
+TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/slime-torchinductor-cache/${USER:-$(id -un)}/${EXPERIMENT_NAME}}"
 TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/slime-triton-cache/${USER:-$(id -un)}/${EXPERIMENT_NAME}}"
+TORCH_COMPILE_JOB_ID="${TORCH_COMPILE_JOB_ID:-${EXPERIMENT_NAME}}"
+TORCHINDUCTOR_FORCE_DISABLE_CACHES="${TORCHINDUCTOR_FORCE_DISABLE_CACHES:-0}"
 XDG_CACHE_HOME="${XDG_CACHE_HOME:-${RUN_ROOT}/cache/xdg}"
 MCP_ENV_ROOT="${MCP_ENV_ROOT:-${RUN_ROOT}/cache/mcp_envs}"
-MCP_ENV_COPY_CONCURRENCY="${MCP_ENV_COPY_CONCURRENCY:-16}"
+MCP_ENV_COPY_CONCURRENCY=32
 
 mkdir -p \
    "${SAVE_DIR}" \
@@ -689,6 +691,7 @@ mkdir -p \
    "${WANDB_CACHE_DIR}" \
    "${HF_HOME}" \
    "${TORCH_HOME}" \
+   "${TORCHINDUCTOR_CACHE_DIR}" \
    "${TRITON_CACHE_DIR}" \
    "${XDG_CACHE_HOME}" \
    "${MCP_ENV_ROOT}"
@@ -910,26 +913,30 @@ fi
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-15472}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-24576}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
-# CP=2 splits one 40960-token sample across two GPUs.  Using the full context
-# budget per GPU lets dynamic batching pack roughly twice that many tokens and
-# can OOM in the vocabulary-parallel softmax on long rollout batches.
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-20480}"
-LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"
+# Each rank must be able to hold one maximum-length sample.  Deriving the
+# default from CP preserves the 40K context at CP=1 while retaining the old
+# 20K-per-rank budget when CP=2 is explicitly requested.
+DEFAULT_TOKENS_PER_GPU=$(((MAX_CONTEXT_LEN + CP_SIZE - 1) / CP_SIZE))
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_PER_GPU}}"
+LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_PER_GPU}}"
 LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-8192}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
-# Apply the quota after dynamic filtering so every training batch contains the
-# same number of accepted webqa and mcp prompt groups.
+# Keep the post-filter training batch at 50/50 webqa and mcp. The synchronous
+# collector keeps sampling each family until both accepted quotas are full.
 ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
 # Bound aggressive admission even when low ROI or long-tail groups keep the
 # collector refilling candidates before the previous wave fully drains.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-64}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
-# Keep enough prompt groups admitted to fill every decode engine even when
-# older groups have only one or two long-tail trajectories left.
-SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS:-$((ROLLOUT_ENGINE_COUNT * 4))}"
+# Keep a 24-group reservoir (768 trajectories at n=32) without saturating the
+# decode queues and KV cache with thousands of multi-turn trajectories.
+SYNC_MIN_PENDING_GROUPS=24
+# MCP groups carry much larger prompts and longer tails. Once MCP is the only
+# unsatisfied quota, keep 256 rather than 768 trajectories in flight.
+SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-8}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
-NUM_ROLLOUT="${NUM_ROLLOUT:-360}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-196400}"
 if [ $((ROLLOUT_BATCH_SIZE % 2)) -ne 0 ]; then
    echo "ROLLOUT_BATCH_SIZE must be even for the 50/50 webqa/mcp training mix; got ${ROLLOUT_BATCH_SIZE}." >&2
    exit 2
@@ -943,6 +950,7 @@ if [ $((EFFECTIVE_GLOBAL_BATCH_SIZE % MICRO_BATCH_DATA_PARALLEL_SIZE)) -ne 0 ]; 
 fi
 ENABLE_DYNAMIC_SAMPLING_FILTER="${ENABLE_DYNAMIC_SAMPLING_FILTER:-true}"
 DYNAMIC_SAMPLING_FILTER_PATH="${DYNAMIC_SAMPLING_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
+ENABLE_QUOTA_BUCKET_SAMPLING="${ENABLE_QUOTA_BUCKET_SAMPLING:-0}"
 # This launcher requires strict reward-variance filtering. Zero disables the
 # collector's fallback that would otherwise admit rejected groups after a
 # candidate threshold; overwrite inherited environment values intentionally.
@@ -953,10 +961,13 @@ if ! is_truthy "${ENABLE_DYNAMIC_SAMPLING_FILTER}"; then
 fi
 
 # Drain or abort every submitted trajectory before the next weight update.
-# The fully-async collector intentionally keeps trajectories alive across
-# training-step boundaries, which can mix SGLang weight versions within one
-# fused trajectory.
-ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.sglang_rollout.generate_rollout}"
+# Keep the synchronous collector as the default so each mismatch measurement
+# is made against a single rollout/train weight version.
+if is_truthy "${FULLY_ASYNC}"; then
+   ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.fully_async_rollout.generate_rollout_fully_async}"
+else
+   ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.sglang_rollout.generate_rollout}"
+fi
 FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY:-true}"
 FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 4))}"
 FULLY_ASYNC_MAX_GROUP_CONCURRENCY="${FULLY_ASYNC_MAX_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 8))}"
@@ -1024,7 +1035,7 @@ CKPT_ARGS=(
    # back the actor/optimizer state to an earlier training step. Larger values
    # remain available explicitly via SAVE_INTERVAL when checkpoint I/O matters
    # more than exact interruption recovery.
-   --save-interval "${SAVE_INTERVAL:-10}"
+   --save-interval "${SAVE_INTERVAL:-5}"
 )
 # Resume training state (model/optimizer/rng/step + rollout data state) from an
 # existing Megatron checkpoint dir. Defaults to SAVE_DIR so a re-launch with the
@@ -1130,12 +1141,15 @@ if [ -n "${DYNAMIC_SAMPLING_FILTER_PATH}" ]; then
    )
 fi
 if [ -n "${ROLLOUT_TASK_FAMILY_QUOTAS:-}" ]; then
-   ROLLOUT_ARGS+=(--rollout-task-family-quotas "${ROLLOUT_TASK_FAMILY_QUOTAS}")
+   ROLLOUT_ARGS+=(
+      --rollout-task-family-quotas "${ROLLOUT_TASK_FAMILY_QUOTAS}"
+      --rollout-task-family-top-mean-steps
+   )
 fi
-if [ "${ENABLE_QUOTA_BUCKET_SAMPLING:-1}" = "1" ]; then
+if [ "${ENABLE_QUOTA_BUCKET_SAMPLING}" = "1" ]; then
    ROLLOUT_ARGS+=(--enable-quota-bucket-sampling)
    if [ -z "${BUFFER_FILTER_PATH:-}" ]; then
-      ROLLOUT_ARGS+=(--buffer-filter-path "slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps")
+      BUFFER_FILTER_PATH="slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps"
    fi
 fi
 if [ -n "${BUFFER_FILTER_PATH:-}" ]; then
@@ -1152,10 +1166,11 @@ if [ -n "${CUSTOM_RM_PATH}" ]; then
 elif [ -n "${RM_TYPE:-}" ]; then
    ROLLOUT_ARGS+=(--rm-type "${RM_TYPE}")
 fi
-if is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTOM_RM_PATH}" ]; then
+if is_truthy "${ENABLE_USE_GRM_TRAIN}" || is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTOM_RM_PATH}" ]; then
    ROLLOUT_ARGS+=(
       --grm-custom-rm-path "${GRM_CUSTOM_RM_PATH}"
-      --grm-model "${GRM_MODEL}"
+      --train-grm-model "${TRAIN_GRM_MODEL}"
+      --eval-grm-model "${EVAL_GRM_MODEL}"
       --grm-mode "${GRM_MODE}"
       --grm-concurrency "${GRM_CONCURRENCY}"
       --grm-max-connections "${GRM_MAX_CONNECTIONS}"
@@ -1168,6 +1183,9 @@ if is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTO
       --grm-temperature "${GRM_TEMPERATURE}"
       --grm-failure-reward "${GRM_FAILURE_REWARD}"
    )
+   if is_truthy "${ENABLE_USE_GRM_TRAIN}"; then
+      ROLLOUT_ARGS+=(--enable-use-grm-train)
+   fi
    if is_truthy "${ENABLE_USE_GRM_EVALS}"; then
       ROLLOUT_ARGS+=(--enable-use-grm-evals)
    fi
@@ -1245,6 +1263,7 @@ PERF_ARGS=(
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
+   --calculate-per-token-loss
 
    --micro-batch-size "${MICRO_BATCH_SIZE}"
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
@@ -1262,8 +1281,8 @@ GRPO_ARGS=(
    --kl-loss-coef "${KL_LOSS_COEF}"
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF:-0.00}"
-   --eps-clip "${EPS_CLIP:-0.2}"
-   --eps-clip-high "${EPS_CLIP_HIGH:-0.6}"
+   --eps-clip "${EPS_CLIP}"
+   --eps-clip-high "${EPS_CLIP_HIGH}"
 )
 if is_truthy "${USE_KL_LOSS}"; then
    GRPO_ARGS+=(--use-kl-loss)
@@ -1319,11 +1338,18 @@ SGLANG_ARGS=(
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
    --sglang-context-length "${MAX_CONTEXT_LEN}"
    --sglang-enable-deterministic-inference
-   --sglang-attention-backend triton
+   --sglang-rl-on-policy-target megatron
+   # Decode stays on FA3. Full, uncached prefills use the SM80-compatible FA2
+   # raw kernel inside this backend to match Megatron Transformer Engine.
+   --sglang-attention-backend fa3
    --sglang-disable-custom-all-reduce
    --sglang-disable-piecewise-cuda-graph
    --router-policy "${ROUTER_POLICY}"
 )
+if is_truthy "${SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES:-0}" \
+   || is_truthy "${SLIME_DIAGNOSE_SGLANG_FIRST_DIVERGENCE:-0}"; then
+   SGLANG_ARGS+=(--sglang-enable-return-hidden-states)
+fi
 WANDB_ARGS=()
 if [ "${USE_WANDB}" = "1" ]; then
    WANDB_ARGS=(
@@ -1347,9 +1373,12 @@ MISC_ARGS=(
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
+   --fp32-residual-connection
    --attention-backend flash
+   --batch-invariant-mode
    --deterministic-mode
    --moe-token-dispatcher-type alltoall
+   --train-memory-margin-bytes "${TRAIN_MEMORY_MARGIN_BYTES}"
    --train-env-vars '{"TMS_INIT_ENABLE_CPU_BACKUP":"1"}'
 )
 if is_truthy "${CHECK_WEIGHT_UPDATE_EQUAL:-1}"; then
@@ -1364,10 +1393,21 @@ fi
 if [ "${PRINT_TRAIN_METRICS_TABLE:-1}" = "1" ]; then
    MISC_ARGS+=(--print-train-metrics-table)
 fi
+if [ -n "${SLIME_DIAGNOSTIC_ROLLOUT_DATA:-}" ]; then
+   MISC_ARGS+=(--load-debug-rollout-data "${SLIME_DIAGNOSTIC_ROLLOUT_DATA}")
+fi
 
 export SCRIPT_DIR REPO_ROOT MEGATRON_LM_PATH HAS_NVLINK
 export RUNS_ROOT RUN_ROOT SAVE_DIR LOG_ROOT EPISODE_LOG_DIR DUMP_DETAILS EVAL_CACHE_DIR PREPARED_PROMPT_DATA
-export UPDATE_WEIGHT_DISK_DIR WANDB_DIR WANDB_CACHE_DIR HF_HOME TORCH_HOME TRITON_CACHE_DIR XDG_CACHE_HOME MCP_ENV_ROOT
+export UPDATE_WEIGHT_DISK_DIR WANDB_DIR WANDB_CACHE_DIR HF_HOME TORCH_HOME TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR XDG_CACHE_HOME MCP_ENV_ROOT
+export TORCH_COMPILE_JOB_ID TORCHINDUCTOR_FORCE_DISABLE_CACHES
+export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=1
+export SLIME_SGLANG_EXACT_RMSNORM=1
+export SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS="${SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS:-0}"
+export SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES="${SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES:-0}"
+export SLIME_DIAGNOSE_SGLANG_FIRST_DIVERGENCE="${SLIME_DIAGNOSE_SGLANG_FIRST_DIVERGENCE:-0}"
+export SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS="${SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS:-1}"
+export SLIME_SGLANG_RECOMPUTE_CONCURRENCY="${SLIME_SGLANG_RECOMPUTE_CONCURRENCY:-8}"
 export SLIME_MCP_ENV_ROOT="${MCP_ENV_ROOT}"
 export SLIME_MCP_ENV_COPY_CONCURRENCY="${MCP_ENV_COPY_CONCURRENCY}"
 export SLIME_MCP_WORKSPACE_SCOPE="${SLIME_MCP_WORKSPACE_SCOPE:-task}"
@@ -1409,7 +1449,10 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
 export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-10000000000}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
+# TorchMemorySaver does not support expandable segments. Preserve large cached
+# blocks instead, so long dynamic microbatches can reuse them without failing a
+# multi-GiB allocation due to allocator fragmentation.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False,max_split_size_mb:256}"
 export OPENROUTER_APP_NAME="${OPENROUTER_APP_NAME:-GRM}"
 export SLIME_FUSED_REQUIRE_WEIGHT_VERSION="${SLIME_FUSED_REQUIRE_WEIGHT_VERSION:-1}"
 
@@ -1434,12 +1477,14 @@ export RLLM_RETRIEVAL_LEXRANK_WORKERS="${RLLM_RETRIEVAL_LEXRANK_WORKERS:-32}"
 export DOCKER_HOST="${DOCKER_HOST:-tcp://10.2.152.50:2375}"
 export DOCKER_API_VERSION="${DOCKER_API_VERSION:-1.44}"
 export SLIME_LOCAL_MCP_PROCESS_ISOLATION="${SLIME_LOCAL_MCP_PROCESS_ISOLATION:-true}"
-export SLIME_LOCAL_MCP_PROCESS_WORKERS="${SLIME_LOCAL_MCP_PROCESS_WORKERS:-16}"
+export SLIME_LOCAL_MCP_PROCESS_WORKERS=32
 export SLIME_LOCAL_MCP_PROCESS_START_METHOD="${SLIME_LOCAL_MCP_PROCESS_START_METHOD:-forkserver}"
 export SLIME_LOCAL_MCP_PROCESS_TIMEOUT="${SLIME_LOCAL_MCP_PROCESS_TIMEOUT:-120}"
 export SLIME_LOCAL_MCP_LEASE_TIMEOUT="${SLIME_LOCAL_MCP_LEASE_TIMEOUT:-120}"
 export SLIME_LOCAL_MCP_DESCRIBE_CACHE_SIZE="${SLIME_LOCAL_MCP_DESCRIBE_CACHE_SIZE:-4096}"
+export SLIME_LOCAL_MCP_TOOLSET_CACHE_SIZE="${SLIME_LOCAL_MCP_TOOLSET_CACHE_SIZE:-64}"
 export SLIME_LOCAL_MCP_PROCESS_WARM_TIMEOUT="${SLIME_LOCAL_MCP_PROCESS_WARM_TIMEOUT:-60}"
+export SLIME_LOCAL_MCP_PROCESS_EAGER_WARM="${SLIME_LOCAL_MCP_PROCESS_EAGER_WARM:-true}"
 export RLLM_MCP_MIN_NOFILE="${RLLM_MCP_MIN_NOFILE:-4096}"
 export RLLM_MCP_FD_THROTTLE_THRESHOLD="${RLLM_MCP_FD_THROTTLE_THRESHOLD:-4096}"
 export RLLM_MCP_INIT_TIMEOUT="${RLLM_MCP_INIT_TIMEOUT:-32}"
@@ -1461,6 +1506,11 @@ export FUSED_CLI_MAX_STEPS="${CLI_MAX_STEPS}"
 export FUSED_TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT}"
 export FUSED_EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT}"
 export SLIME_ROLLOUT_GROUP_TIMEOUT="${ROLLOUT_GROUP_TIMEOUT}"
+export SLIME_SGLANG_ABORT_TIMEOUT_SECONDS=10
+export SLIME_SGLANG_ABORT_HTTP_TIMEOUT_SECONDS=2
+export SLIME_SGLANG_ABORT_RETRY_INTERVAL_SECONDS=0.2
+export SLIME_SGLANG_TRANSPORT_RETRY_TIMES=2
+export SLIME_SGLANG_TRANSPORT_RETRY_BACKOFF_SECONDS=0.25
 export PER_STEP_MAX_TOKENS="${PER_STEP_MAX_TOKENS:-8192}"
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE}"
@@ -1499,7 +1549,8 @@ fi
 export SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER="${SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER:-4}"
 export SLIME_TASK_FAMILY_ROI_PRIOR="${SLIME_TASK_FAMILY_ROI_PRIOR:-0.5}"
 export SLIME_TASK_FAMILY_ROI_PRIOR_STRENGTH="${SLIME_TASK_FAMILY_ROI_PRIOR_STRENGTH:-4}"
-export SLIME_SYNC_MIN_PENDING_GROUPS="${SLIME_SYNC_MIN_PENDING_GROUPS:-${SYNC_MIN_PENDING_GROUPS}}"
+export SLIME_SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS}"
+export SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS}"
 
 # RUNTIME_ENV_JSON contains service credentials and is passed verbatim to Ray.
 set +x
@@ -1512,7 +1563,13 @@ keys = (
     "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL", "OPENROUTER_APP_NAME",
     "SLIME_EPISODE_LOG_DIR", "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE",
     "SLIME_FUSED_EVAL_DUMP_FAILURES", "SLIME_FUSED_EVAL_USE_SGLANG_SESSION",
-    "SLIME_FUSED_REQUIRE_WEIGHT_VERSION",
+    "SLIME_FUSED_REQUIRE_WEIGHT_VERSION", "SLIME_SGLANG_BATCH_INVARIANT_LOGPROB",
+    "SLIME_SGLANG_EXACT_RMSNORM", "SLIME_DIAGNOSE_SGLANG_PREFILL_LOGPROBS",
+    "SLIME_DIAGNOSE_SGLANG_HIDDEN_STATES",
+    "SLIME_DIAGNOSE_SGLANG_FIRST_DIVERGENCE",
+    "SLIME_SGLANG_RECOMPUTE_ROLLOUT_LOGPROBS", "SLIME_SGLANG_RECOMPUTE_CONCURRENCY",
+    "SLIME_SGLANG_TRANSPORT_RETRY_TIMES",
+    "SLIME_SGLANG_TRANSPORT_RETRY_BACKOFF_SECONDS",
     "RAY_WARN_BLOCKING_GET_INSIDE_ASYNC", "TOKENIZERS_PARALLELISM",
     "VLLM_ALLOW_LONG_MAX_MODEL_LEN", "VLLM_ENGINE_ITERATION_TIMEOUT_S",
     "VLLM_WORKER_MULTIPROC_METHOD", "PYTORCH_CUDA_ALLOC_CONF",
@@ -1525,11 +1582,13 @@ keys = (
     "RLLM_RETRIEVAL_LEXRANK_MAX_SENTENCES", "RLLM_RETRIEVAL_LEXRANK_MAX_INPUT_SENTENCES",
     "RLLM_RETRIEVAL_LEXRANK_MULTIPROCESSING", "RLLM_RETRIEVAL_LEXRANK_WORKERS",
     "DOCKER_HOST", "DOCKER_API_VERSION", "WANDB_API_KEY",
-    "WANDB_DIR", "WANDB_CACHE_DIR", "HF_HOME", "TORCH_HOME", "TRITON_CACHE_DIR", "XDG_CACHE_HOME",
+    "WANDB_DIR", "WANDB_CACHE_DIR", "HF_HOME", "TORCH_HOME", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "XDG_CACHE_HOME",
+    "TORCH_COMPILE_JOB_ID", "TORCHINDUCTOR_FORCE_DISABLE_CACHES",
     "MCP_ENV_ROOT", "SLIME_MCP_ENV_ROOT", "SLIME_MCP_ENV_COPY_CONCURRENCY", "SLIME_MCP_WORKSPACE_SCOPE",
     "SLIME_LOCAL_MCP_PROCESS_ISOLATION", "SLIME_LOCAL_MCP_PROCESS_WORKERS", "SLIME_LOCAL_MCP_PROCESS_START_METHOD",
     "SLIME_LOCAL_MCP_PROCESS_TIMEOUT", "SLIME_LOCAL_MCP_LEASE_TIMEOUT", "SLIME_LOCAL_MCP_PROCESS_WARM_TIMEOUT",
-    "SLIME_LOCAL_MCP_DESCRIBE_CACHE_SIZE",
+    "SLIME_LOCAL_MCP_DESCRIBE_CACHE_SIZE", "SLIME_LOCAL_MCP_TOOLSET_CACHE_SIZE",
+    "SLIME_LOCAL_MCP_PROCESS_EAGER_WARM",
     "SLIME_FULLY_ASYNC_ADAPTIVE_CONCURRENCY", "SLIME_FULLY_ASYNC_INITIAL_CONCURRENCY",
     "SLIME_FULLY_ASYNC_MAX_CONCURRENCY", "SLIME_FULLY_ASYNC_CONCURRENCY_STEP",
     "SLIME_FULLY_ASYNC_CONCURRENCY_POLL_INTERVAL", "SLIME_FULLY_ASYNC_KEEP_ALL_GROUPS",
@@ -1560,6 +1619,7 @@ keys = (
     "FUSED_HORIZON_REWARD_TARGET_STEPS", "FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS",
     "SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER", "SLIME_TASK_FAMILY_ROI_PRIOR",
     "SLIME_TASK_FAMILY_ROI_PRIOR_STRENGTH", "SLIME_SYNC_MIN_PENDING_GROUPS",
+    "SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["PYTHONPATH"] = f"{os.environ['MEGATRON_LM_PATH']}:{os.environ['REPO_ROOT']}:{os.environ['SCRIPT_DIR']}"
@@ -1569,7 +1629,6 @@ env["NCCL_ALGO"] = "Ring"
 env["NCCL_NVLS_ENABLE"] = os.environ["HAS_NVLINK"]
 env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
 env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-env["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"
 print(json.dumps({"env_vars": env}))
 PY
 )
@@ -1592,8 +1651,12 @@ echo "Cluster: head=${MASTER_ADDR}, worker=${WORKER_ADDR}, nodes=${ACTOR_NUM_NOD
 echo "Actor GPUs: ${ACTOR_GPUS}, actor TP=${TP_SIZE}, CP=${CP_SIZE}, PP=${PP_SIZE}, rollout GPUs: ${ROLLOUT_GPUS}, rollout TP=${ROLLOUT_NUM_GPUS_PER_ENGINE}, rollout engines=${ROLLOUT_ENGINE_COUNT}, colocate=${COLOCATE}, offload_train=${OFFLOAD_TRAIN}"
 echo "Training token budgets: max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}, log_probs_max_tokens_per_gpu=${LOG_PROBS_MAX_TOKENS_PER_GPU}, log_probs_chunk_size=${LOG_PROBS_CHUNK_SIZE}, max_context_len=${MAX_CONTEXT_LEN}"
 echo "YaRN: enable=${ENABLE_YARN}, factor=${YARN_FACTOR}, original_max_position_embeddings=${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
-echo "SGLang: mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}, server_concurrency=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}"
-echo "Sync rollout admission: min_pending_groups=${SLIME_SYNC_MIN_PENDING_GROUPS}, max_pending_groups=${OVER_SAMPLING_BATCH_SIZE}"
+echo "SGLang: mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}, server_concurrency=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}, rl_on_policy_target=megatron"
+echo "Rollout collector: fully_async=${FULLY_ASYNC}, function=${ROLLOUT_FUNCTION_PATH}"
+echo "Compiler cache: force_disable=${TORCHINDUCTOR_FORCE_DISABLE_CACHES}, job_id=${TORCH_COMPILE_JOB_ID}, inductor_dir=${TORCHINDUCTOR_CACHE_DIR}, triton_dir=${TRITON_CACHE_DIR}"
+echo "SGLang abort: deadline=${SLIME_SGLANG_ABORT_TIMEOUT_SECONDS}s, http_timeout=${SLIME_SGLANG_ABORT_HTTP_TIMEOUT_SECONDS}s, retry_interval=${SLIME_SGLANG_ABORT_RETRY_INTERVAL_SECONDS}s"
+echo "SGLang transport retry: retries=${SLIME_SGLANG_TRANSPORT_RETRY_TIMES}, backoff=${SLIME_SGLANG_TRANSPORT_RETRY_BACKOFF_SECONDS}s"
+echo "Sync rollout admission: min_pending_groups=${SLIME_SYNC_MIN_PENDING_GROUPS}, mcp_only_min_pending_groups=${SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS}, max_pending_groups=${OVER_SAMPLING_BATCH_SIZE}"
 echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_SYSTEM_PROMPT}, disable_thinking=${DISABLE_THINKING}, discard_historical_thinking=${DISCARD_HISTORICAL_THINKING}, max_steps=${FUSED_MAX_STEPS}, mcp_max_steps=${FUSED_MCP_MAX_STEPS}, mcp_max_tool_calls_per_turn=${FUSED_MCP_MAX_TOOL_CALLS_PER_TURN}, web_search_max_steps=${FUSED_WEB_SEARCH_MAX_STEPS}, cli_max_steps=${CLI_MAX_STEPS}, per_step_max_tokens=${PER_STEP_MAX_TOKENS}, partial_rollout=${PARTIAL_ROLLOUT}, terminal_log_style=${TERMINAL_LOG_STYLE}, show_rollout_progress_logs=${SHOW_ROLLOUT_PROGRESS_LOGS}"
 echo "Rollout timeouts: trajectory=${FUSED_TRAJECTORY_TIMEOUT}s, group=${SLIME_ROLLOUT_GROUP_TIMEOUT}s, eval_trajectory=${FUSED_EVAL_TRAJECTORY_TIMEOUT}s"
 echo "Training batches: micro_batch=${MICRO_BATCH_SIZE}, num_steps_per_rollout=${NUM_STEPS_PER_ROLLOUT}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}, rollout_temperature=${TEMPERATURE}"
@@ -1601,12 +1664,12 @@ echo "Retrieval: train_backend=${TRAIN_RETRIEVAL_BACKEND}, train_url=${TRAIN_RET
 echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, strict=true, relax_after_groups=0; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}"
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, benchmarks=${EVAL_INCLUDE_BENCHMARKS}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, temperature=${EVAL_TEMPERATURE}, top_p=${EVAL_TOP_P}, top_k=${EVAL_TOP_K}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}"
 echo "Eval scheduling: inflight=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS}, adaptive=${EVAL_ADAPTIVE_CONCURRENCY}, mix_datasets=${EVAL_MIX_DATASETS}, termination_retries=${EVAL_TERMINATION_RETRY_TIMES}, trajectory_sample_rate=${EVAL_TRAJECTORY_SAMPLE_RATE}, dump_failures=${EVAL_DUMP_FAILURES}, native_session=${NATIVE_SGLANG_SESSION}"
-echo "OpenRouter GRM evals: enable=${ENABLE_USE_GRM_EVALS}, model=${GRM_MODEL}, mode=${GRM_MODE}, concurrency=${GRM_CONCURRENCY}, max_connections=${GRM_MAX_CONNECTIONS}, timeout=${GRM_TIMEOUT}, retries=${GRM_MAX_RETRIES}, max_input_tokens=${GRM_MAX_INPUT_TOKENS}, max_new_tokens=${GRM_MAX_NEW_TOKENS}, custom_rm=${GRM_CUSTOM_RM_PATH}"
-echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, normalize_advantages=${NORMALIZE_ADVANTAGES}, kl_coef=${KL_COEF}, lr=${LR}, eps_clip=${EPS_CLIP:-0.2}, eps_clip_high=${EPS_CLIP_HIGH:-0.28}"
-echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING:-0}, path=${BUFFER_FILTER_PATH:-${ENABLE_QUOTA_BUCKET_SAMPLING:+slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps}}"
+echo "OpenRouter GRM: train=${ENABLE_USE_GRM_TRAIN}, train_model=${TRAIN_GRM_MODEL}, evals=${ENABLE_USE_GRM_EVALS}, eval_model=${EVAL_GRM_MODEL}, mode=${GRM_MODE}, concurrency=${GRM_CONCURRENCY}, max_connections=${GRM_MAX_CONNECTIONS}, timeout=${GRM_TIMEOUT}, retries=${GRM_MAX_RETRIES}, max_input_tokens=${GRM_MAX_INPUT_TOKENS}, max_new_tokens=${GRM_MAX_NEW_TOKENS}, custom_rm=${GRM_CUSTOM_RM_PATH}"
+echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, normalize_advantages=${NORMALIZE_ADVANTAGES}, kl_coef=${KL_COEF}, lr=${LR}, eps_clip=${EPS_CLIP}, eps_clip_high=${EPS_CLIP_HIGH}"
+echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING}, path=${BUFFER_FILTER_PATH:-<none>}"
 echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}"
 echo "Horizon reward shaping: enable=${HORIZON_REWARD_SHAPING}, min_multiplier=${FUSED_HORIZON_REWARD_MIN_MULTIPLIER}, gamma=${FUSED_HORIZON_REWARD_GAMMA}, step_weight=${FUSED_HORIZON_REWARD_STEP_WEIGHT}, tool_call_weight=${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT}, target_steps=${FUSED_HORIZON_REWARD_TARGET_STEPS}, target_tool_calls=${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-target_steps-1}"
-echo "Rollout task family quotas: ${ROLLOUT_TASK_FAMILY_QUOTAS:-<none>}; candidate_multiplier=${SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER}"
+echo "Post-filter rollout task family quotas: ${ROLLOUT_TASK_FAMILY_QUOTAS:-<none>}; candidate_multiplier=${SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER}"
 echo "Tail guard: enable=${TAIL_GUARD}, time_guard=${TAIL_GUARD_TIME_GUARD}, time_multiplier=${TAIL_GUARD_TIME_MULTIPLIER}, time_slack=${TAIL_GUARD_TIME_SLACK_SECONDS}, min_completion_ratio=${TAIL_GUARD_MIN_COMPLETION_RATIO}"
 echo "Credit assignment: enable=${CREDIT_ASSIGNMENT_ENABLE}, tool_parser_error=${CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR}, repeated_search_query=${CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY}, too_many_tool_calls=${CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS}, ngram_repetition=${CREDIT_ASSIGNMENT_NGRAM_REPETITION}(n=${CREDIT_ASSIGNMENT_NGRAM_REPETITION_N}, threshold=${CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD}, min_tokens=${CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS}), search_bypass=${CREDIT_ASSIGNMENT_SEARCH_BYPASS}, direct_submit_without_tool=${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL}, mixed_tool_and_answer=${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER}, tail_guard_early_stop=${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP}"
 

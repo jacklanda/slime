@@ -102,6 +102,18 @@ def test_openrouter_grm_does_not_send_deepseek_reasoning_parameter_to_gemini():
     assert payload["response_format"] == {"type": "json_object"}
 
 
+def test_openrouter_grm_selects_train_and_eval_models():
+    args = Args()
+    args.train_grm_model = "train/judge"
+    args.eval_grm_model = "eval/judge"
+
+    train_payload = openrouter_grm._build_payload(args, _sample())
+    eval_payload = openrouter_grm._build_payload(args, _sample(), evaluation=True)
+
+    assert train_payload["model"] == "train/judge"
+    assert eval_payload["model"] == "eval/judge"
+
+
 def test_mcp_atlas_grm_scores_each_claim_and_averages_partial_credit(monkeypatch):
     client = SequencedFakeClient(
         [
@@ -516,6 +528,58 @@ def test_openrouter_grm_parse_failure_falls_back_to_rule_based(monkeypatch):
     assert client.calls == 1
 
 
+def test_train_grm_timeout_falls_back_to_final_answer_exact_match(monkeypatch):
+    class TimingOutClient:
+        is_closed = False
+
+        async def post(self, path, json):
+            raise TimeoutError("judge timed out")
+
+    args = Args()
+    sample = Sample(
+        response=(
+            '<tool_call>{"name":"finish","arguments":'
+            '{"result":"The Eiffel Tower!"}}</tool_call>'
+        ),
+        label={"ground_truth": "eiffel tower"},
+        metadata={},
+    )
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", TimingOutClient())
+    monkeypatch.setattr(openrouter_grm, "_SEMAPHORE", None)
+
+    reward = asyncio.run(openrouter_grm.reward_func(args, sample, evaluation=False))
+
+    assert reward == 1.0
+    assert sample.metadata["grm"]["fallback"] is True
+    assert sample.metadata["grm"]["fallback_rm_type"] == "exact_match"
+    assert "judge timed out" in sample.metadata["grm"]["error"]
+
+
+def test_train_grm_failure_exact_match_uses_last_finish_result(monkeypatch):
+    class FailingClient:
+        is_closed = False
+
+        async def post(self, path, json):
+            raise RuntimeError("boom")
+
+    args = Args()
+    sample = Sample(
+        response=(
+            '<tool_call>{"name":"finish","arguments":{"result":"correct"}}</tool_call>\n'
+            '<tool_call>{"name":"finish","arguments":{"result":"wrong"}}</tool_call>'
+        ),
+        label="correct",
+        metadata={},
+    )
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", FailingClient())
+    monkeypatch.setattr(openrouter_grm, "_SEMAPHORE", None)
+
+    reward = asyncio.run(openrouter_grm.reward_func(args, sample, evaluation=False))
+
+    assert reward == 0.0
+    assert sample.metadata["grm"]["fallback_rm_type"] == "exact_match"
+
+
 def test_openrouter_grm_failure_for_benchmark_semantic_match_uses_failure_reward(monkeypatch):
     class FailingClient:
         is_closed = False
@@ -574,6 +638,7 @@ def test_eval_generate_and_rm_rescores_generated_samples_with_grm(monkeypatch):
         generated = _sample()
         generated.reward = 0.0
         generated.status = Sample.Status.COMPLETED
+        generated.metadata["rm_type"] = "benchmark_verifier"
         return [generated]
 
     class ArgsWithGenerate(Args):
@@ -595,6 +660,126 @@ def test_eval_generate_and_rm_rescores_generated_samples_with_grm(monkeypatch):
 
     assert samples[0].reward == 1.0
     assert samples[0].custom_rm_path == args.grm_custom_rm_path
+
+
+def test_train_generate_and_rm_rescores_generated_samples_with_grm(monkeypatch):
+    async def fake_generate(args, sample, sampling_params, evaluation=False):
+        generated = _sample()
+        generated.reward = 0.0
+        generated.status = Sample.Status.COMPLETED
+        return [generated]
+
+    class ArgsWithGenerate(Args):
+        enable_use_grm_train = True
+        partial_rollout = False
+        mask_offpolicy_in_partial_rollout = False
+        group_rm = False
+        custom_rm_path = None
+        custom_generate_function_path = None
+        grm_custom_rm_path = "slime.rollout.rm_hub.openrouter_grm.reward_func"
+
+    args = ArgsWithGenerate()
+    prompt_sample = Sample(generate_function_path="tests.fake_generate")
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda path: fake_generate)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: types.SimpleNamespace(semaphore=_NoopAsyncContext(), aborted=False, dp_rank_context=_noop_context))
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", FakeClient({"choices": [{"message": {"content": '{"score": 1}'}}]}))
+    monkeypatch.setattr(openrouter_grm, "_SEMAPHORE", None)
+
+    samples = asyncio.run(sglang_rollout.generate_and_rm(args, prompt_sample, {}, evaluation=False))
+
+    assert samples[0].reward == 1.0
+    assert samples[0].custom_rm_path == args.grm_custom_rm_path
+    assert samples[0].metadata["grm"]["score"] == 1.0
+    assert samples[0].metadata["grm"]["evaluation"] is False
+
+
+def test_train_generate_and_rm_preserves_mcp_environment_reward(monkeypatch):
+    async def fake_generate(args, sample, sampling_params, evaluation=False):
+        return [
+            Sample(
+                index=0,
+                prompt="Use the available MCP tools.",
+                response='<tool_call>{"name":"finish","arguments":{"result":"final report"}}</tool_call>',
+                label={"ground_truth": None, "style": "rule"},
+                reward=1.0,
+                status=Sample.Status.COMPLETED,
+                metadata={"fused_task_type": "mcp"},
+            )
+        ]
+
+    class ArgsWithGenerate(Args):
+        enable_use_grm_train = True
+        partial_rollout = False
+        mask_offpolicy_in_partial_rollout = False
+        group_rm = False
+        custom_rm_path = None
+        custom_generate_function_path = None
+        grm_custom_rm_path = "slime.rollout.rm_hub.openrouter_grm.reward_func"
+
+    args = ArgsWithGenerate()
+    prompt_sample = Sample(generate_function_path="tests.fake_generate")
+    client = FakeClient({"choices": [{"message": {"content": '{"score": 0}'}}]})
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda path: fake_generate)
+    monkeypatch.setattr(
+        sglang_rollout,
+        "GenerateState",
+        lambda args: types.SimpleNamespace(
+            semaphore=_NoopAsyncContext(), aborted=False, dp_rank_context=_noop_context
+        ),
+    )
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", client)
+    monkeypatch.setattr(openrouter_grm, "_SEMAPHORE", None)
+
+    samples = asyncio.run(sglang_rollout.generate_and_rm(args, prompt_sample, {}, evaluation=False))
+
+    assert samples[0].reward == 1.0
+    assert samples[0].custom_rm_path is None
+    assert "grm" not in samples[0].metadata
+    assert client.calls == 0
+
+
+def test_eval_generate_and_rm_preserves_mcp_dataset_verifier_reward(monkeypatch):
+    async def fake_generate(args, sample, sampling_params, evaluation=False):
+        return [
+            Sample(
+                index=0,
+                prompt="Use the available MCP tools.",
+                response='<tool_call>{"name":"finish","arguments":{"result":"final report"}}</tool_call>',
+                label=["claim"],
+                reward=0.5,
+                status=Sample.Status.COMPLETED,
+                metadata={"fused_task_type": "mcp"},
+            )
+        ]
+
+    class ArgsWithGenerate(Args):
+        partial_rollout = False
+        mask_offpolicy_in_partial_rollout = False
+        group_rm = False
+        custom_rm_path = None
+        custom_generate_function_path = None
+        grm_custom_rm_path = "slime.rollout.rm_hub.openrouter_grm.reward_func"
+
+    args = ArgsWithGenerate()
+    prompt_sample = Sample(generate_function_path="tests.fake_generate")
+    client = FakeClient({"choices": [{"message": {"content": '{"score": 0}'}}]})
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda path: fake_generate)
+    monkeypatch.setattr(
+        sglang_rollout,
+        "GenerateState",
+        lambda args: types.SimpleNamespace(
+            semaphore=_NoopAsyncContext(), aborted=False, dp_rank_context=_noop_context
+        ),
+    )
+    monkeypatch.setattr(openrouter_grm, "_CLIENT", client)
+    monkeypatch.setattr(openrouter_grm, "_SEMAPHORE", None)
+
+    samples = asyncio.run(sglang_rollout.generate_and_rm(args, prompt_sample, {}, evaluation=True))
+
+    assert samples[0].reward == 0.5
+    assert samples[0].custom_rm_path is None
+    assert "grm" not in samples[0].metadata
+    assert client.calls == 0
 
 
 class _NoopAsyncContext:
