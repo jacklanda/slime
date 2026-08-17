@@ -188,20 +188,13 @@ class RolloutDataSource(DataSource):
         if not self.args.rollout_global_dataset:
             return
 
-        state_dict = self._rollout_cursor_snapshots.pop(rollout_id, None) or {
-            "sample_offset": self.sample_offset,
-            "epoch_id": self.epoch_id,
-            "sample_group_index": self.sample_group_index,
-            "sample_index": self.sample_index,
-            "deferred_prompt_samples": self._deferred_prompt_samples,
-            "metadata": self.metadata,
-        }
+        state_dict = self._rollout_cursor_snapshots.pop(rollout_id, None) or self.state_dict()
         path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(state_dict, path)
 
-    def snapshot_cursor_for_rollout(self, rollout_id):
-        self._rollout_cursor_snapshots[rollout_id] = {
+    def state_dict(self):
+        return {
             "sample_offset": self.sample_offset,
             "epoch_id": self.epoch_id,
             "sample_group_index": self.sample_group_index,
@@ -209,6 +202,23 @@ class RolloutDataSource(DataSource):
             "deferred_prompt_samples": copy.deepcopy(self._deferred_prompt_samples),
             "metadata": copy.deepcopy(self.metadata),
         }
+
+    def state_dict_for_rollout(self, rollout_id):
+        snapshot = self._rollout_cursor_snapshots.get(rollout_id)
+        return copy.deepcopy(snapshot) if snapshot is not None else self.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.sample_offset = state_dict.get("sample_offset", 0)
+        self.epoch_id = state_dict.get("epoch_id", 0)
+        self.sample_group_index = state_dict.get("sample_group_index", 0)
+        self.sample_index = state_dict.get("sample_index", 0)
+        self._deferred_prompt_samples = state_dict.get("deferred_prompt_samples", [])
+        self.metadata = state_dict.get("metadata", {})
+        if self.args.rollout_global_dataset and self.args.rollout_shuffle and self.dataset is not None:
+            self.dataset.shuffle(self.epoch_id)
+
+    def snapshot_cursor_for_rollout(self, rollout_id):
+        self._rollout_cursor_snapshots[rollout_id] = self.state_dict()
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:
@@ -224,16 +234,9 @@ class RolloutDataSource(DataSource):
 
         logger.info(f"load metadata from {path}")
         logger.info(f"load metadata: {self.metadata}")
-        state_dict = torch.load(path)
-        self.sample_offset = state_dict.get("sample_offset", 0)
-        self.epoch_id = state_dict.get("epoch_id", 0)
-        self.sample_group_index = state_dict.get("sample_group_index", 0)
-        self.sample_index = state_dict.get("sample_index", 0)
-        self._deferred_prompt_samples = state_dict.get("deferred_prompt_samples", [])
-        self.metadata = state_dict.get("metadata", {})
-
-        if self.args.rollout_global_dataset and self.args.rollout_shuffle and self.dataset is not None:
-            self.dataset.shuffle(self.epoch_id)
+        # Rollout state contains Sample objects, so it is not a weights-only checkpoint.
+        state_dict = torch.load(path, weights_only=False)
+        self.load_state_dict(state_dict)
 
     def __len__(self) -> int:
         if self.dataset is None:
@@ -307,6 +310,15 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             ), f"the length of the elements of samples must be equal to n_samples_per_prompt, got {len(samples[i])} != {self.args.n_samples_per_prompt}"
             group = samples[i]  # type: ignore
             self.buffer.append(group)
+
+    def state_dict(self):
+        state = super().state_dict()
+        state["buffer"] = copy.deepcopy(self.buffer)
+        return state
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self.buffer = state_dict.get("buffer", [])
 
     # TODO remove
     def update_metadata(self, metadata: dict):

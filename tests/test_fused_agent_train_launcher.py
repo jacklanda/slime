@@ -668,7 +668,23 @@ def test_odyssey_launchers_balance_webqa_and_mcp_training_groups():
         assert '--rollout-task-family-quotas "${ROLLOUT_TASK_FAMILY_QUOTAS}"' in launcher
         assert "--rollout-task-family-admission-only" not in launcher
         assert "ROLLOUT_BATCH_SIZE must be even for the 50/50 webqa/mcp training mix" in launcher
-    assert "--rollout-task-family-top-mean-steps" in launchers[0]
+        assert 'export FUSED_WEBQA_REWARD_MATCH_MODE="normalized_target_span"' in launcher
+        assert '"FUSED_WEBQA_MIN_UNIQUE_SEARCHES", "FUSED_WEBQA_REWARD_MATCH_MODE",' in launcher
+        assert "FUSED_WEBQA_ALIAS_REGISTRY_PATH" in launcher
+        assert "SLIME_ROLLOUT_PREFILTER_AUDIT_DIR" in launcher
+        assert "webqa_alias_registry.json" in launcher
+        assert "prefilter_audit" in launcher
+    multinode_launcher = launchers[0]
+    assert 'ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-true}"' in multinode_launcher
+    assert '--rollout-task-family-top-mean-steps) ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS=' in multinode_launcher
+    assert 'if is_truthy "${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS}"; then' in multinode_launcher
+    assert 'ROLLOUT_ARGS+=(--rollout-task-family-top-mean-steps)' in multinode_launcher
+    assert 'USE_FAULT_TOLERANCE="${USE_FAULT_TOLERANCE:-true}"' in multinode_launcher
+    assert 'MISC_ARGS+=(--use-fault-tolerance)' in multinode_launcher
+    assert '--replay-rollout-id) REPLAY_ROLLOUT_ID=' in multinode_launcher
+    assert 'SLIME_DIAGNOSTIC_ROLLOUT_DATA="${DUMP_DETAILS}/rollout_data/${REPLAY_ROLLOUT_ID}.pt"' in multinode_launcher
+    assert 'NUM_ROLLOUT=$((REPLAY_ROLLOUT_ID + 1))' in multinode_launcher
+    assert 'MISC_ARGS+=(--debug-train-only)' in multinode_launcher
 
 
 @pytest.mark.unit

@@ -629,6 +629,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     recoverable_tool_parser_error_spans: list[tuple[int, int] | None] = []
     tool_parser_syntax_repairs: list[str] = []
     tool_parser_schema_coercions: list[str] = []
+    shadow_finish_repairs: list[str] = []
     eval_response_anomaly_info: dict[str, Any] = {}
     deepsearch_phase = "plan"
     deepsearch_state = dict(dsw.EMPTY_STATE)
@@ -934,6 +935,52 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             if deepsearch_world:
                 response = dsw.ensure_think_tags(response)
                 parsed_actions = await asyncio.to_thread(parser.parse, response)
+            shadow_finish_rejected = False
+            if env.mode == "mcp":
+                parsed_finish_is_valid = False
+                if len(parsed_actions) == 1 and parsed_actions[0].name == "finish":
+                    parsed_finish_is_valid = not await asyncio.to_thread(
+                        env.finish_validation_errors,
+                        (parsed_actions[0].arguments or {}).get("result"),
+                    )
+                finish_result_was_coerced = any(
+                    coercion.startswith("finish.result: str -> ")
+                    for coercion in (getattr(parser, "last_schema_coercions", ()) or ())
+                )
+                complete_valid_finish = (
+                    parsed_finish_is_valid
+                    and not finish_result_was_coerced
+                    and not response.strip().lower().startswith("<answer>")
+                )
+                shadow_finish = (
+                    None
+                    if complete_valid_finish
+                    else await asyncio.to_thread(parser.repair_finish_shadow, response, parsed_actions)
+                )
+                current_shadow_repairs = list(getattr(parser, "last_shadow_finish_repairs", ()) or ())
+                if shadow_finish is not None and current_shadow_repairs:
+                    validation_errors = await asyncio.to_thread(
+                        env.finish_validation_errors,
+                        (shadow_finish.arguments or {}).get("result"),
+                    )
+                    if validation_errors:
+                        parsed_actions = []
+                        shadow_finish_rejected = True
+                        parser.last_schema_errors = [
+                            "shadow-repaired finish.result does not match the required answer schema: "
+                            + error
+                            for error in validation_errors
+                        ]
+                        parser.last_schema_error_spans = [None] * len(validation_errors)
+                        parser.last_schema_error_kinds = ["finish_answer_schema"] * len(validation_errors)
+                    else:
+                        parsed_actions = [shadow_finish]
+                        shadow_finish_repairs.extend(current_shadow_repairs)
+                        if not evaluation:
+                            response_loss_mask = [0] * len(output_ids)
+                        parser.last_schema_errors = []
+                        parser.last_schema_error_spans = []
+                        parser.last_schema_error_kinds = []
             _record_tool_parser_errors(
                 args=args,
                 base_sample=base_sample,
@@ -1330,7 +1377,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             recoverable_tool_schema_errors = _has_recoverable_tool_schema_errors(parser, parsed_actions)
             if (
                 detect_abnormal_trajectories
-                and credit_assignment_tool_parser_error
+                and (credit_assignment_tool_parser_error or shadow_finish_rejected)
                 and getattr(parser, "last_schema_errors", ())
                 and not recoverable_tool_schema_errors
             ):
@@ -1752,6 +1799,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 raw_observations: list[Any] = []
                 executed_actions: list[ToolCall] = []
                 env_infos: list[dict[str, Any]] = []
+                lazy_system_declarations: list[str] = []
                 batch_done = False
                 batch_reward = 0.0
                 for action in actions:
@@ -1761,7 +1809,10 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     obs, reward, done, env_info = await env.step(action)
                     lazy_tool_declarations = _refresh_lazy_mcp_tools(env, tools, parser, env_info or {})
                     if lazy_tool_declarations:
-                        obs = str(obs) + lazy_tool_declarations
+                        if isinstance(parser, Gemma4ToolParser):
+                            lazy_system_declarations.append(lazy_tool_declarations)
+                        else:
+                            obs = str(obs) + lazy_tool_declarations
                     executed_actions.append(action)
                     raw_observations.append(obs)
                     formatted_observations.append(_format_tool_observation(parser, action.name, obs))
@@ -1805,6 +1856,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 _append_tool_observation_messages(
                     messages, parser, executed_actions, formatted_observations, raw_observations
                 )
+                if lazy_system_declarations:
+                    messages.append({"role": "system", "content": "".join(lazy_system_declarations)})
                 observation = formatted_obs
                 if batch_done:
                     break
@@ -1824,7 +1877,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             base_sample.metadata["rollout_stage"] = "verifier" if action.name == "finish" else "tool_operation"
             obs, reward, done, env_info = await env.step(action)
             lazy_tool_declarations = _refresh_lazy_mcp_tools(env, tools, parser, env_info or {})
-            if lazy_tool_declarations:
+            if lazy_tool_declarations and not isinstance(parser, Gemma4ToolParser):
                 obs = str(obs) + lazy_tool_declarations
             step_env_time = time.time() - env_start
             env_time += step_env_time
@@ -1937,6 +1990,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 )
             )
             _append_tool_observation_message(messages, parser, action, formatted_obs, obs)
+            if lazy_tool_declarations and isinstance(parser, Gemma4ToolParser):
+                messages.append({"role": "system", "content": lazy_tool_declarations})
             observation = formatted_obs
             if done:
                 break
@@ -2076,6 +2131,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         common_metadata["tool_parser_syntax_repairs"] = tool_parser_syntax_repairs
     if tool_parser_schema_coercions:
         common_metadata["tool_parser_schema_coercions"] = tool_parser_schema_coercions
+    if shadow_finish_repairs:
+        common_metadata["tool_parser_shadow_finish_repairs"] = shadow_finish_repairs
+        common_metadata["tool_parser_shadow_finish_policy_masked"] = not evaluation
     if prompt_equal_loss:
         instance_id = (base_sample.metadata or {}).get("instance_id")
         if instance_id is None:
@@ -2435,6 +2493,11 @@ def _append_tool_observation_messages(
     ]
     assistant_message = parser.assistant_tool_results_message(actions, payloads)
     if assistant_message is not None:
+        if isinstance(parser, Gemma4ToolParser):
+            # The official Gemma4 history keeps the exact model turn and appends
+            # one role:tool turn per result. Preserve that raw turn here; the
+            # Gemma4 serializer uses tool_calls only as a structured fallback.
+            assistant_message["content"] = messages[-1].get("content", "")
         messages[-1] = assistant_message
         return
     for formatted_observation in formatted_observations:
@@ -2481,11 +2544,19 @@ def _valid_tool_names(tools: list[dict]) -> set[str]:
 def _refresh_lazy_mcp_tools(env, tools: list[dict], parser, info: dict[str, Any]) -> str:
     if env.mode != "mcp" or not info.get("tools/schema_changed"):
         return ""
+    previous_tool_names = _declared_tool_names(tools)
     current_tools = env.tools()
     tools[:] = current_tools
     parser.valid_tools = _valid_tool_names(current_tools)
     schemas_json = "\n".join(json.dumps(schema, ensure_ascii=False) for schema in current_tools)
     declarations = parser.get_tool_prompt(schemas_json)
+    if isinstance(parser, Gemma4ToolParser):
+        new_tools = [
+            schema
+            for schema in current_tools
+            if _declared_tool_names([schema]) - previous_tool_names
+        ]
+        return _inline_gemma4_tool_declarations(new_tools)
     return (
         "\n\nThe requested tool group is now loaded. The following tool declarations are available "
         "for every later turn:\n"
@@ -3366,61 +3437,25 @@ def _render_gemma4_tito_delta_ids(
     tools: list[dict] | None,
     disable_thinking: bool,
 ) -> list[int]:
-    """Render only the Gemma4 tool-result suffix after a generated action.
-
-    Gemma4 replaces the last raw assistant message with a structured assistant
-    message containing both the parsed tool call and its result. Re-rendering
-    that message would replay and possibly re-tokenize an action whose exact ids
-    are already in the TiTO prefix. Build an otherwise identical assistant turn
-    containing only the result, then take the suffix after the generation prompt.
-    """
-    if len(old_messages) != len(new_messages) or old_messages[:-1] != new_messages[:-1]:
-        raise ValueError("Gemma4 TITO requires only the last assistant message to be replaced")
+    """Append official Gemma4 tool turns without re-tokenizing the action."""
+    if len(new_messages) < len(old_messages) or old_messages[:-1] != new_messages[: len(old_messages) - 1]:
+        raise ValueError("Gemma4 TITO requires the last assistant message to be replaced append-only")
     if not old_messages or old_messages[-1].get("role") != "assistant":
         raise ValueError("Gemma4 TITO requires a previous assistant action")
 
-    replacement = new_messages[-1]
+    replacement_index = len(old_messages) - 1
+    replacement = new_messages[replacement_index]
     if replacement.get("role") != "assistant" or not replacement.get("tool_responses"):
         raise ValueError("Gemma4 TITO requires a structured assistant tool response")
 
-    response_only = {
-        "role": "assistant",
-        "tool_responses": copy.deepcopy(replacement["tool_responses"]),
-    }
-    base_ids = _render_prompt_ids(
-        tokenizer,
-        new_messages[:-1],
-        tools=tools,
-        disable_thinking=disable_thinking,
-    )
-    with_response_ids = _render_prompt_ids(
-        tokenizer,
-        [*new_messages[:-1], response_only],
-        tools=tools,
-        disable_thinking=disable_thinking,
-    )
-    if not _has_token_prefix(with_response_ids, base_ids):
-        raise ValueError("Gemma4 chat template did not produce an append-only tool-response suffix")
-    delta_ids = list(with_response_ids[len(base_ids) :])
-
-    # A native Gemma4 tool call normally stops after generating the opening
-    # <|tool_response> handoff token.  The response-only chat-template suffix
-    # starts with that same token.  Replaying it creates
-    # ``<|tool_response><|tool_response>...`` and the model commonly answers
-    # with one more empty handoff instead of another action.  SGLang may omit
-    # the stop token from output_ids, so remove the suffix opener only when it
-    # is already the last served token.
-    tool_response_ids = tokenizer.encode("<|tool_response>", add_special_tokens=False)
-    if hasattr(tool_response_ids, "tolist"):
-        tool_response_ids = tool_response_ids.tolist()
-    tool_response_ids = [int(token_id) for token_id in tool_response_ids]
-    if (
-        tool_response_ids
-        and prefix_ids
-        and prefix_ids[-len(tool_response_ids) :] == tool_response_ids
-        and delta_ids[: len(tool_response_ids)] == tool_response_ids
-    ):
-        delta_ids = delta_ids[len(tool_response_ids) :]
+    appended_messages = new_messages[replacement_index + 1 :]
+    suffix = _render_gemma4_tool_turn_suffix(replacement, appended_messages, add_generation_prompt=True)
+    delta_ids = _tokenize_text(tokenizer, suffix)
+    for rendered_boundary in ("<turn|>\n", "<turn|>"):
+        boundary_ids = _tokenize_text(tokenizer, rendered_boundary)
+        if prefix_ids and boundary_ids and prefix_ids[-len(boundary_ids) :] == boundary_ids:
+            delta_ids = delta_ids[len(boundary_ids) :]
+            break
     return delta_ids
 
 
@@ -3476,17 +3511,32 @@ def _apply_chat_template(
     disable_thinking: bool,
 ):
     native_tools = _chat_template_accepts_native_tools(tokenizer)
+    gemma4_model = _tito_model_type(getattr(tokenizer, "name_or_path", None)) == "gemma4"
+    gemma4_tools = bool(tools) and gemma4_model
+    if gemma4_tools:
+        # Gemma4's bundled template assumes every property has one scalar
+        # ``type`` and silently renders union schemas as an empty type. Keep the
+        # declarations in the official system turn, but use the schema-complete
+        # formatter that is also used by the parser contract.
+        messages = _messages_with_inline_gemma4_tools(messages, tools or [])
     messages = _prepare_messages_for_chat_template(
         messages,
         disable_thinking=disable_thinking,
         add_empty_reasoning=not native_tools,
     )
+    if gemma4_model:
+        rendered = _render_gemma4_official_messages(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=not disable_thinking,
+        )
+        return _tokenize_text(tokenizer, rendered) if tokenize else rendered
     kwargs = {
         "tokenize": tokenize,
         "add_generation_prompt": add_generation_prompt,
         "enable_thinking": not disable_thinking,
     }
-    if tools and native_tools:
+    if tools and native_tools and not gemma4_tools:
         kwargs["tools"] = tools
     try:
         return tokenizer.apply_chat_template(messages, **kwargs)
@@ -3557,6 +3607,80 @@ def _inline_gemma4_tool_declarations(tools: list[dict]) -> str:
         if declaration:
             declarations.append(f"<|tool>{declaration}<tool|>")
     return "".join(declarations)
+
+
+def _render_gemma4_tool_output(response: Any) -> str:
+    if isinstance(response, dict) and set(response) == {"value"}:
+        response = response["value"]
+    if isinstance(response, str):
+        return response
+    return json.dumps(response, ensure_ascii=False, default=str)
+
+
+def _render_gemma4_tool_turn_suffix(
+    assistant_message: dict[str, Any],
+    appended_messages: list[dict[str, Any]],
+    *,
+    add_generation_prompt: bool,
+) -> str:
+    chunks = ["<turn|>\n"]
+    for tool_response in assistant_message.get("tool_responses") or []:
+        chunks.append("<|turn>tool\n")
+        chunks.append(_render_gemma4_tool_output(tool_response.get("response")))
+        chunks.append("<turn|>\n")
+    for message in appended_messages:
+        chunks.append(_render_gemma4_message(message))
+    if add_generation_prompt:
+        chunks.append("<|turn>model\n")
+    return "".join(chunks)
+
+
+def _render_gemma4_message(message: dict[str, Any]) -> str:
+    role = "model" if message.get("role") == "assistant" else str(message.get("role"))
+    chunks = [f"<|turn>{role}\n"]
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        chunks.append(content.strip())
+    elif role == "model":
+        reasoning = message.get("reasoning") or message.get("reasoning_content")
+        if reasoning:
+            chunks.append(f"<|channel>thought\n{reasoning}\n<channel|>")
+        for tool_call in message.get("tool_calls") or []:
+            function = tool_call.get("function", tool_call)
+            arguments = function.get("arguments") or {}
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+            chunks.append(Gemma4ToolParser().format_action(ToolCall(str(function.get("name", "")), arguments)))
+    chunks.append("<turn|>\n")
+    if role == "model":
+        for tool_response in message.get("tool_responses") or []:
+            chunks.append("<|turn>tool\n")
+            chunks.append(_render_gemma4_tool_output(tool_response.get("response")))
+            chunks.append("<turn|>\n")
+    return "".join(chunks)
+
+
+def _render_gemma4_official_messages(
+    messages: list[dict[str, Any]],
+    *,
+    add_generation_prompt: bool,
+    enable_thinking: bool,
+) -> str:
+    chunks = ["<bos>"]
+    for index, message in enumerate(messages):
+        if index == 0 and message.get("role") == "system" and enable_thinking:
+            content = str(message.get("content") or "").strip()
+            if not content.startswith("<|think|>"):
+                message = {**message, "content": "<|think|>\n" + content}
+        chunks.append(_render_gemma4_message(message))
+    if add_generation_prompt:
+        chunks.append("<|turn>model\n")
+    return "".join(chunks)
 
 
 def _prepare_messages_for_chat_template(

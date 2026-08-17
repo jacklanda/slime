@@ -1285,20 +1285,23 @@ def save(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
     """
     args = get_args()
-    if should_disable_forward_pre_hook(args):
+    pre_hook_disabled = should_disable_forward_pre_hook(args)
+    if pre_hook_disabled:
         disable_forward_pre_hook(model)
-    save_checkpoint(
-        iteration,
-        model,
-        optimizer,
-        opt_param_scheduler,
-        num_floating_point_operations_so_far=0,
-        checkpointing_context=None,
-        train_data_iterator=None,
-        preprocess_common_state_dict_fn=None,
-    )
-    if should_disable_forward_pre_hook(args):
-        enable_forward_pre_hook(model)
+    try:
+        save_checkpoint(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far=0,
+            checkpointing_context=None,
+            train_data_iterator=None,
+            preprocess_common_state_dict_fn=None,
+        )
+    finally:
+        if pre_hook_disabled:
+            enable_forward_pre_hook(model)
 
 
 def initialize_model_and_optimizer(args: Namespace, role: str = "actor") -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:

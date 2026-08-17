@@ -2,10 +2,8 @@ import os
 
 import torch
 
-from slime.rollout.filter_hub.base_types import DynamicFilterOutput
+from slime.rollout.filter_hub.base_types import DynamicFilterOutput, reward_baseline_samples
 from slime.rollout.failure_types import FailureClass
-from slime.utils.credit_assignment import CreditAssignmentConfig, excluded_from_reward_baseline
-from slime.utils.prompt_equal import has_multi_segment_trajectories, trajectory_level_samples, uses_prompt_equal_loss
 from slime.utils.types import Sample
 
 __all__ = [
@@ -98,22 +96,9 @@ def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
     failure_class = group_failure_class(samples)
     if failure_class is not None:
         return DynamicFilterOutput(keep=False, reason=failure_class.value)
-    if uses_prompt_equal_loss(samples) or has_multi_segment_trajectories(samples):
-        # Judge variance on trajectory-level rewards so sparse placeholders or
-        # legacy duplicated segment rewards cannot fake or dilute the std.
-        reward_samples = trajectory_level_samples(samples)
-    else:
-        reward_samples = samples
-
-    credit_config = CreditAssignmentConfig.from_args(args)
-    if credit_config.enable:
-        clean_samples = [
-            sample
-            for sample in reward_samples
-            if not excluded_from_reward_baseline(sample.metadata, credit_config)
-        ]
-        if clean_samples:
-            reward_samples = clean_samples
+    # Keep this selection shared with reward shadow metrics so reported ROI
+    # uses exactly the same trajectory and credit-assignment exclusions.
+    reward_samples = reward_baseline_samples(args, samples)
 
     rewards = [sample.get_reward_value(args) for sample in reward_samples]
     reward_values = torch.tensor(rewards, dtype=torch.float64)

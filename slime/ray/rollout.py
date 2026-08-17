@@ -97,7 +97,14 @@ _SGLANG_DECODE_PERF_FIELDS = (
 )
 
 
-def _write_debug_rollout_data(args, data, rollout_id: int, evaluation: bool, path: Path) -> None:
+def _write_debug_rollout_data(
+    args,
+    data,
+    rollout_id: int,
+    evaluation: bool,
+    path: Path,
+    data_source_state: dict[str, Any] | None = None,
+) -> None:
     if evaluation:
         dump_samples = [sample for info in data.values() for sample in info["samples"]]
     else:
@@ -125,6 +132,8 @@ def _write_debug_rollout_data(args, data, rollout_id: int, evaluation: bool, pat
         "task_groups": list(task_groups.values()),
         "samples": [sample.to_dict() for sample in dump_samples],
     }
+    if data_source_state is not None:
+        dump_data["data_source_state"] = data_source_state
     temp_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(dump_data, temp_path)
     temp_path.replace(path)
@@ -611,6 +620,23 @@ class ServerGroup:
                 )
                 self.mark_engine_group_dead(rollout_engine_id)
 
+    def mark_unavailable_actors(self) -> None:
+        """Mark actor or server-process deaths without issuing a generation request."""
+        for rollout_engine_id, engine in enumerate(self.engines):
+            if engine is None:
+                continue
+            try:
+                if not ray.get(engine.health_actor.remote()):
+                    raise RuntimeError("SGLang server process is not alive")
+            except Exception as exc:
+                logger.error(
+                    "Actor health check failed for rollout engine %s (worker_type=%s): %s",
+                    rollout_engine_id,
+                    self.worker_type,
+                    exc,
+                )
+                self.mark_engine_group_dead(rollout_engine_id)
+
     def mark_engine_group_dead(self, rollout_engine_id: int) -> None:
         """Stop and clear all Ray actors that belong to one logical engine."""
         logger.info(f"Marking rollout engine group {rollout_engine_id} dead (worker_type={self.worker_type})...")
@@ -782,6 +808,30 @@ class RolloutServer:
                     ]
                 )
 
+    @staticmethod
+    def _resolve_lifecycle_operations(operations, operation_name: str):
+        """Resolve concurrent engine operations while isolating dead logical engines."""
+        results = []
+        failed_groups = set()
+        for group, rollout_engine_id, ref in operations:
+            group_key = (id(group), rollout_engine_id)
+            if group_key in failed_groups:
+                continue
+            try:
+                results.append(ray.get(ref))
+            except Exception as exc:
+                logger.error(
+                    "SGLang %s failed for rollout engine %s (worker_type=%s); "
+                    "marking the logical engine dead and continuing: %s",
+                    operation_name,
+                    rollout_engine_id,
+                    group.worker_type,
+                    exc,
+                )
+                failed_groups.add(group_key)
+                group.mark_engine_group_dead(rollout_engine_id)
+        return results
+
     def restart_with_overrides(self, overrides: dict[str, Any]) -> None:
         """Restart all local engines with a temporary SGLang profile."""
         for group in self.server_groups:
@@ -808,46 +858,61 @@ class RolloutServer:
         enough to stop new prefill before the pool disappears.
         """
         for g in self.server_groups:
+            if g.needs_offload and g.generation_health_check_enabled:
+                g.mark_unhealthy_engines(timeout=g.args.rollout_health_check_timeout)
+
+        for g in self.server_groups:
             if g.needs_offload:
                 g.generation_health_check_enabled = False
 
-        pause_handles = [
-            engine.pause_generation.remote()
+        pause_operations = [
+            (g, rollout_engine_id, engine.pause_generation.remote())
             for g in self.server_groups
             if g.needs_offload
-            for engine in g.engines
+            for rollout_engine_id, engine in enumerate(g.engines)
             if engine is not None
         ]
-        if pause_handles:
+        if pause_operations:
             logger.info(
-                "Pausing generation on %d offloaded SGLang engines before releasing memory.", len(pause_handles)
+                "Pausing generation on %d offloaded SGLang engines before releasing memory.",
+                len(pause_operations),
             )
-            ray.get(pause_handles)
+            self._resolve_lifecycle_operations(pause_operations, "pause before offload")
 
-        handles = []
-        for g in self.server_groups:
-            handles.extend(g.offload())
-        return ray.get(handles) if handles else []
+        release_operations = [
+            (g, rollout_engine_id, engine.release_memory_occupation.remote())
+            for g in self.server_groups
+            if g.needs_offload
+            for rollout_engine_id, engine in enumerate(g.engines)
+            if engine is not None
+        ]
+        return self._resolve_lifecycle_operations(release_operations, "offload")
 
     def _continue_generation_for_offloaded_groups(self):
-        handles = [
-            engine.continue_generation.remote()
+        operations = [
+            (g, rollout_engine_id, engine.continue_generation.remote())
             for g in self.server_groups
             if g.needs_offload
-            for engine in g.engines
+            for rollout_engine_id, engine in enumerate(g.engines)
             if engine is not None
         ]
-        if handles:
-            logger.info("Continuing generation on %d offloaded SGLang engines after memory resume.", len(handles))
-            return ray.get(handles)
-        return []
+        if operations:
+            logger.info("Continuing generation on %d offloaded SGLang engines after memory resume.", len(operations))
+        return self._resolve_lifecycle_operations(operations, "continue after onload")
 
     def onload(self, tags: list[str] | None = None):
         """Resume memory occupation across all groups (concurrent)."""
-        handles = []
         for g in self.server_groups:
-            handles.extend(g.onload(tags))
-        result = ray.get(handles) if handles else []
+            if g.needs_offload:
+                g.mark_unavailable_actors()
+        operations = [
+            (g, rollout_engine_id, engine.resume_memory_occupation.remote(tags=tags))
+            for g in self.server_groups
+            if g.needs_offload
+            for rollout_engine_id, engine in enumerate(g.engines)
+            if engine is not None
+        ]
+        result = self._resolve_lifecycle_operations(operations, "onload")
         if _tags_enable_generation(tags):
             self._continue_generation_for_offloaded_groups()
             for g in self.server_groups:
@@ -863,25 +928,42 @@ class RolloutServer:
         ``update_weights`` shortly after.  For non-updatable servers the
         CPU backup already contains the correct (unchanged) weights.
         """
-        handles = []
         for g in self.server_groups:
-            if not g.needs_offload:
-                continue
-            g.generation_health_check_enabled = False
-            handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
-        if handles:
-            logger.info("Onloading weights for %d offloaded SGLang engines; generation remains paused.", len(handles))
-            return ray.get(handles)
-        return []
+            if g.needs_offload:
+                g.mark_unavailable_actors()
+                g.generation_health_check_enabled = False
+        operations = [
+            (g, rollout_engine_id, engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
+            for g in self.server_groups
+            if g.needs_offload
+            for rollout_engine_id, engine in enumerate(g.engines)
+            if engine is not None
+        ]
+        if operations:
+            logger.info("Onloading weights for %d offloaded SGLang engines; generation remains paused.", len(operations))
+        return self._resolve_lifecycle_operations(operations, "weight onload")
 
     def onload_kv(self):
         """Resume KV cache and CUDA graphs for offloaded groups."""
-        handles = []
         for g in self.server_groups:
-            handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]))
-        result = ray.get(handles) if handles else []
-        if handles:
-            logger.info("Onloaded KV cache/CUDA graphs for %d SGLang engines; resuming generation.", len(handles))
+            if g.needs_offload:
+                g.mark_unavailable_actors()
+        operations = [
+            (
+                g,
+                rollout_engine_id,
+                engine.resume_memory_occupation.remote(
+                    tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
+                ),
+            )
+            for g in self.server_groups
+            if g.needs_offload
+            for rollout_engine_id, engine in enumerate(g.engines)
+            if engine is not None
+        ]
+        result = self._resolve_lifecycle_operations(operations, "KV onload")
+        if operations:
+            logger.info("Onloaded KV cache/CUDA graphs for %d SGLang engines; resuming generation.", len(operations))
         self._continue_generation_for_offloaded_groups()
         for g in self.server_groups:
             if g.needs_offload:
@@ -1050,7 +1132,13 @@ class RolloutManager:
             # if debug rollout only, we don't convert samples to train data and directly return
             return len(data)
         data = self._convert_samples_to_train_data(data)
-        return self._split_train_data_by_dp(data, rollout_metrics=rollout_metrics)
+        rollout_data_refs = self._split_train_data_by_dp(data, rollout_metrics=rollout_metrics)
+        if self._debug_dump_future is not None:
+            # The caller may offload immediately after generate() returns. Make
+            # the replay artifact durable before crossing that failure boundary.
+            self._debug_dump_future.result()
+            self._debug_dump_future = None
+        return rollout_data_refs
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -1123,6 +1211,10 @@ class RolloutManager:
     def onload_weights(self):
         for srv in self.servers.values():
             srv.onload_weights()
+            if isinstance(srv, RolloutServer) and not srv.update_weights:
+                # Frozen servers do not participate in the trainer's weight
+                # update recovery path, so rebuild them from model_path here.
+                srv.recover()
 
     def onload_kv(self):
         for srv in self.servers.values():
@@ -1176,11 +1268,22 @@ class RolloutManager:
 
     def _get_rollout_data(self, rollout_id):
         if self.args.load_debug_rollout_data:
-            data = torch.load(
+            dump_data = torch.load(
                 self.args.load_debug_rollout_data.format(rollout_id=rollout_id),
                 weights_only=False,
-            )["samples"]
+            )
+            data = dump_data["samples"]
             data = [Sample.from_dict(sample) for sample in data]
+            data_source_state = dump_data.get("data_source_state")
+            if data_source_state is not None and hasattr(self.data_source, "load_state_dict"):
+                self.data_source.load_state_dict(data_source_state)
+                logger.info("Restored data-source cursor from debug rollout %s", rollout_id)
+            elif self.args.rollout_global_dataset:
+                logger.warning(
+                    "Debug rollout %s predates embedded data-source cursor state; "
+                    "training replay is supported, but the prompt cursor remains at the loaded checkpoint.",
+                    rollout_id,
+                )
             if (ratio := self.args.load_debug_rollout_data_subsample) is not None:
                 original_num_rows = len(data)
                 rough_subsample_num_rows = int(original_num_rows * ratio)
@@ -1220,16 +1323,35 @@ class RolloutManager:
             path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
             logger.info(f"Save debug rollout data to {path}")
             path.parent.mkdir(parents=True, exist_ok=True)
+            data_source_state = None
+            data_source = getattr(self, "data_source", None)
+            if not evaluation and hasattr(data_source, "state_dict_for_rollout"):
+                data_source_state = data_source.state_dict_for_rollout(rollout_id)
+            elif not evaluation and hasattr(data_source, "state_dict"):
+                data_source_state = data_source.state_dict()
             debug_dump_executor = getattr(self, "_debug_dump_executor", None)
             if debug_dump_executor is None:
-                _write_debug_rollout_data(self.args, data, rollout_id, evaluation, path)
+                _write_debug_rollout_data(
+                    self.args,
+                    data,
+                    rollout_id,
+                    evaluation,
+                    path,
+                    data_source_state=data_source_state,
+                )
             else:
                 # Bound memory to one pending batch while overlapping its CPU
                 # serialization and disk write with the next rollout batch.
                 if getattr(self, "_debug_dump_future", None) is not None:
                     self._debug_dump_future.result()
                 self._debug_dump_future = debug_dump_executor.submit(
-                    _write_debug_rollout_data, self.args, data, rollout_id, evaluation, path
+                    _write_debug_rollout_data,
+                    self.args,
+                    data,
+                    rollout_id,
+                    evaluation,
+                    path,
+                    data_source_state,
                 )
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):

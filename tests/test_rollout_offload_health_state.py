@@ -20,24 +20,28 @@ class _RemoteMethod:
 
 
 class _FakeEngine:
-    def __init__(self):
+    def __init__(self, *, health_generate_result=True, health_actor_result=True, pause_result=None):
         self.calls = []
-        self.pause_generation = _RemoteMethod("pause_generation", self.calls)
+        self.pause_generation = _RemoteMethod("pause_generation", self.calls, pause_result)
         self.continue_generation = _RemoteMethod("continue_generation", self.calls)
         self.flush_cache = _RemoteMethod("flush_cache", self.calls)
         self.release_memory_occupation = _RemoteMethod("release_memory_occupation", self.calls)
         self.resume_memory_occupation = _RemoteMethod("resume_memory_occupation", self.calls)
-        self.health_generate = _RemoteMethod("health_generate", self.calls)
+        self.health_generate = _RemoteMethod("health_generate", self.calls, health_generate_result)
+        self.health_actor = _RemoteMethod("health_actor", self.calls, health_actor_result)
+        self.shutdown = _RemoteMethod("shutdown", self.calls)
 
 
 def _ray_get(value):
     if isinstance(value, list):
         return [_ray_get(item) for item in value]
+    if isinstance(value, Exception):
+        raise value
     return value
 
 
 def _make_server(engine):
-    args = Namespace(num_gpus_per_node=1, debug_train_only=False)
+    args = Namespace(num_gpus_per_node=1, debug_train_only=False, rollout_health_check_timeout=3.0)
     group = ServerGroup(
         args=args,
         pg=None,
@@ -58,28 +62,109 @@ def test_recover_skips_generation_health_check_until_kv_is_onloaded(monkeypatch)
 
     server.offload()
     assert group.generation_health_check_enabled is False
-    assert [name for name, _args, _kwargs in engine.calls[:4]] == [
-        "pause_generation",
-        "flush_cache",
+    assert [name for name, _args, _kwargs in engine.calls[:3]] == [
+        "health_generate",
         "pause_generation",
         "release_memory_occupation",
     ]
-    assert engine.calls[0][2] == {}
-    assert engine.calls[2][2] == {"mode": "in_place"}
+    assert engine.calls[1][2] == {}
 
     server.onload_weights()
     assert group.generation_health_check_enabled is False
 
     group.start_engines = lambda port_cursors: ([], port_cursors)
     server.recover(health_check_timeout=3.0)
-    assert [name for name, _args, _kwargs in engine.calls].count("health_generate") == 0
+    assert [name for name, _args, _kwargs in engine.calls].count("health_generate") == 1
 
     server.onload_kv()
     assert group.generation_health_check_enabled is True
     assert [name for name, _args, _kwargs in engine.calls].count("continue_generation") == 1
 
     server.recover(health_check_timeout=3.0)
-    assert [name for name, _args, _kwargs in engine.calls].count("health_generate") == 1
+    assert [name for name, _args, _kwargs in engine.calls].count("health_generate") == 2
+
+
+def test_offload_marks_dead_actor_and_keeps_other_engines_progressing(monkeypatch):
+    monkeypatch.setattr("slime.ray.rollout.ray.get", _ray_get)
+    monkeypatch.setattr("slime.ray.rollout.ray.kill", lambda *_args, **_kwargs: None)
+
+    dead = _FakeEngine(health_generate_result=RuntimeError("actor died"))
+    healthy = _FakeEngine()
+    args = Namespace(num_gpus_per_node=1, debug_train_only=False, rollout_health_check_timeout=3.0)
+    group = ServerGroup(
+        args=args,
+        pg=None,
+        all_engines=[dead, healthy],
+        num_gpus_per_engine=1,
+        num_new_engines=0,
+        needs_offload=True,
+        worker_type="regular",
+    )
+    server = RolloutServer(server_groups=[group])
+
+    server.offload()
+
+    assert group.all_engines[0] is None
+    assert [name for name, _args, _kwargs in healthy.calls] == [
+        "health_generate",
+        "pause_generation",
+        "release_memory_occupation",
+    ]
+
+
+def test_offload_isolates_actor_that_dies_during_pause(monkeypatch):
+    monkeypatch.setattr("slime.ray.rollout.ray.get", _ray_get)
+    monkeypatch.setattr("slime.ray.rollout.ray.kill", lambda *_args, **_kwargs: None)
+
+    engine = _FakeEngine(pause_result=RuntimeError("node heartbeat lost"))
+    server, group = _make_server(engine)
+
+    server.offload()
+
+    assert group.all_engines == [None]
+    assert [name for name, _args, _kwargs in engine.calls].count("release_memory_occupation") == 0
+
+
+def test_dead_actor_found_during_offload_is_rebuilt_before_weight_update(monkeypatch):
+    monkeypatch.setattr("slime.ray.rollout.ray.get", _ray_get)
+    monkeypatch.setattr("slime.ray.rollout.ray.kill", lambda *_args, **_kwargs: None)
+
+    dead = _FakeEngine(pause_result=RuntimeError("node heartbeat lost"))
+    server, group = _make_server(dead)
+
+    server.offload()
+    assert group.all_engines == [None]
+
+    replacement = _FakeEngine()
+
+    def start_replacement(port_cursors):
+        group.all_engines[0] = replacement
+        group.num_new_engines = 1
+        return ["replacement-init"], port_cursors
+
+    group.start_engines = start_replacement
+    server.recover(health_check_timeout=3.0)
+
+    assert group.all_engines == [replacement]
+    assert [name for name, _args, _kwargs in replacement.calls] == [
+        "release_memory_occupation",
+        "resume_memory_occupation",
+    ]
+    assert replacement.calls[1][2] == {"tags": ["weights"]}
+
+
+def test_onload_checks_actor_liveness_without_generation(monkeypatch):
+    monkeypatch.setattr("slime.ray.rollout.ray.get", _ray_get)
+    monkeypatch.setattr("slime.ray.rollout.ray.kill", lambda *_args, **_kwargs: None)
+
+    engine = _FakeEngine(health_actor_result=False)
+    server, group = _make_server(engine)
+    group.generation_health_check_enabled = False
+
+    server.onload_weights()
+
+    assert group.all_engines == [None]
+    assert [name for name, _args, _kwargs in engine.calls].count("resume_memory_occupation") == 0
 
 
 def test_health_monitor_skips_generation_check_while_group_is_not_generation_ready(monkeypatch):

@@ -1,0 +1,118 @@
+{
+  "audit": {
+    "source_run": "odyssey-q3-4b-local-dev99",
+    "scope": "top normalized (question, prediction) pairs with frequency >= 4 after exact and constrained span",
+    "candidate_pairs": 153,
+    "covered_trajectories": 1553,
+    "candidate_manifest_sha256": "a4798f564bcf7becc7ad0e438cca4b757dec0fc0841f4898c79920fb7c91ccfe",
+    "approved_candidate_pairs": 22,
+    "approved_ranks": "1,3,5,7,10,23,26,39,43,55,56,59,63,68,71,74,75,94,112,123,125,151",
+    "approved_trajectory_occurrences": 293,
+    "rejected_candidate_pairs": 131,
+    "rejected_ranks": "2,4,6,8-9,11-22,24-25,27-38,40-42,44-54,57-58,60-62,64-67,69-70,72-73,76-93,95-111,113-122,124,126-150,152-153",
+    "decision_policy": "Approve only question-scoped spelling, translation, acronym, person-name, official-short-name, or unambiguous terminology equivalence. Reject related entities, hypernyms, missing species/strain/version qualifiers, and plausible-but-unverified substitutions.",
+    "structured_equivalence_replay_occurrences": 28
+  },
+  "approved_aliases": {
+    "c56f7530173c662a": {
+      "ground_truth": ["Jacob P. Dalton"],
+      "aliases": ["Jacob Dalton"],
+      "reason": "same scholar with middle initial omitted"
+    },
+    "6bdbfecbce7e8a6d": {
+      "ground_truth": ["People's Liberation Army Academy of Military Sciences"],
+      "aliases": ["The Academy of Military Sciences"],
+      "reason": "unambiguous official-name shortening in this question"
+    },
+    "8c4be1c35a9a8de9": {
+      "ground_truth": ["DNMT3A R882H mutation"],
+      "aliases": ["R882H"],
+      "reason": "question explicitly scopes the requested mutation to DNMT3A"
+    },
+    "cf1283ff4207033a": {
+      "ground_truth": ["Ethnographic Film Festivals"],
+      "aliases": ["ethnographic film festival"],
+      "reason": "singular and plural form of the requested category"
+    },
+    "6180075a4ca18756": {
+      "ground_truth": ["Epigenetic Clock Theory of Aging"],
+      "aliases": ["epigenetic clock theory"],
+      "reason": "standard shortened name preserving the distinguishing term clock"
+    },
+    "d62af2e86639ca86": {
+      "ground_truth": ["Herminia Aburto Colihueque"],
+      "aliases": ["Herminia Colihueque"],
+      "reason": "same person with one surname omitted"
+    },
+    "e4cb52274efffed3": {
+      "ground_truth": ["Codex Regius"],
+      "aliases": ["Konungsbok Eddukvaeda", "Konungsbók Eddukvæða"],
+      "reason": "Icelandic name is stated explicitly in the question"
+    },
+    "4621f409d2b1a0b8": {
+      "ground_truth": ["poly(3-hydroxybutyrate)"],
+      "aliases": ["Polyhydroxybutyrate", "Polyhydroxybutyrate (PHB)"],
+      "reason": "standard chemical name and acronym"
+    },
+    "a4b59db722e275d9": {
+      "ground_truth": ["Borbély's Two-Process Model of Sleep Regulation"],
+      "aliases": ["Two-process model", "Two-process model of sleep regulation"],
+      "reason": "standard shortened name for the model described by the question"
+    },
+    "5f38915ff526fabe": {
+      "ground_truth": ["Double Chooz Experiment"],
+      "aliases": ["Double Chooz"],
+      "reason": "official experiment name with generic suffix omitted"
+    },
+    "51e9835429f3ff97": {
+      "ground_truth": ["Lupus molecular cloud complex"],
+      "aliases": ["Lupus dark cloud complex"],
+      "reason": "established alternate name for the same cloud complex"
+    },
+    "ba0d086549caff6a": {
+      "ground_truth": ["Códice de Santa María Asunción"],
+      "aliases": ["Codex of Santa Maria Asuncion", "Codex of Santa María Asunción"],
+      "reason": "English translation of the same codex title"
+    },
+    "ba7ab8f53803e432": {
+      "ground_truth": ["Paul Rothemund"],
+      "aliases": ["Paul W. K. Rothemund"],
+      "reason": "same person with middle initials included"
+    },
+    "fb591651ce958425": {
+      "ground_truth": ["MUSIC"],
+      "aliases": ["Multidimensional Stellar Implicit Code"],
+      "reason": "question explicitly supplies the acronym expansion"
+    },
+    "f6de9daeca3f4b86": {
+      "ground_truth": ["Rigid Origami Simulator"],
+      "aliases": ["ROS"],
+      "reason": "question explicitly supplies the software acronym"
+    },
+    "2f755308974f5804": {
+      "ground_truth": ["Inter-click interval (ICI)"],
+      "aliases": ["inter-click interval"],
+      "reason": "validated omission of the parenthetical acronym"
+    },
+    "4982abbd66a35446": {
+      "ground_truth": ["Robert Wood"],
+      "aliases": ["Robert J. Wood"],
+      "reason": "same researcher with middle initial included"
+    },
+    "88658795275ce7ba": {
+      "ground_truth": ["Old Dutch Church of Sleepy Hollow"],
+      "aliases": ["Old Dutch Church"],
+      "reason": "unambiguous common short name in this location-scoped question"
+    },
+    "a2801216aee1f84d": {
+      "ground_truth": ["Annual modulation signature"],
+      "aliases": ["annual modulation signal", "DAMA/LIBRA annual modulation signal"],
+      "reason": "signal and signature denote the same measured feature in this question"
+    },
+    "4425092ac505eb5c": {
+      "ground_truth": ["Mixed-mode chromatography"],
+      "aliases": ["hydrophobic ion-exchange chromatography"],
+      "reason": "question defines the mixed hydrophobic and ion-exchange mode explicitly"
+    }
+  }
+}

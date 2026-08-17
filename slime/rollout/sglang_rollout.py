@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -13,6 +14,7 @@ from argparse import Namespace
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -1122,6 +1124,19 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) 
                 and completed_groups >= filter_relax_after
                 and _group_has_trainable_response(group)
             )
+            _append_webqa_prefilter_audit(
+                rollout_id=rollout_id,
+                completed_group_index=completed_groups - 1,
+                samples=flat_group,
+                keep=bool(dynamic_filter_output.keep or relax_filter),
+                drop_reason=(
+                    f"relaxed_{dynamic_filter_output.reason}"
+                    if relax_filter and not dynamic_filter_output.keep
+                    else dynamic_filter_output.reason
+                    if not dynamic_filter_output.keep
+                    else None
+                ),
+            )
             if not dynamic_filter_output.keep and not relax_filter:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 drop_reasons[str(dynamic_filter_output.reason or "unspecified")] += 1
@@ -1752,3 +1767,64 @@ def _flatten_samples(group) -> list[Sample]:
         else:
             samples.append(item)
     return samples
+
+
+def _append_webqa_prefilter_audit(
+    *,
+    rollout_id: int,
+    completed_group_index: int,
+    samples: list[Sample],
+    keep: bool,
+    drop_reason: str | None,
+) -> None:
+    audit_dir = os.environ.get("SLIME_ROLLOUT_PREFILTER_AUDIT_DIR", "").strip()
+    if not audit_dir:
+        return
+    rows = []
+    seen_trajectories = set()
+    for sample in samples:
+        if sample_task_family(sample) != "webqa":
+            continue
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        trajectory_id = metadata.get("parent_traj_id", getattr(sample, "rollout_id", None))
+        if trajectory_id is not None and trajectory_id in seen_trajectories:
+            continue
+        if trajectory_id is not None:
+            seen_trajectories.add(trajectory_id)
+        debug = metadata.get("fused_reward_debug") or metadata.get("reward_debug") or {}
+        question = str(metadata.get("question") or "")
+        question_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16] if question else ""
+        task_id = next(
+            (
+                str(metadata[key])
+                for key in ("task_id", "instance_id", "id")
+                if metadata.get(key) is not None
+            ),
+            question_hash or str(getattr(sample, "index", "")),
+        )
+        old_reward = float(debug.get("exact_reward", 0.0))
+        try:
+            new_reward = float(debug.get("alias_reward", sample.reward))
+        except (TypeError, ValueError):
+            new_reward = 0.0
+        rows.append(
+            {
+                "rollout_id": rollout_id,
+                "group_index": completed_group_index,
+                "task_id": task_id,
+                "prediction": str(debug.get("prediction", "")),
+                "old_reward": old_reward,
+                "new_reward": new_reward,
+                "drop_reason": drop_reason,
+                "keep": keep,
+            }
+        )
+    if not rows:
+        return
+    path = Path(audit_dir) / f"rollout_{rollout_id:06d}.jsonl"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as output:
+            output.writelines(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in rows)
+    except OSError:
+        logger.exception("Failed to append WebQA pre-filter audit records to %s", path)

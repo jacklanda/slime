@@ -1,11 +1,13 @@
 import asyncio
 import gc
+import json
 from types import SimpleNamespace
 import weakref
 
 import pytest
 import slime.rollout.sglang_rollout as sglang_rollout
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput
+from slime.rollout.filter_hub.base_types import MetricGatherer
 from slime.utils.types import Sample
 
 NUM_GPUS = 0
@@ -51,6 +53,73 @@ def _sample(index: int, reward: float):
         response_length=1,
         loss_mask=[1],
     )
+
+
+def _webqa_shadow_sample(index, *, exact, span, alias):
+    sample = _sample(index, alias)
+    sample.metadata = {
+        "data_source": "webqa",
+        "question": f"question {index}",
+        "fused_reward_debug": {
+            "prediction": f"prediction {index}",
+            "exact_reward": float(exact),
+            "span_reward": float(span),
+            "alias_reward": float(alias),
+        },
+    }
+    return sample
+
+
+def test_webqa_reward_shadow_metrics_use_group_keep_semantics():
+    args = SimpleNamespace(reward_key=None, credit_assignment_enable=False)
+    gatherer = MetricGatherer()
+    gatherer.on_completed_group(
+        args,
+        [
+            _webqa_shadow_sample(0, exact=0, span=0, alias=0),
+            _webqa_shadow_sample(1, exact=0, span=1, alias=1),
+        ],
+    )
+    gatherer.on_completed_group(
+        args,
+        [
+            _webqa_shadow_sample(2, exact=0, span=1, alias=1),
+            _webqa_shadow_sample(3, exact=1, span=1, alias=1),
+        ],
+    )
+
+    metrics = gatherer.collect()
+    assert metrics["rollout/webqa_reward_shadow/completed_groups"] == 2
+    assert metrics["rollout/webqa_reward_shadow/exact_would_keep"] == 1
+    assert metrics["rollout/webqa_reward_shadow/span_would_keep"] == 1
+    assert metrics["rollout/webqa_reward_shadow/alias_would_keep"] == 1
+    assert metrics["rollout/webqa_reward_shadow/new_zero_std_1"] == 1
+
+
+def test_webqa_prefilter_audit_contains_lightweight_reward_fields(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLIME_ROLLOUT_PREFILTER_AUDIT_DIR", str(tmp_path))
+    sample = _webqa_shadow_sample(7, exact=0, span=1, alias=1)
+    sample.metadata["task_id"] = "task-7"
+
+    sglang_rollout._append_webqa_prefilter_audit(
+        rollout_id=3,
+        completed_group_index=4,
+        samples=[sample],
+        keep=False,
+        drop_reason="zero_std_1.0",
+    )
+
+    row = json.loads((tmp_path / "rollout_000003.jsonl").read_text(encoding="utf-8"))
+    assert row == {
+        "rollout_id": 3,
+        "group_index": 4,
+        "task_id": "task-7",
+        "prediction": "prediction 7",
+        "old_reward": 0.0,
+        "new_reward": 1.0,
+        "drop_reason": "zero_std_1.0",
+        "keep": False,
+    }
 
 
 def test_sync_dynamic_filter_receives_flattened_fanout_group(monkeypatch):

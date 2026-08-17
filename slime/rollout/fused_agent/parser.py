@@ -50,6 +50,108 @@ class ToolCall:
     end: int | None = None
 
 
+def _remove_json_trailing_commas(text: str) -> tuple[str, bool]:
+    output = []
+    in_string = False
+    escaped = False
+    changed = False
+    pos = 0
+    while pos < len(text):
+        char = text[pos]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            pos += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            pos += 1
+            continue
+        if char == ",":
+            next_pos = pos + 1
+            while next_pos < len(text) and text[next_pos].isspace():
+                next_pos += 1
+            if next_pos == len(text) or text[next_pos] in "}]":
+                changed = True
+                pos += 1
+                continue
+        output.append(char)
+        pos += 1
+    return "".join(output), changed
+
+
+def _json_missing_closers(text: str) -> tuple[str, bool] | None:
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in "}]":
+            if not stack or stack.pop() != char:
+                return None
+    return "".join(reversed(stack)), in_string
+
+
+def _parse_json_with_deterministic_repairs(text: str) -> tuple[Any, tuple[str, ...]] | None:
+    candidate = text.strip()
+    if not candidate:
+        return None
+    try:
+        return json.loads(candidate), ()
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    try:
+        value, end = decoder.raw_decode(candidate)
+    except json.JSONDecodeError:
+        value = None
+    else:
+        suffix = candidate[end:].strip()
+        if suffix and all(char in "}])" for char in suffix):
+            return value, ("extra_wrapper_closer",)
+
+    repaired, removed_trailing_comma = _remove_json_trailing_commas(candidate)
+    structure = _json_missing_closers(repaired)
+    if structure is None:
+        return None
+    missing_closers, missing_string_quote = structure
+    repairs = []
+    if removed_trailing_comma:
+        repairs.append("trailing_comma")
+    if missing_string_quote:
+        repaired += '"'
+        repairs.append("missing_json_string_end")
+    if missing_closers:
+        repaired += missing_closers
+        repairs.append("missing_json_closers")
+    if not repairs:
+        return None
+    try:
+        return json.loads(repaired), tuple(repairs)
+    except json.JSONDecodeError:
+        return None
+
+
 @dataclass(frozen=True)
 class _Gemma4NativeCall:
     raw_name: str
@@ -76,6 +178,7 @@ class QwenToolParser:
 
     def __init__(self, valid_tools: set[str] | None = None):
         self.valid_tools = valid_tools
+        self.last_shadow_finish_repairs: list[str] = []
 
     def get_tool_prompt(self, tools_schema: str) -> str:
         return (
@@ -106,6 +209,7 @@ class QwenToolParser:
         return None
 
     def parse(self, model_response: str) -> list[ToolCall]:
+        self.last_shadow_finish_repairs = []
         calls = []
         for payload, start, end in self._extract_payloads(model_response or ""):
             parsed = self._parse_payload(payload)
@@ -129,6 +233,45 @@ class QwenToolParser:
         if not calls:
             calls.extend(self._extract_answer_fallback(model_response or ""))
         return calls
+
+    def repair_finish_shadow(self, model_response: str, parsed_actions: list[ToolCall]) -> ToolCall | None:
+        if len(parsed_actions) == 1 and parsed_actions[0].name == "finish":
+            result = (parsed_actions[0].arguments or {}).get("result")
+            if isinstance(result, str):
+                decoded = _parse_json_with_deterministic_repairs(result)
+                if decoded is not None and isinstance(decoded[0], (dict, list)):
+                    value, repairs = decoded
+                    stripped_response = model_response.strip().lower()
+                    repair = (
+                        "answer_json"
+                        if stripped_response.startswith("<answer>") and stripped_response.endswith("</answer>")
+                        else "json_string_result"
+                    )
+                    self.last_shadow_finish_repairs.extend((repair, *repairs))
+                    return ToolCall("finish", {**parsed_actions[0].arguments, "result": value}, parsed_actions[0].start, parsed_actions[0].end)
+            return parsed_actions[0] if self.last_shadow_finish_repairs else None
+        if parsed_actions:
+            return None
+
+        tail_start = model_response.rfind("</think>")
+        tail_start = tail_start + len("</think>") if tail_start >= 0 else 0
+        tail = model_response[tail_start:].strip()
+        wrapper_repair = "bare_json"
+        lowered = tail.lower()
+        if lowered.startswith("<answer>") and lowered.endswith("</answer>"):
+            tail = tail[len("<answer>") : -len("</answer>")].strip()
+            wrapper_repair = "answer_json"
+        decoded = _parse_json_with_deterministic_repairs(tail)
+        if decoded is None:
+            return None
+        value, repairs = decoded
+        if isinstance(value, dict) and value.get("name") in {"finish", "submit"}:
+            arguments = value.get("arguments")
+            if not isinstance(arguments, dict) or "result" not in arguments:
+                return None
+            value = arguments["result"]
+        self.last_shadow_finish_repairs.extend((wrapper_repair, *repairs))
+        return ToolCall("finish", {"command": "submit", "result": value}, tail_start, len(model_response))
 
     def _extract_payloads(self, text: str) -> list[tuple[str | tuple[str, str], int, int]]:
         idx = text.rfind("</think>")
@@ -644,7 +787,7 @@ class Gemma4ToolParser(QwenToolParser):
         contract = [
             "Gemma4 native tool-call contract:",
             "- Emit exactly one native call per assistant response:",
-            '  <|tool_call>call:TOOL_NAME{ARGUMENT_NAME:<|"|>STRING_VALUE<|"|>}<tool_call|><|tool_response>',
+            '  <|tool_call>call:TOOL_NAME{ARGUMENT_NAME:<|"|>STRING_VALUE<|"|>}<tool_call|>',
             "- TOOL_NAME must exactly match one of: " + ", ".join(tool_names),
             "- Copy tool and parameter names verbatim. Never add prefixes, remove words, translate names, or escape underscores.",
             '- Use <|"|> only around STRING values. Emit OBJECT values as {...} and ARRAY values as [...] without quoting or escaping the structured value.',
@@ -708,48 +851,69 @@ class Gemma4ToolParser(QwenToolParser):
             "tool_responses": tool_responses,
         }
 
-    def parse(self, model_response: str) -> list[ToolCall]:
+    def parse(self, model_response: str, *, shadow_finish: bool = False) -> list[ToolCall]:
         text = model_response or ""
         self.last_schema_errors = []
         self.last_schema_error_spans = []
         self.last_schema_error_kinds = []
         self.last_syntax_repairs = []
         self.last_schema_coercions = []
+        self.last_shadow_finish_repairs = []
         calls: list[ToolCall] = []
-        for native_call in self._iter_native_tool_calls(text):
+        for native_call in self._iter_native_tool_calls(text, repair_finish=shadow_finish):
             name = self._normalize_name(native_call.raw_name)
             if not name:
                 self.last_schema_errors.append(f"unknown tool name {native_call.raw_name!r}")
                 self.last_schema_error_spans.append(native_call.name_span)
                 self.last_schema_error_kinds.append("unknown_tool")
                 continue
+            native_repairs = list(native_call.repairs)
             try:
                 # A complete web_search object makes a terminal query boundary
                 # unambiguous even when generation omits only its closing native
-                # quote marker. Keep mutating finish calls strict.
+                # quote marker.
                 args, field_spans = self._parse_object(
                     native_call.raw_args,
                     parameter_schema=self._tool_parameter_schemas.get(name),
                     intrinsic_string_keys={"query"} if name == "web_search" else None,
                     terminal_native_string_keys={"query"} if name == "web_search" else None,
                 )
-            except ValueError as exc:
-                self.last_schema_errors.append(f"invalid arguments for tool {name!r}: {exc}")
-                self.last_schema_error_spans.append(self._syntax_error_span(native_call, exc))
-                self.last_schema_error_kinds.append("invalid_syntax")
-                logger.warning(
-                    "Failed to parse Gemma4 tool-call arguments for tool '%s': %s. raw_args=%r",
-                    native_call.raw_name,
-                    exc,
-                    native_call.raw_args[:512],
-                )
-                logger.debug("Gemma4 tool-call argument parse failure.", exc_info=True)
-                continue
-            self.last_syntax_repairs.extend(native_call.repairs)
+            except ValueError as parse_error:
+                repaired_successfully = False
+                repaired_args, removed_trailing_comma = _remove_json_trailing_commas(native_call.raw_args)
+                if shadow_finish and name in {"finish", "submit"} and removed_trailing_comma:
+                    try:
+                        args, field_spans = self._parse_object(
+                            repaired_args,
+                            parameter_schema=self._tool_parameter_schemas.get(name),
+                        )
+                    except ValueError:
+                        pass
+                    else:
+                        native_repairs.append("trailing_comma")
+                        repaired_successfully = True
+                if not repaired_successfully:
+                    self.last_schema_errors.append(f"invalid arguments for tool {name!r}: {parse_error}")
+                    self.last_schema_error_spans.append(self._syntax_error_span(native_call, parse_error))
+                    self.last_schema_error_kinds.append("invalid_syntax")
+                    logger.warning(
+                        "Failed to parse Gemma4 tool-call arguments for tool '%s': %s. raw_args=%r",
+                        native_call.raw_name,
+                        parse_error,
+                        native_call.raw_args[:512],
+                    )
+                    logger.debug("Gemma4 tool-call argument parse failure.", exc_info=True)
+                    continue
+            self.last_syntax_repairs.extend(native_repairs)
+            if shadow_finish and name in {"finish", "submit"} and native_repairs:
+                self.last_shadow_finish_repairs.extend(native_repairs)
             # Some generated MCP schemas historically declared structured
             # submit results as strings. Accept a JSON-encoded object/array so
             # old assets and newly generated native calls share one contract.
-            if name.startswith("submit_result_") and isinstance(args.get("result"), str):
+            if (
+                (shadow_finish and name in {"finish", "submit"})
+                or name.startswith("submit_result_")
+            ) and isinstance(args.get("result"), str):
                 try:
                     decoded_result = json.loads(args["result"])
                 except (TypeError, json.JSONDecodeError):
@@ -757,6 +921,7 @@ class Gemma4ToolParser(QwenToolParser):
                 else:
                     if isinstance(decoded_result, (dict, list)):
                         args["result"] = decoded_result
+                        self.last_shadow_finish_repairs.append("json_string_result")
             args = self._coerce_arguments(name, args)
             schema_errors = self._validate_arguments(
                 name,
@@ -769,13 +934,7 @@ class Gemma4ToolParser(QwenToolParser):
                     self.last_schema_errors.append(error)
                     self.last_schema_error_spans.append(span)
                     self.last_schema_error_kinds.append(kind)
-                if any(kind != "unknown_parameter" for _, _, kind in schema_errors):
-                    continue
-                # Unknown optional fields should not discard an otherwise
-                # executable call. Keep the diagnostics/spans for credit
-                # assignment, but pass only declared arguments to the tool.
-                properties = (self._tool_parameter_schemas.get(name) or {}).get("properties") or {}
-                args = {key: value for key, value in args.items() if key in properties}
+                continue
             calls.append(
                 ToolCall(
                     name=name,
@@ -785,6 +944,29 @@ class Gemma4ToolParser(QwenToolParser):
                 )
             )
         return calls
+
+    def repair_finish_shadow(self, model_response: str, parsed_actions: list[ToolCall]) -> ToolCall | None:
+        if (
+            len(parsed_actions) == 1
+            and parsed_actions[0].name == "finish"
+            and any(
+                coercion.startswith("finish.result: str -> ")
+                for coercion in self.last_schema_coercions
+            )
+        ):
+            self.last_shadow_finish_repairs.append("json_string_result")
+            return parsed_actions[0]
+        shadow = super().repair_finish_shadow(model_response, parsed_actions)
+        if shadow is not None or parsed_actions:
+            return shadow
+        shadow_actions = self.parse(model_response, shadow_finish=True)
+        if (
+            len(shadow_actions) == 1
+            and shadow_actions[0].name == "finish"
+            and self.last_shadow_finish_repairs
+        ):
+            return shadow_actions[0]
+        return super().repair_finish_shadow(model_response, [])
 
     @staticmethod
     def _syntax_error_span(native_call: _Gemma4NativeCall, exc: ValueError) -> tuple[int, int] | None:
@@ -886,10 +1068,19 @@ class Gemma4ToolParser(QwenToolParser):
         for name, value in arguments.items():
             schema = properties.get(name)
             if not isinstance(schema, dict):
-                field_span = field_spans.get(name)
-                key_span = None if field_span is None else (args_start + field_span[0], args_start + field_span[1])
-                errors.append((f"unknown parameter {name!r} for tool {tool_name!r}", key_span, "unknown_parameter"))
-                continue
+                additional_properties = parameter_schema.get("additionalProperties", True)
+                if additional_properties is False:
+                    field_span = field_spans.get(name)
+                    key_span = (
+                        None if field_span is None else (args_start + field_span[0], args_start + field_span[1])
+                    )
+                    errors.append(
+                        (f"unknown parameter {name!r} for tool {tool_name!r}", key_span, "unknown_parameter")
+                    )
+                    continue
+                if not isinstance(additional_properties, dict):
+                    continue
+                schema = additional_properties
             if tool_name.startswith("submit_result_") and name == "result" and isinstance(value, (dict, list)):
                 # Older MCP assets exposed ``result`` as string even though
                 # the callable requires a structured value.
@@ -930,7 +1121,12 @@ class Gemma4ToolParser(QwenToolParser):
         return checks.get(expected, lambda: True)()
 
     @classmethod
-    def _iter_native_tool_calls(cls, text: str) -> list[_Gemma4NativeCall]:
+    def _iter_native_tool_calls(
+        cls,
+        text: str,
+        *,
+        repair_finish: bool = False,
+    ) -> list[_Gemma4NativeCall]:
         calls: list[_Gemma4NativeCall] = []
         search_pos = 0
         while True:
@@ -950,6 +1146,10 @@ class Gemma4ToolParser(QwenToolParser):
                 continue
 
             raw_name = prefix.group(1)
+            finish_call = (
+                raw_name in {"finish", "submit", "submit_result"}
+                or raw_name.startswith("submit_result_")
+            )
             obj_start = prefix.end()
             name_span = (prefix.start(1), prefix.end(1))
             try:
@@ -960,8 +1160,11 @@ class Gemma4ToolParser(QwenToolParser):
                     end = end_marker_start + len(cls.tool_call_end)
                     raw_args = text[obj_start:end_marker_start]
                     repairs: tuple[str, ...] = ()
-                    if cls._syntax_repair_allowed(raw_name):
-                        repaired = cls._repair_incomplete_native_arguments(raw_args)
+                    if repair_finish or not finish_call:
+                        repaired = cls._repair_incomplete_native_arguments(
+                            raw_args,
+                            allow_nested_closers=repair_finish and finish_call,
+                        )
                         if repaired is not None:
                             raw_args, repairs = repaired
                     calls.append(
@@ -977,6 +1180,26 @@ class Gemma4ToolParser(QwenToolParser):
                     )
                     search_pos = end
                     continue
+                raw_args = text[obj_start:].rstrip()
+                if repair_finish and finish_call:
+                    repaired = cls._repair_incomplete_native_arguments(
+                        raw_args,
+                        allow_nested_closers=True,
+                    )
+                    if repaired is not None:
+                        raw_args, repairs = repaired
+                        calls.append(
+                            _Gemma4NativeCall(
+                                raw_name=raw_name,
+                                raw_args=raw_args,
+                                start=start,
+                                end=len(text),
+                                name_span=name_span,
+                                args_start=obj_start,
+                                repairs=(*repairs, "missing_tool_call_end"),
+                            )
+                        )
+                        return calls
                 search_pos = pos
                 continue
 
@@ -986,11 +1209,18 @@ class Gemma4ToolParser(QwenToolParser):
             # The object boundary is already unambiguous, so ignore only this
             # narrow class of wrapper noise and keep argument parsing/schema
             # validation strict.
-            while end_marker_start < len(text) and text[end_marker_start] in "])":
+            extra_wrapper_closer = False
+            while (
+                (repair_finish or not finish_call)
+                and end_marker_start < len(text)
+                and text[end_marker_start] in "])"
+            ):
+                extra_wrapper_closer = True
                 end_marker_start = cls._skip_ws(text, end_marker_start + 1)
             if not text.startswith(cls.tool_call_end, end_marker_start):
-                if cls._syntax_repair_allowed(raw_name) and cls._is_missing_call_end_boundary(
-                    text, end_marker_start
+                if (repair_finish or not finish_call) and cls._is_missing_call_end_boundary(
+                    text,
+                    end_marker_start,
                 ):
                     calls.append(
                         _Gemma4NativeCall(
@@ -1017,20 +1247,25 @@ class Gemma4ToolParser(QwenToolParser):
                     end=end,
                     name_span=name_span,
                     args_start=obj_start,
+                    repairs=("extra_wrapper_closer",) if extra_wrapper_closer else (),
                 )
             )
             search_pos = end
 
-    @staticmethod
-    def _syntax_repair_allowed(tool_name: str) -> bool:
-        return tool_name not in {"finish", "submit"} and not tool_name.startswith("submit_result_")
-
     @classmethod
-    def _repair_incomplete_native_arguments(cls, raw_args: str) -> tuple[str, tuple[str, ...]] | None:
+    def _repair_incomplete_native_arguments(
+        cls,
+        raw_args: str,
+        *,
+        allow_nested_closers: bool = False,
+    ) -> tuple[str, tuple[str, ...]] | None:
         if not raw_args.lstrip().startswith("{"):
             return None
         repaired = raw_args.rstrip()
         repairs: list[str] = []
+        repaired, removed_trailing_comma = _remove_json_trailing_commas(repaired)
+        if removed_trailing_comma:
+            repairs.append("trailing_comma")
         marker = '<|"|>'
         if repaired.count(marker) % 2:
             marker_start = repaired.rfind(marker)
@@ -1054,13 +1289,17 @@ class Gemma4ToolParser(QwenToolParser):
             repairs.append("missing_quoted_string_end")
 
         missing_closers = cls._missing_argument_closers(repaired)
-        if missing_closers is None or len(missing_closers) > 1:
+        if missing_closers is None:
             return None
         if missing_closers:
-            if missing_closers != "}":
+            if len(missing_closers) > 1 and not allow_nested_closers:
                 return None
             repaired += missing_closers
-            repairs.append("missing_argument_object_end")
+            repairs.append(
+                "missing_argument_object_end"
+                if missing_closers == "}"
+                else "missing_argument_closers"
+            )
         return (repaired, tuple(repairs)) if repairs else None
 
     @classmethod
@@ -1169,28 +1408,13 @@ class Gemma4ToolParser(QwenToolParser):
         if isinstance(params, dict):
             if len(parts) > 1:
                 parts.append(",")
-            parts.append("parameters:{")
-            properties = params.get("properties")
-            if isinstance(properties, dict):
-                parts.append("properties:{")
-                parts.append(cls._format_parameters(properties))
-                parts.append("}")
-            required = params.get("required") or []
-            if required:
-                if isinstance(properties, dict):
-                    parts.append(",")
-                parts.append("required:")
-                parts.append(cls._format_argument(list(required)))
-            if params.get("type"):
-                if isinstance(properties, dict) or required:
-                    parts.append(",")
-                parts.append(f"type:{cls._format_schema_type(params['type'])}")
-            for key in ("$defs", "definitions"):
-                rendered = cls._format_schema_definitions(params.get(key))
-                if rendered:
-                    if isinstance(properties, dict) or required or params.get("type"):
-                        parts.append(",")
-                    parts.append(f"{key}:{rendered}")
+            parts.append("parameters:{" + ",".join(cls._format_schema_fields(params)) + "}")
+        response = function.get("response")
+        if isinstance(response, dict):
+            if len(parts) > 1:
+                parts.append(",")
+            parts.append("response:{")
+            parts.append(",".join(cls._format_schema_fields(response)))
             parts.append("}")
         parts.append("}")
         return "".join(parts)
@@ -1220,8 +1444,8 @@ class Gemma4ToolParser(QwenToolParser):
             fields.append("nullable:true")
         if isinstance(schema.get("properties"), dict):
             fields.append(f"properties:{{{cls._format_parameters(schema['properties'])}}}")
-            if schema.get("required"):
-                fields.append(f"required:{cls._format_argument(list(schema['required']))}")
+        if schema.get("required"):
+            fields.append(f"required:{cls._format_argument(list(schema['required']))}")
         if isinstance(schema.get("items"), dict):
             fields.append(f"items:{{{','.join(cls._format_schema_fields(schema['items']))}}}")
         elif isinstance(schema.get("items"), list):

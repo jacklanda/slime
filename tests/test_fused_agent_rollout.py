@@ -1,6 +1,7 @@
 import json
 import os
 import asyncio
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,6 +40,7 @@ from slime.rollout.fused_agent.parser import (
     tool_schema,
 )
 from slime.rollout.fused_agent.prompts import (
+    FUSED_MCP_SYSTEM_PROMPT,
     FUSED_SEARCH_SYSTEM_PROMPT,
     build_system_prompt,
     finish_schema,
@@ -1025,7 +1027,7 @@ def test_gemma4_tool_prompt_uses_native_declarations():
     assert "<|tool>declaration:web_search{" in prompt
     assert 'query:{description:<|"|>Search query.<|"|>,type:<|"|>STRING<|"|>}' in prompt
     assert "<|tool_call>call:TOOL_NAME{" in prompt
-    assert "<tool_call|><|tool_response>" in prompt
+    assert "<tool_call|><|tool_response>" not in prompt
     assert "TOOL_NAME must exactly match one of: finish, web_search" in prompt
     assert "Never emit <|channel>call:, finish.result:" in prompt
     assert 'finish{command:<|"|>submit<|"|>,result:<|"|>CONCISE_FINAL_ANSWER<|"|>}' in prompt
@@ -1141,6 +1143,7 @@ def test_gemma4_tool_parser_localizes_emitted_schema_errors_but_not_omissions():
         {"command": {"type": "string"}, "result": {"type": "object"}},
         ["command", "result"],
     )
+    schema["function"]["parameters"]["additionalProperties"] = False
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
     parser.get_tool_prompt(json.dumps(schema))
 
@@ -1148,8 +1151,7 @@ def test_gemma4_tool_parser_localizes_emitted_schema_errors_but_not_omissions():
         '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
         'extra:1,result:{answer:<|"|>42<|"|>}}<tool_call|>'
     )
-    calls = parser.parse(unknown_parameter)
-    assert calls[0].arguments == {"command": "submit", "result": {"answer": "42"}}
+    assert parser.parse(unknown_parameter) == []
     extra_start = unknown_parameter.index("extra")
     assert parser.last_schema_error_spans == [(extra_start, extra_start + len("extra"))]
     assert parser.last_schema_error_kinds == ["unknown_parameter"]
@@ -1158,6 +1160,55 @@ def test_gemma4_tool_parser_localizes_emitted_schema_errors_but_not_omissions():
     assert parser.parse(missing_parameter) == []
     assert parser.last_schema_error_spans == [None]
     assert parser.last_schema_error_kinds == ["missing_parameter"]
+
+
+def test_gemma4_tool_parser_preserves_official_grep_extension_arguments():
+    schema = tool_schema(
+        "Grep",
+        "Search file contents using regex patterns.",
+        {
+            "glob": {"type": "string"},
+            "path": {"type": "string"},
+            "pattern": {"type": "string"},
+        },
+        ["pattern"],
+    )
+    parser = make_tool_parser("gemma4", valid_tools={"Grep"})
+    parser.get_tool_prompt(json.dumps(schema))
+    response = (
+        '<|tool_call>call:Grep{-i:true,-n:true,output_mode:<|"|>content<|"|>,'
+        'pattern:<|"|>TODO<|"|>}<tool_call|>'
+    )
+
+    calls = parser.parse(response)
+
+    assert calls[0].arguments == {
+        "-i": True,
+        "-n": True,
+        "output_mode": "content",
+        "pattern": "TODO",
+    }
+    assert parser.last_schema_errors == []
+
+
+def test_gemma4_tool_parser_validates_schema_valued_additional_properties():
+    schema = tool_schema("labels", "Attach labels.", {"target": {"type": "string"}}, ["target"])
+    schema["function"]["parameters"]["additionalProperties"] = {"type": "integer"}
+    parser = make_tool_parser("gemma4", valid_tools={"labels"})
+    prompt = parser.get_tool_prompt(json.dumps(schema))
+
+    assert "parameters:{additionalProperties:{type:" in prompt or ",additionalProperties:{type:" in prompt
+
+    calls = parser.parse(
+        '<|tool_call>call:labels{target:<|"|>pod<|"|>,priority:2}<tool_call|>'
+    )
+    assert calls[0].arguments == {"target": "pod", "priority": 2}
+    assert parser.last_schema_errors == []
+
+    assert parser.parse(
+        '<|tool_call>call:labels{target:<|"|>pod<|"|>,priority:<|"|>high<|"|>}<tool_call|>'
+    ) == []
+    assert parser.last_schema_error_kinds == ["invalid_parameter_type"]
 
 
 def test_gemma4_tool_parser_localizes_structured_result_syntax_error():
@@ -1234,6 +1285,22 @@ def test_gemma4_tool_prompt_formats_complex_json_schema_without_python_repr():
     assert ('$defs:{Profile:{properties:{age:{type:<|"|>INTEGER<|"|>},name:{type:<|"|>STRING<|"|>}},' 'required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}') in declaration
     assert 'definitions:{<|"|>legacy type<|"|>:{enum:[<|"|>old<|"|>],type:<|"|>STRING<|"|>}}' in declaration
     assert "['STRING', 'NULL']" not in declaration
+
+
+def test_gemma4_function_declaration_preserves_response_schema():
+    schema = tool_schema("lookup", "Look up one item.", {}, [])
+    schema["function"]["response"] = {
+        "type": "object",
+        "description": "Lookup result.",
+        "properties": {"value": {"type": "string"}},
+        "required": ["value"],
+    }
+
+    declaration = Gemma4ToolParser._format_function_declaration(schema)
+
+    assert 'response:{description:<|"|>Lookup result.<|"|>' in declaration
+    assert 'properties:{value:{type:<|"|>STRING<|"|>}}' in declaration
+    assert 'required:[<|"|>value<|"|>]' in declaration
 
 
 def test_gemma4_tool_parser_parses_native_calls_and_formats_observation():
@@ -1509,6 +1576,70 @@ def test_gemma4_tool_parser_repairs_only_deterministic_call_closures(response, r
 
 
 @pytest.mark.parametrize(
+    ("response", "expected_result", "expected_repairs"),
+    [
+        (
+            '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:{items:[1,2]',
+            {"items": [1, 2]},
+            ["missing_argument_closers", "missing_tool_call_end"],
+        ),
+        (
+            '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:{done:true,},}<tool_call|>',
+            {"done": True},
+            ["trailing_comma"],
+        ),
+        (
+            '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>{"done":true}<|"|>}<tool_call|>',
+            {"done": True},
+            ["json_string_result"],
+        ),
+        (
+            '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:{done:true}}])<tool_call|>',
+            {"done": True},
+            ["extra_wrapper_closer"],
+        ),
+    ],
+)
+def test_gemma4_finish_shadow_repairs_are_deterministic(response, expected_result, expected_repairs):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    parser.get_tool_prompt(json.dumps(finish_schema(result_schema={"type": "object"}), ensure_ascii=False))
+
+    calls = parser.parse(response)
+    shadow = parser.repair_finish_shadow(response, calls)
+
+    assert shadow is not None
+    assert shadow.arguments["result"] == expected_result
+    assert parser.last_shadow_finish_repairs == expected_repairs
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_result", "repair"),
+    [
+        ('{"done":true}', {"done": True}, "bare_json"),
+        ('<answer>{"done":true}</answer>', {"done": True}, "answer_json"),
+        ('{"done":true,}', {"done": True}, "bare_json"),
+        ('{"done":true}}]', {"done": True}, "bare_json"),
+    ],
+)
+def test_finish_shadow_accepts_bounded_json_wrappers(response, expected_result, repair):
+    parser = QwenToolParser(valid_tools={"finish"})
+
+    calls = parser.parse(response)
+    shadow = parser.repair_finish_shadow(response, calls)
+
+    assert shadow is not None
+    assert shadow.arguments["result"] == expected_result
+    assert parser.last_shadow_finish_repairs[0] == repair
+
+
+@pytest.mark.parametrize("response", ['{"items":[1}}', '{"done": tru}', '<answer>{"done":true} trailing'])
+def test_finish_shadow_rejects_ambiguous_json(response):
+    parser = QwenToolParser(valid_tools={"finish"})
+
+    assert parser.repair_finish_shadow(response, parser.parse(response)) is None
+
+
+@pytest.mark.parametrize(
     "response",
     [
         '<|tool_call>call:web_search{query:<|"|>truncated without a boundary',
@@ -1779,7 +1910,7 @@ def test_gemma4_missing_required_parameter_penalizes_terminal_action(tmp_path: P
     assert _policy_masked_text(sample) == bad
 
 
-def test_gemma4_unknown_optional_parameter_executes_declared_subset(tmp_path: Path):
+def test_gemma4_extension_parameter_is_preserved_by_parser_and_safely_dispatched(tmp_path: Path):
     unknown = '<|tool_call>call:echo{value:<|"|>good<|"|>,unknown_parameter:<|"|>bad<|"|>}<tool_call|>'
     result = _run_generate_with_fake_sglang(
         _local_mcp_sample(tmp_path, question="Recover from an optional parameter"),
@@ -1795,8 +1926,9 @@ def test_gemma4_unknown_optional_parameter_executes_declared_subset(tmp_path: Pa
     sample = result[0]
     assert sample.reward == 1.0
     assert sample.metadata["fused_termination"] == "env_done"
-    assert sample.metadata["tool_parser_error_recoverable"] is True
-    assert sample.metadata["tool_parser_error_kinds"] == ["unknown_parameter"]
+    assert "tool_parser_error_recoverable" not in sample.metadata
+    first_step = sample.metadata["rllm_episode"]["trajectories"][0]["steps"][0]
+    assert "unknown_parameter" in first_step["action"]
 
 
 def test_gemma4_deterministic_syntax_repair_continues_rollout(tmp_path: Path):
@@ -1817,6 +1949,141 @@ def test_gemma4_deterministic_syntax_repair_continues_rollout(tmp_path: Path):
     assert sample.metadata["fused_termination"] == "env_done"
     assert sample.metadata["tool_parser_syntax_repairs"] == ["missing_tool_call_end"]
     assert sample.metadata["credit_assignment_event"] is None
+
+
+def test_mcp_finish_shadow_repair_preserves_policy_output_and_masks_turn(tmp_path: Path):
+    evidence_call = _gemma4_echo_call("evidence")
+    raw_response = '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:{done:true}'
+    calls = [{"text": evidence_call}, {"text": raw_response}]
+    sample_spec = _local_mcp_sample(tmp_path, question="Repair the final answer only in the executor")
+    sample_spec.metadata["answer_schema"] = {
+        "type": "object",
+        "properties": {"done": {"const": True}},
+        "required": ["done"],
+        "additionalProperties": False,
+    }
+
+    result = _run_generate_with_fake_sglang(
+        sample_spec,
+        calls,
+        {
+            "SLIME_LOCAL_MCP_PROCESS_ISOLATION": "false",
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    assert calls == []
+    sample = result[0] if isinstance(result, list) else result
+    assert sample.reward == 1.0
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["tool_parser_shadow_finish_repairs"] == [
+        "missing_argument_object_end",
+        "missing_tool_call_end",
+    ]
+    assert sample.metadata["tool_parser_shadow_finish_policy_masked"] is True
+    assert _response_text(sample).endswith(raw_response)
+    assert sample.tokens[-len(raw_response) :] == [ord(char) for char in raw_response]
+    assert _policy_masked_text(sample) == evidence_call
+    assert _policy_unmasked_text(sample).endswith(raw_response)
+    policy_mask = sample.policy_loss_mask if sample.policy_loss_mask is not None else sample.loss_mask
+    assert policy_mask[-len(raw_response) :] == [0] * len(raw_response)
+    episode_step = sample.metadata["rllm_episode"]["trajectories"][0]["steps"][1]
+    assert episode_step["model_response"] == raw_response
+    assert episode_step["chat_completions"][-1]["content"] == raw_response
+
+
+@pytest.mark.parametrize(
+    ("raw_response", "repair"),
+    [
+        ('{"done":true}', "bare_json"),
+        ('<answer>{"done":true}</answer>', "answer_json"),
+    ],
+)
+def test_mcp_json_wrapper_shadow_executes_without_rewriting_policy_output(
+    tmp_path: Path,
+    raw_response: str,
+    repair: str,
+):
+    evidence_call = _echo_call("evidence")
+    calls = [{"text": evidence_call}, {"text": raw_response}]
+    sample_spec = _local_mcp_sample(tmp_path, question="Accept a bounded JSON final wrapper")
+    sample_spec.metadata["answer_schema"] = {
+        "type": "object",
+        "properties": {"done": {"const": True}},
+        "required": ["done"],
+    }
+
+    result = _run_generate_with_fake_sglang(
+        sample_spec,
+        calls,
+        {
+            "SLIME_LOCAL_MCP_PROCESS_ISOLATION": "false",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+    )
+
+    assert calls == []
+    sample = result[0] if isinstance(result, list) else result
+    assert sample.reward == 1.0
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["tool_parser_shadow_finish_repairs"][0] == repair
+    assert sample.tokens[-len(raw_response) :] == [ord(char) for char in raw_response]
+    policy_mask = sample.policy_loss_mask if sample.policy_loss_mask is not None else sample.loss_mask
+    assert policy_mask[-len(raw_response) :] == [0] * len(raw_response)
+    final_step = sample.metadata["rllm_episode"]["trajectories"][0]["steps"][1]
+    assert final_step["model_response"] == raw_response
+    assert final_step["chat_completions"][-1]["content"] == raw_response
+
+
+def test_mcp_finish_shadow_repair_requires_original_answer_schema(tmp_path: Path):
+    raw_response = '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:{done:<|"|>yes<|"|>}'
+    calls = [{"text": raw_response}]
+    sample_spec = _local_mcp_sample(tmp_path, question="Reject a schema-invalid shadow answer")
+    sample_spec.metadata["answer_schema"] = {
+        "type": "object",
+        "properties": {"done": {"type": "boolean"}},
+        "required": ["done"],
+    }
+
+    result = _run_generate_with_fake_sglang(
+        sample_spec,
+        calls,
+        {
+            "SLIME_LOCAL_MCP_PROCESS_ISOLATION": "false",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    assert calls == []
+    sample = result[0] if isinstance(result, list) else result
+    assert sample.reward == 0.0
+    assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR"
+    assert sample.metadata["tool_parser_error_kinds"] == ["finish_answer_schema"]
+    assert "tool_parser_shadow_finish_repairs" not in sample.metadata
+
+
+def test_mcp_valid_finish_remains_policy_trainable(tmp_path: Path):
+    response = '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:{done:true}}<tool_call|>'
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Submit a valid final answer"),
+        [{"text": _gemma4_echo_call("evidence")}, {"text": response}],
+        {
+            "SLIME_LOCAL_MCP_PROCESS_ISOLATION": "false",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0] if isinstance(result, list) else result
+    assert sample.reward == 1.0
+    assert _policy_masked_text(sample).endswith(response)
+    assert "tool_parser_shadow_finish_repairs" not in sample.metadata
 
 
 def test_gemma4_web_search_recovers_terminal_missing_ordinary_quote():
@@ -1955,8 +2222,7 @@ def test_gemma4_tito_delta_does_not_duplicate_generated_tool_response_handoff():
     )
     continuation = tokenizer.decode(delta_ids, skip_special_tokens=False)
 
-    assert continuation.startswith('response:web_search{value:<|"|>result<|"|>}<tool_response|>')
-    assert not continuation.startswith("<|tool_response>")
+    assert continuation == "<turn|>\n<|turn>tool\nresult<turn|>\n<|turn>model\n"
 
 
 def test_gemma4_tito_delta_keeps_tool_response_handoff_when_generation_omits_it():
@@ -1987,7 +2253,35 @@ def test_gemma4_tito_delta_keeps_tool_response_handoff_when_generation_omits_it(
     )
     continuation = tokenizer.decode(delta_ids, skip_special_tokens=False)
 
-    assert continuation.startswith('<|tool_response>response:web_search{value:<|"|>result<|"|>}<tool_response|>')
+    assert continuation == "<turn|>\n<|turn>tool\nresult<turn|>\n<|turn>model\n"
+
+
+def test_gemma4_tito_delta_does_not_duplicate_generated_turn_end():
+    tokenizer = FakeGemma4Tokenizer()
+    action = '<|tool_call>call:web_search{query:<|"|>evidence<|"|>}<tool_call|><turn|>'
+    old_messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": action.removesuffix("<turn|>")},
+    ]
+    new_messages = [
+        old_messages[0],
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "web_search", "arguments": {"query": "evidence"}}}],
+            "tool_responses": [{"name": "web_search", "response": {"value": "result"}}],
+        },
+    ]
+
+    delta_ids = _render_gemma4_tito_delta_ids(
+        tokenizer,
+        old_messages,
+        new_messages,
+        tokenizer.encode(action, add_special_tokens=False),
+        tools=None,
+        disable_thinking=True,
+    )
+
+    assert tokenizer.decode(delta_ids) == "\n<|turn>tool\nresult<turn|>\n<|turn>model\n"
 
 
 def test_build_system_prompt_switches_tool_format_by_model():
@@ -2369,6 +2663,38 @@ def test_local_mcp_lazy_group_executes_new_tool_in_next_rollout_turn(tmp_path: P
     assert samples[-1].reward == 1.0
     assert samples[-1].metadata["fused_termination"] == "env_done"
     assert samples[-1].metadata["fused_tool_call_turns"] == 2
+
+
+def test_gemma4_lazy_group_adds_native_declaration_in_system_turn(tmp_path: Path):
+    sample = _local_mcp_sample(tmp_path, question="Load and call echo")
+    sample.metadata.update(
+        {
+            "enabled_tools": ["echo"],
+            "tool_groups": {"echo_tools": {"description": "Echo a value", "tools": ["echo"]}},
+        }
+    )
+    load = '<|tool_call>call:load_tool_group{group:<|"|>echo_tools<|"|>}<tool_call|>'
+    prompts = []
+
+    result = _run_generate_with_fake_sglang(
+        sample,
+        [{"text": load}, {"text": _gemma4_echo_call("loaded")}, {"text": _gemma4_finish_call()}],
+        {
+            "SLIME_LOCAL_MCP_PROCESS_ISOLATION": "false",
+            "FUSED_MODEL_SERIES": "gemma4",
+            "FUSED_DISABLE_THINKING": "True",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+        prompt_ids_seen=prompts,
+    )
+    rendered_prompts = ["".join(chr(token) for token in prompt) for prompt in prompts]
+
+    assert result[-1].reward == 1.0
+    assert "declaration:echo{" not in rendered_prompts[0]
+    assert "<|turn>system\n<|tool>declaration:echo{" in rendered_prompts[1]
+    tool_response = rendered_prompts[1].split("<|turn>tool\n", 1)[1].split("<turn|>", 1)[0]
+    assert "declaration:echo{" not in tool_response
 
 
 def test_local_mcp_loading_group_does_not_satisfy_evidence_requirement(tmp_path: Path, monkeypatch):
@@ -4127,8 +4453,8 @@ def test_gemma4_tito_delta_appends_only_tool_response_after_raw_action():
     )
     rendered_delta = tokenizer.decode(delta)
 
-    assert rendered_delta.startswith("<|tool_response>")
-    assert "response:echo" in rendered_delta
+    assert rendered_delta.startswith("<turn|>\n<|turn>tool\n")
+    assert '{"echo": "alpha"}' in rendered_delta
     assert "<|tool_call>" not in rendered_delta
     assert rendered_delta.endswith("<turn|>\n<|turn>model\n")
 
@@ -4521,7 +4847,7 @@ def test_render_prompt_ids_fallback_appends_empty_thinking_prefix():
     assert prompt_ids[3:] == [ord(ch) for ch in "<think>\n\n</think>\n\n"]
 
 
-def test_gemma4_render_prompt_ids_falls_back_to_inline_native_tools_when_tools_kwarg_is_unsupported():
+def test_gemma4_render_prompt_ids_inlines_native_tools_before_chat_template():
     class NoToolsGemma4Tokenizer:
         name_or_path = "/models/gemma-4-E2B-it"
 
@@ -4545,13 +4871,30 @@ def test_gemma4_render_prompt_ids_falls_back_to_inline_native_tools_when_tools_k
     )
     rendered = "".join(chr(ch) for ch in prompt_ids)
 
-    assert tokenizer.rendered_messages is not None
+    assert tokenizer.rendered_messages is None
     assert "<|tool>declaration:web_search{" in rendered
     assert "<|tool>declaration:finish{" in rendered
     assert "When you need to call a tool" not in rendered
     assert "Do not wrap Gemma4 tool calls" not in rendered
     assert "<tools>" not in rendered
     assert "<function=FUNCTION_NAME>" not in rendered
+
+
+def test_gemma4_render_prompt_ids_preserves_union_finish_schema():
+    prompt_ids = _render_prompt_ids(
+        FakeGemma4Tokenizer(),
+        [
+            {"role": "system", "content": FUSED_MCP_SYSTEM_PROMPT.strip()},
+            {"role": "user", "content": "Extract."},
+        ],
+        tools=[finish_schema(structured_result=True)],
+    )
+    rendered = "".join(chr(token) for token in prompt_ids)
+
+    assert 'result:{description:<|"|>Final answer or JSON value.<|"|>,anyOf:[' in rendered
+    assert '{type:<|"|>OBJECT<|"|>}' in rendered
+    assert '{type:<|"|>ARRAY<|"|>}' in rendered
+    assert 'type:<|"|><|"|>' not in rendered
 
 
 def test_gemma4_render_prompt_ids_does_not_add_qwen_think_shell_when_enable_thinking_is_unsupported():
@@ -4580,7 +4923,7 @@ def test_gemma4_render_prompt_ids_does_not_add_qwen_think_shell_when_enable_thin
     )
     rendered = "".join(chr(ch) for ch in prompt_ids)
 
-    assert tokenizer.rendered_messages is not None
+    assert tokenizer.rendered_messages is None
     assert "<think>" not in rendered
     assert "</think>" not in rendered
     assert '<|tool_call>call:echo{value:<|"|>x<|"|>}<tool_call|>' in rendered
@@ -4852,7 +5195,7 @@ def test_web_search_prompt_removes_conflicting_answer_tag_instruction():
     assert "do not use <answer> tags or \\boxed{}" in messages[0]["content"]
 
 
-def test_gemma4_initial_messages_leave_tools_to_chat_template():
+def test_gemma4_initial_messages_leave_declaration_rendering_to_prompt_builder():
     schemas = [web_search_schema(), finish_schema()]
 
     messages = _initial_messages(
@@ -4867,7 +5210,14 @@ def test_gemma4_initial_messages_leave_tools_to_chat_template():
     assert "Gemma4 native tool-call contract:" in messages[0]["content"]
     assert "<|tool>declaration:" not in messages[0]["content"]
 
-    rendered = FakeGemma4Tokenizer().apply_chat_template(messages, tools=schemas, tokenize=False)
+    rendered = fused_generate._apply_chat_template(
+        FakeGemma4Tokenizer(),
+        messages,
+        tools=schemas,
+        tokenize=False,
+        add_generation_prompt=True,
+        disable_thinking=False,
+    )
     assert "<|tool>declaration:web_search{" in rendered
     assert "<|tool>declaration:finish{" in rendered
 
@@ -5205,6 +5555,151 @@ def test_webqa_normalized_target_span_mode_scores_verbose_gemma_answer(monkeypat
     assert env.reward_debug["match_mode"] == "normalized_target_span"
     assert env.reward_debug["exact_match"] is False
     assert env.reward_debug["normalized_target_span_match"] is True
+
+
+def test_webqa_normalized_target_span_mode_scores_concise_qualified_answer(monkeypatch):
+    monkeypatch.setenv("FUSED_WEBQA_MIN_UNIQUE_SEARCHES", "1")
+    monkeypatch.setenv("FUSED_WEBQA_REWARD_MATCH_MODE", "normalized_target_span")
+    env = FusedEnvironment({"question": "Find evidence", "ground_truth": "DAMA/NaI"})
+    env.tool_calls = 1
+    env.web_search_queries = {"query"}
+    env.answer = "DAMA/NaI experiment"
+
+    assert env.compute_final_reward() == 1.0
+    assert env.reward_debug["exact_match"] is False
+    assert env.reward_debug["normalized_target_span_match"] is True
+
+
+def test_webqa_normalized_target_span_mode_rejects_short_generic_target(monkeypatch):
+    monkeypatch.setenv("FUSED_WEBQA_MIN_UNIQUE_SEARCHES", "1")
+    monkeypatch.setenv("FUSED_WEBQA_REWARD_MATCH_MODE", "normalized_target_span")
+    env = FusedEnvironment({"question": "Find evidence", "ground_truth": "MUSIC"})
+    env.tool_calls = 1
+    env.web_search_queries = {"query"}
+    env.answer = "The answer is MUSIC"
+
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["normalized_target_span_match"] is False
+
+    env.answer = "MUSIC"
+    assert env.compute_final_reward() == 1.0
+    assert env.reward_debug["exact_match"] is True
+    assert env.reward_debug["normalized_target_span_match"] is False
+
+
+def test_webqa_normalized_target_span_mode_rejects_long_explanation(monkeypatch):
+    monkeypatch.setenv("FUSED_WEBQA_MIN_UNIQUE_SEARCHES", "1")
+    monkeypatch.setenv("FUSED_WEBQA_REWARD_MATCH_MODE", "normalized_target_span")
+    env = FusedEnvironment({"question": "Find evidence", "ground_truth": "Frost Laws"})
+    env.tool_calls = 1
+    env.web_search_queries = {"query"}
+    env.answer = (
+        "The legal framework implicitly referenced is the general traffic regulation system, "
+        "which may include Frost Laws among several broader seasonal restrictions."
+    )
+
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["normalized_target_span_match"] is False
+
+
+@pytest.mark.parametrize(
+    ("ground_truth", "prediction"),
+    [
+        ("Macworld Conference & Expo", "Macworld Conference and Expo"),
+        ("The Huzita–Hatori Axioms", "Huzita-Hatori axioms"),
+        ("The Music Ontology (MO)", "Music Ontology"),
+        ("Variational Quantum Eigensolver (VQE)", "VQE (Variational Quantum Eigensolver)"),
+    ],
+)
+def test_webqa_safe_structured_equivalence(monkeypatch, ground_truth, prediction):
+    monkeypatch.setenv("FUSED_WEBQA_MIN_UNIQUE_SEARCHES", "1")
+    monkeypatch.setenv("FUSED_WEBQA_REWARD_MATCH_MODE", "normalized_target_span")
+    env = FusedEnvironment({"question": "structured equivalence", "ground_truth": ground_truth})
+    env.web_search_queries = {"query"}
+    env.answer = prediction
+
+    assert env.compute_final_reward() == 1.0
+    assert env.reward_debug["structured_alias_match"] is True
+    assert env.reward_debug["reward_match_reason"] == "structured_alias"
+
+
+@pytest.mark.parametrize(
+    ("ground_truth", "prediction"),
+    [
+        ("The Music Ontology (MO)", "Music Ontology (MOO)"),
+        ("Field Music", "Music Field"),
+    ],
+)
+def test_webqa_structured_equivalence_rejects_unsafe_fuzzy_matches(monkeypatch, ground_truth, prediction):
+    monkeypatch.setenv("FUSED_WEBQA_MIN_UNIQUE_SEARCHES", "1")
+    monkeypatch.setenv("FUSED_WEBQA_REWARD_MATCH_MODE", "normalized_target_span")
+    env = FusedEnvironment({"question": "unsafe equivalence", "ground_truth": ground_truth})
+    env.web_search_queries = {"query"}
+    env.answer = prediction
+
+    assert env.compute_final_reward() == 0.0
+    assert env.reward_debug["structured_alias_match"] is False
+
+
+def test_webqa_approved_alias_is_question_scoped(monkeypatch, tmp_path):
+    question = "Which specific mutation is requested?"
+    question_hash = hashlib.sha256(question.encode()).hexdigest()[:16]
+    registry = tmp_path / "aliases.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "approved_aliases": {
+                    question_hash: {
+                        "ground_truth": ["DNMT3A R882H mutation"],
+                        "aliases": ["R882H"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FUSED_WEBQA_MIN_UNIQUE_SEARCHES", "1")
+    monkeypatch.setenv("FUSED_WEBQA_REWARD_MATCH_MODE", "normalized_target_span")
+    monkeypatch.setenv("FUSED_WEBQA_ALIAS_REGISTRY_PATH", str(registry))
+
+    matched = FusedEnvironment({"question": question, "ground_truth": "DNMT3A R882H mutation"})
+    matched.web_search_queries = {"query"}
+    matched.answer = "R882H"
+    assert matched.compute_final_reward() == 1.0
+    assert matched.reward_debug["approved_alias_match"] is True
+
+    other = FusedEnvironment({"question": "A different question", "ground_truth": "DNMT3A R882H mutation"})
+    other.web_search_queries = {"query"}
+    other.answer = "R882H"
+    assert other.compute_final_reward() == 0.0
+    assert other.reward_debug["approved_alias_match"] is False
+
+    changed_target = FusedEnvironment({"question": question, "ground_truth": "DNMT3A R882C mutation"})
+    changed_target.web_search_queries = {"query"}
+    changed_target.answer = "R882H"
+    assert changed_target.compute_final_reward() == 0.0
+    assert changed_target.reward_debug["approved_alias_match"] is False
+
+
+def test_webqa_alias_registry_accounts_for_all_153_audited_candidates():
+    registry_path = Path(fused_env.__file__).with_name("webqa_alias_registry.json")
+    audit = json.loads(registry_path.read_text(encoding="utf-8"))["audit"]
+
+    def expand_ranks(value):
+        ranks = []
+        for item in value.split(","):
+            if "-" in item:
+                start, end = (int(part) for part in item.split("-"))
+                ranks.extend(range(start, end + 1))
+            else:
+                ranks.append(int(item))
+        return ranks
+
+    approved = expand_ranks(audit["approved_ranks"])
+    rejected = expand_ranks(audit["rejected_ranks"])
+    assert len(approved) == audit["approved_candidate_pairs"] == 22
+    assert len(rejected) == audit["rejected_candidate_pairs"] == 131
+    assert sorted(approved + rejected) == list(range(1, 154))
 
 
 def test_webqa_rejects_unknown_reward_match_mode(monkeypatch):
@@ -6922,14 +7417,12 @@ def test_gemma4_tito_masks_tool_response_context_and_trains_only_actions(tmp_pat
     assert len(result) == 1
     sample = result[0]
     assert sample.reward == 1.0
-    # Gemma4's structured tool rewrite replaces the assistant message, but the
-    # strict TITO delta proves token continuity, so the RAW first-turn action
-    # tokens stay in the sample and keep training (mask=1); only the rewritten
-    # replay (tool_call/tool_response markers) is context (mask=0).
+    # The exact generated action stays policy-trainable. TiTO appends only the
+    # official model-turn boundary and role:tool result as masked context.
     assert _masked_text(sample) == first + finish
     full_text = "".join(chr(tok) for tok in sample.tokens)
     assert first in full_text
-    assert 'response:echo{echo:<|"|>before-finish<|"|>}' in full_text
+    assert '<|turn>tool\n{"echo": "before-finish"}<turn|>' in full_text
     assert "<tool_response>\nExecution output" not in full_text
     # The full served context is preserved: system/user prompt precedes the turns.
     assert "system" in full_text
@@ -6960,12 +7453,11 @@ def test_gemma4_batches_multiple_independent_tool_calls_in_one_turn(tmp_path: Pa
     assert first_step["action"] == first_turn
     assert '{"echo": "alpha"}' in first_step["observation"]
     assert '{"echo": "beta"}' in first_step["observation"]
-    # Raw first-turn tool calls keep training (strict TITO merge); only the
-    # structured replay and tool responses are context.
+    # Raw first-turn tool calls keep training; official role:tool turns are context.
     assert _masked_text(sample) == first_turn + finish
     full_text = "".join(chr(tok) for tok in sample.tokens)
-    assert 'response:echo{echo:<|"|>alpha<|"|>}' in full_text
-    assert 'response:echo{echo:<|"|>beta<|"|>}' in full_text
+    assert '<|turn>tool\n{"echo": "alpha"}<turn|>' in full_text
+    assert '<|turn>tool\n{"echo": "beta"}<turn|>' in full_text
     assert "<tool_response>\nExecution output" not in full_text
 
 

@@ -226,6 +226,7 @@ def test_debug_rollout_shard_preserves_all_trajectories_and_metadata(tmp_path):
         save_debug_rollout_data=str(tmp_path / "rollout_data" / "{rollout_id}.pt"),
         n_samples_per_prompt=32,
     )
+    manager.data_source = SimpleNamespace(state_dict=lambda: {"sample_offset": 123, "sample_index": 456})
     manager._pending_rllm_episode_samples = {}
 
     manager._save_debug_rollout_data(samples, rollout_id=7, evaluation=False)
@@ -238,7 +239,23 @@ def test_debug_rollout_shard_preserves_all_trajectories_and_metadata(tmp_path):
     assert dumped["num_samples"] == 64
     assert [group["sample_positions"] for group in dumped["task_groups"]] == [list(range(32)), list(range(32, 64))]
     assert dumped["samples"] == [sample.to_dict() for sample in samples]
+    assert dumped["data_source_state"] == {"sample_offset": 123, "sample_index": 456}
     assert not path.with_suffix(".pt.tmp").exists()
+
+    restored_states = []
+    replay_manager = rollout_manager_class.__new__(rollout_manager_class)
+    replay_manager.args = SimpleNamespace(
+        load_debug_rollout_data=str(path),
+        load_debug_rollout_data_subsample=None,
+        rollout_global_dataset=True,
+    )
+    replay_manager.data_source = SimpleNamespace(load_state_dict=restored_states.append)
+
+    replayed, metrics = replay_manager._get_rollout_data(rollout_id=7)
+
+    assert metrics is None
+    assert len(replayed) == len(samples)
+    assert restored_states == [{"sample_offset": 123, "sample_index": 456}]
 
 
 class FakeWorker:

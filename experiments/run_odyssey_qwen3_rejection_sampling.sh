@@ -543,6 +543,14 @@ export SCRIPT_DIR REPO_ROOT MEGATRON_LM_PATH HAS_NVLINK
 export SLIME_EPISODE_LOG_DIR="${EPISODE_LOG_DIR}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export NUM_GPUS="${NUM_GPUS:-${ROLLOUT_GPUS}}"
+
+# dgx-hyperplane17 currently has a CUDA 12.9 driver but a CUDA 13.1 CuTe DSL
+# runtime. Use FlashInfer's CUDA JIT norm fallback until the node stack is aligned.
+if [ "$(hostname -s)" = "dgx-hyperplane17" ]; then
+   export FLASHINFER_USE_CUDA_NORM=1
+   export LD_LIBRARY_PATH="/home/liuyang/app/anaconda3/envs/slime/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+   echo "Enabled the FlashInfer CUDA norm fallback for dgx-hyperplane17."
+fi
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-7200}"
@@ -651,6 +659,7 @@ RUNTIME_ENV_JSON=$(python3 - <<PY
 import json, os
 keys = (
     "CUDA_HOME", "HYDRA_FULL_ERROR", "NCCL_IB_DISABLE", "NCCL_TIMEOUT",
+    "FLASHINFER_USE_CUDA_NORM", "LD_LIBRARY_PATH",
     "SLIME_EPISODE_LOG_DIR", "RAY_WARN_BLOCKING_GET_INSIDE_ASYNC",
     "TOKENIZERS_PARALLELISM", "VLLM_ALLOW_LONG_MAX_MODEL_LEN",
     "VLLM_ENGINE_ITERATION_TIMEOUT_S", "VLLM_WORKER_MULTIPROC_METHOD",
@@ -772,6 +781,13 @@ SGLANG_ARGS=(
    --sglang-context-length "${MAX_CONTEXT_LEN}"
    --router-policy "${ROUTER_POLICY}"
 )
+
+if [ "$(hostname -s)" = "dgx-hyperplane17" ]; then
+   SGLANG_ARGS+=(
+      --sglang-attention-backend triton
+      --sglang-sampling-backend pytorch
+   )
+fi
 
 echo "Experiment: ${EXPERIMENT_NAME}"
 echo "Output: ${OUTPUT_DIR}"

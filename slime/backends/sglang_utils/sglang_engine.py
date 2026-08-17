@@ -370,6 +370,10 @@ class SGLangEngine(RayActor):
             return None
         return f"http://{self.server_host}:{self.server_port}"
 
+    def health_actor(self) -> bool:
+        """Cheap actor/process liveness check that is safe while GPU memory is offloaded."""
+        return bool(self.process and self.process.is_alive())
+
     def shutdown(self):
         if self.args.rollout_external:
             return

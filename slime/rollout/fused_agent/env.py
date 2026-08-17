@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import types
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -37,6 +38,12 @@ from .search_gym import search_schema
 logger = logging.getLogger(__name__)
 
 _MCP_TOOL_NAME_MAX_LENGTH = 64
+_WEBQA_SPAN_MIN_TARGET_CHARS = 7
+_WEBQA_SPAN_MAX_PREDICTION_WORDS = 12
+_WEBQA_SPAN_MAX_TARGET_WORD_MULTIPLIER = 4
+_WEBQA_SPAN_MIN_PREDICTION_WORD_BUDGET = 4
+_WEBQA_ALIAS_REGISTRY_DEFAULT = Path(__file__).with_name("webqa_alias_registry.json")
+_WEBQA_ALIAS_REGISTRY_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
 
 
 def _compile_generated_mcp_module(tools_py: Path):
@@ -1561,6 +1568,14 @@ class FusedEnvironment:
             return [web_search_schema(), finish_schema()]
         return [finish_schema()]
 
+    def finish_validation_errors(self, result: Any) -> list[str]:
+        if self.mode != "mcp" or self.mcp_tools is None:
+            return []
+        return _validate_mcp_finish_result(
+            result,
+            getattr(self.mcp_tools, "finish_result_schema", None),
+        )
+
     async def step(self, action: ToolCall | str) -> tuple[str, float, bool, dict[str, Any]]:
         if isinstance(action, str):
             return action, 0.0, False, {"parser/unknown_total": 1}
@@ -1569,11 +1584,7 @@ class FusedEnvironment:
         if name in {"finish", "submit"}:
             result = args["result"] if "result" in args else args.get("answer", "")
             if self.mode == "mcp" and self.mcp_tools is not None:
-                validation_errors = await asyncio.to_thread(
-                    _validate_mcp_finish_result,
-                    result,
-                    getattr(self.mcp_tools, "finish_result_schema", None),
-                )
+                validation_errors = await asyncio.to_thread(self.finish_validation_errors, result)
                 if validation_errors:
                     return (
                         "Error: finish.result does not match the required answer schema:\n- "
@@ -1885,10 +1896,18 @@ class FusedEnvironment:
             return 0.0
         match_mode = os.environ.get("FUSED_WEBQA_REWARD_MATCH_MODE", "exact").strip().lower()
         exact_match = _exact_match_reward(pred, gt)
+        normalized_target_span_match = _normalized_target_span_reward(pred, gt)
+        structured_alias_match = _structured_equivalence_reward(pred, gt)
+        approved_aliases = _approved_webqa_aliases(self.task, gt)
+        approved_alias_match = bool(approved_aliases) and bool(
+            _exact_match_reward(pred, approved_aliases)
+            or _normalized_target_span_reward(pred, approved_aliases)
+        )
+        alias_match = structured_alias_match or approved_alias_match
         if match_mode == "exact":
             reward = exact_match
         elif match_mode == "normalized_target_span":
-            reward = _normalized_target_span_reward(pred, gt)
+            reward = exact_match or normalized_target_span_match or alias_match
         else:
             raise ValueError(f"Unsupported FUSED_WEBQA_REWARD_MATCH_MODE: {match_mode!r}")
         self.reward_debug = {
@@ -1896,6 +1915,24 @@ class FusedEnvironment:
             "reward": reward,
             "match_mode": match_mode,
             "exact_match": bool(exact_match),
+            "normalized_target_span_match": bool(normalized_target_span_match),
+            "structured_alias_match": bool(structured_alias_match),
+            "approved_alias_match": bool(approved_alias_match),
+            "alias_match": bool(alias_match),
+            "exact_reward": float(bool(exact_match)),
+            "span_reward": float(bool(exact_match or normalized_target_span_match)),
+            "alias_reward": float(bool(exact_match or normalized_target_span_match or alias_match)),
+            "reward_match_reason": (
+                "exact"
+                if exact_match
+                else "target_span"
+                if normalized_target_span_match
+                else "structured_alias"
+                if structured_alias_match
+                else "approved_alias"
+                if approved_alias_match
+                else "no_match"
+            ),
             "prediction": pred,
             "ground_truth": gt,
             "tool_calls": self.tool_calls,
@@ -1903,8 +1940,6 @@ class FusedEnvironment:
         if self.mode == "web_search":
             self.reward_debug["unique_search_calls"] = len(self.web_search_queries)
             self.reward_debug["min_unique_search_calls"] = min_unique_searches
-            if match_mode == "normalized_target_span":
-                self.reward_debug["normalized_target_span_match"] = bool(reward)
         return float(reward)
 
     def _compute_verifier_reward(self, *, require_tool_evidence: bool = True) -> float | None:
@@ -2189,9 +2224,116 @@ def _exact_match_reward(prediction: str, ground_truth: Any) -> float:
 
 def _normalized_target_span_reward(prediction: str, ground_truth: Any) -> float:
     targets = ground_truth if isinstance(ground_truth, list) else [ground_truth]
-    normalized_prediction = f" {normalize_answer(str(prediction))} "
+    normalized_prediction_value = normalize_answer(str(prediction))
+    prediction_word_count = len(normalized_prediction_value.split())
+    if prediction_word_count > _WEBQA_SPAN_MAX_PREDICTION_WORDS:
+        return 0.0
+
+    normalized_prediction = f" {normalized_prediction_value} "
     normalized_targets = [normalize_answer(str(target)) for target in targets]
-    return 1.0 if any(target and f" {target} " in normalized_prediction for target in normalized_targets) else 0.0
+    for target in normalized_targets:
+        target_word_count = len(target.split())
+        if len(target) < _WEBQA_SPAN_MIN_TARGET_CHARS or not target_word_count:
+            continue
+        prediction_word_budget = max(
+            _WEBQA_SPAN_MIN_PREDICTION_WORD_BUDGET,
+            target_word_count * _WEBQA_SPAN_MAX_TARGET_WORD_MULTIPLIER,
+        )
+        if prediction_word_count <= prediction_word_budget and f" {target} " in normalized_prediction:
+            return 1.0
+    return 0.0
+
+
+def _structured_equivalence_reward(prediction: str, ground_truth: Any) -> float:
+    targets = ground_truth if isinstance(ground_truth, list) else [ground_truth]
+    return 1.0 if any(_is_safe_structured_equivalent(str(prediction), str(target)) for target in targets) else 0.0
+
+
+def _is_safe_structured_equivalent(left: str, right: str) -> bool:
+    if not left.strip() or not right.strip() or _exact_match_reward(left, right):
+        return False
+    if _webqa_structured_normalize(left) == _webqa_structured_normalize(right):
+        return True
+
+    left_parts = _validated_name_acronym(left)
+    right_parts = _validated_name_acronym(right)
+    if left_parts and _webqa_structured_normalize(left_parts[0]) == _webqa_structured_normalize(right):
+        return True
+    if right_parts and _webqa_structured_normalize(right_parts[0]) == _webqa_structured_normalize(left):
+        return True
+    if left_parts and right_parts:
+        return (
+            _webqa_structured_normalize(left_parts[0]) == _webqa_structured_normalize(right_parts[0])
+            and left_parts[1] == right_parts[1]
+        )
+    return False
+
+
+def _webqa_structured_normalize(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value).casefold()
+    value = value.replace("&", " and ")
+    value = re.sub(r"[\u2010-\u2015\u2212]", "-", value)
+    value = re.sub(r"[^\w]+", " ", value, flags=re.UNICODE)
+    return " ".join(word for word in value.split() if word not in {"a", "an", "the"})
+
+
+def _validated_name_acronym(value: str) -> tuple[str, str] | None:
+    match = re.fullmatch(r"\s*(.*?)\s*\(\s*(.*?)\s*\)\s*", value)
+    if not match:
+        return None
+    first, second = match.groups()
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{1,9}", second):
+        name, supplied_acronym = first, second
+    elif re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{1,9}", first):
+        name, supplied_acronym = second, first
+    else:
+        return None
+    words = re.findall(r"[A-Za-z0-9]+", unicodedata.normalize("NFKD", name))
+    while words and words[0].casefold() in {"a", "an", "the"}:
+        words.pop(0)
+    expected = "".join(word[0] for word in words).upper()
+    supplied = supplied_acronym.replace("-", "").upper()
+    if len(expected) < 2 or expected != supplied:
+        return None
+    return name, supplied
+
+
+def _approved_webqa_aliases(task: dict[str, Any], ground_truth: Any) -> list[str]:
+    question = str(task.get("question") or task.get("query") or task.get("input") or "")
+    if not question:
+        return []
+    registry = _load_webqa_alias_registry()
+    entry = registry.get(hashlib.sha256(question.encode("utf-8")).hexdigest()[:16])
+    if not isinstance(entry, dict):
+        return []
+    expected_targets = entry.get("ground_truth", [])
+    expected_targets = expected_targets if isinstance(expected_targets, list) else [expected_targets]
+    actual_targets = ground_truth if isinstance(ground_truth, list) else [ground_truth]
+    if not any(_exact_match_reward(str(actual), expected_targets) for actual in actual_targets):
+        return []
+    aliases = entry.get("aliases", [])
+    return [str(alias) for alias in aliases] if isinstance(aliases, list) else []
+
+
+def _load_webqa_alias_registry() -> dict[str, Any]:
+    path = Path(os.environ.get("FUSED_WEBQA_ALIAS_REGISTRY_PATH", _WEBQA_ALIAS_REGISTRY_DEFAULT))
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+        cache_key = str(path.resolve())
+        cached = _WEBQA_ALIAS_REGISTRY_CACHE.get(cache_key)
+        if cached and cached[0] == mtime_ns:
+            return cached[1]
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        entries = payload.get("approved_aliases", {})
+        if not isinstance(entries, dict):
+            raise ValueError("approved_aliases must be an object")
+        _WEBQA_ALIAS_REGISTRY_CACHE[cache_key] = (mtime_ns, entries)
+        return entries
+    except FileNotFoundError:
+        logger.warning("WebQA alias registry does not exist: %s", path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        logger.exception("Failed to load WebQA alias registry: %s", path)
+    return {}
 
 
 def _normalize_search_query(query: str) -> str:

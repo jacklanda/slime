@@ -38,6 +38,9 @@ Options:
   --rollout-num-gpus-per-engine N        Tensor-parallel GPUs per rollout engine.
                                          Default: 1 on this eight-GPU launcher.
   --ckpt-step N                          Resume this exact iteration from --load instead of its latest tracker.
+  --replay-rollout-id N                  Train exactly one saved rollout N from logs/debug/rollout_data/N.pt.
+                                         Requires checkpoint N-1 and does not start SGLang engines.
+  --fault-tolerance BOOL                 Monitor and recover failed rollout engines. Default: true.
   --retrieval-backend local|serper       Set both train and eval backends (compatibility alias).
   --train-retrieval-backend local|serper Training retrieval backend. Default: local.
   --eval-retrieval-backend local|serper  Evaluation retrieval backend. Default: serper.
@@ -88,6 +91,8 @@ Options:
   --horizon-reward-target-steps X        Target steps for no horizon penalty. Default: 8.
   --horizon-reward-target-tool-calls X   Target tool calls for no horizon penalty. Default: target_steps - 1.
   --enable-dynamic-sampling-filter BOOL  Enable DAPO-style non-zero reward variance dynamic filtering. Default: true.
+  --rollout-task-family-top-mean-steps BOOL
+                                         Prefer higher mean-step groups within each task-family quota. Default: true.
   --normalize-advantages / --no-normalize-advantages
                                          Whiten advantages across the data-parallel batch. Default: enabled.
   --enable_use_grm_train BOOL            Use OpenRouter GRM with rule-based fallback for WebQA training rewards.
@@ -163,6 +168,8 @@ PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
 # running the asynchronous collector as a separate experiment.
 FULLY_ASYNC="${FULLY_ASYNC:-false}"
 CKPT_STEP="${CKPT_STEP:-}"
+REPLAY_ROLLOUT_ID="${REPLAY_ROLLOUT_ID:-}"
+USE_FAULT_TOLERANCE="${USE_FAULT_TOLERANCE:-true}"
 ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
@@ -322,6 +329,8 @@ while [ "$#" -gt 0 ]; do
       --update-weights-interval) UPDATE_WEIGHTS_INTERVAL="${2:?Missing value for --update-weights-interval}"; shift 2 ;;
       --rollout-num-gpus-per-engine) ROLLOUT_NUM_GPUS_PER_ENGINE="${2:?Missing value for --rollout-num-gpus-per-engine}"; shift 2 ;;
       --ckpt-step) CKPT_STEP="${2:?Missing value for --ckpt-step}"; shift 2 ;;
+      --replay-rollout-id) REPLAY_ROLLOUT_ID="${2:?Missing value for --replay-rollout-id}"; shift 2 ;;
+      --fault-tolerance) USE_FAULT_TOLERANCE="${2:?Missing value for --fault-tolerance}"; shift 2 ;;
       --retrieval-backend) TRAIN_RETRIEVAL_BACKEND="${2:?Missing value for --retrieval-backend}"; EVAL_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND}"; shift 2 ;;
       --train-retrieval-backend) TRAIN_RETRIEVAL_BACKEND="${2:?Missing value for --train-retrieval-backend}"; shift 2 ;;
       --eval-retrieval-backend) EVAL_RETRIEVAL_BACKEND="${2:?Missing value for --eval-retrieval-backend}"; shift 2 ;;
@@ -369,6 +378,7 @@ while [ "$#" -gt 0 ]; do
       --horizon-reward-target-steps) FUSED_HORIZON_REWARD_TARGET_STEPS="${2:?Missing value for --horizon-reward-target-steps}"; shift 2 ;;
       --horizon-reward-target-tool-calls) FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS="${2:?Missing value for --horizon-reward-target-tool-calls}"; shift 2 ;;
       --enable-dynamic-sampling-filter) ENABLE_DYNAMIC_SAMPLING_FILTER="${2:?Missing value for --enable-dynamic-sampling-filter}"; shift 2 ;;
+      --rollout-task-family-top-mean-steps) ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${2:?Missing value for --rollout-task-family-top-mean-steps}"; shift 2 ;;
       --normalize-advantages) NORMALIZE_ADVANTAGES=true; shift ;;
       --no-normalize-advantages) NORMALIZE_ADVANTAGES=false; shift ;;
       --enable_use_grm_train|--enable-use-grm-train) ENABLE_USE_GRM_TRAIN="${2:?Missing value for --enable_use_grm_train}"; shift 2 ;;
@@ -680,6 +690,46 @@ XDG_CACHE_HOME="${XDG_CACHE_HOME:-${RUN_ROOT}/cache/xdg}"
 MCP_ENV_ROOT="${MCP_ENV_ROOT:-${RUN_ROOT}/cache/mcp_envs}"
 MCP_ENV_COPY_CONCURRENCY=32
 
+if [ -n "${REPLAY_ROLLOUT_ID}" ]; then
+   if ! [[ "${REPLAY_ROLLOUT_ID}" =~ ^[0-9]+$ ]] || [ "${REPLAY_ROLLOUT_ID}" -lt 1 ]; then
+      echo "--replay-rollout-id must be a positive integer; got ${REPLAY_ROLLOUT_ID}." >&2
+      exit 2
+   fi
+   replay_ckpt_step=$((REPLAY_ROLLOUT_ID - 1))
+   if [ -n "${CKPT_STEP}" ] && [ "${CKPT_STEP}" -ne "${replay_ckpt_step}" ]; then
+      echo "Replay rollout ${REPLAY_ROLLOUT_ID} requires --ckpt-step ${replay_ckpt_step}; got ${CKPT_STEP}." >&2
+      exit 2
+   fi
+   CKPT_STEP="${replay_ckpt_step}"
+   SLIME_DIAGNOSTIC_ROLLOUT_DATA="${DUMP_DETAILS}/rollout_data/${REPLAY_ROLLOUT_ID}.pt"
+   if [ ! -f "${SLIME_DIAGNOSTIC_ROLLOUT_DATA}" ]; then
+      echo "Replay rollout dump does not exist: ${SLIME_DIAGNOSTIC_ROLLOUT_DATA}" >&2
+      exit 2
+   fi
+   python3 - "${SLIME_DIAGNOSTIC_ROLLOUT_DATA}" "${REPLAY_ROLLOUT_ID}" <<'PY'
+import sys
+import torch
+
+path, expected_id = sys.argv[1], int(sys.argv[2])
+payload = torch.load(path, map_location="cpu", weights_only=False)
+if int(payload.get("rollout_id", -1)) != expected_id:
+    raise SystemExit(
+        f"Replay dump rollout_id mismatch: expected {expected_id}, got {payload.get('rollout_id')!r}"
+    )
+samples = payload.get("samples")
+if not isinstance(samples, list) or not samples:
+    raise SystemExit(f"Replay dump has no samples: {path}")
+required = {"tokens", "response", "reward", "loss_mask"}
+missing = required - samples[0].keys()
+if missing:
+    raise SystemExit(f"Replay dump is missing training fields: {sorted(missing)}")
+print(
+    f"Validated replay rollout {expected_id}: samples={len(samples)}, "
+    f"cursor_state={'data_source_state' in payload}, path={path}"
+)
+PY
+fi
+
 mkdir -p \
    "${SAVE_DIR}" \
    "${LOG_ROOT}" \
@@ -928,6 +978,7 @@ ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 # Keep the post-filter training batch at 50/50 webqa and mcp. The synchronous
 # collector keeps sampling each family until both accepted quotas are full.
 ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
+ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-true}"
 # Bound aggressive admission even when low ROI or long-tail groups keep the
 # collector refilling candidates before the previous wave fully drains.
 OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
@@ -944,6 +995,9 @@ SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-96}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-196400}"
+if [ -n "${REPLAY_ROLLOUT_ID}" ]; then
+   NUM_ROLLOUT=$((REPLAY_ROLLOUT_ID + 1))
+fi
 if [ $((ROLLOUT_BATCH_SIZE % 2)) -ne 0 ]; then
    echo "ROLLOUT_BATCH_SIZE must be even for the 50/50 webqa/mcp training mix; got ${ROLLOUT_BATCH_SIZE}." >&2
    exit 2
@@ -1149,10 +1203,10 @@ if [ -n "${DYNAMIC_SAMPLING_FILTER_PATH}" ]; then
    )
 fi
 if [ -n "${ROLLOUT_TASK_FAMILY_QUOTAS:-}" ]; then
-   ROLLOUT_ARGS+=(
-      --rollout-task-family-quotas "${ROLLOUT_TASK_FAMILY_QUOTAS}"
-      --rollout-task-family-top-mean-steps
-   )
+   ROLLOUT_ARGS+=(--rollout-task-family-quotas "${ROLLOUT_TASK_FAMILY_QUOTAS}")
+   if is_truthy "${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS}"; then
+      ROLLOUT_ARGS+=(--rollout-task-family-top-mean-steps)
+   fi
 fi
 if [ "${ENABLE_QUOTA_BUCKET_SAMPLING}" = "1" ]; then
    ROLLOUT_ARGS+=(--enable-quota-bucket-sampling)
@@ -1398,6 +1452,14 @@ fi
 if [ -n "${SLIME_DIAGNOSTIC_ROLLOUT_DATA:-}" ]; then
    MISC_ARGS+=(--load-debug-rollout-data "${SLIME_DIAGNOSTIC_ROLLOUT_DATA}")
 fi
+if [ -n "${REPLAY_ROLLOUT_ID}" ]; then
+   # Replay consumes the durable rollout shard and trains only; it must remain
+   # usable while the failed SGLang node is still unavailable.
+   MISC_ARGS+=(--debug-train-only)
+fi
+if is_truthy "${USE_FAULT_TOLERANCE}"; then
+   MISC_ARGS+=(--use-fault-tolerance)
+fi
 
 export SCRIPT_DIR REPO_ROOT MEGATRON_LM_PATH HAS_NVLINK
 export RUNS_ROOT RUN_ROOT SAVE_DIR LOG_ROOT EPISODE_LOG_DIR DUMP_DETAILS EVAL_CACHE_DIR PREPARED_PROMPT_DATA
@@ -1457,6 +1519,9 @@ export SLIME_FUSED_REQUIRE_WEIGHT_VERSION="${SLIME_FUSED_REQUIRE_WEIGHT_VERSION:
 # env only; current slime code consumes the subset used by selected generators.
 export RLLM_RETRIEVAL_MAX_WORDS="${RLLM_RETRIEVAL_MAX_WORDS:-1024}"
 export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-1}"
+export FUSED_WEBQA_REWARD_MATCH_MODE="normalized_target_span"
+export FUSED_WEBQA_ALIAS_REGISTRY_PATH="${FUSED_WEBQA_ALIAS_REGISTRY_PATH:-${REPO_ROOT}/slime/rollout/fused_agent/webqa_alias_registry.json}"
+export SLIME_ROLLOUT_PREFILTER_AUDIT_DIR="${SLIME_ROLLOUT_PREFILTER_AUDIT_DIR:-${LOG_ROOT}/prefilter_audit}"
 # Summarize is a ~2s LLM call per search with a large retry budget; on slow
 # trajectories it stacks up and blows the 180s rollout collection timeout,
 # causing groups to be dropped. Default off and use raw retrieve docs instead.
@@ -1572,7 +1637,8 @@ keys = (
     "RETRIEVAL_SERVER_URL", "TRAIN_RETRIEVAL_SERVER_URL", "EVAL_RETRIEVAL_SERVER_URL", "SERPER_PROXY_TOKEN", "SERPER_SEARCH_URL", "RLLM_RETRIEVAL_MODE", "RLLM_RETRIEVAL_MAX_WORDS",
     "RLLM_RETRIEVAL_CONCURRENCY", "RLLM_RETRIEVAL_CACHE_SIZE",
     "RETRIEVAL_MAX_RESULTS", "RLLM_RETRIEVAL_SUMMARIZE",
-    "FUSED_WEBQA_MIN_UNIQUE_SEARCHES",
+    "FUSED_WEBQA_MIN_UNIQUE_SEARCHES", "FUSED_WEBQA_REWARD_MATCH_MODE",
+    "FUSED_WEBQA_ALIAS_REGISTRY_PATH", "SLIME_ROLLOUT_PREFILTER_AUDIT_DIR",
     "RLLM_RETRIEVAL_RETRY_BUDGET", "RLLM_RETRIEVAL_SUMMARY_RETRY_BUDGET",
     "RLLM_RETRIEVAL_LEXRANK_FALLBACK", "RLLM_RETRIEVAL_LEXRANK_MAX_WORDS",
     "RLLM_RETRIEVAL_LEXRANK_MAX_SENTENCES", "RLLM_RETRIEVAL_LEXRANK_MAX_INPUT_SENTENCES",
@@ -1632,6 +1698,7 @@ PY
 
 echo "Experiment: ${EXPERIMENT_NAME}"
 echo "Run root: ${RUN_ROOT}"
+echo "Fault tolerance: ${USE_FAULT_TOLERANCE}; replay_rollout_id=${REPLAY_ROLLOUT_ID:-<none>}; replay_data=${SLIME_DIAGNOSTIC_ROLLOUT_DATA:-<none>}"
 echo "Model: ${MODEL_DIR}"
 echo "Ref: ${REF_LOAD}"
 echo "Prompt data: ${PROMPT_DATA_FOR_SLIME}"
@@ -1658,7 +1725,7 @@ echo "Fused controls: harness=${FUSED_HARNESS}, unified_system_prompt=${UNIFIED_
 echo "Rollout timeouts: trajectory=${FUSED_TRAJECTORY_TIMEOUT}s, group=${SLIME_ROLLOUT_GROUP_TIMEOUT}s, eval_trajectory=${FUSED_EVAL_TRAJECTORY_TIMEOUT}s"
 echo "Training batches: micro_batch=${MICRO_BATCH_SIZE}, num_steps_per_rollout=${NUM_STEPS_PER_ROLLOUT}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}, rollout_temperature=${TEMPERATURE}"
 echo "Retrieval: train_backend=${TRAIN_RETRIEVAL_BACKEND}, train_url=${TRAIN_RETRIEVAL_SERVER_URL}, eval_backend=${EVAL_RETRIEVAL_BACKEND}, eval_url=${EVAL_RETRIEVAL_SERVER_URL}, mode=${RLLM_RETRIEVAL_MODE}, concurrency=${RLLM_RETRIEVAL_CONCURRENCY}, cache_size=${RLLM_RETRIEVAL_CACHE_SIZE}, max_words=${RLLM_RETRIEVAL_MAX_WORDS}, max_results=${RETRIEVAL_MAX_RESULTS}, retry=${RETRIEVAL_RETRY_BUDGET}, summary_retry=${RETRIEVAL_SUMMARY_RETRY_BUDGET}, lexrank_fallback=${RETRIEVAL_LEXRANK_FALLBACK}"
-echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, strict=true, relax_after_groups=0; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}"
+echo "Dynamic filter: enable=${ENABLE_DYNAMIC_SAMPLING_FILTER}, path=${DYNAMIC_SAMPLING_FILTER_PATH:-<none>}, strict=true, relax_after_groups=0; webqa_min_unique_searches=${FUSED_WEBQA_MIN_UNIQUE_SEARCHES}, webqa_reward_match=${FUSED_WEBQA_REWARD_MATCH_MODE}, webqa_alias_registry=${FUSED_WEBQA_ALIAS_REGISTRY_PATH}, prefilter_audit=${SLIME_ROLLOUT_PREFILTER_AUDIT_DIR}"
 echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, benchmarks=${EVAL_INCLUDE_BENCHMARKS}, config=${EVAL_CONFIG:-<none>}, prompt_data=${EVAL_PROMPT_DATA[*]:-<none>}, n=${N_SAMPLES_PER_EVAL_PROMPT}, temperature=${EVAL_TEMPERATURE}, top_p=${EVAL_TOP_P}, top_k=${EVAL_TOP_K}, max_prompt_len=${EVAL_MAX_PROMPT_LEN}, max_response_len=${EVAL_MAX_RESPONSE_LEN}, max_context_len=${EVAL_MAX_CONTEXT_LEN}, val_before_train=${VAL_BEFORE_TRAIN}"
 echo "Eval scheduling: inflight=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS}, adaptive=${EVAL_ADAPTIVE_CONCURRENCY}, mix_datasets=${EVAL_MIX_DATASETS}, termination_retries=${EVAL_TERMINATION_RETRY_TIMES}, trajectory_sample_rate=${EVAL_TRAJECTORY_SAMPLE_RATE}, dump_failures=${EVAL_DUMP_FAILURES}, native_session=${NATIVE_SGLANG_SESSION}"
 echo "OpenRouter GRM: train=${ENABLE_USE_GRM_TRAIN}, train_model=${TRAIN_GRM_MODEL}, evals=${ENABLE_USE_GRM_EVALS}, eval_model=${EVAL_GRM_MODEL}, mode=${GRM_MODE}, concurrency=${GRM_CONCURRENCY}, max_connections=${GRM_MAX_CONNECTIONS}, timeout=${GRM_TIMEOUT}, retries=${GRM_MAX_RETRIES}, max_input_tokens=${GRM_MAX_INPUT_TOKENS}, max_new_tokens=${GRM_MAX_NEW_TOKENS}, custom_rm=${GRM_CUSTOM_RM_PATH}"
@@ -1666,7 +1733,7 @@ echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, normalize_advantag
 echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING}, path=${BUFFER_FILTER_PATH:-<none>}"
 echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}"
 echo "Horizon reward shaping: enable=${HORIZON_REWARD_SHAPING}, min_multiplier=${FUSED_HORIZON_REWARD_MIN_MULTIPLIER}, gamma=${FUSED_HORIZON_REWARD_GAMMA}, step_weight=${FUSED_HORIZON_REWARD_STEP_WEIGHT}, tool_call_weight=${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT}, target_steps=${FUSED_HORIZON_REWARD_TARGET_STEPS}, target_tool_calls=${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-target_steps-1}"
-echo "Post-filter rollout task family quotas: ${ROLLOUT_TASK_FAMILY_QUOTAS:-<none>}; candidate_multiplier=${SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER}"
+echo "Post-filter rollout task family quotas: ${ROLLOUT_TASK_FAMILY_QUOTAS:-<none>}; top_mean_steps=${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS}; candidate_multiplier=${SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER}"
 echo "Tail guard: enable=${TAIL_GUARD}, time_guard=${TAIL_GUARD_TIME_GUARD}, time_multiplier=${TAIL_GUARD_TIME_MULTIPLIER}, time_slack=${TAIL_GUARD_TIME_SLACK_SECONDS}, min_completion_ratio=${TAIL_GUARD_MIN_COMPLETION_RATIO}"
 echo "Credit assignment: enable=${CREDIT_ASSIGNMENT_ENABLE}, tool_parser_error=${CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR}, repeated_search_query=${CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY}, too_many_tool_calls=${CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS}, ngram_repetition=${CREDIT_ASSIGNMENT_NGRAM_REPETITION}(n=${CREDIT_ASSIGNMENT_NGRAM_REPETITION_N}, threshold=${CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD}, min_tokens=${CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS}), search_bypass=${CREDIT_ASSIGNMENT_SEARCH_BYPASS}, direct_submit_without_tool=${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL}, mixed_tool_and_answer=${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER}, tail_guard_early_stop=${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP}"
 

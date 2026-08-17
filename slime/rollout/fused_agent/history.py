@@ -57,6 +57,9 @@ def strip_trailing_chat_template_stop(text: str) -> str:
     stripped = text
     while True:
         without_ws = stripped.rstrip()
-        if not without_ws.endswith("<|im_end|>"):
+        for marker in ("<|im_end|>", "<turn|>"):
+            if without_ws.endswith(marker):
+                stripped = without_ws[: -len(marker)]
+                break
+        else:
             return stripped
-        stripped = without_ws[: -len("<|im_end|>")]
