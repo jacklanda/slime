@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import random
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -1023,13 +1024,54 @@ class RolloutManager:
         self._debug_dump_future: Future | None = None
 
         self._health_monitors = []
+        self._reboost_lock = threading.Lock()
         if not self.args.debug_train_only and self.args.use_fault_tolerance:
             for srv in self.servers.values():
                 for group in srv.server_groups:
-                    monitor = RolloutHealthMonitor(group, args)
+                    monitor = RolloutHealthMonitor(group, args, on_engine_failure=self._reboost_engine_group)
                     monitor.start()
                     self._health_monitors.append(monitor)
             self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
+
+    def _reboost_engine_group(self, failed_group: ServerGroup, rollout_engine_id: int) -> None:
+        """Synchronously rebuild a group after a health-check failure.
+
+        The failed request has already been converted into a retryable
+        infrastructure failure by the rollout path.  Rebuilding here removes
+        the dead worker from the router before that logical slot is retried,
+        while the lock prevents several monitor threads from racing through
+        server recovery.
+        """
+        with self._reboost_lock:
+            server = next(
+                (candidate for candidate in self.servers.values() if failed_group in candidate.server_groups),
+                None,
+            )
+            if server is None:
+                logger.warning("Cannot reboost engine %s: owning server was not found", rollout_engine_id)
+                return
+
+            logger.warning(
+                "Reboosting rollout engine group %s after health failure (worker_type=%s)",
+                rollout_engine_id,
+                failed_group.worker_type,
+            )
+            self.health_monitoring_pause()
+            try:
+                timeout = getattr(self.args, "rollout_health_check_timeout", None)
+                if isinstance(server, RolloutServer):
+                    server.recover(health_check_timeout=timeout)
+                    # ``recover`` restores weights for colocated engines but
+                    # intentionally leaves KV/CUDA-graph memory offloaded;
+                    # reboost happens during rollout, so finish that lifecycle
+                    # here before failed logical slots are retried.
+                    if failed_group.needs_offload:
+                        server.onload_kv()
+                else:
+                    server.recover()
+                logger.info("Rollout engine group %s reboost completed", rollout_engine_id)
+            finally:
+                self.health_monitoring_resume()
 
     def _try_ci_fault_injection(self):
         """Try to inject fault during generate (when health monitor is running)."""

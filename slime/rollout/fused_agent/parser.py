@@ -868,6 +868,17 @@ class Gemma4ToolParser(QwenToolParser):
                 self.last_schema_error_kinds.append("unknown_tool")
                 continue
             native_repairs = list(native_call.repairs)
+            # A missing ordinary quote is only deterministic when the declared
+            # schema identifies the field boundary (for example web_search's
+            # terminal query).  Without properties, repairing it would turn a
+            # malformed call into a fabricated valid action.
+            if "missing_quoted_string_end" in native_repairs:
+                parameter_schema = self._tool_parameter_schemas.get(name)
+                if not isinstance(parameter_schema, dict) or not parameter_schema.get("properties"):
+                    self.last_schema_errors.append(f"invalid arguments for tool {name!r}: unterminated quoted string")
+                    self.last_schema_error_spans.append(self._syntax_error_span(native_call, ValueError("offset 0")))
+                    self.last_schema_error_kinds.append("invalid_syntax")
+                    continue
             try:
                 # A complete web_search object makes a terminal query boundary
                 # unambiguous even when generation omits only its closing native
@@ -877,6 +888,7 @@ class Gemma4ToolParser(QwenToolParser):
                     parameter_schema=self._tool_parameter_schemas.get(name),
                     intrinsic_string_keys={"query"} if name == "web_search" else None,
                     terminal_native_string_keys={"query"} if name == "web_search" else None,
+                    allow_implicit_commas=shadow_finish and name in {"finish", "submit"},
                 )
             except ValueError as parse_error:
                 repaired_successfully = False
@@ -886,6 +898,7 @@ class Gemma4ToolParser(QwenToolParser):
                         args, field_spans = self._parse_object(
                             repaired_args,
                             parameter_schema=self._tool_parameter_schemas.get(name),
+                            allow_implicit_commas=shadow_finish and name in {"finish", "submit"},
                         )
                     except ValueError:
                         pass
@@ -1550,6 +1563,7 @@ class Gemma4ToolParser(QwenToolParser):
         parameter_schema: dict[str, Any] | None = None,
         intrinsic_string_keys: set[str] | None = None,
         terminal_native_string_keys: set[str] | None = None,
+        allow_implicit_commas: bool = False,
     ) -> tuple[dict[str, Any], dict[str, tuple[int, int, int, int]]]:
         properties = (parameter_schema or {}).get("properties") or {}
         string_keys = {
@@ -1563,6 +1577,7 @@ class Gemma4ToolParser(QwenToolParser):
             top_level_string_keys=string_keys,
             top_level_keys=set(map(str, properties)) | string_keys,
             terminal_native_string_keys=terminal_native_string_keys,
+            allow_implicit_commas=allow_implicit_commas,
         )
         value = parser.parse_value()
         parser.skip_ws()
@@ -1581,12 +1596,14 @@ class _Gemma4ArgumentParser:
         top_level_string_keys: set[str] | None = None,
         top_level_keys: set[str] | None = None,
         terminal_native_string_keys: set[str] | None = None,
+        allow_implicit_commas: bool = False,
     ):
         self.text = text
         self.pos = 0
         self.top_level_string_keys = top_level_string_keys or set()
         self.top_level_keys = top_level_keys or set(self.top_level_string_keys)
         self.terminal_native_string_keys = terminal_native_string_keys or set()
+        self.allow_implicit_commas = allow_implicit_commas
         self.object_depth = 0
         self.top_level_field_spans: dict[str, tuple[int, int, int, int]] = {}
 
@@ -1669,6 +1686,15 @@ class _Gemma4ArgumentParser:
                     return result
             if self._declared_key_at(self.pos) is not None:
                 continue
+            # Gemma4 occasionally drops the comma between two fields in a
+            # deeply nested object (most often in long MCP ``result``
+            # payloads).  At this point the previous value has already been
+            # parsed completely, so a syntactically recognizable key is an
+            # unambiguous recovery boundary.  Keep this recovery local to
+            # object parsing; schema validation below still rejects unknown
+            # or missing fields.
+            if self.allow_implicit_commas and self._key_at(self.pos) is not None:
+                continue
             raise ValueError(f"Expected ',' or '}}' at offset {self.pos}.")
 
     def parse_array(self) -> list[Any]:
@@ -1688,6 +1714,12 @@ class _Gemma4ArgumentParser:
             if ch == "]":
                 self.pos += 1
                 return result
+            # Long arrays of records are another common source of omitted
+            # commas in Gemma4 output.  Adjacent containers provide a safe
+            # boundary for an implicit separator; scalar adjacency remains
+            # invalid and is deliberately rejected.
+            if self.allow_implicit_commas and ch in "[{":
+                continue
             raise ValueError(f"Expected ',' or ']' at offset {self.pos}.")
 
     def parse_key(self) -> str:
@@ -1758,6 +1790,20 @@ class _Gemma4ArgumentParser:
             ):
                 return key
         return None
+
+    def _key_at(self, pos: int) -> str | None:
+        """Return a syntactic object key at *pos*, independent of schema."""
+        pos = self._skip_ws_pos(pos)
+        if self.text.startswith('<|"|>', pos):
+            # Native quoted keys are self-delimiting; only accept them when a
+            # key/value separator follows the closing marker.
+            end = self.text.find('<|"|>', pos + len('<|"|>'))
+            if end < 0:
+                return None
+            after = self._skip_ws_pos(end + len('<|"|>'))
+            return self.text[pos : end] if after < len(self.text) and self.text[after] in {":", "="} else None
+        match = re.match(r"([A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]", self.text[pos:])
+        return match.group(1) if match else None
 
     def _argument_key_at(self, pos: int) -> str | None:
         """Return any syntactic argument key after an explicit comma."""

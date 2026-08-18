@@ -20,6 +20,7 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
 from slime.utils.misc import load_function
+from .tiled_policy_loss import install_tiled_policy_loss
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -264,6 +265,8 @@ def _get_model_provider_func(
 
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
+        elif post_process and role == "actor" and os.environ.get("SLIME_TILED_POLICY_LOSS") == "1":
+            install_tiled_policy_loss(model)
 
         return model
 

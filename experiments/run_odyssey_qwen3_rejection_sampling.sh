@@ -544,12 +544,12 @@ export SLIME_EPISODE_LOG_DIR="${EPISODE_LOG_DIR}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export NUM_GPUS="${NUM_GPUS:-${ROLLOUT_GPUS}}"
 
-# dgx-hyperplane17 currently has a CUDA 12.9 driver but a CUDA 13.1 CuTe DSL
-# runtime. Use FlashInfer's CUDA JIT norm fallback until the node stack is aligned.
-if [ "$(hostname -s)" = "dgx-hyperplane17" ]; then
+# These nodes currently have a CUDA 12.9 driver but a CUDA 13.1 CuTe DSL
+# runtime. Use FlashInfer's CUDA JIT norm fallback until the node stacks align.
+if [[ "$(hostname -s)" == "dgx-hyperplane17" || "$(hostname -s)" == "hgx-hyperplane09" ]]; then
    export FLASHINFER_USE_CUDA_NORM=1
    export LD_LIBRARY_PATH="/home/liuyang/app/anaconda3/envs/slime/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-   echo "Enabled the FlashInfer CUDA norm fallback for dgx-hyperplane17."
+   echo "Enabled the FlashInfer CUDA norm fallback for $(hostname -s)."
 fi
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
@@ -782,7 +782,7 @@ SGLANG_ARGS=(
    --router-policy "${ROUTER_POLICY}"
 )
 
-if [ "$(hostname -s)" = "dgx-hyperplane17" ]; then
+if [[ "$(hostname -s)" == "dgx-hyperplane17" || "$(hostname -s)" == "hgx-hyperplane09" ]]; then
    SGLANG_ARGS+=(
       --sglang-attention-backend triton
       --sglang-sampling-backend pytorch

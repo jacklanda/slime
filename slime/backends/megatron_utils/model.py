@@ -951,15 +951,19 @@ def train_one_step(
 
             output_tensor = model(**forward_kwargs)
 
-        gemma4_output_layer = None
-        gemma4_output_weight = None
-        if os.environ.get("SLIME_GEMMA4_ACTOR_TRAIN_ACTIVE") == "1" and mpu.is_pipeline_last_stage():
+        tiled_output_layer = None
+        tiled_output_weight = None
+        tiled_policy_loss_active = (
+            os.environ.get("SLIME_TILED_POLICY_LOSS_ACTIVE") == "1"
+            or os.environ.get("SLIME_GEMMA4_ACTOR_TRAIN_ACTIVE") == "1"
+        )
+        if tiled_policy_loss_active and mpu.is_pipeline_last_stage():
             inner_model = model
             while hasattr(inner_model, "module"):
                 inner_model = inner_model.module
-            gemma4_output_layer = inner_model.output_layer
+            tiled_output_layer = inner_model.output_layer
             if inner_model.share_embeddings_and_output_weights:
-                gemma4_output_weight = inner_model.shared_embedding_or_output_weight()
+                tiled_output_weight = inner_model.shared_embedding_or_output_weight()
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
@@ -970,8 +974,8 @@ def train_one_step(
             batch,
             num_microbatches,
             step_global_batch_size,
-            gemma4_output_layer=gemma4_output_layer,
-            gemma4_output_weight=gemma4_output_weight,
+            tiled_output_layer=tiled_output_layer,
+            tiled_output_weight=tiled_output_weight,
         )
 
     # Forward pass.

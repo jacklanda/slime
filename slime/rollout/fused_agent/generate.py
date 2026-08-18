@@ -1391,10 +1391,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         error_span = _parser_error_action_span(response)
                     error_attribution = "localized" if error_span is not None else "unattributable"
                 else:
-                    # XML/Qwen parser diagnostics currently do not expose a
-                    # token-precise span; do not blame the whole parsed call.
-                    error_span = None
-                    error_attribution = "unattributable"
+                    # XML/Qwen diagnostics do not expose field-level spans, but
+                    # the enclosing tool-call block is still a reliable action
+                    # boundary for credit assignment.
+                    error_span = _parser_error_action_span(response)
+                    error_attribution = "localized" if error_span is not None else "unattributable"
                 await _mark_pending_turn_error_span(
                     state.tokenizer,
                     pending_turns[-1],

@@ -589,7 +589,7 @@ def get_log_probs_and_entropy(
     return torch.empty((0,), device=device), res
 
 
-def get_gemma4_tiled_log_probs_and_entropy(
+def get_tiled_log_probs_and_entropy(
     hidden_states: torch.Tensor,
     *,
     args: Namespace,
@@ -597,11 +597,11 @@ def get_gemma4_tiled_log_probs_and_entropy(
     output_layer: torch.nn.Module,
     output_weight: torch.Tensor | None,
 ) -> dict[str, list[torch.Tensor]]:
-    """Project Gemma4 hidden states without materializing full-vocabulary logits."""
+    """Project response hidden states without materializing full-sequence logits."""
     if mpu.get_tensor_model_parallel_world_size() != 1:
-        raise RuntimeError("Gemma4 tiled policy loss currently requires tensor-model-parallel-size=1")
+        raise RuntimeError("Tiled policy loss currently requires tensor-model-parallel-size=1")
     if hidden_states.ndim != 3 or hidden_states.size(0) != 1:
-        raise RuntimeError(f"Expected Gemma4 hidden states with shape [1,T,H], got {hidden_states.shape}")
+        raise RuntimeError(f"Expected hidden states with shape [1,T,H], got {hidden_states.shape}")
 
     hidden_states = hidden_states.squeeze(0).contiguous()
     total_lengths = batch["total_lengths"]
@@ -1459,8 +1459,8 @@ def loss_function(
     num_microbatches: int,
     step_global_batch_size: int,
     logits: torch.Tensor,
-    gemma4_output_layer: torch.nn.Module | None = None,
-    gemma4_output_weight: torch.Tensor | None = None,
+    tiled_output_layer: torch.nn.Module | None = None,
+    tiled_output_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
@@ -1516,15 +1516,15 @@ def loss_function(
         case _:
             raise ValueError(f"Unknown loss type: {args.loss_type}")
 
-    if gemma4_output_layer is not None:
+    if tiled_output_layer is not None:
         if args.loss_type != "policy_loss":
-            raise RuntimeError("Gemma4 tiled output projection only supports policy_loss")
-        log_probs_and_entropy = get_gemma4_tiled_log_probs_and_entropy(
+            raise RuntimeError("Tiled output projection only supports policy_loss")
+        log_probs_and_entropy = get_tiled_log_probs_and_entropy(
             logits,
             args=args,
             batch=batch,
-            output_layer=gemma4_output_layer,
-            output_weight=gemma4_output_weight,
+            output_layer=tiled_output_layer,
+            output_weight=tiled_output_weight,
         )
         loss, log = policy_loss_function(
             args,
@@ -1557,12 +1557,16 @@ def loss_function(
     else:
         loss = loss * mpu.get_context_parallel_world_size()
 
-    # Tiled Gemma4 projection uses large, variably sized vocabulary buffers.
+    # Tiled output projection uses large, variably sized vocabulary buffers.
     # Release free blocks left by the preceding microbatch after this forward
     # has finished, so the imminent backward can obtain one contiguous block.
     # Keep this at the loss/schedule boundary: placing it in sft_loss_function
     # never affected the policy-loss actor update.
-    if gemma4_output_layer is not None and os.environ.get("SLIME_GEMMA4_CLEAR_CACHE_BEFORE_BACKWARD") == "1":
+    clear_tiled_cache = (
+        os.environ.get("SLIME_TILED_POLICY_LOSS_CLEAR_CACHE_BEFORE_BACKWARD") == "1"
+        or os.environ.get("SLIME_GEMMA4_CLEAR_CACHE_BEFORE_BACKWARD") == "1"
+    )
+    if tiled_output_layer is not None and clear_tiled_cache:
         torch.cuda.empty_cache()
 
     return (

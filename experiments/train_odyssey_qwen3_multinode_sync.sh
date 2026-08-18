@@ -58,9 +58,8 @@ Options:
   --retrieval-lexrank-multiprocessing BOOL
                                          Retrieval LexRank multiprocessing env.
   --retrieval-lexrank-workers N          Retrieval LexRank workers env.
-  --master-addr HOST                     Ray head address. Default: dgx-hyperplane14.
-  --worker-addr HOST                     Ray worker address. Defaults to the other node in
-                                         the dgx-hyperplane14/dgx-hyperplane17 pair.
+  --master-addr HOST                     Ray head address. Default: dgx-hyperplane17.
+  --worker-addr HOST                     Ray worker address. Default: hgx-hyperplane08.
   --ray-ssh-user USER                    SSH user used to start Ray on the worker. Default: current user.
   --socket-ifname NAME                   Interface used by Gloo/NCCL. Default: enp225s0f0np0.
   --ray-num-cpus N                       Ray CPU resource count.
@@ -178,8 +177,8 @@ COLOCATE="${COLOCATE:-true}"
 ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
 HYPERPLANE01_CUDA_VISIBLE_DEVICES="${HYPERPLANE01_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-MASTER_ADDR="${MASTER_ADDR:-dgx-hyperplane14}"
-WORKER_ADDR="${WORKER_ADDR:-}"
+MASTER_ADDR="${MASTER_ADDR:-dgx-hyperplane17}"
+WORKER_ADDR="${WORKER_ADDR:-hgx-hyperplane08}"
 RAY_SSH_USER="${RAY_SSH_USER:-$(id -un)}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-enp225s0f0np0}}"
 RAY_BIN="${RAY_BIN:-$(command -v ray)}"
@@ -286,10 +285,10 @@ EVAL_PROMPT_DATA=()
 # changes it. Release-train overrides this below because it replaces the trainer
 # actor instead of pausing it.
 OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-}}"
-# Keep trainers alive and publish tensor weights in place. The pinned
-# torch_memory_saver revision contains the CUDA VMM granularity fix needed by
-# repeated pause/resume cycles. RELEASE_TRAIN=true remains a disk-I/O fallback.
-RELEASE_TRAIN="${RELEASE_TRAIN:-false}"
+# Recreate trainers through the shared checkpoint path by default. This avoids
+# native torch_memory_saver pause/resume failures after long colocated runs.
+# Set RELEASE_TRAIN=false explicitly to opt into persistent trainer offload.
+RELEASE_TRAIN="${RELEASE_TRAIN:-true}"
 ENABLE_USE_GRM_TRAIN="${ENABLE_USE_GRM_TRAIN:-${enable_use_grm_train:-false}}"
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
@@ -466,15 +465,9 @@ if [ "${ACTOR_NUM_NODES}" -ne 2 ] || [ "${ACTOR_NUM_GPUS_PER_NODE}" -ne 8 ]; the
    exit 2
 fi
 case "${MASTER_ADDR%%.*}" in
-   dgx-hyperplane14|dgx-hyperplane17) ;;
-   *) echo "This launcher requires dgx-hyperplane14 or dgx-hyperplane17 as the Ray head; got MASTER_ADDR=${MASTER_ADDR}." >&2; exit 2 ;;
+   dgx-hyperplane17) ;;
+   *) echo "This launcher requires dgx-hyperplane17 as the Ray head; got MASTER_ADDR=${MASTER_ADDR}." >&2; exit 2 ;;
 esac
-if [ -z "${WORKER_ADDR}" ]; then
-   case "${MASTER_ADDR%%.*}" in
-      dgx-hyperplane14) WORKER_ADDR="dgx-hyperplane17" ;;
-      dgx-hyperplane17) WORKER_ADDR="dgx-hyperplane14" ;;
-   esac
-fi
 if [ "${WORKER_ADDR%%.*}" = "${MASTER_ADDR%%.*}" ]; then
    echo "Ray head and worker must be different hosts; both resolve from ${MASTER_ADDR}." >&2
    exit 2
@@ -970,10 +963,11 @@ MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
 DEFAULT_TOKENS_PER_GPU=$(((MAX_CONTEXT_LEN + CP_SIZE - 1) / CP_SIZE))
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_PER_GPU}}"
 LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_PER_GPU}}"
-# Batch-invariant log-softmax materializes [chunk, vocab] BF16 output during
-# backward recomputation. At vocab=151936, a 512-token chunk is about 148 MiB,
-# fitting the observed worst-case free memory after TorchMemorySaver's margin.
-LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-512}"
+# Tiled policy projection and batch-invariant log-softmax materialize
+# [chunk, vocab] BF16 buffers during backward recomputation. At vocab=151936,
+# a 256-token chunk is about 74 MiB, leaving room below TMS's 512 MiB margin
+# even on the rank with the smallest fragmented free block.
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-256}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 # Keep the post-filter training batch at 50/50 webqa and mcp. The synchronous
 # collector keeps sampling each family until both accepted quotas are full.
@@ -1097,7 +1091,7 @@ CKPT_ARGS=(
    # back the actor/optimizer state to an earlier training step. Larger values
    # remain available explicitly via SAVE_INTERVAL when checkpoint I/O matters
    # more than exact interruption recovery.
-   --save-interval "${SAVE_INTERVAL:-5}"
+   --save-interval "${SAVE_INTERVAL:-1}"
 )
 # Resume training state (model/optimizer/rng/step + rollout data state) from an
 # existing Megatron checkpoint dir. Defaults to SAVE_DIR so a re-launch with the
@@ -1467,6 +1461,10 @@ export UPDATE_WEIGHT_DISK_DIR WANDB_DIR WANDB_CACHE_DIR HF_HOME TORCH_HOME TORCH
 export TORCH_COMPILE_JOB_ID TORCHINDUCTOR_FORCE_DISABLE_CACHES
 export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=1
 export SLIME_SGLANG_EXACT_RMSNORM=1
+# Avoid materializing up to 40K x 152K full-sequence logits during policy
+# training. Only response positions are projected, in LOG_PROBS_CHUNK_SIZE tiles.
+export SLIME_TILED_POLICY_LOSS=1
+export SLIME_TILED_POLICY_LOSS_CLEAR_CACHE_BEFORE_BACKWARD=1
 export SLIME_MCP_ENV_ROOT="${MCP_ENV_ROOT}"
 export SLIME_MCP_ENV_COPY_CONCURRENCY="${MCP_ENV_COPY_CONCURRENCY}"
 export SLIME_MCP_WORKSPACE_SCOPE="${SLIME_MCP_WORKSPACE_SCOPE:-task}"
@@ -1628,7 +1626,8 @@ keys = (
     "SLIME_EPISODE_LOG_DIR", "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE",
     "SLIME_FUSED_EVAL_DUMP_FAILURES", "SLIME_FUSED_EVAL_USE_SGLANG_SESSION",
     "SLIME_FUSED_REQUIRE_WEIGHT_VERSION", "SLIME_SGLANG_BATCH_INVARIANT_LOGPROB",
-    "SLIME_SGLANG_EXACT_RMSNORM",
+    "SLIME_SGLANG_EXACT_RMSNORM", "SLIME_TILED_POLICY_LOSS",
+    "SLIME_TILED_POLICY_LOSS_CLEAR_CACHE_BEFORE_BACKWARD",
     "SLIME_SGLANG_TRANSPORT_RETRY_TIMES",
     "SLIME_SGLANG_TRANSPORT_RETRY_BACKOFF_SECONDS",
     "RAY_WARN_BLOCKING_GET_INSIDE_ASYNC", "TOKENIZERS_PARALLELISM",

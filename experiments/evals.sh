@@ -1819,14 +1819,14 @@ export CUDA_HOME="/cm/shared/apps/cuda12.9"
 export MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
 
 SGLANG_COMPAT_ARGS=()
-if [ "$(hostname -s)" = "dgx-hyperplane17" ]; then
+if [[ "$(hostname -s)" == "dgx-hyperplane17" || "$(hostname -s)" == "hgx-hyperplane09" ]]; then
    export FLASHINFER_USE_CUDA_NORM=1
    export LD_LIBRARY_PATH="/home/liuyang/app/anaconda3/envs/slime/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
    SGLANG_COMPAT_ARGS+=(
       --sglang-attention-backend triton
       --sglang-sampling-backend pytorch
    )
-   echo "Enabled the SGLang CUDA 12.9 compatibility settings for dgx-hyperplane17."
+   echo "Enabled the SGLang CUDA 12.9 compatibility settings for $(hostname -s)."
 fi
 
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"

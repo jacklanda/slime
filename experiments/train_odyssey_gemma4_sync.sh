@@ -1,5 +1,5 @@
 #!/bin/bash
-# Synchronous fused-agent training launcher for Gemma4 E4B on current slime.
+# Synchronous fused-agent training launcher for Gemma4 E2B/E4B/12B on current slime.
 #
 # This uses array-based args, ray job submit, and a runtime PYTHONPATH rooted at
 # this slime checkout. The fused-agent workload knobs mirror the rllm fused
@@ -523,7 +523,9 @@ RUNS_ROOT="${RUNS_ROOT:-/share/nlp/share/gem/runs}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 
 default_experiment_name() {
-   local prefix="odyssey-g4-8b-it-dev"
+   #local prefix="odyssey-g4-8b-it-dev"
+   local prefix="odyssey-g4-4b-it-dev"
+   #local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
    #local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
    #local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
    #local prefix="fused-dapo-q3-4b-dht-gem-sync-dev"  # w/o rft warmup
@@ -565,15 +567,44 @@ elif [ "${SLIME_CLEANUP:-0}" = "1" ]; then
    echo "SLIME_CLEANUP=1 ignored because SLIME_CLEANUP_CONFIRM=1 is not set; preserving existing processes and artifacts."
 fi
 
+# Resolve the model before constructing MODEL_ARGS.  Gemma4's provider reads
+# the full HF config at runtime, but Megatron needs these shape arguments while
+# constructing the model and while converting the initial checkpoint.
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/gemma-4-E2B-it}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/gemma-4-E4B-it}"
+if [ ! -f "${MODEL_DIR}/config.json" ]; then
+   echo "Gemma4 model config does not exist: ${MODEL_DIR}/config.json" >&2
+   exit 1
+fi
+read -r GEMMA4_NUM_LAYERS GEMMA4_HIDDEN_SIZE GEMMA4_FFN_HIDDEN_SIZE \
+   GEMMA4_NUM_ATTENTION_HEADS GEMMA4_NUM_QUERY_GROUPS GEMMA4_VOCAB_SIZE \
+   < <(python3 - "${MODEL_DIR}/config.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    text = json.load(f).get("text_config", {})
+
+fields = (
+    "num_hidden_layers", "hidden_size", "intermediate_size",
+    "num_attention_heads", "num_key_value_heads", "vocab_size",
+)
+values = [text.get(field) for field in fields]
+if any(value is None for value in values):
+    raise SystemExit("config.json is missing required Gemma4 text_config fields")
+print(*values)
+PY
+)
+
 MODEL_ARGS=(
    --spec "slime_plugins.models.gemma4" "get_gemma4_spec"
    --custom-model-provider-path "slime_plugins.models.gemma4_provider.model_provider"
-   --num-layers 42
-   --hidden-size 2560
-   --ffn-hidden-size 10240
-   --num-attention-heads 8
+   --num-layers "${GEMMA4_NUM_LAYERS}"
+   --hidden-size "${GEMMA4_HIDDEN_SIZE}"
+   --ffn-hidden-size "${GEMMA4_FFN_HIDDEN_SIZE}"
+   --num-attention-heads "${GEMMA4_NUM_ATTENTION_HEADS}"
    --group-query-attention
-   --num-query-groups 2
+   --num-query-groups "${GEMMA4_NUM_QUERY_GROUPS}"
    --kv-channels 256
    --use-rotary-position-embeddings
    --disable-bias-linear
@@ -581,13 +612,14 @@ MODEL_ARGS=(
    --norm-epsilon 1e-6
    --rotary-base 10000
    --rotary-percent 1.0
-   --vocab-size 262144
+   --vocab-size "${GEMMA4_VOCAB_SIZE}"
    --qk-layernorm
    --moe-token-dispatcher-type alltoall
 )
 
-# Gemma4 E4B uses KV-sharing across late layers. Keep TP and PP at 1 unless the
-# model implementation grows support for those layouts.
+# Gemma4 E2B/E4B use KV-sharing across late layers. Keep TP and PP at 1 unless
+# the model implementation grows support for those layouts; this is also the
+# conservative layout for the dense 12B checkpoint.
 DEFAULT_TP_SIZE=1
 
 # Colocated training and rollout both use the full node, matching the common
@@ -607,11 +639,11 @@ ROLLOUT_ENGINE_COUNT=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
 
 TP_SIZE="${TP_SIZE:-${DEFAULT_TP_SIZE}}"
 if [ "${TP_SIZE}" -ne 1 ]; then
-   echo "Gemma4 E4B launcher currently requires TP_SIZE=1; got TP_SIZE=${TP_SIZE}." >&2
+   echo "Gemma4 launcher currently requires TP_SIZE=1; got TP_SIZE=${TP_SIZE}." >&2
    exit 2
 fi
 if [ "${PP_SIZE}" -ne 1 ]; then
-   echo "Gemma4 E4B launcher requires PP_SIZE=1 because late layers reuse earlier K/V states; got PP_SIZE=${PP_SIZE}." >&2
+   echo "Gemma4 launcher requires PP_SIZE=1 because the supported checkpoints use custom layer layouts; got PP_SIZE=${PP_SIZE}." >&2
    exit 2
 fi
 if [ "${CP_SIZE}" -lt 1 ] || [ $((ACTOR_GPUS % CP_SIZE)) -ne 0 ]; then
@@ -630,7 +662,6 @@ if is_truthy "${PARTIAL_ROLLOUT}"; then
 fi
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(default_experiment_name)}"
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/gemma-4-E4B-it}"
 # The Megatron conversion is code-dependent: reusing a torch_dist directory
 # generated before a Gemma4 parity fix silently trains against stale weights
 # while SGLang loads the current HF checkpoint. Version the default cache by
@@ -901,7 +932,7 @@ LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"
 # policy-loss checkpoint materializes a [chunk, vocab] logits tile during
 # backward, so 8192 would require roughly 4.3 GiB for one temporary tensor and
 # can exhaust an 80 GiB rank even when the forward pass fits.
-LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-512}"
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-1024}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 # The fully-async collector counts prompt groups, so the default batch of eight
 # groups is selected as four MCP groups and four WebQA groups.
@@ -1059,6 +1090,7 @@ if is_truthy "${NO_LOAD_OPTIM:-false}"; then
 fi
 
 ROLLOUT_ARGS=(
+   --use-fault-tolerance
    --rollout-function-path "${ROLLOUT_FUNCTION_PATH}"
 
    --prompt-data "${PROMPT_DATA_FOR_SLIME}"

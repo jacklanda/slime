@@ -272,9 +272,10 @@ EVAL_PROMPT_DATA=()
 # changes it. Release-train overrides this below because it replaces the trainer
 # actor instead of pausing it.
 OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-}}"
-# Keep trainers alive and publish tensor weights in place. RELEASE_TRAIN=true
-# remains a disk-I/O fallback for hosts where pause/resume is unhealthy.
-RELEASE_TRAIN="${RELEASE_TRAIN:-false}"
+# Recreate trainers through the shared checkpoint path by default. This avoids
+# native torch_memory_saver pause/resume failures after long colocated runs.
+# Set RELEASE_TRAIN=false explicitly to opt into persistent trainer offload.
+RELEASE_TRAIN="${RELEASE_TRAIN:-true}"
 ENABLE_USE_GRM_TRAIN="${ENABLE_USE_GRM_TRAIN:-${enable_use_grm_train:-false}}"
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"

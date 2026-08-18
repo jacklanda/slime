@@ -583,15 +583,19 @@ def test_qwen3_sync_launcher_defaults_to_colocated_trainer_offload():
 
 
 @pytest.mark.unit
-def test_odyssey_sync_launcher_defaults_to_persistent_trainer_offload():
+def test_odyssey_sync_launcher_avoids_train_memory_saver_by_default():
     repo_root = Path(__file__).resolve().parents[1]
     launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
 
-    assert 'RELEASE_TRAIN="${RELEASE_TRAIN:-false}"' in launcher
+    assert 'RELEASE_TRAIN="${RELEASE_TRAIN:-true}"' in launcher
     assert 'OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${COLOCATE}}"' in launcher
     assert '--train-env-vars \'{"TMS_INIT_ENABLE_CPU_BACKUP":"1"}\'' in launcher
     assert 'TRAIN_MEMORY_MARGIN_BYTES="${TRAIN_MEMORY_MARGIN_BYTES:-536870912}"' in launcher
+    assert 'LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-256}"' in launcher
     assert '--train-memory-margin-bytes "${TRAIN_MEMORY_MARGIN_BYTES}"' in launcher
+    assert "export SLIME_TILED_POLICY_LOSS=1" in launcher
+    assert "export SLIME_TILED_POLICY_LOSS_CLEAR_CACHE_BEFORE_BACKWARD=1" in launcher
+    assert '"SLIME_SGLANG_EXACT_RMSNORM", "SLIME_TILED_POLICY_LOSS",' in launcher
     assert (
         'PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False,'
         'max_split_size_mb:256}"' in launcher

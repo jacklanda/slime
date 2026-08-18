@@ -190,5 +190,28 @@ def test_health_monitor_skips_generation_check_while_group_is_not_generation_rea
     assert [name for name, _args, _kwargs in engine.calls].count("health_generate") == 0
 
 
+def test_health_monitor_reboosts_after_marking_engine_dead(monkeypatch):
+    monkeypatch.setattr("slime.utils.health_monitor.ray.get", _ray_get)
+    monkeypatch.setattr("slime.utils.health_monitor.ray.kill", lambda *_args, **_kwargs: None)
+
+    engine = _FakeEngine(health_generate_result=RuntimeError("sglang unavailable"))
+    _server_obj, group = _make_server(engine)
+    reboosts = []
+    monitor = RolloutHealthMonitor(
+        group,
+        Namespace(
+            rollout_health_check_interval=1.0,
+            rollout_health_check_timeout=1.0,
+            rollout_health_check_first_wait=0.0,
+        ),
+        on_engine_failure=lambda failed_group, engine_id: reboosts.append((failed_group, engine_id)),
+    )
+
+    monitor._check_engine_health(0, engine)
+
+    assert group.all_engines == [None]
+    assert reboosts == [(group, 0)]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

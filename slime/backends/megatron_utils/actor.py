@@ -536,8 +536,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
                 tiled_gemma4_loss = os.environ.get("SLIME_GEMMA4_TILED_POLICY_LOSS") == "1"
+                tiled_policy_loss = os.environ.get("SLIME_TILED_POLICY_LOSS") == "1"
                 if tiled_gemma4_loss:
                     os.environ["SLIME_GEMMA4_ACTOR_TRAIN_ACTIVE"] = "1"
+                if tiled_policy_loss:
+                    os.environ["SLIME_TILED_POLICY_LOSS_ACTIVE"] = "1"
                 try:
                     train(
                         rollout_id,
@@ -553,6 +556,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 finally:
                     if tiled_gemma4_loss:
                         os.environ.pop("SLIME_GEMMA4_ACTOR_TRAIN_ACTIVE", None)
+                    if tiled_policy_loss:
+                        os.environ.pop("SLIME_TILED_POLICY_LOSS_ACTIVE", None)
 
             self.prof.step(rollout_id=rollout_id)
 

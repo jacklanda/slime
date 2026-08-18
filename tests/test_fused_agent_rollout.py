@@ -916,6 +916,7 @@ def test_qwen3_coder_parser_normalizes_quoted_parameter_names_and_drops_unknown_
 
 def test_qwen35_schema_violation_terminates_current_turn_as_tool_parser_error():
     bad = "<tool_call>\n<function=web_search>\n" '<parameter="query>seed cone</parameter>\n' "<parameter=include_full_text>true</parameter>\n" "</function>\n</tool_call>"
+    malformed_action = bad
 
     result = _run_generate_with_fake_sglang(
         Sample(
@@ -1317,6 +1318,30 @@ def test_gemma4_tool_parser_parses_native_calls_and_formats_observation():
 
     observation = parser.format_tool_observation("web_search", "Sunny")
     assert observation == '<|tool_response>response:web_search{value:<|"|>Sunny<|"|>}<tool_response|>'
+
+
+def test_gemma4_tool_parser_recovers_missing_commas_in_nested_result_payload():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+
+    response = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:{'
+        'concrete_examples:[{action:<|"|>first<|"|>,context:<|"|>one<|"|>}'
+        '{action:<|"|>second<|"|>,context:<|"|>two<|"|>}],'
+        'edge_cases:[{description:<|"|>edge<|"|>}{description:<|"|>another<|"|>}]'
+        '}}<tool_call|>'
+    )
+
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert len(calls) == 1
+    assert calls[0].arguments["result"]["concrete_examples"] == [
+        {"action": "first", "context": "one"},
+        {"action": "second", "context": "two"},
+    ]
+    assert calls[0].arguments["result"]["edge_cases"] == [
+        {"description": "edge"},
+        {"description": "another"},
+    ]
 
 
 def test_gemma4_formatter_uses_json_string_when_value_contains_native_quote_marker():

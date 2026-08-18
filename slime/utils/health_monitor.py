@@ -1,5 +1,6 @@
 import logging
 import threading
+from collections.abc import Callable
 
 import ray
 
@@ -20,8 +21,9 @@ class RolloutHealthMonitor:
     - stop(): Stop the monitor thread completely (called during dispose)
     """
 
-    def __init__(self, server_group, args):
+    def __init__(self, server_group, args, on_engine_failure: Callable[[object, int], None] | None = None):
         self._server_group = server_group
+        self._on_engine_failure = on_engine_failure
 
         self._thread = None
         self._stop_event = None
@@ -166,3 +168,13 @@ class RolloutHealthMonitor:
 
     def _kill_engine(self, rollout_engine_id: int):
         self._server_group.mark_engine_group_dead(rollout_engine_id)
+        if self._on_engine_failure is not None:
+            try:
+                self._on_engine_failure(self._server_group, rollout_engine_id)
+            except Exception:
+                # Recovery is best effort; the next health check or the
+                # normal weight-update recovery path can retry it.
+                logger.exception(
+                    "Automatic rollout engine reboost failed for engine %s",
+                    rollout_engine_id,
+                )
