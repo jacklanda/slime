@@ -18,6 +18,11 @@ from slime.utils.types import Sample
 
 
 NUM_GPUS = 0
+ODYSSEY_GEMMA4_LAUNCHERS = (
+    "train_odyssey_gemma4_sync.sh",
+    "train_odyssey_gemma4_multinode_sync.sh",
+    "train_odyssey_gemma4_async.sh",
+)
 
 
 def _args(**overrides):
@@ -283,9 +288,10 @@ def test_bias_grows_monotonically_with_the_length_correlation():
     assert all(later < earlier for earlier, later in zip(biases, biases[1:], strict=False)), biases
 
 
-def test_launcher_disables_normalize_advantages_by_default():
+@pytest.mark.parametrize("launcher_name", ODYSSEY_GEMMA4_LAUNCHERS)
+def test_launcher_disables_normalize_advantages_by_default(launcher_name):
     """The Gemma4 fused-agent launcher must not stack whitening on group norm."""
-    launcher = Path(__file__).resolve().parents[1] / "experiments" / "train_gemma4_fused_agent_sync.sh"
+    launcher = Path(__file__).resolve().parents[1] / "experiments" / launcher_name
     text = launcher.read_text()
 
     assert 'NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"' in text
@@ -403,23 +409,31 @@ def test_mean_only_flattens_the_advantage_mass_held_by_sparse_groups():
     assert mean_only < 2 / len(observed_group_sizes) < with_std
 
 
-def test_gemma4_launcher_uses_dr_grpo_mean_only_advantages_by_default():
-    """Sparse binary groups must not receive an inverse-evidence amplification."""
+@pytest.mark.parametrize("launcher_name", ODYSSEY_GEMMA4_LAUNCHERS)
+def test_gemma4_launcher_keeps_grpo_std_normalization_by_default(launcher_name):
+    """Odyssey Gemma4 launchers intentionally retain standard GRPO scaling."""
     repo_root = Path(__file__).resolve().parents[1]
-    launcher = (repo_root / "experiments" / "train_gemma4_fused_agent_sync.sh").read_text()
+    launcher = (repo_root / "experiments" / launcher_name).read_text()
+    assert 'GRPO_STD_NORMALIZATION="${GRPO_STD_NORMALIZATION:-true}"' in launcher
+    assert 'GRPO_STD_NORMALIZATION="${GRPO_STD_NORMALIZATION:-false}"' not in launcher
 
-    assert 'GRPO_STD_NORMALIZATION="${GRPO_STD_NORMALIZATION:-false}"' in launcher
-    assert 'FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS="${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS:-0}"' in launcher
-    # The flag has to actually reach the trainer, not just be declared.
-    assert 'if ! is_truthy "${GRPO_STD_NORMALIZATION}"; then' in launcher
-    assert "GRPO_ARGS+=(--disable-grpo-std-normalization)" in launcher
 
-    # The stabilization is intentionally launcher-scoped to Gemma4: other model
-    # families have not been measured and keep upstream GRPO defaults.
-    for name in ("train_qwen3_fused_agent_sync.sh", "train_qwen3.5_fused_agent_sync.sh"):
-        other = repo_root / "experiments" / name
-        if other.exists():
-            assert "GRPO_STD_NORMALIZATION" not in other.read_text()
+def test_gemma4_multinode_sync_uses_strict_qwen_rollout_admission():
+    """Keep a deep candidate reservoir while rejecting zero-variance groups."""
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments" / "train_odyssey_gemma4_multinode_sync.sh").read_text()
+
+    assert 'SYNC_MIN_PENDING_GROUPS=96' in launcher
+    assert 'SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-32}"' in launcher
+    assert 'SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-32}"' in launcher
+    assert 'SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-96}"' in launcher
+    assert 'ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-true}"' in launcher
+    assert 'FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS=0' in launcher
+    assert 'This launcher requires strict dynamic sampling' in launcher
+    assert 'SLIME_SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS}"' in launcher
+    assert 'SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS}"' in launcher
+    assert '--fully-async-filter-relax-after-groups "${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}"' in launcher
+    assert 'ROLLOUT_ARGS+=(--rollout-task-family-top-mean-steps)' in launcher
 
 
 # ---------------------------------------------------------------------------

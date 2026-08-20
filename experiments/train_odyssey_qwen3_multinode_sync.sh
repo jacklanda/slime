@@ -115,7 +115,7 @@ Options:
   --trajectory-timeout N                 Fused trajectory timeout env.
   --eval-trajectory-timeout N            Fused eval trajectory timeout env.
   --rollout-group-timeout N              Per-attempt deadline for each prompt group's unfinished slots.
-                                         Timeout classification uses the active trajectory stage. Default: 3600.
+                                         Timeout classification uses the active trajectory stage. Default: 7200.
   --rollout-infra-retry-times N          Replacement attempts per logical slot after retryable infra failure.
                                          Default: 2.
   --eval-interval N                      Run interval eval every N rollout steps.
@@ -249,7 +249,7 @@ TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-7200}"
 # Bound each group attempt. The rollout stage determines whether an unfinished
 # slot is retryable infra, permanent task failure, or policy behavior.
-ROLLOUT_GROUP_TIMEOUT="${ROLLOUT_GROUP_TIMEOUT:-3600}"
+ROLLOUT_GROUP_TIMEOUT="${ROLLOUT_GROUP_TIMEOUT:-7200}"
 ROLLOUT_INFRA_RETRY_TIMES="${ROLLOUT_INFRA_RETRY_TIMES:-4}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
@@ -1380,7 +1380,7 @@ OPTIMIZER_ARGS=(
 # has enough headroom while trainer CUDA allocations are still being released.
 if [ -z "${SGLANG_MEM_FRACTION_STATIC:-}" ]; then
    if is_truthy "${COLOCATE}"; then
-      SGLANG_MEM_FRACTION_STATIC=0.7
+      SGLANG_MEM_FRACTION_STATIC=0.6
    else
       SGLANG_MEM_FRACTION_STATIC="${GPU_MEMORY_UTILIZATION:-0.9}"
    fi

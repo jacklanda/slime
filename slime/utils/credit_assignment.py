@@ -7,6 +7,7 @@ from typing import Any
 
 _TOOL_PARSER_ERROR_REASONS = {
     "ABNORMAL_PARSE_ERROR",
+    "ABNORMAL_PARSE_ERROR_LOOP",
     "INVALID_REACT_STRUCTURE",
     "INVALID_FINAL_STEP",
     "tool_parse_error",
@@ -32,6 +33,7 @@ _MIXED_TOOL_AND_ANSWER_REASONS = {
 }
 _METADATA_CREDIT_EVENTS = {
     "tool_parser_error",
+    "think_parser_error",
     "repeated_search_query",
     "too_many_tool_calls",
     "search_bypass",
@@ -111,9 +113,14 @@ def enabled_credit_assignment_event(
         return metadata_event
 
     if config.tool_parser_error and (
+        # Some terminal paths only persist the abnormal termination reason;
+        # retain parser credit even when the explicit event was lost while
+        # serializing the trajectory metadata.
+        _reason_matches(metadata, _TOOL_PARSER_ERROR_REASONS)
+        or (
         _metadata_flag(metadata, "tool_call_parse_error", "parse_error", "tool_parser_error", "parse_tool_args_error")
         or _metadata_int(metadata, "tool_parser_error_count", "total_parse_tool_args_error", "parse_tool_args_error")
-        or _reason_matches(metadata, _TOOL_PARSER_ERROR_REASONS)
+        )
     ):
         return "tool_parser_error"
 

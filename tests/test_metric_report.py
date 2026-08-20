@@ -369,5 +369,29 @@ def test_train_one_step_per_token_loss_report_invariant_to_cp(monkeypatch, mock_
     assert simulate(1) == pytest.approx(simulate(2))
 
 
+@pytest.mark.unit
+def test_policy_token_ratios_are_not_multiplied_by_cp(monkeypatch, mock_dp_with_cp_group):
+    """Full-mask token diagnostics remain ratios when CP duplicates masks."""
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "all_reduce", lambda tensor, group=None, op=None: None)
+    reduced = reduce_train_step_metrics(
+        [
+            {
+                "keys": ["policy_loss_tokens", "effective_policy_loss_tokens", "loss"],
+                # CP=2 all-reduce has duplicated both mask totals and num_tokens.
+                "values": torch.tensor([20.0, 20.0, 20.0, 4.0]),
+            }
+        ],
+        calculate_per_token_loss=True,
+        step_global_batch_size=256,
+        cp_size=2,
+        dp_with_cp_group=mock_dp_with_cp_group,
+    )
+    assert reduced["policy_loss_tokens"] == pytest.approx(1.0)
+    assert reduced["effective_policy_loss_tokens"] == pytest.approx(1.0)
+    assert reduced["loss"] == pytest.approx(0.4)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

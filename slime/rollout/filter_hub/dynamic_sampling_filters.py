@@ -104,9 +104,34 @@ def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
     reward_values = torch.tensor(rewards, dtype=torch.float64)
     spread = reward_values.std() if reward_values.numel() > 1 else torch.tensor(0.0, dtype=reward_values.dtype)
     keep = bool(torch.isfinite(spread)) and bool(spread > 1e-6)
+    if keep and _grpo_advantage_limit_enabled(args):
+        # Mirror the rollout-side GRPO normalization before admission.  This
+        # rejects sparse winner groups instead of clipping their advantages in
+        # the optimizer, preserving the requested GRPO std-normalization
+        # semantics while bounding the update contribution of one group.
+        normalized = (reward_values - reward_values.mean()) / (spread + 1e-6)
+        max_abs_advantage = float(normalized.abs().max().item())
+        limit = _float_env("FUSED_FILTER_MAX_ABS_ADVANTAGE", 0.0)
+        if max_abs_advantage > limit:
+            return DynamicFilterOutput(
+                keep=False,
+                reason=(
+                    f"high_abs_advantage_{_reason_value(max_abs_advantage)}_gt_"
+                    f"{_reason_value(limit)}"
+                ),
+            )
     return DynamicFilterOutput(
         keep=keep,
         reason=None if keep else f"zero_std_{round(rewards[0], 1)}",
+    )
+
+
+def _grpo_advantage_limit_enabled(args) -> bool:
+    """Apply the admission guard only when GRPO std normalization is active."""
+    return (
+        _float_env("FUSED_FILTER_MAX_ABS_ADVANTAGE", 0.0) > 0
+        and getattr(args, "advantage_estimator", None) in {"grpo", "gspo", "cispo"}
+        and bool(getattr(args, "grpo_std_normalization", False))
     )
 
 

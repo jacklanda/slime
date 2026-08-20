@@ -86,6 +86,17 @@ def _remove_json_trailing_commas(text: str) -> tuple[str, bool]:
     return "".join(output), changed
 
 
+def _repair_native_quote_noise(text: str) -> tuple[str, bool]:
+    """Repair only delimiter-adjacent ordinary quote leakage in native values."""
+    repaired = re.sub(r"(['\"`])\s*,\s*(?=<\|\"\|>)", ",", text)
+    repaired = re.sub(
+        r"(['\"`])(?=\s*]\s*,\s*[A-Za-z_][A-Za-z0-9_.-]*\s*[:=])",
+        "",
+        repaired,
+    )
+    return repaired, repaired != text
+
+
 def _json_missing_closers(text: str) -> tuple[str, bool] | None:
     stack: list[str] = []
     in_string = False
@@ -905,6 +916,20 @@ class Gemma4ToolParser(QwenToolParser):
                     else:
                         native_repairs.append("trailing_comma")
                         repaired_successfully = True
+                if shadow_finish and name in {"finish", "submit"} and not repaired_successfully:
+                    repaired_args, removed_quote_noise = _repair_native_quote_noise(native_call.raw_args)
+                    if removed_quote_noise:
+                        try:
+                            args, field_spans = self._parse_object(
+                                repaired_args,
+                                parameter_schema=self._tool_parameter_schemas.get(name),
+                                allow_implicit_commas=True,
+                            )
+                        except ValueError:
+                            pass
+                        else:
+                            native_repairs.append("native_quote_delimiter_noise")
+                            repaired_successfully = True
                 if not repaired_successfully:
                     self.last_schema_errors.append(f"invalid arguments for tool {name!r}: {parse_error}")
                     self.last_schema_error_spans.append(self._syntax_error_span(native_call, parse_error))
@@ -917,6 +942,17 @@ class Gemma4ToolParser(QwenToolParser):
                     )
                     logger.debug("Gemma4 tool-call argument parse failure.", exc_info=True)
                     continue
+            if shadow_finish and name in {"finish", "submit"} and not native_repairs:
+                try:
+                    self._parse_object(
+                        native_call.raw_args,
+                        parameter_schema=self._tool_parameter_schemas.get(name),
+                    )
+                except ValueError:
+                    # The shadow parser accepted a deterministic structural
+                    # recovery. Record it so rollout validates the repaired
+                    # result and masks the original malformed policy tokens.
+                    native_repairs.append("implicit_structure_repair")
             self.last_syntax_repairs.extend(native_repairs)
             if shadow_finish and name in {"finish", "submit"} and native_repairs:
                 self.last_shadow_finish_repairs.extend(native_repairs)
@@ -1199,6 +1235,19 @@ class Gemma4ToolParser(QwenToolParser):
                         raw_args,
                         allow_nested_closers=True,
                     )
+                    if repaired is None:
+                        # Some long finish payloads contain a single misplaced
+                        # nested closer but otherwise end at an unambiguous EOF
+                        # boundary. The permissive parser can consume every
+                        # generated field/value without inventing content;
+                        # answer-schema validation remains mandatory and the
+                        # original finish turn is policy-masked by generate.py.
+                        try:
+                            cls._parse_object(raw_args, allow_implicit_commas=True)
+                        except ValueError:
+                            pass
+                        else:
+                            repaired = (raw_args, ("implicit_structure_repair",))
                     if repaired is not None:
                         raw_args, repairs = repaired
                         calls.append(
@@ -1226,11 +1275,31 @@ class Gemma4ToolParser(QwenToolParser):
             while (
                 (repair_finish or not finish_call)
                 and end_marker_start < len(text)
-                and text[end_marker_start] in "])"
+                and text[end_marker_start] in "}])"
             ):
                 extra_wrapper_closer = True
                 end_marker_start = cls._skip_ws(text, end_marker_start + 1)
             if not text.startswith(cls.tool_call_end, end_marker_start):
+                if repair_finish and finish_call:
+                    # A wrong nested closer can make the strict boundary
+                    # scanner stop at an inner ``}``.  The explicit call-end
+                    # marker still gives the shadow parser a deterministic
+                    # outer boundary, so pass it the complete argument text.
+                    explicit_end = text.find(cls.tool_call_end, end_marker_start)
+                    if explicit_end >= 0:
+                        calls.append(
+                            _Gemma4NativeCall(
+                                raw_name=raw_name,
+                                raw_args=text[obj_start:explicit_end],
+                                start=start,
+                                end=explicit_end + len(cls.tool_call_end),
+                                name_span=name_span,
+                                args_start=obj_start,
+                                repairs=(),
+                            )
+                        )
+                        search_pos = explicit_end + len(cls.tool_call_end)
+                        continue
                 if (repair_finish or not finish_call) and cls._is_missing_call_end_boundary(
                     text,
                     end_marker_start,
@@ -1280,10 +1349,48 @@ class Gemma4ToolParser(QwenToolParser):
         if removed_trailing_comma:
             repairs.append("trailing_comma")
         marker = '<|"|>'
+        if allow_nested_closers and repaired.count(marker) % 2:
+            # A native string may contain arbitrary braces and still omit its
+            # closing marker before the next field. Use only a subsequent
+            # marker-backed ``key:`` boundary whose prefix has odd marker
+            # parity; this is the unique unambiguous recovery point.
+            while repaired.count(marker) % 2:
+                boundary = None
+                for match in re.finditer(
+                    r',\s*[A-Za-z_][A-Za-z0-9_.-]*\s*[:=]\s*' + re.escape(marker),
+                    repaired,
+                ):
+                    if repaired[: match.start()].count(marker) % 2:
+                        boundary = match.start()
+                        break
+                if boundary is None:
+                    break
+                repaired = repaired[:boundary] + marker + repaired[boundary:]
+                repairs.append("missing_native_string_end_before_field")
+        missing_finish_result = re.search(
+            r'([,{]\s*result)\s+([^{}\[\],]+?)\s*' + re.escape(marker) + r'\s*}$',
+            repaired,
+            flags=re.DOTALL,
+        )
+        if allow_nested_closers and missing_finish_result:
+            prefix = missing_finish_result.group(1)
+            value = missing_finish_result.group(2).strip()
+            repaired = repaired[: missing_finish_result.start()] + f"{prefix}:{marker}{value}{marker}}}"
+            repairs.append("missing_finish_result_string_open")
         if repaired.count(marker) % 2:
             marker_start = repaired.rfind(marker)
             value_start = marker_start + len(marker)
             value = repaired[value_start:]
+            noisy_terminal_value = value.endswith('"""}') and (
+                any(char.isspace() for char in value[:-4]) and value[:-4].count('"') >= 2
+            )
+            if noisy_terminal_value:
+                # A native string was closed with ordinary quote noise before
+                # the object close. Convert the noise into the native marker.
+                value = value[:-4].rstrip()
+                repaired = repaired[:value_start] + value + marker + "}"
+                repairs.append("trailing_ordinary_quote_noise")
+                return (repaired, tuple(repairs))
             if '"""' in value or "'''" in value:
                 return None
             if repaired.endswith("}") and not any(char in value[:-1] for char in "{}[]"):
@@ -1303,7 +1410,7 @@ class Gemma4ToolParser(QwenToolParser):
 
         missing_closers = cls._missing_argument_closers(repaired)
         if missing_closers is None:
-            return None
+            return (repaired, tuple(repairs)) if repairs else None
         if missing_closers:
             if len(missing_closers) > 1 and not allow_nested_closers:
                 return None
@@ -1369,6 +1476,15 @@ class Gemma4ToolParser(QwenToolParser):
                 end = text.find(marker, pos + len(marker))
                 if end < 0:
                     raise ValueError("Unterminated Gemma4 string.")
+                # If the candidate closing marker is immediately preceded by
+                # a field boundary, the current native string omitted its
+                # closing marker and this is the next field's opening marker.
+                # Leave that marker for the outer scan so shadow parsing can
+                # recover the missing boundary deterministically.
+                prefix = text[pos + len(marker) : end]
+                if re.search(r",\s*[A-Za-z_][A-Za-z0-9_.-]*\s*[:=]\s*$", prefix):
+                    pos = end
+                    continue
                 pos = end + len(marker)
                 continue
 
@@ -1581,6 +1697,14 @@ class Gemma4ToolParser(QwenToolParser):
         )
         value = parser.parse_value()
         parser.skip_ws()
+        if allow_implicit_commas:
+            while parser.peek() and parser.peek() in "}])":
+                parser.pos += 1
+                parser.skip_ws()
+            if re.fullmatch(r'''["'}\])]+''', parser.text[parser.pos :].strip()):
+                parser.pos = len(parser.text)
+            elif re.fullmatch(r",?\s*(?:`?<channel\|>)?<eos>\s*", parser.text[parser.pos :]):
+                parser.pos = len(parser.text)
         if parser.pos != len(parser.text):
             raise ValueError(f"Unexpected trailing Gemma4 argument text at offset {parser.pos}.")
         if not isinstance(value, dict):
@@ -1605,6 +1729,7 @@ class _Gemma4ArgumentParser:
         self.terminal_native_string_keys = terminal_native_string_keys or set()
         self.allow_implicit_commas = allow_implicit_commas
         self.object_depth = 0
+        self.array_depth = 0
         self.top_level_field_spans: dict[str, tuple[int, int, int, int]] = {}
 
     def parse_value(self, *, schema_string: bool = False, terminal_native_string: bool = False) -> Any:
@@ -1657,9 +1782,22 @@ class _Gemma4ArgumentParser:
             terminal_native_string = self.object_depth == 1 and key in self.terminal_native_string_keys
             if self.peek() in {":", "="}:
                 self.pos += 1
+            elif (
+                self.allow_implicit_commas
+                and "_" in key
+                and (separator := re.match(r"[A-Za-z]+\s*[:=]", self.text[self.pos :])) is not None
+            ):
+                # A single hallucinated word occasionally appears between a
+                # valid snake_case key and its separator (for example
+                # ``priority_level falsch:``). Preserve the recognizable key.
+                self.pos += separator.end()
             elif not (
                 schema_string
-                and (self.text.startswith('<|"|>', self.pos) or self.peek() in {'"', "'"})
+                and (
+                    self.text.startswith('<|"|>', self.pos)
+                    or self.peek() in {'"', "'"}
+                    or self._has_terminal_native_string_close(self.pos)
+                )
             ):
                 raise ValueError(f"Expected ':' at offset {self.pos}.")
             value_start = self._skip_ws_pos(self.pos)
@@ -1671,11 +1809,76 @@ class _Gemma4ArgumentParser:
                 self.top_level_field_spans[key] = (key_start, key_end, value_start, self.pos)
             self.skip_ws()
             ch = self.peek()
+            if not ch and self.allow_implicit_commas:
+                self.object_depth -= 1
+                return result
+            if self.allow_implicit_commas and re.fullmatch(
+                r",?\s*(?:`?<channel\|>)?<eos>\s*", self.text[self.pos :]
+            ):
+                self.pos = len(self.text)
+                self.object_depth -= 1
+                return result
+            if (
+                self.allow_implicit_commas
+                and self.object_depth == 1
+                and re.fullmatch(r'''["'}\])]+''', self.text[self.pos :].strip())
+            ):
+                self.pos = len(self.text)
+                self.object_depth -= 1
+                return result
+            if (
+                self.allow_implicit_commas
+                and self.object_depth == 2
+                and result
+                and re.fullmatch(
+                    r'''[A-Za-z][^{}\[\]<>]*[.!?]\s*["'}\])]*''',
+                    self.text[self.pos :].strip(),
+                )
+            ):
+                # Gemma4 sometimes appends a short completion statement after
+                # the final structured result field. The statement contains
+                # no possible key/value syntax; answer-schema validation still
+                # decides whether the preceding result is actually complete.
+                self.pos = len(self.text)
+                self.object_depth -= 1
+                return result
+            if self.allow_implicit_commas and self.text.startswith('<|"|>', self.pos):
+                marker_end = self._skip_ws_pos(self.pos + len('<|"|>'))
+                next_pos = (
+                    self._skip_ws_pos(marker_end + 1)
+                    if self.text[marker_end : marker_end + 1] == ","
+                    else -1
+                )
+                if next_pos >= 0 and self._key_at(next_pos) is not None:
+                    self.pos = next_pos
+                    continue
             if ch == ",":
                 self.pos += 1
                 continue
+            if self.allow_implicit_commas and self.object_depth == 2 and ch == "}":
+                comma_pos = self._skip_ws_pos(self.pos + 1)
+                if self.text.startswith('<|"|>', comma_pos):
+                    comma_pos = self._skip_ws_pos(comma_pos + len('<|"|>'))
+                next_pos = (
+                    self._skip_ws_pos(comma_pos + 1)
+                    if self.text[comma_pos : comma_pos + 1] == ","
+                    else -1
+                )
+                if next_pos >= 0 and self._key_at(next_pos) is not None:
+                    # ``finish.result`` is the depth-2 object. A closer before
+                    # another result field is therefore wrapper noise, not the
+                    # end of the argument object.
+                    self.pos = next_pos
+                    continue
             if ch == "}":
                 self.pos += 1
+                self.object_depth -= 1
+                return result
+            if self.allow_implicit_commas and self.object_depth > 1 and ch == "]":
+                # A nested record occasionally ends with the parent array's
+                # closer, omitting only its own ``}``.  Leave ``]`` for the
+                # array parser; the already parsed fields make the boundary
+                # unambiguous.
                 self.object_depth -= 1
                 return result
             if schema_string and ch == "]":
@@ -1699,20 +1902,44 @@ class _Gemma4ArgumentParser:
 
     def parse_array(self) -> list[Any]:
         self.expect("[")
+        self.array_depth += 1
         result = []
         self.skip_ws()
         if self.peek() == "]":
             self.pos += 1
+            self.array_depth -= 1
             return result
         while True:
             result.append(self.parse_value())
             self.skip_ws()
             ch = self.peek()
+            if not ch and self.allow_implicit_commas:
+                self.array_depth -= 1
+                return result
             if ch == ",":
+                next_pos = self._skip_ws_pos(self.pos + 1)
+                if (
+                    self.allow_implicit_commas
+                    and result
+                    and all(isinstance(item, dict) for item in result)
+                    and self._key_at(next_pos) is not None
+                ):
+                    # The array contains records, but the next token is
+                    # unmistakably a sibling object field.  Consume the
+                    # separator and infer the omitted array closer.
+                    self.pos = next_pos
+                    self.array_depth -= 1
+                    return result
                 self.pos += 1
                 continue
             if ch == "]":
                 self.pos += 1
+                self.array_depth -= 1
+                return result
+            if self.allow_implicit_commas and ch == "}":
+                # The parent object closer is present but this array's ``]``
+                # is missing.  Do not consume it; parse_object owns it.
+                self.array_depth -= 1
                 return result
             # Long arrays of records are another common source of omitted
             # commas in Gemma4 output.  Adjacent containers provide a safe
@@ -1746,10 +1973,14 @@ class _Gemma4ArgumentParser:
             self.pos += 1
 
         value = self.text[start : self.pos].rstrip()
-        if value.endswith(quote):
-            return value[: -len(quote)]
         if value.endswith(marker):
-            return value[: -len(marker)]
+            value = value[: -len(marker)].rstrip()
+        if marker in value:
+            value = value.replace(marker, "").rstrip()
+        if value.endswith(quote):
+            value = value[: -len(quote)]
+        if value:
+            return value
         if allow_terminal_object_close and self.object_depth == 1 and value:
             # web_search.query is a read-only scalar and the enclosing object
             # close gives us an unambiguous terminal boundary.  Recover a
@@ -1777,6 +2008,11 @@ class _Gemma4ArgumentParser:
         value = self.text[start : self.pos].rstrip()
         if not value:
             raise ValueError(f"Expected string at offset {start}.")
+        marker = '<|"|>'
+        if value.endswith(marker):
+            value = value[: -len(marker)].rstrip()
+        elif marker in value:
+            value = value.replace(marker, "").rstrip()
         return value
 
     def _declared_key_at(self, pos: int) -> str | None:
@@ -1790,6 +2026,14 @@ class _Gemma4ArgumentParser:
             ):
                 return key
         return None
+
+    def _has_terminal_native_string_close(self, pos: int) -> bool:
+        """Recognize a missing ``:<|"|>`` before a terminal string value."""
+        marker = '<|"|>'
+        close = self.text.find(marker, self._skip_ws_pos(pos))
+        if self.object_depth != 1 or close < 0:
+            return False
+        return self.text[close + len(marker) :].strip() == "}"
 
     def _key_at(self, pos: int) -> str | None:
         """Return a syntactic object key at *pos*, independent of schema."""
@@ -1817,8 +2061,69 @@ class _Gemma4ArgumentParser:
     def parse_gemma_string(self, *, allow_terminal_object_close: bool = False) -> str:
         marker = '<|"|>'
         self.pos += len(marker)
+        start = self.pos
         end = self.text.find(marker, self.pos)
+        if self.allow_implicit_commas:
+            search_end = end if end >= 0 else len(self.text)
+            missing_key_close = re.search(
+                r',\s*(?=[A-Za-z][A-Za-z0-9.-]*_[A-Za-z0-9_.-]+\s*[:=])',
+                self.text[start:search_end],
+            )
+            if missing_key_close is not None:
+                boundary = start + missing_key_close.start()
+                value_end = boundary
+                if value_end >= start + 2 and self.text[value_end - 2 : value_end] in {'"]', "']", "`]"}:
+                    value_end -= 2
+                if value_end > start and self.text[value_end - 1] in {'`', '"'}:
+                    value_end -= 1
+                self.pos = boundary
+                return self.text[start:value_end]
+
+            if self.array_depth:
+                array_terminal = re.search(
+                    r"(['\"`])\s*](?=\s*,\s*[A-Za-z_][A-Za-z0-9_.-]*\s*[:=])",
+                    self.text[start:search_end],
+                )
+                if array_terminal is not None:
+                    value_end = start + array_terminal.start()
+                    self.pos = value_end
+                    return self.text[start:value_end].rstrip()
+                missing_close = re.search(
+                    r'](?=\s*(?:[}\]]|,\s*(?:[A-Za-z_][A-Za-z0-9_.-]*|(["\'])[A-Za-z_][A-Za-z0-9_.-]*\1)\s*[:=]|$))',
+                    self.text[start:search_end],
+                )
+                if missing_close is not None:
+                    value_end = start + missing_close.start()
+                    if value_end > start and self.text[value_end - 1] in {'`', '"', "'"}:
+                        value_end -= 1
+                    self.pos = value_end
+                    return self.text[start:value_end].rstrip()
+
+            mixed_close = re.search(
+                r'[`"]\s*,\s*(?=(?:[A-Za-z_][A-Za-z0-9_.-]*|(["\'])[A-Za-z_][A-Za-z0-9_.-]*\1)\s*[:=])',
+                self.text[start : end if end >= 0 else None],
+            )
+            if mixed_close is not None:
+                value_end = start + mixed_close.start()
+                self.pos = start + mixed_close.end() - 1
+                return self.text[start:value_end]
+
+            html_key = re.search(
+                r'</td>(?=\s*,?\s*[A-Za-z_][A-Za-z0-9_.-]*\s*[:=])',
+                self.text[start : end if end >= 0 else None],
+                flags=re.IGNORECASE,
+            )
+            if html_key is not None:
+                value_end = start + html_key.start()
+                self.pos = start + html_key.end()
+                return self.text[start:value_end]
         if end < 0:
+            if self.allow_implicit_commas and self.object_depth > 1:
+                terminal_closers = re.search(r'''(?=[}\]])[}\])"']+\s*$''', self.text[start:])
+                if terminal_closers is not None:
+                    value_end = start + terminal_closers.start()
+                    self.pos = value_end
+                    return self.text[start:value_end]
             if allow_terminal_object_close and self.object_depth == 1:
                 end = len(self.text) - 1
                 value = self.text[self.pos : end]
@@ -1832,7 +2137,35 @@ class _Gemma4ArgumentParser:
                     self.pos = end
                     return value
             raise ValueError("Unterminated Gemma4 string.")
+        if self.allow_implicit_commas and self.array_depth:
+            # A missing native close before the next array element leaves the
+            # next element's opening marker as the first marker we find.  A
+            # comma immediately before that marker is an unambiguous boundary
+            # because the marker cannot occur as literal string content.
+            prefix = self.text[self.pos : end]
+            boundary = re.search(r",\s*$", prefix)
+            if boundary is not None:
+                value = prefix[: boundary.start()].rstrip()
+                if value.endswith(('"', "'", "`")):
+                    value = value[:-1].rstrip()
+                self.pos = self.pos + boundary.start()
+                return value
+            # Likewise, the final element may have an ordinary quote before
+            # the array closer and the next field's native marker.  Keep the
+            # closer for ``parse_array`` and discard only that quote noise.
+            terminal = re.search(r"(['\"`])\s*](?=\s*,\s*[A-Za-z_][A-Za-z0-9_.-]*\s*[:=])", prefix)
+            if terminal is not None:
+                value = prefix[: terminal.start()].rstrip()
+                self.pos = self.pos + terminal.start()
+                return value
         value = self.text[self.pos : end]
+        # The native marker is the authoritative string boundary.  Gemma4
+        # occasionally leaks one ordinary quote/backtick immediately before
+        # that marker (most often in array elements, e.g.
+        # ``<|"|>Concept drift",<|"|>``).  Treat only this terminal noise as
+        # syntax repair; quotes elsewhere remain part of the value.
+        if self.allow_implicit_commas and self.array_depth and value.endswith(('"', "'", "`")):
+            value = value[:-1].rstrip()
         self.pos = end + len(marker)
         return value
 

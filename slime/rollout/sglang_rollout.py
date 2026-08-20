@@ -383,6 +383,7 @@ class GenerateState(metaclass=SingletonMeta):
         # dp rank balancing
         self.dp_counts = [0] * (args.sglang_dp_size or 1)
         self.dp_rank = 0
+        self.quarantined_tasks: set[asyncio.Task] = set()
 
         self.reset()
 
@@ -871,6 +872,7 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     state = GenerateState(args)
     assert not state.aborted
     state.aborted = True
+    cancellation_incomplete = False
 
     # Stop multi-turn producers before aborting the servers. Otherwise an
     # aborted generate call can return to the agent, which immediately submits
@@ -887,7 +889,14 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         if cancellation_done:
             await asyncio.gather(*cancellation_done, return_exceptions=True)
         if cancellation_pending:
-            logger.error("%d stale rollout tasks ignored cancellation; detaching them", len(cancellation_pending))
+            cancellation_incomplete = True
+            state.quarantined_tasks.update(cancellation_pending)
+            for task in cancellation_pending:
+                task.add_done_callback(state.quarantined_tasks.discard)
+            logger.error(
+                "%d stale rollout tasks did not finish cancellation; quarantining them and requiring engine restart",
+                len(cancellation_pending),
+            )
         if args.partial_rollout:
             for task in stale_tasks:
                 group = state.pending_groups.get(task)
@@ -920,9 +929,18 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
             logger.exception("Failed to discover SGLang workers from the router during abort")
 
     if urls:
-        await abort_servers_until_idle(urls)
+        engines_idle = await abort_servers_until_idle(urls)
+        if not engines_idle or cancellation_incomplete:
+            # The control-plane abort timed out, so the server-side requests
+            # may outlive these Python tasks.  Tell RolloutManager to replace
+            # the engine actors before any offload/onload cycle can reuse them.
+            setattr(args, "_rollout_abort_engine_restart_required", True)
+            logger.error(
+                "SGLang abort left cancellation or engine state incomplete; marking rollout engines for restart"
+            )
     else:
         logger.error("No SGLang engine URLs are available during abort; local rollout tasks were cancelled")
+        setattr(args, "_rollout_abort_engine_restart_required", True)
 
     if args.partial_rollout:
         logger.info(f"Collected {count} partial samples into the data buffer")

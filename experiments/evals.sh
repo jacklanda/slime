@@ -173,6 +173,8 @@ Generation/eval:
 
 SGLang/runtime:
   --sglang-mem-fraction-static X       Default: 0.9.
+  --sglang-disable-cuda-graph BOOL     Disable CUDA graph capture (use for insufficient-driver errors).
+  --sglang-cuda-graph-max-bs N         Limit CUDA graph capture batch size.
   --sglang-server-concurrency N        Default: 60.
   --sglang-max-running-requests N      Per-engine limit. Default: cot=4, agent=96.
   --router-policy NAME                 Default: manual.
@@ -301,6 +303,8 @@ GRM_MAX_NEW_TOKENS="${GRM_MAX_NEW_TOKENS:-2048}"
 GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.6}"
 GRM_FAILURE_REWARD="${GRM_FAILURE_REWARD:-0.0}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.9}"
+SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-false}"
+SGLANG_CUDA_GRAPH_MAX_BS="${SGLANG_CUDA_GRAPH_MAX_BS:-}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-60}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-128}"
 ROUTER_POLICY="${ROUTER_POLICY:-manual}"
@@ -514,6 +518,8 @@ while [ "$#" -gt 0 ]; do
       --mcp-atlas-skip-state-check) MCP_ATLAS_SKIP_STATE_CHECK="${2:?Missing value for --mcp-atlas-skip-state-check}"; shift 2 ;;
       --mcp-atlas-allow-busy-ray) MCP_ATLAS_ALLOW_BUSY_RAY="${2:?Missing value for --mcp-atlas-allow-busy-ray}"; shift 2 ;;
       --sglang-mem-fraction-static) SGLANG_MEM_FRACTION_STATIC="${2:?Missing value for --sglang-mem-fraction-static}"; shift 2 ;;
+      --sglang-disable-cuda-graph) SGLANG_DISABLE_CUDA_GRAPH="${2:?Missing value for --sglang-disable-cuda-graph}"; shift 2 ;;
+      --sglang-cuda-graph-max-bs) SGLANG_CUDA_GRAPH_MAX_BS="${2:?Missing value for --sglang-cuda-graph-max-bs}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
       --router-policy) ROUTER_POLICY="${2:?Missing value for --router-policy}"; shift 2 ;;
@@ -1815,7 +1821,7 @@ fi
 start_managed_serper "${LOG_ROOT}/serper_search_server.log"
 
 export SCRIPT_DIR REPO_ROOT
-export CUDA_HOME="/cm/shared/apps/cuda12.9"
+export CUDA_HOME="${CUDA_HOME:-/cm/shared/apps/cuda12.9}"
 export MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
 
 SGLANG_COMPAT_ARGS=()
@@ -2014,6 +2020,18 @@ if is_truthy "${MCP_ATLAS_SELECTED}" && ! is_truthy "${MCP_ATLAS_POST_AUDIT}"; t
    echo "Warning: MCP-Atlas post-run state audit is disabled because neither Ray wait nor log following is enabled." >&2
 fi
 
+SGLANG_CUDA_GRAPH_ARGS=()
+if is_truthy "${SGLANG_DISABLE_CUDA_GRAPH}"; then
+   SGLANG_CUDA_GRAPH_ARGS+=(--sglang-disable-cuda-graph)
+fi
+if [ -n "${SGLANG_CUDA_GRAPH_MAX_BS}" ]; then
+   if ! [[ "${SGLANG_CUDA_GRAPH_MAX_BS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "--sglang-cuda-graph-max-bs must be a positive integer." >&2
+      exit 2
+   fi
+   SGLANG_CUDA_GRAPH_ARGS+=(--sglang-cuda-graph-max-bs "${SGLANG_CUDA_GRAPH_MAX_BS}")
+fi
+
 cleanup_eval_services() {
    local exit_status=$?
    post_audit_mcp_atlas
@@ -2072,6 +2090,7 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    --dump-details "${DUMP_DETAILS}" \
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}" \
    --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}" \
+   "${SGLANG_CUDA_GRAPH_ARGS[@]}" \
    --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}" \
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}" \
    --router-policy "${ROUTER_POLICY}" \

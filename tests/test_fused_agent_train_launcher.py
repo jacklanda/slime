@@ -565,6 +565,18 @@ def test_gemma4_launcher_avoids_train_memory_saver_by_default():
 
 
 @pytest.mark.unit
+def test_odyssey_gemma4_sync_launcher_avoids_train_memory_saver_by_default():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_odyssey_gemma4_sync.sh").read_text(encoding="utf-8")
+
+    assert 'RELEASE_TRAIN="${RELEASE_TRAIN:-true}"' in launcher
+    assert 'OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${COLOCATE}}"' in launcher
+    assert "OFFLOAD_TRAIN=false" in launcher
+    assert "--update-weight-mode full" in launcher
+    assert "--update-weight-transport disk" in launcher
+
+
+@pytest.mark.unit
 def test_qwen3_sync_launcher_defaults_to_colocated_trainer_offload():
     repo_root = Path(__file__).resolve().parents[1]
     launcher = (repo_root / "experiments/train_qwen3_fused_agent_sync.sh").read_text(encoding="utf-8")
@@ -657,6 +669,17 @@ def test_odyssey_sync_launcher_keeps_aggressive_pending_group_reservoir():
     assert launcher.count("SLIME_LOCAL_MCP_TOOLSET_CACHE_SIZE") >= 2
     assert launcher.count("SLIME_LOCAL_MCP_PROCESS_EAGER_WARM") >= 2
     assert '"SLIME_SYNC_MIN_PENDING_GROUPS"' in launcher
+
+
+@pytest.mark.unit
+def test_single_node_odyssey_sync_launcher_bounds_pending_groups_by_engine_count():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_odyssey_qwen3_sync.sh").read_text(encoding="utf-8")
+
+    assert 'OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-$((ROLLOUT_ENGINE_COUNT * 2))}"' in launcher
+    assert 'SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS:-$((ROLLOUT_ENGINE_COUNT * 2))}"' in launcher
+    assert 'SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-${ROLLOUT_ENGINE_COUNT}}"' in launcher
+    assert 'SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-${ROLLOUT_ENGINE_COUNT}}"' in launcher
 
 
 @pytest.mark.unit

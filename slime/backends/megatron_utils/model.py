@@ -149,6 +149,40 @@ def _episode_metrics_for_actor_update(rollout_data: dict | None) -> dict:
             "episode/training_reward/mean": 0.0,
         }
     )
+    advantage_values = [
+        float(value)
+        for value in metrics_data.get("advantage_values", [])
+        if isinstance(value, (int, float)) and math.isfinite(float(value))
+    ]
+    if advantage_values:
+        abs_advantages = sorted(abs(value) for value in advantage_values)
+        p99_index = min(len(abs_advantages) - 1, max(0, math.ceil(0.99 * len(abs_advantages)) - 1))
+        metrics["train/advantage_max"] = abs_advantages[-1]
+        metrics["train/advantage_min"] = min(advantage_values)
+        metrics["train/advantage_p99"] = abs_advantages[p99_index]
+
+    reward_histogram = metrics_data.get("reward_histogram", {})
+    if reward_histogram:
+        reward_total = sum(float(value) for value in reward_histogram.values())
+        if reward_total > 0:
+            for bucket in ("zero", "one", "other"):
+                metrics[f"train/reward_histogram/{bucket}"] = float(
+                    reward_histogram.get(bucket, 0)
+                ) / reward_total
+    group_reward_histogram = metrics_data.get("group_reward_histogram", {})
+    if group_reward_histogram:
+        group_total = sum(float(value) for value in group_reward_histogram.values())
+        if group_total > 0:
+            for bucket in ("all_zero", "all_one", "mixed", "other"):
+                metrics[f"train/group_reward_histogram/{bucket}"] = float(
+                    group_reward_histogram.get(bucket, 0)
+                ) / group_total
+    useful_tokens = metrics_data.get("useful_training_tokens")
+    policy_token_total = metrics_data.get("policy_token_total")
+    if useful_tokens is not None and policy_token_total is not None:
+        metrics["train/useful_token_ratio"] = (
+            float(useful_tokens) / float(policy_token_total) if float(policy_token_total) > 0 else 0.0
+        )
     if not valid_indices:
         return metrics
 
@@ -317,6 +351,7 @@ _RLLM_TERMINATION_REASONS = (
     "max_response_len_exceeded",
     "max_context_len_exceeded",
     "abnormal_parse_error",
+    "abnormal_parse_error_loop",
     "invalid_react_structure",
     "invalid_final_step",
     "abnormal_tool_burst",

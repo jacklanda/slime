@@ -85,8 +85,8 @@ Options:
                                          Whiten advantages across the data-parallel batch. Default: disabled.
                                          Redundant under GRPO group std-normalization, and its
                                          token-weighted re-centering injects a length-correlated bias.
-  --grpo-std-normalization                Keep GRPO's per-group std normalization. Default: disabled.
-  --disable-grpo-std-normalization        Use mean-only GRPO advantages (default).
+  --grpo-std-normalization                Keep GRPO's per-group std normalization (default: enabled).
+  --disable-grpo-std-normalization        Use mean-only GRPO advantages.
   --enable_use_grm_train BOOL            Use OpenRouter GRM with rule-based fallback for WebQA training rewards.
                                          MCP retains environment verifier rewards. Default: true.
   --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for interval eval scoring. Default: true.
@@ -139,7 +139,7 @@ Options:
   --val_before_train BOOL                Run one eval before training starts. Default: true.
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
   --offload-train BOOL                   Offload trainer model between phases. Disabled by --release-train.
-  --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: false.
+  --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: true.
   --max-tool-output-length N             Fused max tool output length env.
   --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 128.
   --sglang-router-request-timeout-secs N Router request timeout. Default: 21600.
@@ -206,17 +206,17 @@ CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_ST
 CREDIT_ASSIGNMENT_MAX_TURNS="${CREDIT_ASSIGNMENT_MAX_TURNS:-True}"
 CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN:-True}"
 HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
-# Global advantage whitening is OFF by default for GRPO, and group std-normalization
-# is also disabled by default: rewards are mean-centered *within each prompt group*
+# Global advantage whitening is OFF by default for GRPO, while group std-normalization
+# is enabled by default: rewards are mean-centered and std-scaled *within each prompt group*
 # on the rollout side. A second, global whitening pass re-centers on a TOKEN-weighted mean
 # while group norm centered on a SEQUENCE-weighted mean. Because wrong/truncated
 # trajectories are longer, that token-weighted mean is systematically negative, so
 # whitening adds a uniform positive constant to every token -- an unconditional
 # likelihood push whose token mass sits mostly on wrong trajectories. It also breaks
 # GRPO's per-group zero-mean invariant. See tests/test_group_reward_normalization.py.
-NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
+NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"
 GRPO_STD_NORMALIZATION="${GRPO_STD_NORMALIZATION:-true}"
-LR="${LR:-2e-6}"
+LR="${LR:-1e-6}"
 CLIP_GRAD="${CLIP_GRAD:-1.0}"
 KL_COEF="${KL_COEF:-0.0}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
@@ -289,8 +289,13 @@ EVAL_PROMPT_DATA=()
 # changes it. Release-train overrides this below because it replaces the trainer
 # actor instead of pausing it.
 OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-}}"
-RELEASE_TRAIN="${RELEASE_TRAIN:-false}"
-ENABLE_USE_GRM_TRAIN="${ENABLE_USE_GRM_TRAIN:-${enable_use_grm_train:-true}}"
+# Colocated Gemma4 training must not use torch_memory_saver pause/resume by
+# default.  That native path can fail after a successful actor update with
+# cudaErrorInvalidValue in torch_memory_saver.pause(), killing one distributed
+# rank and taking the whole Ray actor group down.  Release-train preserves the
+# checkpoint/weight-update contract while avoiding that fragile lifecycle.
+RELEASE_TRAIN="${RELEASE_TRAIN:-true}"
+ENABLE_USE_GRM_TRAIN="${ENABLE_USE_GRM_TRAIN:-${enable_use_grm_train:-false}}"
 ENABLE_USE_GRM_EVALS="${ENABLE_USE_GRM_EVALS:-${enable_use_grm_evals:-true}}"
 GRM_CUSTOM_RM_PATH="${GRM_CUSTOM_RM_PATH:-slime.rollout.rm_hub.openrouter_grm.reward_func}"
 TRAIN_GRM_MODEL="${TRAIN_GRM_MODEL:-deepseek/deepseek-v4-flash-0731}"
@@ -933,15 +938,28 @@ LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"
 # backward, so 8192 would require roughly 4.3 GiB for one temporary tensor and
 # can exhaust an 80 GiB rank even when the forward pass fits.
 LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-1024}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
-# The fully-async collector counts prompt groups, so the default batch of eight
-# groups is selected as four MCP groups and four WebQA groups.
+# Keep at least eight independent groups per task family with the default
+# 50/50 WebQA/MCP quota and a 256-sample global batch.
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
+# The default batch has sixteen prompt groups, selected as eight MCP groups and
+# eight WebQA groups by the 50/50 task-family quota.
 #ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-mcp=0.5,webqa=0.5}"
 ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
 # Keep enough candidate groups queued to feed the default four TP2 rollout
 # engines without generating the much larger surplus created by a batch of 64.
 OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
-N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
+# Keep a large candidate pool before selecting the fixed training batch. These
+# admission thresholds mirror the Qwen3 synchronous collector and prevent a
+# batch from being formed from the first few sparse mixed-reward groups.
+ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-false}"
+SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS:-0}"
+SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-0}"
+SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-0}"
+SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-0}"
+# Reject groups whose clean-reward GRPO-normalized advantage would exceed this
+# value. This is rollout admission, not optimizer-side advantage clipping.
+FUSED_FILTER_MAX_ABS_ADVANTAGE="${FUSED_FILTER_MAX_ABS_ADVANTAGE:-0}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 # Gemma4 requires a top-k shortlist to avoid sampling low-probability noise from
 # its 262k vocabulary. Keep top-p disabled by default because slime's fused TIS
@@ -1122,13 +1140,13 @@ fi
 
 if [ -n "${DYNAMIC_SAMPLING_FILTER_PATH}" ]; then
    ROLLOUT_ARGS+=(--dynamic-sampling-filter-path "${DYNAMIC_SAMPLING_FILTER_PATH}")
-fi
-if [ -n "${DYNAMIC_SAMPLING_FILTER_PATH}" ] \
-   && [ "${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}" -gt 0 ]; then
    ROLLOUT_ARGS+=(--fully-async-filter-relax-after-groups "${FULLY_ASYNC_FILTER_RELAX_AFTER_GROUPS}")
 fi
 if [ -n "${ROLLOUT_TASK_FAMILY_QUOTAS:-}" ]; then
    ROLLOUT_ARGS+=(--rollout-task-family-quotas "${ROLLOUT_TASK_FAMILY_QUOTAS}")
+   if is_truthy "${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS}"; then
+      ROLLOUT_ARGS+=(--rollout-task-family-top-mean-steps)
+   fi
 fi
 if [ "${ENABLE_QUOTA_BUCKET_SAMPLING:-1}" = "1" ]; then
    ROLLOUT_ARGS+=(--enable-quota-bucket-sampling)
@@ -1516,6 +1534,7 @@ export CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN}
 export FUSED_FILTER_MIN_MEAN_STEPS="${FUSED_FILTER_MIN_MEAN_STEPS:-0}"
 export FUSED_FILTER_MIN_MCP_MEAN_STEPS="${FUSED_FILTER_MIN_MCP_MEAN_STEPS:-0}"
 export FUSED_FILTER_MAX_ABNORMAL_RATIO="${FUSED_FILTER_MAX_ABNORMAL_RATIO:-0}"
+export FUSED_FILTER_MAX_ABS_ADVANTAGE="${FUSED_FILTER_MAX_ABS_ADVANTAGE}"
 export FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER}"
 export FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA}"
 export FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT}"
@@ -1525,6 +1544,10 @@ if [ -n "${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS}" ]; then
    export FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS
 fi
 export SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER="${SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER:-4}"
+export SLIME_SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS}"
+export SLIME_SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS}"
+export SLIME_SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS}"
+export SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS}"
 export SLIME_TENSOR_BACKUP_PIN_MEMORY="${SLIME_TENSOR_BACKUP_PIN_MEMORY:-0}"
 export SLIME_GEMMA4_CLEAR_CACHE_BEFORE_BACKWARD=1
 # SGLang exposes rollout logprobs from its FP32 logits buffer. Keep the
@@ -1599,11 +1622,13 @@ keys = (
     "CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER", "CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP",
     "CREDIT_ASSIGNMENT_MAX_TURNS", "CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN",
     "FUSED_FILTER_MIN_MEAN_STEPS", "FUSED_FILTER_MIN_MCP_MEAN_STEPS",
-    "FUSED_FILTER_MAX_ABNORMAL_RATIO",
+    "FUSED_FILTER_MAX_ABNORMAL_RATIO", "FUSED_FILTER_MAX_ABS_ADVANTAGE",
     "FUSED_HORIZON_REWARD_MIN_MULTIPLIER", "FUSED_HORIZON_REWARD_GAMMA",
     "FUSED_HORIZON_REWARD_STEP_WEIGHT", "FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT",
     "FUSED_HORIZON_REWARD_TARGET_STEPS", "FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS",
-    "SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER",
+    "SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER", "SLIME_SYNC_MIN_PENDING_GROUPS",
+    "SLIME_SYNC_WEBQA_MIN_PENDING_GROUPS", "SLIME_SYNC_MCP_MIN_PENDING_GROUPS",
+    "SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["PYTHONPATH"] = f"{os.environ['MEGATRON_LM_PATH']}:{os.environ['REPO_ROOT']}:{os.environ['SCRIPT_DIR']}"
@@ -1648,9 +1673,10 @@ echo "Eval scheduling: inflight=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIG
 echo "OpenRouter GRM: train=${ENABLE_USE_GRM_TRAIN}, train_model=${TRAIN_GRM_MODEL}, evals=${ENABLE_USE_GRM_EVALS}, eval_model=${EVAL_GRM_MODEL}, mode=${GRM_MODE}, concurrency=${GRM_CONCURRENCY}, max_connections=${GRM_MAX_CONNECTIONS}, timeout=${GRM_TIMEOUT}, retries=${GRM_MAX_RETRIES}, max_input_tokens=${GRM_MAX_INPUT_TOKENS}, max_new_tokens=${GRM_MAX_NEW_TOKENS}, temperature=${GRM_TEMPERATURE}, custom_rm=${GRM_CUSTOM_RM_PATH}"
 echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, std_normalization=${GRPO_STD_NORMALIZATION}, normalize_advantages=${NORMALIZE_ADVANTAGES}, kl_coef=${KL_COEF}, lr=${LR}, eps_clip=${EPS_CLIP:-0.2}, eps_clip_high=${EPS_CLIP_HIGH:-0.28}"
 echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING:-0}, path=${BUFFER_FILTER_PATH:-${ENABLE_QUOTA_BUCKET_SAMPLING:+slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps}}"
-echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}"
+echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}, max_abs_advantage=${FUSED_FILTER_MAX_ABS_ADVANTAGE}"
+echo "Sync rollout admission: min_pending_groups=${SYNC_MIN_PENDING_GROUPS}, webqa_min_pending_groups=${SYNC_WEBQA_MIN_PENDING_GROUPS}, mcp_min_pending_groups=${SYNC_MCP_MIN_PENDING_GROUPS}, mcp_only_min_pending_groups=${SYNC_MCP_ONLY_MIN_PENDING_GROUPS}, max_pending_groups=${OVER_SAMPLING_BATCH_SIZE}"
+echo "Rollout task family quotas: ${ROLLOUT_TASK_FAMILY_QUOTAS:-<none>}; top_mean_steps=${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS}; candidate_multiplier=${SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER}"
 echo "Horizon reward shaping: enable=${HORIZON_REWARD_SHAPING}, min_multiplier=${FUSED_HORIZON_REWARD_MIN_MULTIPLIER}, gamma=${FUSED_HORIZON_REWARD_GAMMA}, step_weight=${FUSED_HORIZON_REWARD_STEP_WEIGHT}, tool_call_weight=${FUSED_HORIZON_REWARD_TOOL_CALL_WEIGHT}, target_steps=${FUSED_HORIZON_REWARD_TARGET_STEPS}, target_tool_calls=${FUSED_HORIZON_REWARD_TARGET_TOOL_CALLS:-target_steps-1}"
-echo "Rollout task family quotas: ${ROLLOUT_TASK_FAMILY_QUOTAS:-<none>}; candidate_multiplier=${SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER}"
 echo "Tail guard: enable=${TAIL_GUARD}, time_guard=${TAIL_GUARD_TIME_GUARD}, time_multiplier=${TAIL_GUARD_TIME_MULTIPLIER}, time_slack=${TAIL_GUARD_TIME_SLACK_SECONDS}, min_completion_ratio=${TAIL_GUARD_MIN_COMPLETION_RATIO}"
 echo "Credit assignment: enable=${CREDIT_ASSIGNMENT_ENABLE}, tool_parser_error=${CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR}, repeated_search_query=${CREDIT_ASSIGNMENT_REPEATED_SEARCH_QUERY}, too_many_tool_calls=${CREDIT_ASSIGNMENT_TOO_MANY_TOOL_CALLS}, ngram_repetition=${CREDIT_ASSIGNMENT_NGRAM_REPETITION}(n=${CREDIT_ASSIGNMENT_NGRAM_REPETITION_N}, threshold=${CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD}, min_tokens=${CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS}), search_bypass=${CREDIT_ASSIGNMENT_SEARCH_BYPASS}, direct_submit_without_tool=${CREDIT_ASSIGNMENT_DIRECT_SUBMIT_WITHOUT_TOOL}, mixed_tool_and_answer=${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER}, tail_guard_early_stop=${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP}"
 

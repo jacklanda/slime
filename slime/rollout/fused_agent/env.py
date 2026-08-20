@@ -2255,6 +2255,20 @@ def _is_safe_structured_equivalent(left: str, right: str) -> bool:
     if _webqa_structured_normalize(left) == _webqa_structured_normalize(right):
         return True
 
+    # Names commonly differ only by omitted middle names/initials.  Require
+    # both the first and family names to agree and only relax the middle span.
+    if _person_name_equivalent(left, right):
+        return True
+
+    # Accept an acronym only when it is exactly the initials of the other
+    # phrase.  This covers answers such as ``ROS`` vs ``Rigid Origami
+    # Simulator`` without turning arbitrary short strings into aliases.
+    if _acronym_phrase_equivalent(left, right):
+        return True
+
+    if _simple_plural_equivalent(left, right):
+        return True
+
     left_parts = _validated_name_acronym(left)
     right_parts = _validated_name_acronym(right)
     if left_parts and _webqa_structured_normalize(left_parts[0]) == _webqa_structured_normalize(right):
@@ -2266,6 +2280,87 @@ def _is_safe_structured_equivalent(left: str, right: str) -> bool:
             _webqa_structured_normalize(left_parts[0]) == _webqa_structured_normalize(right_parts[0])
             and left_parts[1] == right_parts[1]
         )
+    return False
+
+
+def _name_tokens(value: str) -> list[str]:
+    return re.findall(r"[A-Za-z]+", unicodedata.normalize("NFKD", value))
+
+
+def _person_name_equivalent(left: str, right: str) -> bool:
+    # This intentionally recognizes a narrow person-name grammar, rather than
+    # treating any phrases with matching outer words as names.  In particular,
+    # identifiers (``miR-34a``), versions, and ordinary titles must not gain a
+    # match merely because a word was inserted or omitted between their ends.
+    name_word = r"[A-Za-z]+(?:[-'][A-Za-z]+)*"
+    name_pattern = rf"\s*{name_word}(?:\s+{name_word}\.?)*\s*"
+    if not re.fullmatch(name_pattern, left) or not re.fullmatch(name_pattern, right):
+        return False
+    left_tokens = _name_tokens(left)
+    right_tokens = _name_tokens(right)
+    if len(left_tokens) < 2 or len(right_tokens) < 2:
+        return False
+    if left_tokens[0].casefold() != right_tokens[0].casefold():
+        return False
+    if left_tokens[-1].casefold() != right_tokens[-1].casefold():
+        return False
+    left_middle = left_tokens[1:-1]
+    right_middle = right_tokens[1:-1]
+    # There is no middle-name omission to reconcile when both forms contain
+    # only a given and family name.
+    if not left_middle and not right_middle:
+        return False
+    if not all(token[0].isupper() or len(token) == 1 for token in left_tokens + right_tokens):
+        return False
+    if not left_middle or not right_middle:
+        return True
+    # Compare initials when one representation supplies abbreviated middle
+    # names (including ``T.-S.`` style punctuation).
+    left_initials = "".join(token[0].casefold() for token in left_middle)
+    right_initials = "".join(token[0].casefold() for token in right_middle)
+    if left_initials == right_initials:
+        return True
+    if len(left_middle) == 1 and len(right_middle) > 1:
+        return left_middle[0][0].casefold() == right_initials[0] and len(right_initials) == 1
+    if len(right_middle) == 1 and len(left_middle) > 1:
+        return right_middle[0][0].casefold() == left_initials[0] and len(left_initials) == 1
+    return False
+
+
+def _acronym_phrase_equivalent(left: str, right: str) -> bool:
+    def parts(value: str) -> tuple[str, list[str]] | None:
+        tokens = _name_tokens(value)
+        raw_tokens = re.findall(r"[A-Za-z][A-Za-z0-9-]*", value)
+        if len(tokens) < 2 or len(raw_tokens) != len(tokens):
+            return None
+        return "".join(token[0].upper() for token in tokens if token.casefold() not in {"a", "an", "the"}), tokens
+
+    def is_acronym(value: str) -> bool:
+        value = value.strip()
+        return bool(re.fullmatch(r"[A-Z][A-Z0-9-]{1,9}", value))
+
+    for acronym, phrase in ((left, right), (right, left)):
+        if not is_acronym(acronym):
+            continue
+        phrase_parts = parts(phrase)
+        if phrase_parts and phrase_parts[0] == acronym.replace("-", "").upper():
+            return True
+    return False
+
+
+def _simple_plural_equivalent(left: str, right: str) -> bool:
+    left_tokens = _webqa_structured_normalize(left).split()
+    right_tokens = _webqa_structured_normalize(right).split()
+    if len(left_tokens) != len(right_tokens) or len(left_tokens) < 2:
+        return False
+    differences = [(a, b) for a, b in zip(left_tokens, right_tokens) if a != b]
+    if len(differences) != 1:
+        return False
+    first, second = differences[0]
+    if len(first) >= 5 and first.endswith("s") and first[:-1] == second:
+        return True
+    if len(second) >= 5 and second.endswith("s") and second[:-1] == first:
+        return True
     return False
 
 

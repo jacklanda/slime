@@ -684,14 +684,15 @@ def test_abort_cancels_pending_before_using_known_engine_urls(monkeypatch):
     monkeypatch.setattr(sglang_rollout, "get", unexpected_router_request)
     monkeypatch.setattr(sglang_rollout, "abort_servers_until_idle", abort_known_engines)
 
+    args = Namespace(
+        partial_rollout=True,
+        sglang_router_ip="router",
+        sglang_router_port=30000,
+        sglang_engine_urls=["http://engine-0", None, "http://engine-1"],
+    )
     aborted = asyncio.run(
         sglang_rollout.abort(
-            Namespace(
-                partial_rollout=True,
-                sglang_router_ip="router",
-                sglang_router_port=30000,
-                sglang_engine_urls=["http://engine-0", None, "http://engine-1"],
-            ),
+            args,
             rollout_id=7,
         )
     )
@@ -700,6 +701,47 @@ def test_abort_cancels_pending_before_using_known_engine_urls(monkeypatch):
     assert events == ["cancelled", "abort"]
     assert aborted == [pending_group]
     assert pending_group[0].metadata["start_rollout_id"] == 7
+    assert args._rollout_abort_engine_restart_required is True
+
+
+def test_abort_requires_restart_when_task_cancellation_does_not_finish(monkeypatch):
+    class AbortGenerateState:
+        def __init__(self, _args):
+            self.aborted = False
+            self.pending_groups = {}
+            self.pendings = set()
+            self.quarantined_tasks = set()
+
+            async def slow_cancellation():
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.05)
+
+            task = asyncio.create_task(slow_cancellation())
+            self.pendings.add(task)
+            self.pending_groups[task] = [Sample(index=0, prompt="a")]
+
+    async def abort_cleanly(_urls):
+        return True
+
+    async def cancellation_stays_pending(tasks, timeout):
+        return set(), set(tasks)
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", AbortGenerateState)
+    monkeypatch.setattr(sglang_rollout, "ABORT_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(sglang_rollout, "abort_servers_until_idle", abort_cleanly)
+    monkeypatch.setattr(sglang_rollout.asyncio, "wait", cancellation_stays_pending)
+    args = Namespace(
+        partial_rollout=False,
+        sglang_router_ip="router",
+        sglang_router_port=30000,
+        sglang_engine_urls=["http://engine-0"],
+    )
+
+    asyncio.run(sglang_rollout.abort(args, rollout_id=8))
+
+    assert args._rollout_abort_engine_restart_required is True
 
 
 def test_eval_generation_limits_inflight_tasks_and_preserves_order(monkeypatch):

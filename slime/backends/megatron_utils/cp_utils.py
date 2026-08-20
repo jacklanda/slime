@@ -158,7 +158,17 @@ def reduce_train_step_metrics(
     else:
         num_samples_or_tokens = step_global_batch_size
         cp_factor = 1
-    return {key: value * cp_factor / num_samples_or_tokens for key, value in zip(keys, values[1:], strict=False)}
+    # ``policy_loss_tokens`` and ``effective_policy_loss_tokens`` are already
+    # computed from the full response masks on every CP rank.  Their numerator
+    # and the per-token denominator are both duplicated by the DP*CP all-reduce,
+    # so applying the generic CP compensation would report a ratio multiplied
+    # by ``cp_size`` (2.0 on Gemma4).  Keep the compensation for loss metrics,
+    # but leave these mask ratios in their natural [0, 1] scale.
+    cp_invariant_metrics = {"policy_loss_tokens", "effective_policy_loss_tokens"}
+    return {
+        key: value * (1 if key in cp_invariant_metrics else cp_factor) / num_samples_or_tokens
+        for key, value in zip(keys, values[1:], strict=False)
+    }
 
 
 def rollout_log_metric_contribution(

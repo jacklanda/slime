@@ -6,7 +6,7 @@ from slime.agent.trajectory import TrajectoryManager, TurnRecord
 from slime.ray.rollout import _collect_fused_agent_stats, _mismatch_bucket_ids, convert_samples_to_train_data
 from slime.rollout.filter_hub.horizon_reward_shaping import post_process_rewards as post_process_horizon_rewards
 from slime.rollout.sglang_rollout import _timeout_sample
-from slime.utils.credit_assignment import CreditAssignmentConfig, build_policy_loss_mask
+from slime.utils.credit_assignment import CreditAssignmentConfig, build_policy_loss_mask, enabled_credit_assignment_event
 from slime.utils.types import Sample
 
 
@@ -50,6 +50,32 @@ def test_credit_assignment_masks_only_valid_action_span():
 
     assert event == "tool_parser_error"
     assert mask == [0, 0, 0, 1, 1, 0]
+
+
+@pytest.mark.parametrize("reason", ["ABNORMAL_PARSE_ERROR", "ABNORMAL_PARSE_ERROR_LOOP"])
+def test_missing_parser_event_is_recovered_from_malformed_termination(reason):
+    config = CreditAssignmentConfig(enable=True, tool_parser_error=True)
+    metadata = {
+        "termination_reason": reason,
+        "credit_assignment_action_start": 1,
+        "credit_assignment_action_end": 5,
+    }
+
+    assert enabled_credit_assignment_event(metadata, config) == "tool_parser_error"
+    mask, event = build_policy_loss_mask(metadata=metadata, loss_mask=[1] * 6, config=config)
+    assert event == "tool_parser_error"
+    assert mask == [0, 1, 1, 1, 1, 0]
+
+
+def test_think_parser_event_is_a_credit_assignment_event():
+    config = CreditAssignmentConfig(enable=True)
+    mask, event = build_policy_loss_mask(
+        metadata={"credit_assignment_event": "think_parser_error"},
+        loss_mask=[1, 1, 0],
+        config=config,
+    )
+    assert event == "think_parser_error"
+    assert mask == [1, 1, 0]
 
 
 def test_credit_assignment_caps_long_parser_error_action_span_to_window():
@@ -209,6 +235,15 @@ def test_rollout_conversion_separates_advantage_and_policy_masks():
     assert train_data["episode_metrics_data"]["loss_mask_sums"] == [4, 2]
     assert train_data["episode_metrics_data"]["policy_loss_mask_sums"] == [2, 2]
     assert train_data["episode_metrics_data"]["useful_training_tokens"] == 4
+    assert train_data["episode_metrics_data"]["advantage_values"] == [1.0, 0.0]
+    assert train_data["episode_metrics_data"]["reward_histogram"] == {"zero": 1, "one": 1, "other": 0}
+    assert train_data["episode_metrics_data"]["group_reward_histogram"] == {
+        "all_zero": 0,
+        "all_one": 0,
+        "mixed": 1,
+        "other": 0,
+    }
+    assert train_data["episode_metrics_data"]["policy_token_total"] == 4
 
 
 def test_useful_training_tokens_exclude_zero_variance_groups():
@@ -1410,6 +1445,33 @@ def test_zero_std_filter_keeps_nonzero_variance_among_clean_samples():
             metadata={"credit_assignment_event": "tool_parser_error"} if index < 30 else {},
         )
         for index, reward in enumerate([0.0] * 30 + [0.0, 1.0])
+    ]
+
+    assert check_reward_nonzero_std(_args(), samples).keep is True
+
+
+def test_reward_filter_rejects_sparse_grpo_winner(monkeypatch):
+    from slime.rollout.filter_hub.dynamic_sampling_filters import check_reward_nonzero_std
+
+    monkeypatch.setenv("FUSED_FILTER_MAX_ABS_ADVANTAGE", "3.0")
+    samples = [
+        Sample(index=index, rollout_id=index, reward=float(index >= 30))
+        for index in range(32)
+    ]
+
+    result = check_reward_nonzero_std(_args(), samples)
+
+    assert result.keep is False
+    assert result.reason.startswith("high_abs_advantage_")
+
+
+def test_reward_filter_keeps_bounded_grpo_winner(monkeypatch):
+    from slime.rollout.filter_hub.dynamic_sampling_filters import check_reward_nonzero_std
+
+    monkeypatch.setenv("FUSED_FILTER_MAX_ABS_ADVANTAGE", "3.0")
+    samples = [
+        Sample(index=index, rollout_id=index, reward=float(index >= 28))
+        for index in range(32)
     ]
 
     assert check_reward_nonzero_std(_args(), samples).keep is True

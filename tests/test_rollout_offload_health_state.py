@@ -2,7 +2,7 @@ from argparse import Namespace
 
 import pytest
 
-from slime.ray.rollout import RolloutServer, ServerGroup
+from slime.ray.rollout import RolloutManager, RolloutServer, ServerGroup
 from slime.utils.health_monitor import RolloutHealthMonitor
 
 NUM_GPUS = 0
@@ -211,6 +211,40 @@ def test_health_monitor_reboosts_after_marking_engine_dead(monkeypatch):
 
     assert group.all_engines == [None]
     assert reboosts == [(group, 0)]
+
+
+def test_offload_restarts_local_engines_after_incomplete_abort(monkeypatch):
+    events = []
+
+    class FakeServer:
+        def restart_with_overrides(self, overrides):
+            events.append(("restart", overrides))
+
+        def offload(self):
+            events.append(("offload", None))
+
+    manager_cls = RolloutManager.__ray_metadata__.modified_class
+    manager = object.__new__(manager_cls)
+    manager.args = Namespace(
+        _rollout_abort_engine_restart_required=True,
+        rollout_external=False,
+        ci_test=False,
+        use_fault_tolerance=False,
+        rollout_only_inference_fast_path=False,
+        debug_rollout_only=True,
+    )
+    manager.servers = {"default": FakeServer()}
+    manager._health_monitors = []
+    manager._get_rollout_data = lambda rollout_id: ([object()], {})
+    manager._save_debug_rollout_data = lambda *_args, **_kwargs: None
+    monkeypatch.setattr("slime.ray.rollout._log_rollout_data", lambda *_args, **_kwargs: {})
+
+    with pytest.raises(RuntimeError, match=r"call offload\(\)"):
+        manager.generate(59)
+    assert events == []
+    manager.offload()
+    assert events == [("restart", {})]
+    assert manager.args._rollout_abort_engine_restart_required is False
 
 
 if __name__ == "__main__":

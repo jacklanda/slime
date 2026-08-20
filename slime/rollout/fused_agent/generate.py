@@ -411,16 +411,20 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         try:
             task, mcp_workspace = await asyncio.shield(prepare_task)
         except asyncio.CancelledError:
-            # Cancelling the coroutine cannot interrupt the worker thread
-            # running rsync. Drain it before returning so a completed copy is
-            # still removed and never becomes a leaked trajectory workspace.
-            try:
-                prepared = await asyncio.shield(prepare_task)
-            except BaseException:
-                prepared = None
-            if prepared is not None:
-                _, mcp_workspace = prepared
-                await asyncio.to_thread(cleanup_mcp_workspace, mcp_workspace)
+            # A cancellation cannot interrupt rsync in the worker thread. Do
+            # not wait for it here: a wave of cancelled MCP rollouts must be
+            # able to leave the event loop promptly.  Clean up the workspace
+            # after the copy finishes, including the partially-created case.
+            async def reap_cancelled_workspace(copy_task):
+                try:
+                    prepared = await copy_task
+                except BaseException:
+                    return
+                if prepared is not None:
+                    _, workspace = prepared
+                    await asyncio.to_thread(cleanup_mcp_workspace, workspace)
+
+            asyncio.create_task(reap_cancelled_workspace(prepare_task))
             raise
         # The main rollout finally block owns normal cleanup. This callback
         # covers setup/parser failures that occur before that block starts.
@@ -542,6 +546,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     ngram_repetition_threshold = float(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_THRESHOLD", "0.35"))
     ngram_repetition_min_tokens = int(os.environ.get("CREDIT_ASSIGNMENT_NGRAM_REPETITION_MIN_TOKENS", "128"))
     repeated_search_max_strikes = max(1, int(os.environ.get("FUSED_REPEATED_SEARCH_MAX_STRIKES", "2")))
+    parse_error_max_streak = max(1, int(os.environ.get("FUSED_PARSE_ERROR_MAX_STREAK", "2")))
     inference_only = bool(getattr(args, "rollout_only_inference_fast_path", False))
     detect_abnormal_trajectories = not evaluation and not research_search
     detect_eval_response_anomalies = evaluation and not deepsearch_world
@@ -618,6 +623,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     last_search_query: str | None = None
     seen_rllm_calls: set[tuple[str, str]] = set()
     repeated_search_strikes = 0
+    parse_error_streak = 0
+    parse_error_total = 0
+    anomaly_counts: dict[str, int] = {"parse": 0, "tool": 0, "repetition": 0, "length": 0}
     used_non_finish_tool = False
     final_response = ""
     last_finish_reason = "stop"
@@ -912,7 +920,16 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         rid=output.get("rid"),
                     )
                 response = _strip_trailing_chat_template_stop(output["text"])
-                parsed_actions = [] if reasoning_only else await asyncio.to_thread(parser.parse, response)
+                # Shadow repairs only affect the parsed action AST. The original
+                # response/output_ids remain untouched and repaired finishes are
+                # masked below so no synthetic delimiter can reach actor loss.
+                parse_with_finish_shadow = isinstance(parser, Gemma4ToolParser) and env.mode == "mcp"
+                if reasoning_only:
+                    parsed_actions = []
+                elif parse_with_finish_shadow:
+                    parsed_actions = await asyncio.to_thread(parser.parse, response, shadow_finish=True)
+                else:
+                    parsed_actions = await asyncio.to_thread(parser.parse, response)
             else:
                 output_ids = output["output_ids"]
                 output_logprobs = output["output_logprobs"]
@@ -925,16 +942,24 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 # rollout event loop (which must stay free to dispatch env/LLM
                 # requests for every other in-flight trajectory).
                 decode_fn = _decode_step if reasoning_only else _decode_and_parse_step
+                decode_kwargs = {"disable_thinking": disable_thinking}
+                if decode_fn is _decode_and_parse_step:
+                    decode_kwargs["shadow_finish"] = (
+                        not reasoning_only and isinstance(parser, Gemma4ToolParser) and env.mode == "mcp"
+                    )
                 response, parsed_actions, response_loss_mask = await asyncio.to_thread(
                     decode_fn,
                     state.tokenizer,
                     None if reasoning_only else parser,
                     output_ids,
-                    disable_thinking=disable_thinking,
+                    **decode_kwargs,
                 )
             if deepsearch_world:
                 response = dsw.ensure_think_tags(response)
-                parsed_actions = await asyncio.to_thread(parser.parse, response)
+                if isinstance(parser, Gemma4ToolParser) and env.mode == "mcp":
+                    parsed_actions = await asyncio.to_thread(parser.parse, response, shadow_finish=True)
+                else:
+                    parsed_actions = await asyncio.to_thread(parser.parse, response)
             shadow_finish_rejected = False
             if env.mode == "mcp":
                 parsed_finish_is_valid = False
@@ -950,6 +975,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 complete_valid_finish = (
                     parsed_finish_is_valid
                     and not finish_result_was_coerced
+                    and not getattr(parser, "last_syntax_repairs", ())
                     and not response.strip().lower().startswith("<answer>")
                 )
                 shadow_finish = (
@@ -981,6 +1007,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         parser.last_schema_errors = []
                         parser.last_schema_error_spans = []
                         parser.last_schema_error_kinds = []
+                # Rejected finishes remain genuine sampled policy output. Keep
+                # their original loss mask so heuristic credit assignment can
+                # penalize the localized malformed action tokens. Only an
+                # accepted shadow repair is fully masked above: its successful
+                # environment transition depends on parser-synthetic syntax.
             _record_tool_parser_errors(
                 args=args,
                 base_sample=base_sample,
@@ -1115,6 +1146,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     parsed_actions = [ToolCall("finish", {"command": "submit", "result": response.strip()})]
 
             if detect_abnormal_trajectories and finish_reason == "length":
+                anomaly_counts["length"] += 1
                 final_done = True
                 last_info = {"termination_reason": "max_response_len_exceeded"}
                 trajectory_steps.append(
@@ -1161,6 +1193,55 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 break
 
             actions = parsed_actions
+            parser_error_kinds = list(getattr(parser, "last_schema_error_kinds", ()) or ())
+            parser_syntax_repairs = list(getattr(parser, "last_syntax_repairs", ()) or ())
+            parser_error_present = (
+                bool(getattr(parser, "last_schema_errors", ()))
+                or bool(parser_syntax_repairs)
+                or (not actions and _response_has_malformed_tool_call(response))
+            )
+            if parser_syntax_repairs and not parser_error_kinds:
+                parser_error_kinds = ["syntax_repair"] * len(parser_syntax_repairs)
+            parser_anomaly_recorded_this_turn = False
+            if parser_error_present:
+                parse_error_streak += 1
+                parse_error_total += 1
+                anomaly_counts["parse"] += 1
+                parser_anomaly_recorded_this_turn = True
+            else:
+                parse_error_streak = 0
+            if parse_error_streak >= parse_error_max_streak and not (
+                detect_eval_response_anomalies or deepsearch_world
+            ):
+                final_reward = 0.0
+                final_done = True
+                credit_event = "tool_parser_error"
+                credit_step_index = len(pending_turns) - 1
+                last_info = {
+                    "termination_reason": "ABNORMAL_PARSE_ERROR_LOOP",
+                    "parse_error_loop_early_stop": True,
+                    "parse_error_streak": parse_error_streak,
+                    "parse_error_total": parse_error_total,
+                    "tool_parser_error_kinds": parser_error_kinds,
+                    "credit_assignment_event": credit_event,
+                    "credit_assignment_error_step_index": credit_step_index,
+                }
+                trajectory_steps.append(
+                    _episode_step(
+                        observation=observation,
+                        response=response,
+                        action="",
+                        reward=0.0,
+                        done=True,
+                        messages=rollout_messages if capture_eval_details else [],
+                        tito_context_reason=tito_context_reason,
+                        historical_thinking_discarded=historical_thinking_discarded,
+                        llm_time=step_llm_time,
+                        env_time=0.0,
+                        disable_thinking=disable_thinking,
+                    )
+                )
+                break
             if detect_eval_response_anomalies:
                 anomaly_info = await asyncio.to_thread(
                     _eval_response_anomaly_info,
@@ -1347,6 +1428,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 and _has_unclosed_think(response)
                 and not _response_has_malformed_tool_call(response)
             ):
+                if not parser_anomaly_recorded_this_turn:
+                    anomaly_counts["parse"] += 1
                 final_reward = 0.0
                 final_done = True
                 credit_event = "think_parser_error"
@@ -1381,6 +1464,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 and getattr(parser, "last_schema_errors", ())
                 and not recoverable_tool_schema_errors
             ):
+                if not parser_anomaly_recorded_this_turn:
+                    anomaly_counts["parse"] += 1
                 final_reward = 0.0
                 final_done = True
                 credit_event = "tool_parser_error"
@@ -1455,6 +1540,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         messages = dsw.action_messages(deepsearch_task, deepsearch_state, deepsearch_steps)
                     continue
                 if detect_abnormal_trajectories and credit_assignment_tool_parser_error:
+                    if not parser_anomaly_recorded_this_turn:
+                        anomaly_counts["parse"] += 1
                     final_reward = 0.0
                     final_done = True
                     credit_event = "tool_parser_error"
@@ -1506,6 +1593,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 and _response_has_malformed_tool_call(response)
                 and not getattr(parser, "last_syntax_repairs", ())
             ):
+                if not parser_anomaly_recorded_this_turn:
+                    anomaly_counts["parse"] += 1
                 final_reward = 0.0
                 final_done = True
                 credit_event = "tool_parser_error"
@@ -1550,6 +1639,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 )
                 break
             if detect_abnormal_trajectories and max_tool_calls_per_turn > 0 and len(actions) > max_tool_calls_per_turn:
+                anomaly_counts["tool"] += 1
                 final_reward = 0.0
                 final_done = True
                 if credit_assignment_too_many_tool_calls:
@@ -1589,6 +1679,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 and credit_assignment_mixed_tool_and_answer
                 and _has_mixed_tool_and_answer(response, actions)
             ):
+                anomaly_counts["tool"] += 1
                 final_reward = 0.0
                 final_done = True
                 credit_event = "mixed_tool_and_answer"
@@ -1674,6 +1765,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 last_search_query = query
             repeated_query = repeated_action_span is not None
             if repeated_query and (detect_abnormal_trajectories or evaluation):
+                anomaly_counts["repetition"] += 1
                 duplicate_search_info = {
                     "duplicate_search_detected": True,
                     "duplicate_query_count": repeated_search_strikes,
@@ -1756,6 +1848,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 and repeated_output["score"] > ngram_repetition_threshold
                 and repeated_action_span is not None
             ):
+                anomaly_counts["repetition"] += 1
                 final_reward = 0.0
                 final_done = True
                 if credit_assignment_ngram_repetition:
@@ -2030,6 +2123,45 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         await asyncio.to_thread(cleanup_mcp_workspace, mcp_workspace)
 
     termination_reason = last_info.get("termination_reason", "env_done" if final_done else "unknown")
+    terminal_anomaly_categories = {
+        "parse": {
+            "ABNORMAL_PARSE_ERROR",
+            "ABNORMAL_PARSE_ERROR_LOOP",
+            "ABNORMAL_THINK_PARSE_ERROR",
+            "INVALID_FINAL_STEP",
+            "INVALID_REACT_STRUCTURE",
+        },
+        "tool": {
+            "ABNORMAL_DIRECT_SUBMIT_WITHOUT_TOOL",
+            "ABNORMAL_MIXED_TOOL_AND_ANSWER",
+            "ABNORMAL_NESTED_FINISH_PAYLOAD",
+            "ABNORMAL_SEARCH_BYPASS",
+            "ABNORMAL_TOOL_BURST",
+        },
+        "repetition": {
+            "ABNORMAL_NGRAM_REPETITION",
+            "ABNORMAL_REPEATED_QUERY",
+            "repeated_query_early_stop",
+        },
+        "length": {"max_context_len_exceeded", "max_response_len_exceeded"},
+    }
+    for category, reasons in terminal_anomaly_categories.items():
+        if termination_reason in reasons and anomaly_counts[category] == 0:
+            anomaly_counts[category] = 1
+    parse_error_total = max(parse_error_total, anomaly_counts["parse"])
+    anomaly_details = {
+        "termination_reason": termination_reason,
+        "parse_error_total": parse_error_total,
+        "parse_error_final_streak": parse_error_streak,
+        "parse_error_max_streak": parse_error_max_streak,
+        "parse_error_kinds": list(last_info.get("tool_parser_error_kinds") or []),
+        "tool_calls": int(getattr(env, "tool_calls", 0) or 0),
+        "max_tool_calls_per_turn": max_tool_calls_per_turn,
+        "duplicate_query_count": int(last_info.get("duplicate_query_count", 0) or 0),
+        "duplicate_query_max_strikes": repeated_search_max_strikes,
+        "completion_tokens": total_completion_tokens,
+        "finish_reason": last_finish_reason,
+    }
     if (
         detect_abnormal_trajectories
         and termination_reason == "TAIL_GUARD_EARLY_STOP"
@@ -2078,6 +2210,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         "fused_tool_call_turns": total_tool_call_turns,
         "fused_prompt_length_tokens": compact_prompt_length,
         "fused_completion_length_tokens": total_completion_tokens,
+        "fused_anomaly_counts": dict(anomaly_counts),
+        "fused_anomaly_details": anomaly_details,
+        "fused_anomaly_parse_count": anomaly_counts["parse"],
+        "fused_anomaly_tool_count": anomaly_counts["tool"],
+        "fused_anomaly_repetition_count": anomaly_counts["repetition"],
+        "fused_anomaly_length_count": anomaly_counts["length"],
         "rollout_weight_version": trajectory_weight_version,
         "fused_rollout_weight_versions": rollout_versions,
         "fused_rollout_weight_version_count": len(rollout_versions),
@@ -2166,6 +2304,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 credit_event=credit_event,
                 credit_step_index=credit_step_index,
                 response_anomaly_info=eval_response_anomaly_info,
+                anomaly_counts=anomaly_counts,
                 total_steps=total_steps,
                 total_tool_call_turns=total_tool_call_turns,
                 timing=episode_timing,
@@ -2201,6 +2340,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         credit_event=credit_event,
         credit_step_index=credit_step_index,
         response_anomaly_info=eval_response_anomaly_info,
+        anomaly_counts=anomaly_counts,
         total_steps=total_steps,
         total_tool_call_turns=total_tool_call_turns,
         timing=episode_timing,
@@ -3184,7 +3324,14 @@ def _credit_assignment_loss_mask(
     return apply_base([1] * output_len if turn_index == credit_step_index else [0] * output_len)
 
 
-def _decode_and_parse_step(tokenizer, parser, output_ids: list[int], *, disable_thinking: bool):
+def _decode_and_parse_step(
+    tokenizer,
+    parser,
+    output_ids: list[int],
+    *,
+    disable_thinking: bool,
+    shadow_finish: bool = False,
+):
     """Decode one LLM turn and derive its parsed actions + default loss mask.
 
     Everything here is CPU-bound pure-Python/tokenizer work; callers run it via
@@ -3192,7 +3339,11 @@ def _decode_and_parse_step(tokenizer, parser, output_ids: list[int], *, disable_
     """
     raw_response = tokenizer.decode(output_ids, skip_special_tokens=False) if output_ids else ""
     response = _strip_trailing_chat_template_stop(raw_response)
-    parsed_actions = parser.parse(response)
+    parsed_actions = (
+        parser.parse(response, shadow_finish=True)
+        if shadow_finish
+        else parser.parse(response)
+    )
     loss_mask = _default_response_loss_mask(
         tokenizer,
         response,
@@ -3203,7 +3354,13 @@ def _decode_and_parse_step(tokenizer, parser, output_ids: list[int], *, disable_
     return response, parsed_actions, loss_mask
 
 
-def _decode_step(tokenizer, _parser, output_ids: list[int], *, disable_thinking: bool):
+def _decode_step(
+    tokenizer,
+    _parser,
+    output_ids: list[int],
+    *,
+    disable_thinking: bool,
+):
     raw_response = tokenizer.decode(output_ids, skip_special_tokens=False) if output_ids else ""
     response = _strip_trailing_chat_template_stop(raw_response)
     loss_mask = _default_response_loss_mask(
@@ -3885,6 +4042,7 @@ def _rllm_episode_dict(
     credit_event: str | None,
     credit_step_index: int | None,
     response_anomaly_info: dict[str, Any],
+    anomaly_counts: dict[str, int],
     total_steps: int,
     total_tool_call_turns: int,
     timing: dict[str, Any],
@@ -3899,6 +4057,7 @@ def _rllm_episode_dict(
         f"{benchmark}/pass@1": float(reward > 0),
         "traj/steps": float(total_steps),
         "turn/tool_call_turn": float(total_tool_call_turns),
+        **{f"anomaly/{category}_count": float(count) for category, count in anomaly_counts.items()},
     }
     suffix = _task_metric_suffix(task_type)
     metrics[f"traj/steps/{suffix}"] = float(total_steps)

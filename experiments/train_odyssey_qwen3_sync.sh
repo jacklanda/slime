@@ -111,7 +111,7 @@ Options:
   --trajectory-timeout N                 Fused trajectory timeout env.
   --eval-trajectory-timeout N            Fused eval trajectory timeout env.
   --rollout-group-timeout N              Per-attempt deadline for each prompt group's unfinished slots.
-                                         Timeout classification uses the active trajectory stage. Default: 3600.
+                                         Timeout classification uses the active trajectory stage. Default: 7200.
   --rollout-infra-retry-times N          Replacement attempts per logical slot after retryable infra failure.
                                          Default: 2.
   --eval-interval N                      Run interval eval every N rollout steps.
@@ -236,14 +236,14 @@ TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-7200}"
 # Bound each group attempt. The rollout stage determines whether an unfinished
 # slot is retryable infra, permanent task failure, or policy behavior.
-ROLLOUT_GROUP_TIMEOUT="${ROLLOUT_GROUP_TIMEOUT:-3600}"
+ROLLOUT_GROUP_TIMEOUT="${ROLLOUT_GROUP_TIMEOUT:-7200}"
 ROLLOUT_INFRA_RETRY_TIMES="${ROLLOUT_INFRA_RETRY_TIMES:-4}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-128}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-128}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-16}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-16}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-50}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
@@ -957,12 +957,15 @@ ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
 ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-true}"
 # Bound aggressive admission even when low ROI or long-tail groups keep the
 # collector refilling candidates before the previous wave fully drains.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-$((ROLLOUT_ENGINE_COUNT * 2))}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
-SYNC_MIN_PENDING_GROUPS=96
-SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-32}"
-SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-32}"
-SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-96}"
+# Keep the reservoir bounded by the number of rollout engines.  A group has
+# 32 samples, so a 96-group reservoir admitted thousands of requests while
+# only 128 SGLang request slots were runnable and made abort unable to drain.
+SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS:-$((ROLLOUT_ENGINE_COUNT * 2))}"
+SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-${ROLLOUT_ENGINE_COUNT}}"
+SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-${ROLLOUT_ENGINE_COUNT}}"
+SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-${SYNC_MIN_PENDING_GROUPS}}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-196400}"
@@ -1368,11 +1371,15 @@ SGLANG_ARGS=(
    --sglang-router-request-timeout-secs "${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS}"
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
    --sglang-context-length "${MAX_CONTEXT_LEN}"
+   # Route RMSNorm through SGLang's batch-invariant Triton implementation.
+   # This avoids FlashInfer CuTe-DSL RMSNorm, which fails with
+   # cudaErrorInsufficientDriver on the CUDA/driver combination used here.
    --sglang-enable-deterministic-inference
-   --sglang-rl-on-policy-target megatron
-   --sglang-attention-backend fa3
-   --sglang-disable-custom-all-reduce
-   --sglang-disable-piecewise-cuda-graph
+   #--sglang-rl-on-policy-target megatron
+   #--sglang-attention-backend fa3
+   --sglang-attention-backend triton
+   #--sglang-disable-custom-all-reduce
+   #--sglang-disable-piecewise-cuda-graph
    --router-policy "${ROUTER_POLICY}"
 )
 WANDB_ARGS=()

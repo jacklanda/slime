@@ -371,6 +371,22 @@ def convert_samples_to_train_data(
         for position in positions
     }
     useful_training_tokens = sum(sum(policy_loss_masks[position]) for position in useful_sample_positions)
+    reward_groups: dict[Any, list[float]] = defaultdict(list)
+    for sample, raw_reward in zip(samples, raw_rewards, strict=True):
+        group_id = sample.group_index
+        if group_id is None:
+            group_id = sample.rollout_id if sample.rollout_id is not None else sample.index
+        reward_groups[group_id].append(float(raw_reward))
+    group_reward_histogram = {"all_zero": 0, "all_one": 0, "mixed": 0, "other": 0}
+    for values in reward_groups.values():
+        if values and all(value == 0.0 for value in values):
+            group_reward_histogram["all_zero"] += 1
+        elif values and all(value == 1.0 for value in values):
+            group_reward_histogram["all_one"] += 1
+        elif any(value not in (0.0, 1.0) for value in values):
+            group_reward_histogram["other"] += 1
+        else:
+            group_reward_histogram["mixed"] += 1
 
     # Per-rollout aggregate, precomputed at the step level (where we can
     # see every sample of every rollout) and broadcast per-sample so the
@@ -419,6 +435,17 @@ def convert_samples_to_train_data(
             [sum(m) for m in policy_loss_masks] if has_explicit_policy_mask else mask_sums_per_sample
         ),
         "useful_training_tokens": useful_training_tokens,
+        # These are the normalized per-sample advantages before optional
+        # global whitening.  Keeping them with the full rollout metadata lets
+        # actor-update logging expose outliers without changing training.
+        "advantage_values": [float(value) for value in rewards],
+        "reward_histogram": {
+            "zero": sum(1 for value in raw_rewards if float(value) == 0.0),
+            "one": sum(1 for value in raw_rewards if float(value) == 1.0),
+            "other": sum(1 for value in raw_rewards if float(value) not in (0.0, 1.0)),
+        },
+        "group_reward_histogram": group_reward_histogram,
+        "policy_token_total": sum(sum(mask) for mask in policy_loss_masks),
         "credit_assignment_events": credit_assignment_events,
         "prompt_lengths": [len(sample.tokens) - sample.response_length for sample in samples],
         "response_lengths": [sample.response_length for sample in samples],
@@ -1160,6 +1187,14 @@ class RolloutManager:
     def generate(self, rollout_id):
         start_time = time.time()
         self.rollout_id = rollout_id
+        if getattr(self.args, "_rollout_abort_engine_restart_required", False):
+            if getattr(self.args, "rollout_external", False):
+                raise RuntimeError(
+                    "SGLang abort did not drain external rollout engines; restart them before resuming training"
+                )
+            raise RuntimeError(
+                "SGLang abort left rollout engines quarantined; call offload() to restart them before generation"
+            )
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
@@ -1243,6 +1278,14 @@ class RolloutManager:
 
     def offload(self):
         self.health_monitoring_pause()
+        if getattr(self.args, "_rollout_abort_engine_restart_required", False):
+            logger.error("Restarting rollout engines after an incomplete SGLang abort")
+            for server in self.servers.values():
+                server.restart_with_overrides({})
+            self.args._rollout_abort_engine_restart_required = False
+            # Recovery already leaves colocated replacement engines with KV
+            # and CUDA-graph memory offloaded and weights available for sync.
+            return
         for srv in self.servers.values():
             srv.offload()
 
@@ -2397,6 +2440,10 @@ def _collect_fused_agent_stats(args, all_samples: list[Sample]):
             "fused_tito_boundary_count",
             "fused_tito_exact_prefix_turns",
             "fused_tito_prompt_prefix_mismatch_turns",
+            "fused_anomaly_parse_count",
+            "fused_anomaly_tool_count",
+            "fused_anomaly_repetition_count",
+            "fused_anomaly_length_count",
             "infra_retry_count",
             "segment_count",
         ):
@@ -2471,6 +2518,7 @@ def _normalize_termination_reason(reason: str) -> str:
         "max_response_len_exceeded",
         "max_context_len_exceeded",
         "abnormal_parse_error",
+        "abnormal_parse_error_loop",
         "invalid_react_structure",
         "invalid_final_step",
         "abnormal_tool_burst",

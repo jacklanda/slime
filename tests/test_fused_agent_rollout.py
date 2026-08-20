@@ -2,6 +2,7 @@ import json
 import os
 import asyncio
 import hashlib
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -65,6 +66,44 @@ from slime.utils.types import Sample
 
 
 NUM_GPUS = 0
+
+
+def test_cancelled_local_mcp_workspace_setup_returns_before_copy_finishes(monkeypatch):
+    copy_started = threading.Event()
+    release_copy = threading.Event()
+    cleaned = []
+
+    def prepare(task, session_id, workspace_root):
+        copy_started.set()
+        release_copy.wait(timeout=2)
+        return task, "workspace"
+
+    monkeypatch.setattr(fused_generate, "GenerateState", lambda _args: SimpleNamespace())
+    monkeypatch.setattr(fused_generate, "is_local_mcp_task", lambda _task: True)
+    monkeypatch.setattr(fused_generate, "prepare_mcp_workspace", prepare)
+    monkeypatch.setattr(fused_generate, "cleanup_mcp_workspace", cleaned.append)
+
+    async def run_test():
+        rollout = asyncio.create_task(
+            fused_generate.generate(
+                SimpleNamespace(),
+                Sample(prompt="question", metadata={"data_source": "mcp"}),
+                {},
+            )
+        )
+        await asyncio.to_thread(copy_started.wait, 1)
+        rollout.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(rollout, timeout=0.1)
+        release_copy.set()
+        for _ in range(100):
+            if cleaned:
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(run_test())
+
+    assert cleaned == ["workspace"]
 
 
 def test_parser_error_log_can_be_disabled_without_changing_parser_state(monkeypatch):
@@ -534,7 +573,7 @@ def test_deepsearch_world_plan_then_answer_uses_independent_prompts():
         tokenizer=tokenizer,
     )
 
-    sample = result[0]
+    sample = result[0] if isinstance(result, list) else result
     assert sample.metadata["fused_termination"] == "env_done"
     assert sample.metadata["fused_traj_steps"] == 2
     assert sample.response.endswith("<answer>Ulm</answer>")
@@ -1344,6 +1383,145 @@ def test_gemma4_tool_parser_recovers_missing_commas_in_nested_result_payload():
     ]
 
 
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (
+            '[{component_levels:[{level_name:<|"|>Core<|"|>},'
+            'extraction_notes:<|"|>Extracted functions.<|"|>}]',
+            [{"component_levels": [{"level_name": "Core"}], "extraction_notes": "Extracted functions."}],
+        ),
+        (
+            '{recommendations:[{rank:1,justification:<|"|>Important.<|"|>],matrix:[]}',
+            {"recommendations": [{"rank": 1, "justification": "Important."}], "matrix": []},
+        ),
+        (
+            '{cross:{drivers:{robotics:[<|"|>actuator effort<|"|>,<|"|>payload<|"|>}},next:[]}',
+            {"cross": {"drivers": {"robotics": ["actuator effort", "payload"]}}, "next": []},
+        ),
+        (
+            '{outer:{items:[<|"|>complete value<|"|>}',
+            {"outer": {"items": ["complete value"]}},
+        ),
+    ],
+)
+def test_gemma4_finish_shadow_recovers_unambiguous_missing_nested_closers(result, expected):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    response = f'<|tool_call>call:finish{{command:<|"|>submit<|"|>,result:{result}}}<tool_call|>'
+
+    assert parser.parse(response) == []
+
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert len(calls) == 1
+    assert calls[0].arguments["result"] == expected
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (
+            '{evidence:<|"|>Operational hurdle.","risk":"Integration Risk"}',
+            {"evidence": "Operational hurdle.", "risk": "Integration Risk"},
+        ),
+        (
+            '{extraction_notes:<|"|>Extracted from the guide.`,framework_name:<|"|>AI Governance<|"|>}',
+            {"extraction_notes": "Extracted from the guide.", "framework_name": "AI Governance"},
+        ),
+        (
+            '{driver:<|"|>Human-Centric Experience</td>evidence:<|"|>Prioritize people.<|"|>}',
+            {"driver": "Human-Centric Experience", "evidence": "Prioritize people."},
+        ),
+        (
+            '{cases:[<|"|>AI and human oversight failure.]},audit:{items:[<|"|>provenance<|"|>]}',
+            {"cases": ["AI and human oversight failure."], "audit": {"items": ["provenance"]}},
+        ),
+        (
+            '{visual:{demands:[<|"|>context analysis<|"|>}},architecture:{review:true}',
+            {"visual": {"demands": ["context analysis"]}, "architecture": {"review": True}},
+        ),
+        (
+            '{stages:[<|"|>Final Review: uncertainty resolution steps.]}}}\"}',
+            {"stages": ["Final Review: uncertainty resolution steps."]},
+        ),
+        (
+            '{visual:{pressures:[{challenge:<|"|>synthetic claims<|"|>}]}}]',
+            {"visual": {"pressures": [{"challenge": "synthetic claims"}]}},
+        ),
+        (
+            '{architecture:{review:true}Processing complete and framework designed successfully.]]',
+            {"architecture": {"review": True}},
+        ),
+        (
+            '{description:<|"|>Automates triage.</td>,measure:<|"|>Voice AI support<|"|>}',
+            {"description": "Automates triage.", "measure": "Voice AI support"},
+        ),
+        (
+            '{description:<|"|>Defines assumptions and constraints.,source_evidence:[<|"|>baseline<|"|>]}',
+            {"description": "Defines assumptions and constraints.", "source_evidence": ["baseline"]},
+        ),
+        (
+            '{summary:{complete:true}}<|"|>,next_field:{ready:true}',
+            {"summary": {"complete": True}, "next_field": {"ready": True}},
+        ),
+        (
+            '{outer:{workload:<|"|>Inspection capacity may increase.}}',
+            {"outer": {"workload": "Inspection capacity may increase."}},
+        ),
+        (
+            '{priority_level falsch:<|"|>Tier 2 - Enhanced<|"|>}',
+            {"priority_level": "Tier 2 - Enhanced"},
+        ),
+    ],
+)
+def test_gemma4_finish_shadow_recovers_mixed_native_string_boundaries(result, expected):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    response = f'<|tool_call>call:finish{{command:<|"|>submit<|"|>,result:{result}}}<tool_call|>'
+
+    assert parser.parse(response) == []
+
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert len(calls) == 1
+    assert calls[0].arguments["result"] == expected
+    assert parser.last_shadow_finish_repairs == ["implicit_structure_repair"]
+
+
+@pytest.mark.parametrize("suffix", [",\n<eos>", "}`<channel|><eos>"])
+def test_gemma4_finish_shadow_ignores_terminal_control_suffix(suffix):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    response = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:{done:true}}'
+        f'{suffix}<tool_call|>'
+    )
+
+    assert parser.parse(response) == []
+
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert len(calls) == 1
+    assert calls[0].arguments["result"] == {"done": True}
+    assert parser.last_shadow_finish_repairs == ["implicit_structure_repair"]
+
+
+@pytest.mark.parametrize(
+    ("result", "strict_valid"),
+    [
+        ('{items:[{description:<|"|>First item without native close",next_field:<|"|>Second value<|"|>}]}' , False),
+        ('{items:[{addresses_gap:<|"|>Long-term impact measurement of engagement strategies<|"|>,element:<|"|>A sustained index<|"|>}]}' , True),
+    ],
+)
+def test_gemma4_finish_shadow_recovers_native_string_before_next_field(result, strict_valid):
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    response = f'<|tool_call>call:finish{{command:<|"|>submit<|"|>,result:{result}}}<tool_call|>'
+
+    assert bool(parser.parse(response)) is strict_valid
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert len(calls) == 1
+    assert isinstance(calls[0].arguments["result"], dict)
+
+
 def test_gemma4_formatter_uses_json_string_when_value_contains_native_quote_marker():
     parser = make_tool_parser("gemma4", valid_tools={"echo"})
     value = 'prefix <|"|> sentinel suffix'
@@ -1681,6 +1859,21 @@ def test_gemma4_tool_parser_does_not_repair_ambiguous_truncation(response):
     assert parser.last_syntax_repairs == []
 
 
+def test_gemma4_finish_shadow_accepts_complete_payload_at_eof():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    parser.get_tool_prompt(json.dumps(finish_schema(result_schema={"type": "object"}), ensure_ascii=False))
+
+    response = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+        'result:{summary:<|"|>complete<|"|>,items:[{name:<|"|>one<|"|>}]}}]}'
+    )
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert len(calls) == 1
+    assert calls[0].arguments["result"]["summary"] == "complete"
+    assert parser.last_syntax_repairs == ["missing_tool_call_end"]
+
+
 @pytest.mark.parametrize(
     ("arguments", "expected_query", "expected_max_results"),
     [
@@ -1771,6 +1964,34 @@ def test_gemma4_tool_parser_decodes_json_like_unicode_escapes():
 
     assert len(calls) == 1
     assert calls[0].arguments == {"text": "<script>", "emoji": "😀"}
+
+
+def test_gemma4_finish_recovers_missing_result_colon_and_native_string_open():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    parser.get_tool_prompt(json.dumps(finish_schema(), ensure_ascii=False))
+
+    calls = parser.parse(
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+        'result specific_information_could_not_be_found_in_search_results<|"|>}<tool_call|>',
+        shadow_finish=True,
+    )
+
+    assert len(calls) == 1
+    assert calls[0].arguments["result"] == "specific_information_could_not_be_found_in_search_results"
+
+
+def test_gemma4_web_search_recovers_terminal_ordinary_quote_noise():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+
+    calls = parser.parse(
+        '<|tool_call>call:web_search{query:<|"|>Vaxign-DL '
+        '"Pasteurella atlantica" 99.5%"""}<tool_call|>'
+    )
+
+    assert len(calls) == 1
+    assert calls[0].arguments["query"] == 'Vaxign-DL "Pasteurella atlantica" 99.5%'
+    assert parser.last_syntax_repairs == ["trailing_ordinary_quote_noise"]
 
 
 def test_gemma4_tool_parser_tolerates_unescaped_quotes_inside_json_like_strings():
@@ -1956,6 +2177,36 @@ def test_gemma4_extension_parameter_is_preserved_by_parser_and_safely_dispatched
     assert "unknown_parameter" in first_step["action"]
 
 
+def test_gemma4_consecutive_recoverable_parse_errors_stop_at_bound(tmp_path: Path):
+    malformed = '<|tool_call>call:echo{value:<|"|>good<|"|>}<|tool_response>'
+
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Stop a recoverable parser-error loop"),
+        [{"text": malformed}, {"text": malformed}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "CREDIT_ASSIGNMENT_TOOL_PARSER_ERROR": "True",
+            "FUSED_DISABLE_THINKING": "True",
+            "FUSED_PARSE_ERROR_MAX_STREAK": "2",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["fused_termination"] == "ABNORMAL_PARSE_ERROR_LOOP"
+    assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
+    assert sample.metadata["parse_error_loop_early_stop"] is True
+    assert sample.metadata["parse_error_streak"] == 2
+    assert sample.metadata["fused_anomaly_counts"] == {
+        "parse": 2,
+        "tool": 0,
+        "repetition": 0,
+        "length": 0,
+    }
+    assert sample.metadata["rllm_episode"]["metrics"]["anomaly/parse_count"] == 2.0
+
+
 def test_gemma4_deterministic_syntax_repair_continues_rollout(tmp_path: Path):
     missing_call_end = '<|tool_call>call:echo{value:<|"|>good<|"|>}<|tool_response>'
     result = _run_generate_with_fake_sglang(
@@ -1974,6 +2225,25 @@ def test_gemma4_deterministic_syntax_repair_continues_rollout(tmp_path: Path):
     assert sample.metadata["fused_termination"] == "env_done"
     assert sample.metadata["tool_parser_syntax_repairs"] == ["missing_tool_call_end"]
     assert sample.metadata["credit_assignment_event"] is None
+
+
+def test_mcp_deterministic_finish_syntax_repair_masks_original_policy_turn(tmp_path: Path):
+    raw_response = '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>done<|"|>}'
+    result = _run_generate_with_fake_sglang(
+        _local_mcp_sample(tmp_path, question="Mask a repaired finish delimiter"),
+        [{"text": _gemma4_echo_call("evidence")}, {"text": raw_response}],
+        {
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0] if isinstance(result, list) else result
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["tool_parser_shadow_finish_policy_masked"] is True
+    policy_mask = sample.policy_loss_mask if sample.policy_loss_mask is not None else sample.loss_mask
+    assert policy_mask[-len(raw_response) :] == [0] * len(raw_response)
 
 
 def test_mcp_finish_shadow_repair_preserves_policy_output_and_masks_turn(tmp_path: Path):
@@ -2017,6 +2287,83 @@ def test_mcp_finish_shadow_repair_preserves_policy_output_and_masks_turn(tmp_pat
     episode_step = sample.metadata["rllm_episode"]["trajectories"][0]["steps"][1]
     assert episode_step["model_response"] == raw_response
     assert episode_step["chat_completions"][-1]["content"] == raw_response
+
+
+def test_mcp_implicit_finish_structure_repair_masks_malformed_policy_turn(tmp_path: Path):
+    evidence_call = _gemma4_echo_call("evidence")
+    raw_response = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+        'result:{items:[{value:1},done:true}}<tool_call|>'
+    )
+    sample_spec = _local_mcp_sample(tmp_path, question="Repair a malformed structured finish")
+    sample_spec.metadata["answer_schema"] = {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"value": {"const": 1}},
+                    "required": ["value"],
+                },
+            },
+            "done": {"const": True},
+        },
+        "required": ["items", "done"],
+    }
+
+    result = _run_generate_with_fake_sglang(
+        sample_spec,
+        [{"text": evidence_call}, {"text": raw_response}],
+        {
+            "SLIME_LOCAL_MCP_PROCESS_ISOLATION": "false",
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0] if isinstance(result, list) else result
+    assert sample.reward == 1.0
+    assert sample.metadata["fused_termination"] == "env_done"
+    assert sample.metadata["tool_parser_shadow_finish_repairs"] == ["implicit_structure_repair"]
+    assert sample.metadata["tool_parser_shadow_finish_policy_masked"] is True
+    assert _policy_masked_text(sample) == evidence_call
+    policy_mask = sample.policy_loss_mask if sample.policy_loss_mask is not None else sample.loss_mask
+    assert policy_mask[-len(raw_response) :] == [0] * len(raw_response)
+
+
+def test_mcp_unrepaired_finish_parser_error_penalizes_only_real_action_tokens(tmp_path: Path):
+    evidence_call = _gemma4_echo_call("evidence")
+    raw_response = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+        'result:{broken:[<|"|>unterminated<tool_call|>'
+    )
+    sample_spec = _local_mcp_sample(tmp_path, question="Mask an unrepaired malformed finish")
+    sample_spec.metadata["answer_schema"] = {
+        "type": "object",
+        "properties": {"done": {"const": True}},
+        "required": ["done"],
+    }
+
+    result = _run_generate_with_fake_sglang(
+        sample_spec,
+        [{"text": evidence_call}, {"text": raw_response}],
+        {
+            "SLIME_LOCAL_MCP_PROCESS_ISOLATION": "false",
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0] if isinstance(result, list) else result
+    policy_mask = sample.policy_loss_mask if sample.policy_loss_mask is not None else sample.loss_mask
+    finish_mask = policy_mask[-len(raw_response) :]
+    assert any(finish_mask)
+    assert sample.metadata["credit_assignment_event"] == "tool_parser_error"
+    assert sample.metadata["credit_assignment_error_step_index"] == 1
+    assert _policy_masked_text(sample) != evidence_call
 
 
 @pytest.mark.parametrize(
@@ -2109,6 +2456,46 @@ def test_mcp_valid_finish_remains_policy_trainable(tmp_path: Path):
     assert sample.reward == 1.0
     assert _policy_masked_text(sample).endswith(response)
     assert "tool_parser_shadow_finish_repairs" not in sample.metadata
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_repair"),
+    [
+        (
+            '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:{done:true}}',
+            "missing_tool_call_end",
+        ),
+        (
+            '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:{done:true}}])<tool_call|>',
+            "extra_wrapper_closer",
+        ),
+    ],
+)
+def test_mcp_finish_envelope_repair_masks_original_tokens_only(tmp_path: Path, response: str, expected_repair: str):
+    sample_spec = _local_mcp_sample(tmp_path, question="Repair a bounded finish envelope")
+    sample_spec.metadata["answer_schema"] = {
+        "type": "object",
+        "properties": {"done": {"const": True}},
+        "required": ["done"],
+    }
+    result = _run_generate_with_fake_sglang(
+        sample_spec,
+        [{"text": _gemma4_echo_call("evidence")}, {"text": response}],
+        {
+            "SLIME_LOCAL_MCP_PROCESS_ISOLATION": "false",
+            "CREDIT_ASSIGNMENT_ENABLE": "False",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0] if isinstance(result, list) else result
+    assert sample.reward == 1.0
+    assert sample.metadata["tool_parser_shadow_finish_repairs"] == [expected_repair]
+    assert _response_text(sample).endswith(response)
+    assert _policy_masked_text(sample) == _gemma4_echo_call("evidence")
+    policy_mask = sample.policy_loss_mask if sample.policy_loss_mask is not None else sample.loss_mask
+    assert policy_mask[-len(response) :] == [0] * len(response)
 
 
 def test_gemma4_web_search_recovers_terminal_missing_ordinary_quote():
@@ -5634,6 +6021,10 @@ def test_webqa_normalized_target_span_mode_rejects_long_explanation(monkeypatch)
         ("The Huzita–Hatori Axioms", "Huzita-Hatori axioms"),
         ("The Music Ontology (MO)", "Music Ontology"),
         ("Variational Quantum Eigensolver (VQE)", "VQE (Variational Quantum Eigensolver)"),
+        ("Chester F. Gorman", "Chester Gorman"),
+        ("Paul W. K. Rothemund", "Paul Rothemund"),
+        ("Rigid Origami Simulator", "ROS"),
+        ("Ethnographic Film Festivals", "ethnographic film festival"),
     ],
 )
 def test_webqa_safe_structured_equivalence(monkeypatch, ground_truth, prediction):
@@ -5653,6 +6044,10 @@ def test_webqa_safe_structured_equivalence(monkeypatch, ground_truth, prediction
     [
         ("The Music Ontology (MO)", "Music Ontology (MOO)"),
         ("Field Music", "Music Field"),
+        ("miR-146a", "miR-34a"),
+        ("BCI2000 V3.0", "BCI2000 V2.0"),
+        ("Richtmyer-Meshkov instability", "Richtmyer-Meshkovsky instability"),
+        ("Lupus molecular cloud complex", "Lupus complex"),
     ],
 )
 def test_webqa_structured_equivalence_rejects_unsafe_fuzzy_matches(monkeypatch, ground_truth, prediction):
