@@ -109,9 +109,16 @@ try:
     from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
 
     _ACCELERATOR_ERROR = getattr(torch, "AcceleratorError", RuntimeError)
+    # Pinned host allocations can remain unavailable for the lifetime of a
+    # colocated trainer after one cudaErrorInvalidValue.  Remember the failure
+    # so every later checkpoint uses the reliable pageable-copy path directly.
+    _PINNED_STAGING_DISABLED = False
 
     @staticmethod
     def _preload_tensors_with_pinned_fallback(write_buckets, non_blocking=True):
+        global _PINNED_STAGING_DISABLED
+        if _PINNED_STAGING_DISABLED and non_blocking:
+            non_blocking = False
         result = []
         for bucket in write_buckets:
             file_name, storage_key, (bytes_data, tensor_data) = bucket
@@ -127,6 +134,7 @@ try:
                     file_name,
                     exc_info=True,
                 )
+                _PINNED_STAGING_DISABLED = True
                 torch.cuda.synchronize()
                 staged = [(item, tensor.to("cpu", non_blocking=False)) for item, tensor in tensor_data]
             result.append((file_name, storage_key, (bytes_data, staged)))

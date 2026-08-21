@@ -766,6 +766,13 @@ class Gemma4ToolParser(QwenToolParser):
         name = name.strip()
         if self.valid_tools is None or name in self.valid_tools:
             return name
+        # Keep the compatibility aliases used by the generic parser.  Native
+        # Gemma4 calls occasionally use ``submit`` for the declared ``finish``
+        # tool; accepting it is a name normalization only and does not alter
+        # the sampled argument/token stream.
+        alias = self._ALIASES.get(name)
+        if alias and (self.valid_tools is None or alias in self.valid_tools):
+            return alias
         return ""
 
     def get_tool_prompt(self, tools_schema: str) -> str:

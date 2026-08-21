@@ -214,7 +214,7 @@ HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 # whitening adds a uniform positive constant to every token -- an unconditional
 # likelihood push whose token mass sits mostly on wrong trajectories. It also breaks
 # GRPO's per-group zero-mean invariant. See tests/test_group_reward_normalization.py.
-NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-true}"
+NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
 GRPO_STD_NORMALIZATION="${GRPO_STD_NORMALIZATION:-true}"
 LR="${LR:-1e-6}"
 CLIP_GRAD="${CLIP_GRAD:-1.0}"
@@ -1035,7 +1035,7 @@ CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}"
    --ref-load "${REF_LOAD}"
    --save "${SAVE_DIR}"
-   --save-interval "${SAVE_INTERVAL:-10}"
+   --save-interval "${SAVE_INTERVAL:-5}"
 )
 # Resume training state (model/optimizer/rng/step + rollout data state) from an
 # existing Megatron checkpoint dir. Defaults to SAVE_DIR so a re-launch with the
@@ -1148,7 +1148,7 @@ if [ -n "${ROLLOUT_TASK_FAMILY_QUOTAS:-}" ]; then
       ROLLOUT_ARGS+=(--rollout-task-family-top-mean-steps)
    fi
 fi
-if [ "${ENABLE_QUOTA_BUCKET_SAMPLING:-1}" = "1" ]; then
+if [ "${ENABLE_QUOTA_BUCKET_SAMPLING:-0}" = "1" ]; then
    ROLLOUT_ARGS+=(--enable-quota-bucket-sampling)
    if [ -z "${BUFFER_FILTER_PATH:-}" ]; then
       ROLLOUT_ARGS+=(--buffer-filter-path "slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps")
@@ -1672,7 +1672,12 @@ echo "Eval: interval=${EVAL_INTERVAL:-<disabled>}, benchmarks=${EVAL_INCLUDE_BEN
 echo "Eval scheduling: inflight=${EVAL_INITIAL_INFLIGHT_TASKS}-${EVAL_MAX_INFLIGHT_TASKS}, adaptive=${EVAL_ADAPTIVE_CONCURRENCY}, mix_datasets=${EVAL_MIX_DATASETS}, termination_retries=${EVAL_TERMINATION_RETRY_TIMES}, trajectory_sample_rate=${EVAL_TRAJECTORY_SAMPLE_RATE}, dump_failures=${EVAL_DUMP_FAILURES}, native_session=${NATIVE_SGLANG_SESSION}"
 echo "OpenRouter GRM: train=${ENABLE_USE_GRM_TRAIN}, train_model=${TRAIN_GRM_MODEL}, evals=${ENABLE_USE_GRM_EVALS}, eval_model=${EVAL_GRM_MODEL}, mode=${GRM_MODE}, concurrency=${GRM_CONCURRENCY}, max_connections=${GRM_MAX_CONNECTIONS}, timeout=${GRM_TIMEOUT}, retries=${GRM_MAX_RETRIES}, max_input_tokens=${GRM_MAX_INPUT_TOKENS}, max_new_tokens=${GRM_MAX_NEW_TOKENS}, temperature=${GRM_TEMPERATURE}, custom_rm=${GRM_CUSTOM_RM_PATH}"
 echo "GRPO: advantage_estimator=${ADVANTAGE_ESTIMATOR:-grpo}, std_normalization=${GRPO_STD_NORMALIZATION}, normalize_advantages=${NORMALIZE_ADVANTAGES}, kl_coef=${KL_COEF}, lr=${LR}, eps_clip=${EPS_CLIP:-0.2}, eps_clip_high=${EPS_CLIP_HIGH:-0.28}"
-echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING:-0}, path=${BUFFER_FILTER_PATH:-${ENABLE_QUOTA_BUCKET_SAMPLING:+slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps}}"
+if [ "${ENABLE_QUOTA_BUCKET_SAMPLING:-0}" = "1" ]; then
+   EFFECTIVE_BUFFER_FILTER_PATH="${BUFFER_FILTER_PATH:-slime.rollout.filter_hub.buffer_filters.quota_bucket_by_steps}"
+else
+   EFFECTIVE_BUFFER_FILTER_PATH="${BUFFER_FILTER_PATH:-<none>}"
+fi
+echo "Buffer filter: enable_quota_bucket_sampling=${ENABLE_QUOTA_BUCKET_SAMPLING:-0}, path=${EFFECTIVE_BUFFER_FILTER_PATH}"
 echo "Fused filter thresholds: min_mean_steps=${FUSED_FILTER_MIN_MEAN_STEPS}, min_mcp_mean_steps=${FUSED_FILTER_MIN_MCP_MEAN_STEPS}, max_abnormal_ratio=${FUSED_FILTER_MAX_ABNORMAL_RATIO}, max_abs_advantage=${FUSED_FILTER_MAX_ABS_ADVANTAGE}"
 echo "Sync rollout admission: min_pending_groups=${SYNC_MIN_PENDING_GROUPS}, webqa_min_pending_groups=${SYNC_WEBQA_MIN_PENDING_GROUPS}, mcp_min_pending_groups=${SYNC_MCP_MIN_PENDING_GROUPS}, mcp_only_min_pending_groups=${SYNC_MCP_ONLY_MIN_PENDING_GROUPS}, max_pending_groups=${OVER_SAMPLING_BATCH_SIZE}"
 echo "Rollout task family quotas: ${ROLLOUT_TASK_FAMILY_QUOTAS:-<none>}; top_mean_steps=${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS}; candidate_multiplier=${SLIME_FUSED_QUOTA_CANDIDATE_MULTIPLIER}"

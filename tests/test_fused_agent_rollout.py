@@ -1265,6 +1265,22 @@ def test_gemma4_tool_parser_localizes_structured_result_syntax_error():
     assert malformed[start:end] == "{"
 
 
+def test_gemma4_tool_parser_accepts_declared_finish_alias_without_masking_tokens():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    parser.get_tool_prompt(json.dumps(finish_schema(structured_result=True)))
+    response = (
+        '<|tool_call>call:submit{command:<|"|>submit<|"|>,'
+        'result:{answer:<|"|>42<|"|>}}<tool_call|>'
+    )
+
+    calls = parser.parse(response)
+
+    assert len(calls) == 1
+    assert calls[0].name == "finish"
+    assert calls[0].arguments["result"] == {"answer": "42"}
+    assert parser.last_schema_errors == []
+
+
 def test_gemma4_tool_prompt_formats_complex_json_schema_without_python_repr():
     schema = {
         "type": "function",
