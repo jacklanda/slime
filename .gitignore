@@ -198,6 +198,7 @@ experiments/**
 !experiments/
 !experiments/*.sh
 !experiments/revals.py
+!experiments/openrouter_evals.py
 !experiments/lib/
 !experiments/lib/retrieval_backend.sh
 !experiments/fused_agent_tis_wide_rs.yaml

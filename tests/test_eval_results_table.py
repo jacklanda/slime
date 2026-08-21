@@ -92,6 +92,26 @@ def test_format_eval_results_table_includes_power_of_two_pass_at_k_columns():
     assert "search_r1" in table
 
 
+def test_format_eval_results_table_supports_split_mean_std_columns():
+    args = SimpleNamespace(eval_datasets=[], n_samples_per_eval_prompt=1)
+
+    table = format_eval_results_table(
+        args,
+        {"bamboogle": {"rewards": [1.0, 0.0]}},
+        split_metric_columns=True,
+        extended_termination_columns=False,
+    )
+
+    assert "pass@1 mean (%)" in table
+    assert "pass@1 std (%)" in table
+    assert "pass^1 mean (%)" in table
+    assert "pass^1 std (%)" in table
+    assert "% pass@1 (±)" not in table
+    assert "# abnormal / all" in table
+    assert "# max turns / all" not in table
+    assert "# clip / all" not in table
+
+
 def test_termination_columns_count_clipped_trajectories_and_grouped_terminations():
     args = SimpleNamespace(
         eval_datasets=[SimpleNamespace(name="search_r1", n_samples_per_eval_prompt=2)],

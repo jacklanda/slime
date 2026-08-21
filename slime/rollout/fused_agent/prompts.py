@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from .parser import Gemma4ToolParser, make_tool_parser, tool_schema
 
@@ -202,6 +203,38 @@ def build_system_prompt(
     if not inline_tool_prompt:
         return base_prompt.strip()
     return base_prompt.strip() + "\n" + tool_prompt
+
+
+def build_web_search_messages(
+    observation: str,
+    schemas: list[dict],
+    model_name: str | None = None,
+    *,
+    tool_parser=None,
+    inline_tool_prompt: bool = True,
+    unified: bool = False,
+    user_prompt: str = "short",
+) -> list[dict[str, str]]:
+    base = FUSED_UNIFIED_SYSTEM_PROMPT if unified else FUSED_SEARCH_SYSTEM_PROMPT
+    system = build_system_prompt(
+        base,
+        schemas,
+        model_name,
+        tool_parser=tool_parser,
+        inline_tool_prompt=inline_tool_prompt,
+    )
+    observation = re.sub(
+        r"\s*When ready, output the final answer enclosed in <answer> and </answer> tags\.\s*"
+        r"Do not generate any content after the </answer> tag\.\s*$",
+        "",
+        observation,
+        flags=re.IGNORECASE,
+    )
+    template = FUSED_SEARCH_LONG_USER_PROMPT if user_prompt == "long" else FUSED_SEARCH_USER_PROMPT
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": template.format(problem_statement=observation)},
+    ]
 
 
 def normalize_harness(harness: str | None) -> str:

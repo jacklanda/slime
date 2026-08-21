@@ -663,6 +663,10 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_openrouter_evals.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_placement_group.py"
             },
             {

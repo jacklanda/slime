@@ -18,7 +18,10 @@ Usage:
 Core:
   --model PATH                         HF model path.
   --model-config NAME                  scripts/models/<NAME>.sh. Defaults by --model-series.
-  --model-series qwen3|qwen3.5|gemma4  Default: qwen3.5. Gemma 4 aliases are accepted.
+  --model-series openrouter|qwen3|qwen3.5|gemma4
+                                       Use openrouter for API models; local models default to qwen3.
+  --openrouter-concurrency N           Concurrent API requests. Default: 128.
+  --openrouter-max-retries N           Attempts per API request. Default: 5.
   --benchmarks-root PATH               Default: experiments/artifacts/benchmarks.
   --include LIST                       Comma-separated benchmark names, or all.
                                        Use bfcl-v3 or bfcl-v4 to select the BFCL version.
@@ -104,7 +107,8 @@ Core:
 Generation/eval:
   --harness NAME                       Harness: bare, cot, rag, react, gem, unified_gem,
                                        search_gym, agentcpm_explore, deepsearch_world,
-                                       rllm_deepresearch (alias: rllm_dr), cut_bill. Default: cot.
+                                       rllm_deepresearch (alias: rllm_dr), cut_bill. Default: cot;
+                                       OpenRouter models default to gem.
   --user_prompt long|short             Web-search user prompt. Default: short.
   --rllm-dr-refine-server-url URLS     Comma-separated OpenAI-compatible Refine server base URLs.
   --unified-system-prompt              Sets harness to unified_gem unless --harness is later set.
@@ -215,6 +219,8 @@ MODEL_SERIES="${MODEL_SERIES:-qwen3}"
 #MODEL_SERIES="${MODEL_SERIES:-qwen3.5}"
 MODEL_CONFIG="${MODEL_CONFIG:-}"
 MODEL_DIR="${MODEL_DIR:-}"
+OPENROUTER_CONCURRENCY="${OPENROUTER_CONCURRENCY:-128}"
+OPENROUTER_MAX_RETRIES="${OPENROUTER_MAX_RETRIES:-5}"
 BENCHMARKS_ROOT="${BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 #INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-2wiki,bamboogle,gpqa_diamond,medqa}"
 #INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-browsecomp_plus}"
@@ -391,6 +397,8 @@ while [ "$#" -gt 0 ]; do
       --model) MODEL_DIR="${2:?Missing value for --model}"; shift 2 ;;
       --model-config) MODEL_CONFIG="${2:?Missing value for --model-config}"; shift 2 ;;
       --model-series) MODEL_SERIES="${2:?Missing value for --model-series}"; shift 2 ;;
+      --openrouter-concurrency) OPENROUTER_CONCURRENCY="${2:?Missing value for --openrouter-concurrency}"; shift 2 ;;
+      --openrouter-max-retries) OPENROUTER_MAX_RETRIES="${2:?Missing value for --openrouter-max-retries}"; shift 2 ;;
       --benchmarks-root) BENCHMARKS_ROOT="${2:?Missing value for --benchmarks-root}"; shift 2 ;;
       --include) INCLUDE_BENCHMARKS="${2:?Missing value for --include}"; shift 2 ;;
       --exclude) EXCLUDE_BENCHMARKS="${2:?Missing value for --exclude}"; shift 2 ;;
@@ -535,6 +543,10 @@ while [ "$#" -gt 0 ]; do
    esac
 done
 
+if [ "${MODEL_SERIES}" = "openrouter" ] && [ "${harness_explicit}" = "false" ]; then
+   FUSED_HARNESS=gem
+fi
+
 if [ "${bfcl_discard_historical_thinking_explicit}" = "false" ]; then
    BFCL_DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING}"
 fi
@@ -670,18 +682,6 @@ if is_truthy "${MCP_ATLAS_SELECTED}" && is_truthy "${MCP_ATLAS_SKIP_STATE_CHECK}
 fi
 export MCP_ATLAS_AUTH_TOKEN
 
-case "${MODEL_SERIES}" in
-   qwen3|qwen3.5|gemma4|gemma-4|gemma-4-*) ;;
-   *) echo "Unsupported --model-series ${MODEL_SERIES}; expected qwen3, qwen3.5, or gemma4." >&2; exit 2 ;;
-esac
-case "${MODEL_SERIES}" in
-   gemma-4|gemma-4-*) MODEL_SERIES="gemma4" ;;
-esac
-if [ "${MODEL_SERIES}" = "qwen3.5" ]; then
-   TEMPERATURE=1.0
-   TOP_P=0.95
-   TOP_K=20
-fi
 case "${USER_PROMPT}" in
    long|short) ;;
    *) echo "Unsupported --user_prompt ${USER_PROMPT}; expected long or short." >&2; exit 2 ;;
@@ -760,6 +760,40 @@ for _ in range(50):
 raise SystemExit(f"Managed Serper service failed to start at {url}")
 PY
 }
+
+# OpenRouter API model mode: provider/model ids do not require a local checkpoint.
+if [ "${MODEL_SERIES}" = "openrouter" ]; then
+   if [ -z "${MODEL_DIR}" ]; then
+      echo "--model is required with --model-series openrouter" >&2
+      exit 2
+   fi
+   case "${FUSED_HARNESS}" in
+      gem|cot|bare) ;;
+      *) echo "OpenRouter eval currently supports --harness gem, cot, or bare, got ${FUSED_HARNESS}" >&2; exit 2 ;;
+   esac
+   OR_LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/evals/${EXPERIMENT_NAME}}"
+   mkdir -p "${OR_LOG_ROOT}"
+   if [ "${FUSED_HARNESS}" = "gem" ]; then
+      start_managed_serper "${OR_LOG_ROOT}/serper_search_server.log"
+   fi
+   PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" python3 -m slime_plugins.evals.fused_benchmark_config --benchmarks-root "${BENCHMARKS_ROOT}" --output-config "${OR_LOG_ROOT}/eval_config.yaml" --cache-dir "${OR_LOG_ROOT}/normalized_benchmarks" --include "${INCLUDE_BENCHMARKS}" --exclude "${EXCLUDE_BENCHMARKS}" --limit-per-benchmark "${LIMIT_PER_BENCHMARK}" --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}" --temperature "${TEMPERATURE}" --top-p "${TOP_P}" --top-k "${TOP_K}" --long-response-len "${EVAL_MAX_RESPONSE_LEN}"
+   PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" python3 "${SCRIPT_DIR}/openrouter_evals.py" --model "${MODEL_DIR}" --eval-config "${OR_LOG_ROOT}/eval_config.yaml" --output "${OR_LOG_ROOT}/evals/global_steps_0.json" --limit "${LIMIT_PER_BENCHMARK}" --n-samples "${N_SAMPLES_PER_PROMPT}" --concurrency "${OPENROUTER_CONCURRENCY}" --max-retries "${OPENROUTER_MAX_RETRIES}" --max-tokens "${EVAL_MAX_RESPONSE_LEN}" --temperature "${TEMPERATURE}" --top-p "${TOP_P}" --timeout "${EVAL_TRAJECTORY_TIMEOUT}" --harness "${FUSED_HARNESS}" --user-prompt "${USER_PROMPT}" --retrieval-url "${RETRIEVAL_SERVER_URL}" --retrieval-max-results "${RETRIEVAL_MAX_RESULTS:-10}" --max-steps "${WEB_SEARCH_MAX_STEPS}" --enable-use-grm-evals "${ENABLE_USE_GRM_EVALS}" --grm-model "${GRM_MODEL}" --grm-base-url "${GRM_BASE_URL}" --grm-mode "${GRM_MODE}" --grm-concurrency "${GRM_CONCURRENCY}" --grm-max-connections "${GRM_MAX_CONNECTIONS}" --grm-timeout "${GRM_TIMEOUT}" --grm-max-retries "${GRM_MAX_RETRIES}" --grm-max-input-tokens "${GRM_MAX_INPUT_TOKENS}" --grm-max-new-tokens "${GRM_MAX_NEW_TOKENS}" --grm-temperature "${GRM_TEMPERATURE}" --grm-failure-reward "${GRM_FAILURE_REWARD}"
+   echo "OpenRouter eval complete: model=${MODEL_DIR}; trajectories=${OR_LOG_ROOT}/evals/global_steps_0.json"
+   exit 0
+fi
+
+case "${MODEL_SERIES}" in
+   qwen3|qwen3.5|gemma4|gemma-4|gemma-4-*) ;;
+   *) echo "Unsupported --model-series ${MODEL_SERIES}; expected openrouter, qwen3, qwen3.5, or gemma4." >&2; exit 2 ;;
+esac
+case "${MODEL_SERIES}" in
+   gemma-4|gemma-4-*) MODEL_SERIES="gemma4" ;;
+esac
+if [ "${MODEL_SERIES}" = "qwen3.5" ]; then
+   TEMPERATURE=1.0
+   TOP_P=0.95
+   TOP_K=20
+fi
 
 if [ -z "${MODEL_CONFIG}" ]; then
    if [ "${MODEL_SERIES}" = "qwen3.5" ]; then

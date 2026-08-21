@@ -43,13 +43,11 @@ from .prompts import (
     FUSED_CLI_USER_PROMPT,
     FUSED_ET_SYSTEM_PROMPT,
     FUSED_ET_USER_PROMPT,
-    FUSED_SEARCH_LONG_USER_PROMPT,
-    FUSED_SEARCH_SYSTEM_PROMPT,
-    FUSED_SEARCH_USER_PROMPT,
     FUSED_UNIFIED_SYSTEM_PROMPT,
     REACT_SYSTEM_PROMPT,
     REACT_USER_PROMPT,
     build_system_prompt,
+    build_web_search_messages,
     finish_schema,
     normalize_harness,
 )
@@ -2589,15 +2587,15 @@ def _initial_messages(
         system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser, inline_tool_prompt=inline_tool_prompt)
         user = FUSED_ET_USER_PROMPT.format(problem_statement=observation)
     else:
-        base = FUSED_UNIFIED_SYSTEM_PROMPT if harness == "unified_gem" else FUSED_SEARCH_SYSTEM_PROMPT
-        system = build_system_prompt(base, tools, model_name, tool_parser=tool_parser, inline_tool_prompt=inline_tool_prompt)
-        observation = _strip_conflicting_answer_tag_instruction(observation)
-        user_prompt = (
-            FUSED_SEARCH_LONG_USER_PROMPT
-            if os.environ.get("FUSED_WEB_SEARCH_USER_PROMPT", "short") == "long"
-            else FUSED_SEARCH_USER_PROMPT
+        return build_web_search_messages(
+            observation,
+            tools,
+            model_name,
+            tool_parser=tool_parser,
+            inline_tool_prompt=inline_tool_prompt,
+            unified=harness == "unified_gem",
+            user_prompt=os.environ.get("FUSED_WEB_SEARCH_USER_PROMPT", "short"),
         )
-        user = user_prompt.format(problem_statement=observation)
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 

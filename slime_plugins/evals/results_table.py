@@ -35,7 +35,13 @@ def log_eval_results_table(rollout_id: int, args: Any, data: dict[str, Any], ext
     return False
 
 
-def format_eval_results_table(args: Any, data: dict[str, Any]) -> str:
+def format_eval_results_table(
+    args: Any,
+    data: dict[str, Any],
+    *,
+    split_metric_columns: bool = False,
+    extended_termination_columns: bool = True,
+) -> str:
     rows: list[tuple[str, dict[str, float | str]]] = []
     for dataset_name, dataset_data in data.items():
         rewards = dataset_data["rewards"]
@@ -60,7 +66,11 @@ def format_eval_results_table(args: Any, data: dict[str, Any]) -> str:
 
     if not rows:
         return ""
-    return _render_table(rows)
+    return _render_table(
+        rows,
+        split_metric_columns=split_metric_columns,
+        extended_termination_columns=extended_termination_columns,
+    )
 
 
 def _source_rows(metrics: dict[str, float | str]) -> list[tuple[str, dict[str, float | str]]]:
@@ -89,13 +99,28 @@ def _result_row(
     return (name, row_metrics)
 
 
-def _render_table(rows: list[tuple[str, dict[str, float | str]]]) -> str:
+def _render_table(
+    rows: list[tuple[str, dict[str, float | str]]],
+    *,
+    split_metric_columns: bool = False,
+    extended_termination_columns: bool = True,
+) -> str:
     metric_keys = _table_metric_keys(rows)
+    termination_columns = _TERMINATION_COLUMNS if extended_termination_columns else _TERMINATION_COLUMNS[:1]
+    metric_columns = (
+        [
+            (header, _METRIC_COLUMN_WIDTH, ">")
+            for key in metric_keys
+            for header in (f"{key} mean (%)", f"{key} std (%)")
+        ]
+        if split_metric_columns
+        else [(f"% {key} (±)", _METRIC_COLUMN_WIDTH, ">") for key in metric_keys]
+    )
     columns = (
         _BENCHMARK_COLUMN,
-        *[(f"% {key} (±)", _METRIC_COLUMN_WIDTH, ">") for key in metric_keys],
+        *metric_columns,
         *[(header, width, align) for header, _, width, align in _COUNT_COLUMNS],
-        *[(header, width, align) for header, _, width, align in _TERMINATION_COLUMNS],
+        *[(header, width, align) for header, _, width, align in termination_columns],
     )
     header = _render_cells(tuple(column[0] for column in columns), columns)
     heavy_rule = "  ".join("━" * width for _, width, _ in columns)
@@ -103,14 +128,21 @@ def _render_table(rows: list[tuple[str, dict[str, float | str]]]) -> str:
     lines = [header, heavy_rule]
     for index, row in enumerate(rows):
         name, metrics = row
-        values = tuple(
-            _format_metric(metrics[f"{key}/mean"], metrics[f"{key}/std"])
-            if f"{key}/mean" in metrics and f"{key}/std" in metrics
-            else ""
-            for key in metric_keys
-        )
+        if split_metric_columns:
+            values = tuple(
+                f"{float(metrics.get(f'{key}/{stat}', 0.0)) * 100:.1f}"
+                for key in metric_keys
+                for stat in ("mean", "std")
+            )
+        else:
+            values = tuple(
+                _format_metric(metrics[f"{key}/mean"], metrics[f"{key}/std"])
+                if f"{key}/mean" in metrics and f"{key}/std" in metrics
+                else ""
+                for key in metric_keys
+            )
         counts = tuple(_format_count(metrics[key]) if key in metrics else "" for _, key, _, _ in _COUNT_COLUMNS)
-        terminations = tuple(str(metrics.get(key, "")) for _, key, _, _ in _TERMINATION_COLUMNS)
+        terminations = tuple(str(metrics.get(key, "")) for _, key, _, _ in termination_columns)
         lines.append(_render_cells((name, *values, *counts, *terminations), columns))
         if index != len(rows) - 1:
             lines.append(light_rule)

@@ -205,7 +205,7 @@ CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSW
 CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP:-False}"
 CREDIT_ASSIGNMENT_MAX_TURNS="${CREDIT_ASSIGNMENT_MAX_TURNS:-True}"
 CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN:-True}"
-HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
+HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-true}"
 # Global advantage whitening is OFF by default for GRPO, while group std-normalization
 # is enabled by default: rewards are mean-centered and std-scaled *within each prompt group*
 # on the rollout side. A second, global whitening pass re-centers on a TOKEN-weighted mean
