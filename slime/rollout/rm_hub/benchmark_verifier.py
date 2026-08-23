@@ -132,6 +132,19 @@ def _score_sample(sample: Sample) -> float:
     data_source = str(metadata.get("data_source") or metadata.get("benchmark") or "").lower()
     label = sample.label
 
+    if data_source == "officeqa":
+        from slime_plugins.evals.officeqa import score_prediction
+
+        ground_truth = _reward_ground_truth(label, metadata)
+        prediction = _extract_final_answer(str(sample.response or "")) or str(sample.response or "")
+        reward_path = metadata.get("official_reward_path")
+        if not reward_path:
+            return 0.0
+        reward, scores = score_prediction(ground_truth, prediction, str(reward_path))
+        metadata["officeqa_scores"] = scores
+        metadata["officeqa_prediction"] = prediction
+        return reward
+
     if data_source == "browsecomp_plus":
         ground_truth = _reward_ground_truth(label, metadata)
         if not isinstance(ground_truth, dict):

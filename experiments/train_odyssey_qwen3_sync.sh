@@ -213,7 +213,7 @@ HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
 LR="${LR:-2e-6}"
 EPS_CLIP="${EPS_CLIP:-0.2}"
-EPS_CLIP_HIGH="${EPS_CLIP_HIGH:-0.28}"
+EPS_CLIP_HIGH="${EPS_CLIP_HIGH:-0.6}"
 KL_COEF="${KL_COEF:-0.0}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
 # A zero-weight reference KL neither changes advantages nor the actor loss.
@@ -245,7 +245,7 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-16}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-16}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-50}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-100}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-}"
 EVAL_INCLUDE_BENCHMARKS="${EVAL_INCLUDE_BENCHMARKS:-asearcher}"
@@ -510,7 +510,8 @@ RUNS_ROOT="${RUNS_ROOT:-/share/nlp/share/gem/runs}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 
 default_experiment_name() {
-   local prefix="odyssey-q3-4b-local-dev"
+   #local prefix="odyssey-q3-4b-local-dev"
+   local prefix="odyssey-q3-4b-think-dev"
    #local prefix="odyssey-q3-8b-think-dev"
    #local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
    #local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
@@ -579,7 +580,7 @@ case "${MODEL_CONFIG,,}" in
 esac
 
 case "${MODEL_CONFIG,,}" in
-   qwen3-4b|qwen3-4b-*) DEFAULT_TP_SIZE=1 ;;
+   qwen3-4b|qwen3-4b-*) DEFAULT_TP_SIZE=4 ;;
    *) DEFAULT_TP_SIZE=2 ;;
 esac
 # Match the CP=1 attention topology used by the TP=1 SGLang engines.
@@ -953,7 +954,8 @@ LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-512}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 # Keep the post-filter training batch at 50/50 webqa and mcp. The synchronous
 # collector keeps sampling each family until both accepted quotas are full.
-ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
+#ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
+ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-}"
 ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-true}"
 # Bound aggressive admission even when low ROI or long-tail groups keep the
 # collector refilling candidates before the previous wave fully drains.
@@ -1069,7 +1071,7 @@ CKPT_ARGS=(
    # back the actor/optimizer state to an earlier training step. Larger values
    # remain available explicitly via SAVE_INTERVAL when checkpoint I/O matters
    # more than exact interruption recovery.
-   --save-interval "${SAVE_INTERVAL:-5}"
+   --save-interval "${SAVE_INTERVAL:-1}"
 )
 # Resume training state (model/optimizer/rng/step + rollout data state) from an
 # existing Megatron checkpoint dir. Defaults to SAVE_DIR so a re-launch with the

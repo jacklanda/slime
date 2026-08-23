@@ -547,7 +547,10 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     parse_error_max_streak = max(1, int(os.environ.get("FUSED_PARSE_ERROR_MAX_STREAK", "2")))
     inference_only = bool(getattr(args, "rollout_only_inference_fast_path", False))
     detect_abnormal_trajectories = not evaluation and not research_search
-    detect_eval_response_anomalies = evaluation and not deepsearch_world
+    officeqa_eval = str(task.get("data_source", "")).strip().lower() == "officeqa"
+    # OfficeQA answers can contain long table reasoning and may finish directly
+    # from the oracle page; generic search anomaly guards misclassify them.
+    detect_eval_response_anomalies = evaluation and not deepsearch_world and not officeqa_eval
 
     tools = [cut_bill_search_schema()] if cut_bill else [local_search_schema(), finish_schema()] if rllm_deepresearch else env.tools()
     model_name = getattr(state.tokenizer, "name_or_path", None) or getattr(args, "hf_checkpoint", None)
@@ -571,6 +574,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             tool_parser=parser,
             inline_tool_prompt=not _chat_template_accepts_native_tools(state.tokenizer),
             retrieved_context=retrieved_context,
+            system_prompt=info.get("system_prompt") or task.get("system_prompt"),
         )
     )
     # Keep the first-turn declaration block immutable. Lazy MCP tool groups are
@@ -2533,7 +2537,10 @@ def _initial_messages(
     tool_parser=None,
     inline_tool_prompt: bool = True,
     retrieved_context: str = "",
+    system_prompt: str | None = None,
 ) -> list[dict[str, str]]:
+    if system_prompt:
+        return [{"role": "system", "content": system_prompt}, {"role": "user", "content": observation}]
     if harness == "rllm_deepresearch":
         system = build_system_prompt(RLLM_DR_SEARCH_SYSTEM_PROMPT, tools, model_name, tool_parser=tool_parser, inline_tool_prompt=inline_tool_prompt)
         return [

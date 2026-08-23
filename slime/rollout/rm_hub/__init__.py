@@ -92,6 +92,10 @@ async def async_rm(args, sample: Sample, **kwargs):
         from .benchmark_verifier import reward_func
 
         return await reward_func(args, sample, **kwargs)
+    elif rm_type == "officeqa":
+        from .officeqa import reward_func
+
+        return await reward_func(args, sample, **kwargs)
     elif rm_type == "random":
         return random.randint(0, 1)
     elif rm_type:

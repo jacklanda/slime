@@ -1534,7 +1534,11 @@ class FusedEnvironment:
         if self.mode in {"cli", "et"} and self.docker_env is not None:
             return self.docker_env.reset()
         question = self.task.get("question") or self.task.get("query") or self.task.get("input") or self.task.get("problem_statement") or self.task.get("prompt") or ""
-        return str(question), {"task_type": "web search"}
+        info = {"task_type": "web search"}
+        if str(self.task.get("data_source", "")).lower() == "officeqa":
+            question = self.task.get("oracle_prompt") or self.task.get("input") or question
+            info["system_prompt"] = self.task.get("system_prompt")
+        return str(question), info
 
     def _question_from_environment(self) -> str:
         env = self.task.get("environment")

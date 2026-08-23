@@ -542,13 +542,13 @@ def test_gemma4_launcher_defaults_to_even_mcp_webqa_groups():
 
 
 @pytest.mark.unit
-def test_gemma4_launcher_starts_a_new_wandb_run_for_each_attempt_by_default():
+def test_gemma4_launcher_strictly_resumes_an_explicit_wandb_run_by_default():
     repo_root = Path(__file__).resolve().parents[1]
-    launcher = (repo_root / "experiments/train_gemma4_fused_agent_sync.sh").read_text(encoding="utf-8")
+    launcher = (repo_root / "experiments/train_odyssey_gemma4_sync.sh").read_text(encoding="utf-8")
 
-    assert 'WANDB_RESUME_SAME_RUN="${WANDB_RESUME_SAME_RUN:-0}"' in launcher
+    assert 'WANDB_RESUME_SAME_RUN="${WANDB_RESUME_SAME_RUN:-1}"' in launcher
     assert '[ -n "${WANDB_RUN_ID:-}" ] && is_truthy "${WANDB_RESUME_SAME_RUN}"' in launcher
-    assert "unset WANDB_RUN_ID" in launcher
+    assert 'WANDB_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")' in launcher
 
 
 @pytest.mark.unit
@@ -574,6 +574,19 @@ def test_odyssey_gemma4_sync_launcher_avoids_train_memory_saver_by_default():
     assert "OFFLOAD_TRAIN=false" in launcher
     assert "--update-weight-mode full" in launcher
     assert "--update-weight-transport disk" in launcher
+
+
+@pytest.mark.unit
+def test_odyssey_gemma4_sync_validates_model_and_resume_checkpoint_shapes():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_odyssey_gemma4_sync.sh").read_text(encoding="utf-8")
+
+    assert 'MODEL_CONFIG="${MODEL_CONFIG:-}"' in launcher
+    assert 'gemma4-e2b|gemma-4-e2b)' in launcher
+    assert 'gemma4-e4b|gemma-4-e4b)' in launcher
+    assert '"hidden_size": int(sys.argv[9])' in launcher
+    assert '"ffn_hidden_size": int(sys.argv[10])' in launcher
+    assert "Refusing incompatible resume" in launcher
 
 
 @pytest.mark.unit

@@ -106,6 +106,22 @@ def test_recovery_reconciles_tracker_and_cleans_failed_newer_save(monkeypatch, t
     assert not incomplete.exists()
 
 
+def test_explicit_resume_rewinds_tracker_and_removes_newer_checkpoints(monkeypatch, tmp_path):
+    checkpoint = _load_checkpoint_module(monkeypatch)
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("59")
+    _write_complete_checkpoint(tmp_path / "iter_0000058")
+    _write_complete_checkpoint(tmp_path / "iter_0000059")
+    stale_staging = tmp_path / ".iter_0000060.incomplete"
+    stale_staging.mkdir()
+
+    checkpoint._rewind_checkpoint_state(tmp_path, 58)
+
+    assert checkpoint._checkpoint_is_complete(tmp_path / "iter_0000058")
+    assert not (tmp_path / "iter_0000059").exists()
+    assert not stale_staging.exists()
+    assert (tmp_path / "latest_checkpointed_iteration.txt").read_text() == "58"
+
+
 def test_load_recovers_incomplete_checkpoint_before_megatron_load(monkeypatch, tmp_path):
     checkpoint = _load_checkpoint_module(monkeypatch)
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("21")

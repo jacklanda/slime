@@ -84,6 +84,8 @@ Core:
   --bfcl-discard-historical-thinking BOOL
                                        Drop prior CoT from BFCL requests. Defaults to
                                        --discard-historical-thinking.
+  --officeqa-use-sglang-session BOOL   Reuse incremental KV state. Default: true.
+  --officeqa-overwrite                 Replace normalized OfficeQA inputs and prior results.
   --acebench-language zh|en|both       ACEBench language. Default: both.
   --acebench-category NAME             ACEBench category group. Default: test_all.
   --acebench-num-threads N|auto        ACEBench generation concurrency. Default: 8 per DP replica.
@@ -346,6 +348,8 @@ BFCL_WEB_SEARCH_MAX_STEPS="${BFCL_WEB_SEARCH_MAX_STEPS:-}"
 BFCL_SEED="${BFCL_SEED:-${ROLLOUT_SEED}}"
 BFCL_DISCARD_HISTORICAL_THINKING="${BFCL_DISCARD_HISTORICAL_THINKING:-}"
 BFCL_V3_COMMIT="${BFCL_V3_COMMIT:-cd9429ccf3d4d04156affe883c495b3b047e6b64}"
+OFFICEQA_USE_SGLANG_SESSION="${OFFICEQA_USE_SGLANG_SESSION:-true}"
+OFFICEQA_OVERWRITE="${OFFICEQA_OVERWRITE:-false}"
 VITABENCH_DOMAIN="${VITABENCH_DOMAIN:-delivery,instore,ota}"
 VITABENCH_LANGUAGE="${VITABENCH_LANGUAGE:-chinese}"
 VITABENCH_USER_MODEL="${VITABENCH_USER_MODEL:-}"
@@ -450,6 +454,8 @@ while [ "$#" -gt 0 ]; do
       --bfcl-max-tokens) BFCL_MAX_TOKENS="${2:?Missing value for --bfcl-max-tokens}"; shift 2 ;;
       --bfcl-seed) BFCL_SEED="${2:?Missing value for --bfcl-seed}"; shift 2 ;;
       --bfcl-discard-historical-thinking) BFCL_DISCARD_HISTORICAL_THINKING="${2:?Missing value for --bfcl-discard-historical-thinking}"; bfcl_discard_historical_thinking_explicit=true; shift 2 ;;
+      --officeqa-use-sglang-session) OFFICEQA_USE_SGLANG_SESSION="${2:?Missing value for --officeqa-use-sglang-session}"; shift 2 ;;
+      --officeqa-overwrite) OFFICEQA_OVERWRITE=true; shift ;;
       --acebench-language) ACEBENCH_LANGUAGE="${2:?Missing value for --acebench-language}"; shift 2 ;;
       --acebench-category) ACEBENCH_CATEGORY="${2:?Missing value for --acebench-category}"; shift 2 ;;
       --acebench-num-threads) ACEBENCH_NUM_THREADS="${2:?Missing value for --acebench-num-threads}"; shift 2 ;;
@@ -555,6 +561,32 @@ BFCL_SELECTED=false
 BFCL_BENCH_VERSION=""
 normalized_include="$(printf '%s' "${INCLUDE_BENCHMARKS}" | tr '[:upper:]_' '[:lower:]-')"
 normalized_exclude="$(printf '%s' "${EXCLUDE_BENCHMARKS}" | tr '[:upper:]_' '[:lower:]-')"
+OFFICEQA_SELECTED=false
+case ",${normalized_include}," in *,officeqa,*) OFFICEQA_SELECTED=true ;; esac
+case ",${normalized_exclude}," in *,officeqa,*) OFFICEQA_SELECTED=false ;; esac
+if is_truthy "${OFFICEQA_SELECTED}" && [ "${normalized_include}" != "officeqa" ]; then
+   echo "OfficeQA uses a dedicated oracle-page prompt and cannot be mixed with other datasets in one run." >&2
+   echo "Run it separately with --include officeqa." >&2
+   exit 2
+fi
+if is_truthy "${OFFICEQA_SELECTED}"; then
+   if [ "${FUSED_HARNESS}" != "gem" ]; then
+      echo "OfficeQA's web-search reproduction requires --harness gem, got ${FUSED_HARNESS}" >&2
+      exit 2
+   fi
+   case "${OFFICEQA_USE_SGLANG_SESSION,,}" in true|false|1|0|yes|no|on|off) ;;
+      *) echo "--officeqa-use-sglang-session must be a boolean" >&2; exit 2 ;;
+   esac
+   NATIVE_SGLANG_SESSION="${OFFICEQA_USE_SGLANG_SESSION}"
+   EVAL_MAX_RESPONSE_LEN=50000
+   EVAL_MAX_PROMPT_LEN=30000
+   EVAL_MAX_CONTEXT_LEN=81920
+   PER_STEP_MAX_TOKENS=50000
+   WEB_SEARCH_MAX_STEPS=20
+   ENABLE_USE_GRM_EVALS=false
+   SUMMARY_BACKEND=local
+   FUSED_WEBQA_MIN_UNIQUE_SEARCHES=0
+fi
 TAU2_SELECTED=false
 case ",${normalized_include}," in *,tau2,*|*,tau2-bench,*|*,tau-2,*|*,tau\^2,*|*,tau\^2-bench,*) TAU2_SELECTED=true ;; esac
 case ",${normalized_exclude}," in *,tau2,*|*,tau2-bench,*|*,tau-2,*|*,tau\^2,*|*,tau\^2-bench,*) TAU2_SELECTED=false ;; esac
@@ -1662,6 +1694,9 @@ LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/evals/${EXPERIMENT_NAME}}"
 EVAL_CONFIG="${EVAL_CONFIG:-${LOG_ROOT}/eval_config.yaml}"
 EVAL_CACHE_DIR="${EVAL_CACHE_DIR:-${LOG_ROOT}/normalized_benchmarks}"
 DUMP_DETAILS="${DUMP_DETAILS:-${LOG_ROOT}/debug}"
+if is_truthy "${OFFICEQA_SELECTED}" && is_truthy "${OFFICEQA_OVERWRITE}"; then
+   rm -f "${LOG_ROOT}/evals/global_steps_0.json" "${EVAL_CONFIG}" "${EVAL_CACHE_DIR}/officeqa.jsonl"
+fi
 mkdir -p "${LOG_ROOT}" "${EVAL_CACHE_DIR}" "${DUMP_DETAILS}"
 
 # Transitional Gemma-4 checkpoints use pre-release config and processor class
@@ -1823,6 +1858,26 @@ if [ "${RETRIEVAL_BACKEND}" = "serper" ] && ! is_truthy "${retrieval_url_explici
    exit 2
 fi
 
+export SCRIPT_DIR REPO_ROOT
+export CUDA_HOME="${CUDA_HOME:-/cm/shared/apps/cuda12.9}"
+export MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
+
+SGLANG_COMPAT_ARGS=()
+case "$(hostname -s)" in
+   dgx-hyperplane17|dgx-hyperplane18|hgx-hyperplane09)
+      # Ray workers can import FlashInfer before a job-level runtime env is
+      # applied. Set the CUDA fallback before starting Ray or submitting work.
+      export FLASHINFER_USE_CUDA_NORM=1
+      export LD_LIBRARY_PATH="/home/liuyang/app/anaconda3/envs/slime/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+      SGLANG_DISABLE_CUDA_GRAPH=true
+      SGLANG_COMPAT_ARGS+=(
+         --sglang-attention-backend triton
+         --sglang-sampling-backend pytorch
+      )
+      echo "Enabled the SGLang CUDA 12.9 compatibility settings for $(hostname -s), including disabled CUDA graphs."
+      ;;
+esac
+
 if is_truthy "${CLEANUP}"; then
    ray stop --force 2>/dev/null || true
 fi
@@ -1853,21 +1908,6 @@ else
 fi
 
 start_managed_serper "${LOG_ROOT}/serper_search_server.log"
-
-export SCRIPT_DIR REPO_ROOT
-export CUDA_HOME="${CUDA_HOME:-/cm/shared/apps/cuda12.9}"
-export MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
-
-SGLANG_COMPAT_ARGS=()
-if [[ "$(hostname -s)" == "dgx-hyperplane17" || "$(hostname -s)" == "hgx-hyperplane09" ]]; then
-   export FLASHINFER_USE_CUDA_NORM=1
-   export LD_LIBRARY_PATH="/home/liuyang/app/anaconda3/envs/slime/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-   SGLANG_COMPAT_ARGS+=(
-      --sglang-attention-backend triton
-      --sglang-sampling-backend pytorch
-   )
-   echo "Enabled the SGLang CUDA 12.9 compatibility settings for $(hostname -s)."
-fi
 
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
@@ -1919,6 +1959,7 @@ export FUSED_WEB_SEARCH_MAX_STEPS="${WEB_SEARCH_MAX_STEPS}"
 export FUSED_CLI_MAX_STEPS="${CLI_MAX_STEPS}"
 export FUSED_TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT}"
 export FUSED_EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT}"
+export FUSED_WEBQA_MIN_UNIQUE_SEARCHES="${FUSED_WEBQA_MIN_UNIQUE_SEARCHES:-2}"
 export PER_STEP_MAX_TOKENS
 export SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH="${SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH:-4096}"
 export SLIME_FUSED_TERMINAL_LOG_STYLE="${SLIME_FUSED_TERMINAL_LOG_STYLE:-both}"
@@ -1963,7 +2004,7 @@ keys = (
     "FUSED_EVAL_TRAJECTORY_TIMEOUT", "PER_STEP_MAX_TOKENS",
     "SLIME_FUSED_MAX_TOOL_OUTPUT_LENGTH", "SLIME_FUSED_TERMINAL_LOG_STYLE",
     "SLIME_FUSED_PROGRESS_LOGS", "SLIME_EPISODE_LOG_DIR",
-    "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE", "SLIME_FUSED_EVAL_DUMP_FAILURES",
+    "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE", "SLIME_FUSED_EVAL_DUMP_FAILURES", "FUSED_WEBQA_MIN_UNIQUE_SEARCHES",
     "SLIME_FUSED_EVAL_USE_SGLANG_SESSION", "SLIME_FUSED_SESSION_CONTROL_TIMEOUT",
     "SLIME_FUSED_SESSION_IDLE_TIMEOUT", "SGLANG_TIMEOUT_KEEP_ALIVE",
     "SLIME_HTTP_KEEPALIVE_EXPIRY", "SLIME_SGLANG_BASE_PORT",

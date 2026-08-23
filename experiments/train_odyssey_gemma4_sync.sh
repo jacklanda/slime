@@ -205,7 +205,7 @@ CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSWER="${CREDIT_ASSIGNMENT_MIXED_TOOL_AND_ANSW
 CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP="${CREDIT_ASSIGNMENT_TAIL_GUARD_EARLY_STOP:-False}"
 CREDIT_ASSIGNMENT_MAX_TURNS="${CREDIT_ASSIGNMENT_MAX_TURNS:-True}"
 CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN:-True}"
-HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-true}"
+HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 # Global advantage whitening is OFF by default for GRPO, while group std-normalization
 # is enabled by default: rewards are mean-centered and std-scaled *within each prompt group*
 # on the rollout side. A second, global whitening pass re-centers on a TOKEN-weighted mean
@@ -224,11 +224,10 @@ KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
 # Keep the expensive reference-model forward opt-in for this Gemma4 workload.
 USE_KL_LOSS="${USE_KL_LOSS:-0}"
 USE_WANDB="${USE_WANDB:-1}"
-# A checkpoint restart is a distinct sampling/training attempt. Start a fresh
-# W&B run by default so replayed rollout ids do not mix with the previous
-# attempt's curves. Set this explicitly only when the process is continuing
-# without replaying already-logged steps.
-WANDB_RESUME_SAME_RUN="${WANDB_RESUME_SAME_RUN:-0}"
+# An explicit W&B run id means the caller is resuming that exact curve. The
+# Python logger uses resume="must", so a missing or inaccessible run fails
+# instead of silently creating a replacement run.
+WANDB_RESUME_SAME_RUN="${WANDB_RESUME_SAME_RUN:-1}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
@@ -250,8 +249,8 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-128}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-128}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-96}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-96}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
 # Gemma4 compounds small batch-shape-dependent kernel differences through 42
 # PLE-enhanced layers. Keep rollout batch-invariant to match deterministic
@@ -600,6 +599,30 @@ if any(value is None for value in values):
 print(*values)
 PY
 )
+
+# MODEL_CONFIG is commonly supplied by job wrappers. Treat it as an assertion
+# about MODEL_DIR so a stale checkpoint/model pairing fails before Ray starts.
+MODEL_CONFIG="${MODEL_CONFIG:-}"
+case "${MODEL_CONFIG,,}" in
+   "") ;;
+   gemma4-e2b|gemma-4-e2b)
+      EXPECTED_MODEL_SHAPE="35 1536 6144 8 1 262144"
+      ;;
+   gemma4-e4b|gemma-4-e4b)
+      EXPECTED_MODEL_SHAPE="42 2560 10240 8 2 262144"
+      ;;
+   *)
+      echo "Unsupported MODEL_CONFIG=${MODEL_CONFIG}; expected gemma4-E2B or gemma4-E4B." >&2
+      exit 2
+      ;;
+esac
+if [ -n "${EXPECTED_MODEL_SHAPE:-}" ]; then
+   ACTUAL_MODEL_SHAPE="${GEMMA4_NUM_LAYERS} ${GEMMA4_HIDDEN_SIZE} ${GEMMA4_FFN_HIDDEN_SIZE} ${GEMMA4_NUM_ATTENTION_HEADS} ${GEMMA4_NUM_QUERY_GROUPS} ${GEMMA4_VOCAB_SIZE}"
+   if [ "${ACTUAL_MODEL_SHAPE}" != "${EXPECTED_MODEL_SHAPE}" ]; then
+      echo "MODEL_CONFIG=${MODEL_CONFIG} does not match MODEL_DIR=${MODEL_DIR}: expected shape [${EXPECTED_MODEL_SHAPE}], found [${ACTUAL_MODEL_SHAPE}] (layers hidden_size ffn_hidden_size attention_heads query_groups vocab_size)." >&2
+      exit 2
+   fi
+fi
 
 MODEL_ARGS=(
    --spec "slime_plugins.models.gemma4" "get_gemma4_spec"
@@ -1035,7 +1058,7 @@ CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}"
    --ref-load "${REF_LOAD}"
    --save "${SAVE_DIR}"
-   --save-interval "${SAVE_INTERVAL:-5}"
+   --save-interval "${SAVE_INTERVAL:-1}"
 )
 # Resume training state (model/optimizer/rng/step + rollout data state) from an
 # existing Megatron checkpoint dir. Defaults to SAVE_DIR so a re-launch with the
@@ -1062,7 +1085,9 @@ fi
 # silently dropping RNG or rerun state.
 if [ -n "${LOAD}" ] && [ -f "${LOAD}/latest_checkpointed_iteration.txt" ]; then
    EXPECTED_DP_SIZE=$((ACTOR_GPUS / MODEL_PARALLEL_SIZE))
-   python3 - "${LOAD}" "${CKPT_STEP}" "${TP_SIZE}" "${PP_SIZE}" "${CP_SIZE}" "${ACTOR_GPUS}" "${EXPECTED_DP_SIZE}" <<'PY'
+   python3 - "${LOAD}" "${CKPT_STEP}" "${TP_SIZE}" "${PP_SIZE}" "${CP_SIZE}" "${ACTOR_GPUS}" "${EXPECTED_DP_SIZE}" \
+      "${GEMMA4_NUM_LAYERS}" "${GEMMA4_HIDDEN_SIZE}" "${GEMMA4_FFN_HIDDEN_SIZE}" \
+      "${GEMMA4_NUM_ATTENTION_HEADS}" "${GEMMA4_NUM_QUERY_GROUPS}" "${GEMMA4_VOCAB_SIZE}" <<'PY'
 import pathlib
 import sys
 
@@ -1085,6 +1110,12 @@ expected = {
     "context_parallel_size": int(sys.argv[5]),
     "world_size": int(sys.argv[6]),
     "data_parallel_size": int(sys.argv[7]),
+    "num_layers": int(sys.argv[8]),
+    "hidden_size": int(sys.argv[9]),
+    "ffn_hidden_size": int(sys.argv[10]),
+    "num_attention_heads": int(sys.argv[11]),
+    "num_query_groups": int(sys.argv[12]),
+    "vocab_size": int(sys.argv[13]),
 }
 mismatches = {
     name: (getattr(checkpoint_args, name, None), value)
@@ -1096,9 +1127,12 @@ if mismatches:
         f"{name}: checkpoint={actual}, requested={requested}"
         for name, (actual, requested) in mismatches.items()
     )
-    raise SystemExit(f"Refusing inexact resume from iteration {iteration}: {details}")
+    raise SystemExit(
+        f"Refusing incompatible resume from iteration {iteration}: {details}. "
+        "Use the MODEL_DIR/MODEL_CONFIG that created this checkpoint, or set LOAD= and CKPT_STEP= for a fresh run."
+    )
 
-print(f"Validated exact resume topology for iteration {iteration}: {expected}")
+print(f"Validated resume topology and model architecture for iteration {iteration}: {expected}")
 PY
 fi
 
@@ -1294,7 +1328,7 @@ GRPO_ARGS=(
    --kl-loss-type low_var_kl
    --entropy-coef "${ENTROPY_COEF:-0.00}"
    --eps-clip "${EPS_CLIP:-0.2}"
-   --eps-clip-high "${EPS_CLIP_HIGH:-0.28}"
+   --eps-clip-high "${EPS_CLIP_HIGH:-0.6}"
 )
 if is_truthy "${USE_KL_LOSS}"; then
    GRPO_ARGS+=(--use-kl-loss)

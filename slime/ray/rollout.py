@@ -570,6 +570,9 @@ class ServerGroup:
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
                 }.items()
             }
+            env_vars.update(
+                {key: os.environ[key] for key in ("FLASHINFER_USE_CUDA_NORM", "LD_LIBRARY_PATH") if key in os.environ}
+            )
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,

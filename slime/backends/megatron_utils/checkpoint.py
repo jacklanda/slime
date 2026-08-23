@@ -96,51 +96,25 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 try:
-    # Checkpoint staging copies every shard GPU->CPU with `non_blocking=True`, which makes
-    # torch allocate a *pinned* host buffer per tensor. On this CUDA/driver stack that
-    # cudaHostAlloc can fail with cudaErrorInvalidValue once the process has already
-    # registered a lot of pinned memory (the weight backuper pins a full model copy, and
-    # release-train recreates the actor every step so registrations churn). The failure is
-    # per-rank and non-deterministic: some ranks write their .distcp shards fine while
-    # others die, leaving a torn checkpoint dir with no latest_checkpointed_iteration.txt.
-    #
-    # Retry the bucket with blocking (pageable) copies instead of taking the job down. This
-    # is slower for the affected bucket but produces an identical checkpoint.
+    # Checkpoint staging normally copies every shard GPU->CPU with `non_blocking=True`,
+    # which makes torch allocate a pinned host buffer per tensor. On this CUDA/driver
+    # stack cudaHostAlloc can fail with cudaErrorInvalidValue after the weight backuper
+    # has registered a full model copy. release-train recreates the actor every step, so
+    # probing pinned staging and remembering a per-process failure still throws once per
+    # checkpoint. Use pageable copies directly; this is slower but avoids poisoning the
+    # CUDA context and produces an identical checkpoint.
     from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
 
-    _ACCELERATOR_ERROR = getattr(torch, "AcceleratorError", RuntimeError)
-    # Pinned host allocations can remain unavailable for the lifetime of a
-    # colocated trainer after one cudaErrorInvalidValue.  Remember the failure
-    # so every later checkpoint uses the reliable pageable-copy path directly.
-    _PINNED_STAGING_DISABLED = False
-
     @staticmethod
-    def _preload_tensors_with_pinned_fallback(write_buckets, non_blocking=True):
-        global _PINNED_STAGING_DISABLED
-        if _PINNED_STAGING_DISABLED and non_blocking:
-            non_blocking = False
+    def _preload_tensors_blocking(write_buckets, non_blocking=True):
         result = []
         for bucket in write_buckets:
             file_name, storage_key, (bytes_data, tensor_data) = bucket
-            try:
-                staged = [(item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data]
-                if non_blocking:
-                    torch.cuda.synchronize()
-            except (_ACCELERATOR_ERROR, RuntimeError):
-                if not non_blocking:
-                    raise
-                logger.warning(
-                    "Pinned checkpoint staging failed for %s; retrying with blocking copies.",
-                    file_name,
-                    exc_info=True,
-                )
-                _PINNED_STAGING_DISABLED = True
-                torch.cuda.synchronize()
-                staged = [(item, tensor.to("cpu", non_blocking=False)) for item, tensor in tensor_data]
+            staged = [(item, tensor.to("cpu", non_blocking=False)) for item, tensor in tensor_data]
             result.append((file_name, storage_key, (bytes_data, staged)))
         return result
 
-    FileSystemWriterAsync.preload_tensors = _preload_tensors_with_pinned_fallback
+    FileSystemWriterAsync.preload_tensors = _preload_tensors_blocking
 
 except ImportError:
     pass
@@ -210,6 +184,28 @@ def _recover_checkpoint_state(save_dir: Path) -> None:
             _atomic_write_tracker(save_dir, recovered_iteration)
             latest_iteration = recovered_iteration
     _remove_failed_checkpoint_artifacts(save_dir, iteration=-1)
+
+
+def _rewind_checkpoint_state(save_dir: Path, iteration: int) -> None:
+    """Discard checkpoint descendants when explicitly resuming an older iteration."""
+    selected_checkpoint = save_dir / f"iter_{iteration:07d}"
+    if not _checkpoint_is_complete(selected_checkpoint):
+        raise RuntimeError(f"Cannot rewind to incomplete checkpoint iteration {iteration}: {selected_checkpoint}")
+
+    for path in save_dir.iterdir():
+        match = _ITERATION_DIR_RE.fullmatch(path.name)
+        if match and path.is_dir() and int(match.group(1)) > iteration:
+            logger.warning("Removing checkpoint %s newer than explicit resume iteration %s", path, iteration)
+            shutil.rmtree(path)
+
+        staging_match = _STAGING_DIR_RE.fullmatch(path.name)
+        if staging_match and path.is_dir() and int(staging_match.group(1)) > iteration:
+            logger.warning("Removing checkpoint staging directory %s newer than explicit resume iteration %s", path, iteration)
+            shutil.rmtree(path)
+
+    if _read_latest_iteration(save_dir) != iteration:
+        logger.warning("Rewinding checkpoint tracker to explicit resume iteration %s", iteration)
+        _atomic_write_tracker(save_dir, iteration)
 
 
 def _atomic_write_tracker(save_dir: Path, iteration: int) -> None:
@@ -337,6 +333,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             recovery_error = None
             if _distributed_rank() == 0:
                 try:
+                    if getattr(args, "ckpt_step", None) is not None:
+                        _rewind_checkpoint_state(load_dir, args.ckpt_step)
                     _recover_checkpoint_state(load_dir)
                 except BaseException as exc:
                     recovery_error = exc

@@ -211,8 +211,21 @@ def discover_benchmarks(args: argparse.Namespace) -> list[dict[str, Any]]:
         if name in exclude or (include and name not in include):
             continue
 
+        if name == "officeqa":
+            from slime_plugins.evals.officeqa import prepare_dataset
+
+            path, _, _ = prepare_dataset(
+                bench_dir,
+                cache_dir / "officeqa.jsonl",
+                limit=args.limit_per_benchmark,
+            )
+        else:
+            path = None
+
         verl_path = bench_dir / "data_verl.parquet"
-        if verl_path.is_file():
+        if path is not None:
+            pass
+        elif verl_path.is_file():
             path = verl_path
         else:
             sources = _source_files(bench_dir)
@@ -246,6 +259,10 @@ def discover_benchmarks(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "data_source": name,
             },
         }
+        if name == "officeqa":
+            entry["rm_type"] = "benchmark_verifier"
+            entry["metadata_overrides"].update({"rm_type": "benchmark_verifier", "oracle_mode": "gem-text-oracle"})
+            entry["max_response_len"] = args.long_response_len
         if name == "bamboogle":
             entry["metadata_overrides"]["strict_exact_match"] = True
         if name in {"mcp-atlas", "mcp_atlas"}:
