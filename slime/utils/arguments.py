@@ -1517,6 +1517,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--replay-and-generate",
+                action="store_true",
+                default=False,
+                help=(
+                    "Use the forge rollout dump for the first replay step, then run a real SGLang rollout "
+                    "after the actor weight update. Requires --load-forge-rollout-data and an explicit start id."
+                ),
+            )
+            parser.add_argument(
                 "--load-debug-rollout-data-subsample",
                 type=float,
                 default=None,

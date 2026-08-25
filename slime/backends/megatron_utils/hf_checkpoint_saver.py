@@ -140,6 +140,7 @@ def save_hf_model_direct_to_path(
     _finalize_distributed_shards(path, writer.state())
 
     if is_save_rank:
+        _validate_hf_checkpoint_for_reload(args, path)
         logger.info("Successfully saved HuggingFace model to %s", path)
 
 
@@ -171,7 +172,81 @@ def save_hf_model_bridge_to_path(args, output_dir: str | Path, model) -> None:
         dist.barrier()
 
     if should_log:
+        _validate_hf_checkpoint_for_reload(args, path)
         logger.info("Successfully saved HuggingFace model to %s", path)
+
+
+def _validate_hf_checkpoint_for_reload(args, path: Path) -> None:
+    """Reject structurally invalid reload checkpoints before SGLang sees them."""
+    index_path = path / "model.safetensors.index.json"
+    if not index_path.is_file():
+        raise RuntimeError(f"HF reload checkpoint is missing {index_path}")
+    with index_path.open(encoding="utf-8") as f:
+        index = json.load(f)
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise RuntimeError(f"HF reload checkpoint has an empty/invalid weight map: {index_path}")
+
+    from safetensors import safe_open
+
+    # Tensor names are architecture-specific (Gemma4, for example, does not
+    # use Qwen's ``model.embed_tokens``/``model.norm`` names). Restrict these
+    # semantic checks to Qwen-family checkpoints and keep generic structural
+    # validation for other architectures.
+    model_type = ""
+    tie_word_embeddings = None
+    config_path = Path(getattr(args, "hf_checkpoint", "")) / "config.json"
+    if config_path.is_file():
+        try:
+            with config_path.open(encoding="utf-8") as f:
+                config = json.load(f)
+                model_type = str(config.get("model_type", "")).lower()
+                tie_word_embeddings = config.get("tie_word_embeddings")
+        except (OSError, ValueError):
+            model_type = ""
+    model_name = str(getattr(args, "model_name", "") or "").lower()
+    is_qwen = model_type.startswith("qwen") or "qwen" in model_name or not config_path.is_file()
+    required = set()
+    if is_qwen:
+        # Match the canonical HF representation. Tied Qwen checkpoints omit
+        # lm_head.weight; Transformers/SGLang recreate the alias from the
+        # embedding tensor. An explicit lm_head is required only when the
+        # source model is configured with untied embeddings.
+        required.update({"model.embed_tokens.weight", "model.norm.weight"})
+        if tie_word_embeddings is False or (
+            tie_word_embeddings is None and getattr(args, "untie_embeddings_and_output_weights", False)
+        ):
+            required.add("lm_head.weight")
+    names = set(weight_map)
+    missing = required - names
+    if missing:
+        raise RuntimeError(f"HF reload checkpoint is missing required tensors: {sorted(missing)}")
+
+    vocab_size = int(getattr(args, "vocab_size", 0) or 0)
+    hidden_size = int(getattr(args, "hidden_size", 0) or 0)
+    checked = 0
+    for filename in sorted(set(weight_map.values())):
+        shard = path / filename
+        if not shard.is_file():
+            raise RuntimeError(f"HF reload checkpoint references missing shard: {shard}")
+        with safe_open(str(shard), framework="pt", device="cpu") as handle:
+            for name in handle.keys():
+                tensor = handle.get_tensor(name)
+                if not torch.isfinite(tensor).all().item():
+                    raise RuntimeError(f"HF reload checkpoint contains non-finite values: {name}")
+                checked += 1
+                if name in {"model.embed_tokens.weight", "lm_head.weight"}:
+                    if vocab_size and tensor.shape != (vocab_size, hidden_size):
+                        raise RuntimeError(
+                            f"Unexpected {name} shape {tuple(tensor.shape)}, "
+                            f"expected {(vocab_size, hidden_size)}"
+                        )
+                elif name == "model.norm.weight" and hidden_size and tensor.shape != (hidden_size,):
+                    raise RuntimeError(
+                        f"Unexpected model.norm.weight shape {tuple(tensor.shape)}, expected {(hidden_size,)}"
+                    )
+    if checked != len(names):
+        raise RuntimeError(f"HF reload checkpoint index mismatch: index={len(names)}, shards={checked}")
 
 
 class _SafetensorShardWriter:

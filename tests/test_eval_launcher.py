@@ -32,6 +32,7 @@ def test_hyperplane18_uses_sglang_cuda_compatibility_settings():
     assert "dgx-hyperplane17|dgx-hyperplane18|hgx-hyperplane09)" in launcher
     assert "export FLASHINFER_USE_CUDA_NORM=1" in launcher
     assert "SGLANG_DISABLE_CUDA_GRAPH=true" in launcher
-    assert '"FLASHINFER_USE_CUDA_NORM", "LD_LIBRARY_PATH"' in launcher
+    assert '"FLASHINFER_USE_CUDA_NORM", "FLASHINFER_USE_TORCH_NORM", "LD_LIBRARY_PATH"' in launcher
     assert launcher.index("export FLASHINFER_USE_CUDA_NORM=1") < launcher.index("ray start --head")
-    assert '("FLASHINFER_USE_CUDA_NORM", "LD_LIBRARY_PATH") if key in os.environ' in rollout
+    assert '"FLASHINFER_USE_CUDA_NORM",' in rollout
+    assert '"FLASHINFER_USE_TORCH_NORM",' in rollout

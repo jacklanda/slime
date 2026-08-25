@@ -294,7 +294,12 @@ def save_checkpoint(iteration, *args, **kwargs):
     _raise_rank_zero_error(preparation_error)
     final_checkpoint = save_dir / f"iter_{iteration:07d}"
     if _checkpoint_is_complete(final_checkpoint):
-        raise FileExistsError(f"Refusing to replace complete checkpoint: {final_checkpoint}")
+        # Resume/replay may intentionally revisit the loaded iteration. A
+        # complete immutable checkpoint is already authoritative; treating
+        # this save as an idempotent no-op lets the subsequent actor->rollout
+        # weight publication complete instead of aborting the whole step.
+        _barrier()
+        return None
 
     original_save_dir = megatron_args.save
     megatron_args.save = str(staging_dir)

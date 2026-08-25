@@ -1976,13 +1976,20 @@ export SLIME_FUSED_SESSION_IDLE_TIMEOUT="${SLIME_FUSED_SESSION_IDLE_TIMEOUT:-600
 export SGLANG_TIMEOUT_KEEP_ALIVE="${SGLANG_TIMEOUT_KEEP_ALIVE:-120}"
 export SLIME_HTTP_KEEPALIVE_EXPIRY="${SLIME_HTTP_KEEPALIVE_EXPIRY:-60}"
 
+# Set compatibility variables before constructing Ray's runtime environment;
+# workers inherit only the values captured in RUNTIME_ENV_JSON.
+if is_truthy "${SGLANG_DISABLE_CUDA_GRAPH}"; then
+   export FLASHINFER_USE_CUDA_NORM=1
+   export FLASHINFER_USE_TORCH_NORM=1
+fi
+
 RUNTIME_ENV_JSON="$(python3 - <<'PY'
 import json
 import os
 
 keys = (
     "CUDA_HOME", "HYDRA_FULL_ERROR", "TOKENIZERS_PARALLELISM", "VLLM_ALLOW_LONG_MAX_MODEL_LEN",
-    "FLASHINFER_USE_CUDA_NORM", "LD_LIBRARY_PATH",
+    "FLASHINFER_USE_CUDA_NORM", "FLASHINFER_USE_TORCH_NORM", "LD_LIBRARY_PATH",
     "VLLM_ENGINE_ITERATION_TIMEOUT_S", "VLLM_WORKER_MULTIPROC_METHOD",
     "PYTORCH_CUDA_ALLOC_CONF", "RETRIEVAL_SERVER_URL", "RLLM_RETRIEVAL_MODE",
     "RLLM_RETRIEVAL_MAX_WORDS", "RLLM_RETRIEVAL_CONCURRENCY", "RLLM_RETRIEVAL_CACHE_SIZE",
@@ -2097,7 +2104,17 @@ fi
 
 SGLANG_CUDA_GRAPH_ARGS=()
 if is_truthy "${SGLANG_DISABLE_CUDA_GRAPH}"; then
+   # The CUTLASS RMSNorm path can initialize CUDA libraries even when graph
+   # capture is disabled. Use FlashInfer's CUDA norm implementation as the
+   # compatible fallback on hosts with an older driver.
+   export FLASHINFER_USE_CUDA_NORM=1
+   export FLASHINFER_USE_TORCH_NORM=1
    SGLANG_CUDA_GRAPH_ARGS+=(--sglang-disable-cuda-graph)
+   # SGLang exposes piecewise CUDA graphs as a separate option.  The eval
+   # switch is intended to disable all CUDA graph capture (in particular for
+   # hosts whose driver cannot initialize the CUTLASS/FlashInfer graph
+   # kernels), so disable piecewise capture as well.
+   SGLANG_CUDA_GRAPH_ARGS+=(--sglang-disable-piecewise-cuda-graph)
 fi
 if [ -n "${SGLANG_CUDA_GRAPH_MAX_BS}" ]; then
    if ! [[ "${SGLANG_CUDA_GRAPH_MAX_BS}" =~ ^[1-9][0-9]*$ ]]; then

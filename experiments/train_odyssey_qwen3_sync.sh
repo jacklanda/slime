@@ -40,6 +40,8 @@ Options:
   --ckpt-step N                          Resume this exact iteration from --load instead of its latest tracker.
   --replay-rollout-id N                  Train exactly one saved rollout N from logs/debug/rollout_data/N.pt.
                                          Requires checkpoint N-1 and does not start SGLang engines.
+  --replay-and-generate                  Replay rollout N for actor training, then keep SGLang live and
+                                         generate the next canary rollout after actor weight update.
   --fault-tolerance BOOL                 Monitor and recover failed rollout engines. Default: true.
   --retrieval-backend local|serper       Set both train and eval backends (compatibility alias).
   --train-retrieval-backend local|serper Training retrieval backend. Default: local.
@@ -160,9 +162,21 @@ is_truthy() {
 PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
 FULLY_ASYNC="${FULLY_ASYNC:-false}"
 CKPT_STEP="${CKPT_STEP:-}"
+START_ROLLOUT_ID="${START_ROLLOUT_ID:-}"
 REPLAY_ROLLOUT_ID="${REPLAY_ROLLOUT_ID:-}"
+REPLAY_ROLLOUT_DATA_PATH="${REPLAY_ROLLOUT_DATA_PATH:-}"
+REPLAY_AND_GENERATE="${REPLAY_AND_GENERATE:-false}"
 USE_FAULT_TOLERANCE="${USE_FAULT_TOLERANCE:-true}"
-ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"
+# Keep the raw model construction mode for exact optimizer/checkpoint resume.
+# Qwen3's tied embedding/output publication is hardened in the raw converter.
+MEGATRON_TO_HF_MODE="${MEGATRON_TO_HF_MODE:-raw}"
+UPDATE_WEIGHT_DISK_KEEP_FILES="${UPDATE_WEIGHT_DISK_KEEP_FILES:-false}"
+NO_LOAD_OPTIM="${NO_LOAD_OPTIM:-false}"
+ALLOW_NO_LOAD_OPTIM="${ALLOW_NO_LOAD_OPTIM:-false}"
+# Newer SGLang-Miles exposes cache-aware routing instead of the removed
+# consistent_hashing alias. Keep an explicit environment override for older
+# deployments while defaulting to a parser-compatible policy.
+ROUTER_POLICY="${ROUTER_POLICY:-cache_aware}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 # Alternate training and rollout across all eight GPUs on this node.
@@ -213,7 +227,8 @@ HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
 LR="${LR:-2e-6}"
 EPS_CLIP="${EPS_CLIP:-0.2}"
-EPS_CLIP_HIGH="${EPS_CLIP_HIGH:-0.6}"
+EPS_CLIP_HIGH="${EPS_CLIP_HIGH:-0.3}"
+CLIP_GRAD="${CLIP_GRAD:-1.0}"
 KL_COEF="${KL_COEF:-0.0}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
 # A zero-weight reference KL neither changes advantages nor the actor loss.
@@ -221,6 +236,7 @@ KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
 USE_KL_LOSS="${USE_KL_LOSS:-0}"
 USE_TIS="${USE_TIS:-0}"
 USE_WANDB="${USE_WANDB:-1}"
+WANDB_RESUME_SAME_RUN="${WANDB_RESUME_SAME_RUN:-1}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
@@ -236,16 +252,17 @@ TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-7200}"
 # Bound each group attempt. The rollout stage determines whether an unfinished
 # slot is retryable infra, permanent task failure, or policy behavior.
-ROLLOUT_GROUP_TIMEOUT="${ROLLOUT_GROUP_TIMEOUT:-7200}"
+ROLLOUT_GROUP_TIMEOUT="${ROLLOUT_GROUP_TIMEOUT:-3600}"
 ROLLOUT_INFRA_RETRY_TIMES="${ROLLOUT_INFRA_RETRY_TIMES:-4}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-16}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-16}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-12}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-12}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-100}"
+SGLANG_DETERMINISTIC_INFERENCE="${SGLANG_DETERMINISTIC_INFERENCE:-true}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-}"
 EVAL_INCLUDE_BENCHMARKS="${EVAL_INCLUDE_BENCHMARKS:-asearcher}"
@@ -316,6 +333,7 @@ while [ "$#" -gt 0 ]; do
       --rollout-num-gpus-per-engine) ROLLOUT_NUM_GPUS_PER_ENGINE="${2:?Missing value for --rollout-num-gpus-per-engine}"; shift 2 ;;
       --ckpt-step) CKPT_STEP="${2:?Missing value for --ckpt-step}"; shift 2 ;;
       --replay-rollout-id) REPLAY_ROLLOUT_ID="${2:?Missing value for --replay-rollout-id}"; shift 2 ;;
+      --replay-and-generate) REPLAY_AND_GENERATE=true; shift ;;
       --fault-tolerance) USE_FAULT_TOLERANCE="${2:?Missing value for --fault-tolerance}"; shift 2 ;;
       --retrieval-backend) TRAIN_RETRIEVAL_BACKEND="${2:?Missing value for --retrieval-backend}"; EVAL_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND}"; shift 2 ;;
       --train-retrieval-backend) TRAIN_RETRIEVAL_BACKEND="${2:?Missing value for --train-retrieval-backend}"; shift 2 ;;
@@ -363,6 +381,8 @@ while [ "$#" -gt 0 ]; do
       --rollout-task-family-top-mean-steps) ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${2:?Missing value for --rollout-task-family-top-mean-steps}"; shift 2 ;;
       --normalize-advantages) NORMALIZE_ADVANTAGES=true; shift ;;
       --no-normalize-advantages) NORMALIZE_ADVANTAGES=false; shift ;;
+      --grpo-std-normalization) GRPO_STD_NORMALIZATION=true; shift ;;
+      --disable-grpo-std-normalization) GRPO_STD_NORMALIZATION=false; shift ;;
       --enable_use_grm_train|--enable-use-grm-train) ENABLE_USE_GRM_TRAIN="${2:?Missing value for --enable_use_grm_train}"; shift 2 ;;
       --enable_use_grm_evals|--enable-use-grm-evals) ENABLE_USE_GRM_EVALS="${2:?Missing value for --enable_use_grm_evals}"; shift 2 ;;
       --train-grm-model) TRAIN_GRM_MODEL="${2:?Missing value for --train-grm-model}"; shift 2 ;;
@@ -482,8 +502,20 @@ case "${TERMINAL_LOG_STYLE}" in
 esac
 FUSED_HARNESS="${FUSED_HARNESS:-gem}"
 
-NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
-HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
+# GPU topology is advisory; a transient nvidia-smi failure must not prevent
+# Ray from starting the training job. Bound the probe so launch cannot hang.
+if [ -n "${HAS_NVLINK:-}" ]; then
+   NVLINK_COUNT="configured"
+else
+   TOPOLOGY_PROBE_FILE="${TMPDIR:-/tmp}/slime-nvidia-topology-$$.txt"
+   if timeout 15s nvidia-smi topo -m >"${TOPOLOGY_PROBE_FILE}" 2>/dev/null; then
+      NVLINK_COUNT=$(grep -o 'NV[0-9][0-9]*' "${TOPOLOGY_PROBE_FILE}" | wc -l)
+   else
+      NVLINK_COUNT=0
+   fi
+   rm -f "${TOPOLOGY_PROBE_FILE}"
+   HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
+fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 source "${SCRIPT_DIR}/lib/retrieval_backend.sh"
@@ -682,7 +714,7 @@ if [ -n "${REPLAY_ROLLOUT_ID}" ]; then
       exit 2
    fi
    CKPT_STEP="${replay_ckpt_step}"
-   SLIME_DIAGNOSTIC_ROLLOUT_DATA="${DUMP_DETAILS}/rollout_data/${REPLAY_ROLLOUT_ID}.pt"
+   SLIME_DIAGNOSTIC_ROLLOUT_DATA="${REPLAY_ROLLOUT_DATA_PATH:-${DUMP_DETAILS}/rollout_data/${REPLAY_ROLLOUT_ID}.pt}"
    if [ ! -f "${SLIME_DIAGNOSTIC_ROLLOUT_DATA}" ]; then
       echo "Replay rollout dump does not exist: ${SLIME_DIAGNOSTIC_ROLLOUT_DATA}" >&2
       exit 2
@@ -709,6 +741,16 @@ print(
     f"cursor_state={'data_source_state' in payload}, path={path}"
 )
 PY
+fi
+
+if is_truthy "${REPLAY_AND_GENERATE}"; then
+   if [ -z "${REPLAY_ROLLOUT_ID}" ]; then
+      echo "--replay-and-generate requires --replay-rollout-id N." >&2
+      exit 2
+   fi
+   # The forged rollout is consumed for training at N; the next loop iteration
+   # is the canary generation after the actor update.
+   START_ROLLOUT_ID="${START_ROLLOUT_ID:-${REPLAY_ROLLOUT_ID}}"
 fi
 
 mkdir -p \
@@ -950,8 +992,8 @@ MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
 DEFAULT_TOKENS_PER_GPU=$(((MAX_CONTEXT_LEN + CP_SIZE - 1) / CP_SIZE))
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_PER_GPU}}"
 LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_PER_GPU}}"
-LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-512}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-2048}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 # Keep the post-filter training batch at 50/50 webqa and mcp. The synchronous
 # collector keeps sampling each family until both accepted quotas are full.
 #ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
@@ -959,20 +1001,24 @@ ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-}"
 ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-true}"
 # Bound aggressive admission even when low ROI or long-tail groups keep the
 # collector refilling candidates before the previous wave fully drains.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-$((ROLLOUT_ENGINE_COUNT * 2))}"
-N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
 # Keep the reservoir bounded by the number of rollout engines.  A group has
 # 32 samples, so a 96-group reservoir admitted thousands of requests while
 # only 128 SGLang request slots were runnable and made abort unable to drain.
-SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS:-$((ROLLOUT_ENGINE_COUNT * 2))}"
-SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-${ROLLOUT_ENGINE_COUNT}}"
-SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-${ROLLOUT_ENGINE_COUNT}}"
-SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-${SYNC_MIN_PENDING_GROUPS}}"
+ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-false}"
+SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS:-0}"
+SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-0}"
+SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-0}"
+SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-0}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-196400}"
 if [ -n "${REPLAY_ROLLOUT_ID}" ]; then
    NUM_ROLLOUT=$((REPLAY_ROLLOUT_ID + 1))
+fi
+if is_truthy "${REPLAY_AND_GENERATE}"; then
+   NUM_ROLLOUT=$((REPLAY_ROLLOUT_ID + 2))
 fi
 if [ $((ROLLOUT_BATCH_SIZE % 2)) -ne 0 ]; then
    echo "ROLLOUT_BATCH_SIZE must be even for the 50/50 webqa/mcp training mix; got ${ROLLOUT_BATCH_SIZE}." >&2
@@ -1003,6 +1049,10 @@ if is_truthy "${FULLY_ASYNC}"; then
    ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.fully_async_rollout.generate_rollout_fully_async}"
 else
    ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.sglang_rollout.generate_rollout}"
+fi
+LOAD_FORGE_ROLLOUT_DATA="${LOAD_FORGE_ROLLOUT_DATA:-}"
+if is_truthy "${REPLAY_AND_GENERATE}"; then
+   LOAD_FORGE_ROLLOUT_DATA="${SLIME_DIAGNOSTIC_ROLLOUT_DATA}"
 fi
 FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY:-true}"
 FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 4))}"
@@ -1073,6 +1123,10 @@ CKPT_ARGS=(
    # more than exact interruption recovery.
    --save-interval "${SAVE_INTERVAL:-1}"
 )
+CKPT_ARGS+=(--megatron-to-hf-mode "${MEGATRON_TO_HF_MODE}")
+if is_truthy "${NO_LOAD_OPTIM}"; then
+   CKPT_ARGS+=(--no-load-optim --no-load-rng)
+fi
 # Resume training state (model/optimizer/rng/step + rollout data state) from an
 # existing Megatron checkpoint dir. Defaults to SAVE_DIR so a re-launch with the
 # same EXPERIMENT_NAME continues from the latest saved iteration. Set LOAD=""
@@ -1091,6 +1145,15 @@ if [ -n "${CKPT_STEP}" ]; then
       exit 2
    fi
    CKPT_ARGS+=(--ckpt-step "${CKPT_STEP}")
+fi
+
+START_ROLLOUT_ARGS=()
+if [ -n "${START_ROLLOUT_ID}" ]; then
+   if ! [[ "${START_ROLLOUT_ID}" =~ ^[0-9]+$ ]]; then
+      echo "START_ROLLOUT_ID must be a non-negative integer; got ${START_ROLLOUT_ID}." >&2
+      exit 2
+   fi
+   START_ROLLOUT_ARGS+=(--start-rollout-id "${START_ROLLOUT_ID}")
 fi
 
 # torch_dist checkpoints can reshard the distributed optimizer across a changed
@@ -1139,8 +1202,8 @@ print(
 PY
 fi
 
-if is_truthy "${NO_LOAD_OPTIM:-false}"; then
-   echo "NO_LOAD_OPTIM is not supported by this launcher because it discards optimizer and RNG resume state. Unset NO_LOAD_OPTIM." >&2
+if is_truthy "${NO_LOAD_OPTIM:-false}" && [ -z "${REPLAY_ROLLOUT_ID}" ] && ! is_truthy "${ALLOW_NO_LOAD_OPTIM}"; then
+   echo "NO_LOAD_OPTIM is only supported with --replay-rollout-id; it must not discard optimizer/RNG state during a normal resume." >&2
    exit 2
 fi
 
@@ -1169,6 +1232,12 @@ ROLLOUT_ARGS=(
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
    --balance-data
 )
+if [ -n "${LOAD_FORGE_ROLLOUT_DATA}" ]; then
+   ROLLOUT_ARGS+=(--load-forge-rollout-data "${LOAD_FORGE_ROLLOUT_DATA}")
+fi
+if is_truthy "${REPLAY_AND_GENERATE}"; then
+   ROLLOUT_ARGS+=(--replay-and-generate)
+fi
 
 if [ -n "${DYNAMIC_SAMPLING_FILTER_PATH}" ]; then
    ROLLOUT_ARGS+=(
@@ -1360,7 +1429,7 @@ OPTIMIZER_ARGS=(
 # has enough headroom while trainer CUDA allocations are still being released.
 if [ -z "${SGLANG_MEM_FRACTION_STATIC:-}" ]; then
    if is_truthy "${COLOCATE}"; then
-      SGLANG_MEM_FRACTION_STATIC=0.7
+      SGLANG_MEM_FRACTION_STATIC=0.6
    else
       SGLANG_MEM_FRACTION_STATIC="${GPU_MEMORY_UTILIZATION:-0.9}"
    fi
@@ -1376,12 +1445,12 @@ SGLANG_ARGS=(
    # Route RMSNorm through SGLang's batch-invariant Triton implementation.
    # This avoids FlashInfer CuTe-DSL RMSNorm, which fails with
    # cudaErrorInsufficientDriver on the CUDA/driver combination used here.
-   --sglang-enable-deterministic-inference
+   #--sglang-enable-deterministic-inference
    #--sglang-rl-on-policy-target megatron
    #--sglang-attention-backend fa3
    --sglang-attention-backend triton
-   #--sglang-disable-custom-all-reduce
-   #--sglang-disable-piecewise-cuda-graph
+   --sglang-disable-custom-all-reduce
+   --sglang-disable-piecewise-cuda-graph
    --router-policy "${ROUTER_POLICY}"
 )
 WANDB_ARGS=()
@@ -1403,13 +1472,14 @@ if [ "${USE_WANDB}" = "1" ]; then
 fi
 
 MISC_ARGS=(
+   --clip-grad "${CLIP_GRAD}"
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
-   --fp32-residual-connection
+   #--fp32-residual-connection
    --attention-backend flash
-   --batch-invariant-mode
+   #--batch-invariant-mode
    --deterministic-mode
    --moe-token-dispatcher-type alltoall
    --train-memory-margin-bytes "${TRAIN_MEMORY_MARGIN_BYTES}"
@@ -1427,10 +1497,10 @@ fi
 if [ "${PRINT_TRAIN_METRICS_TABLE:-1}" = "1" ]; then
    MISC_ARGS+=(--print-train-metrics-table)
 fi
-if [ -n "${SLIME_DIAGNOSTIC_ROLLOUT_DATA:-}" ]; then
+if [ -n "${SLIME_DIAGNOSTIC_ROLLOUT_DATA:-}" ] && ! is_truthy "${REPLAY_AND_GENERATE}"; then
    MISC_ARGS+=(--load-debug-rollout-data "${SLIME_DIAGNOSTIC_ROLLOUT_DATA}")
 fi
-if [ -n "${REPLAY_ROLLOUT_ID}" ]; then
+if [ -n "${REPLAY_ROLLOUT_ID}" ] && ! is_truthy "${REPLAY_AND_GENERATE}"; then
    MISC_ARGS+=(--debug-train-only)
 fi
 if is_truthy "${USE_FAULT_TOLERANCE}"; then
@@ -1768,6 +1838,9 @@ if is_truthy "${RELEASE_TRAIN}"; then
       --update-weight-disk-dir "${UPDATE_WEIGHT_DISK_DIR}"
    )
 fi
+if is_truthy "${UPDATE_WEIGHT_DISK_KEEP_FILES}"; then
+   CLUSTER_ARGS+=(--update-weight-disk-keep-files)
+fi
 if is_truthy "${OFFLOAD_TRAIN}"; then
    CLUSTER_ARGS+=(--offload-train)
 else
@@ -1809,6 +1882,7 @@ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
    "${CLUSTER_ARGS[@]}" \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
+   "${START_ROLLOUT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \
    "${EVAL_ARGS[@]}" \
    "${OPTIMIZER_ARGS[@]}" \

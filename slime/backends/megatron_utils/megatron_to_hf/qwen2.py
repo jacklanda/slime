@@ -4,6 +4,11 @@ import torch
 
 def convert_qwen2_to_hf(args, name, param):
     if name == "module.module.embedding.word_embeddings.weight":
+        # HF's canonical tied-weight checkpoint stores only embed_tokens and
+        # lets the model tie lm_head at construction time.  Emitting a second
+        # alias makes SGLang's disk loader treat the tied head as an explicit
+        # parameter (and log that it cannot find it in the model parameter
+        # map), so only publish it for genuinely untied models.
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":
         return [("lm_head.weight", param)]

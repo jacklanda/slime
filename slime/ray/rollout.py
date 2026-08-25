@@ -570,8 +570,20 @@ class ServerGroup:
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
                 }.items()
             }
+            # Keep norm-kernel compatibility settings in the actor and the
+            # spawned SGLang server.  The Gemma4 PLE projection uses the
+            # layernorm implementation during model import, before requests
+            # are served, so relying on the driver's environment is too late.
             env_vars.update(
-                {key: os.environ[key] for key in ("FLASHINFER_USE_CUDA_NORM", "LD_LIBRARY_PATH") if key in os.environ}
+                {
+                    key: os.environ[key]
+                    for key in (
+                        "FLASHINFER_USE_CUDA_NORM",
+                        "FLASHINFER_USE_TORCH_NORM",
+                        "LD_LIBRARY_PATH",
+                    )
+                    if key in os.environ
+                }
             )
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
@@ -1355,7 +1367,25 @@ class RolloutManager:
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
 
     def _get_rollout_data(self, rollout_id):
-        if self.args.load_debug_rollout_data:
+        replay_step = getattr(self.args, "start_rollout_id", None)
+        use_forge_replay = (
+            getattr(self.args, "replay_and_generate", False)
+            and self.args.load_forge_rollout_data
+            and replay_step is not None
+            and rollout_id == replay_step
+        )
+        if self.args.load_debug_rollout_data or use_forge_replay:
+            if use_forge_replay:
+                from slime.rollout.forge_load import generate_rollout as forge_generate_rollout
+
+                forged = forge_generate_rollout(self.args, rollout_id, self.data_source, evaluation=False)
+                data = forged.samples
+                metrics = None
+                logger.info(
+                    "replay-and-generate: using forged rollout %s for actor update; later steps use live SGLang",
+                    rollout_id,
+                )
+                return data, metrics
             dump_data = torch.load(
                 self.args.load_debug_rollout_data.format(rollout_id=rollout_id),
                 weights_only=False,
