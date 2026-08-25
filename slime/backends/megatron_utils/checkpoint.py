@@ -1,6 +1,8 @@
 import json
+import io
 import logging
 import os
+import pickle
 import re
 import shutil
 from pathlib import Path
@@ -94,6 +96,40 @@ except ImportError:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_legacy_te_extra_state(state):
+    """Convert pre-TE-2.0 torch-dist extra state to the current byte tensor format."""
+    if not isinstance(state, io.BytesIO):
+        return state
+    state.seek(0)
+    legacy = torch.load(state, map_location="cpu", weights_only=False)
+    # Older TE checkpoints commonly contain ``[empty_uint8_tensor]`` when no
+    # FP8 metadata was active.  Current TE represents that as an empty tensor.
+    if legacy is None or (
+        isinstance(legacy, (list, tuple))
+        and all(isinstance(item, torch.Tensor) and item.numel() == 0 for item in legacy)
+    ):
+        return torch.empty(0, dtype=torch.uint8)
+    payload = bytearray(pickle.dumps(legacy))
+    return torch.frombuffer(payload, dtype=torch.uint8).clone()
+
+
+def _patch_transformer_engine_extra_state_compat() -> None:
+    """Make current Transformer Engine load legacy Megatron extra-state blobs."""
+    try:
+        from transformer_engine.pytorch.ops.op import BasicOperation
+    except (ImportError, AttributeError):
+        return
+    if getattr(BasicOperation, "_slime_legacy_extra_state_compat", False):
+        return
+    original = BasicOperation.set_extra_state
+
+    def set_extra_state(self, state):
+        return original(self, _normalize_legacy_te_extra_state(state))
+
+    BasicOperation.set_extra_state = set_extra_state
+    BasicOperation._slime_legacy_extra_state_compat = True
 
 try:
     # Checkpoint staging normally copies every shard GPU->CPU with `non_blocking=True`,
@@ -331,6 +367,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     load_path = args.load
 
     assert Path(load_path).exists() and _is_dir_nonempty(load_path), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
+
+    # Checkpoints written with older Transformer Engine versions encode its
+    # empty FP8 operation state as torch-serialized BytesIO objects. Patch the
+    # current TE loader before Megatron recursively loads the model state.
+    _patch_transformer_engine_extra_state_compat()
 
     if _is_megatron_checkpoint(load_path):
         load_dir = Path(load_path)
