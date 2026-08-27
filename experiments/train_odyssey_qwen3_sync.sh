@@ -60,6 +60,10 @@ Options:
   --retrieval-lexrank-multiprocessing BOOL
                                          Retrieval LexRank multiprocessing env.
   --retrieval-lexrank-workers N          Retrieval LexRank workers env.
+  --master-addr HOST                     Ray head address. Default: dgx-hyperplane17.
+  --worker-addr HOST                     Ray worker address. Default: hgx-hyperplane08.
+  --ray-ssh-user USER                    SSH user used to start Ray on the worker. Default: current user.
+  --socket-ifname NAME                   Interface used by Gloo/NCCL. Default: enp225s0f0np0.
   --ray-num-cpus N                       Ray CPU resource count.
   --tail-guard BOOL                      Stored in env for compatible fused code.
   --tail-guard-time-guard BOOL           Stored in env for compatible fused code.
@@ -146,6 +150,7 @@ Options:
   --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 128.
   --sglang-router-request-timeout-secs N Router request timeout. Default: 21600.
   --sglang-max-running-requests N        SGLang max running requests. Default: 128.
+  --sglang-disable-cuda-graph BOOL       Disable CUDA graph capture for insufficient-driver hosts.
   --colocate                             Share trainer and rollout GPUs with offload. Required by this launcher.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
@@ -160,6 +165,9 @@ is_truthy() {
 }
 
 PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
+# Keep this multinode launcher on the synchronous collector for the
+# train/rollout mismatch baseline. Set FULLY_ASYNC=true explicitly only when
+# running the asynchronous collector as a separate experiment.
 FULLY_ASYNC="${FULLY_ASYNC:-false}"
 CKPT_STEP="${CKPT_STEP:-}"
 START_ROLLOUT_ID="${START_ROLLOUT_ID:-}"
@@ -225,7 +233,9 @@ CREDIT_ASSIGNMENT_MAX_TURNS="${CREDIT_ASSIGNMENT_MAX_TURNS:-True}"
 CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN:-True}"
 HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
-LR="${LR:-2e-6}"
+# Keep the default aligned with existing Odyssey Qwen3 checkpoints so an
+# optimizer resume does not fail on Megatron's scheduler consistency check.
+LR="${LR:-1e-6}"
 EPS_CLIP="${EPS_CLIP:-0.2}"
 EPS_CLIP_HIGH="${EPS_CLIP_HIGH:-0.3}"
 CLIP_GRAD="${CLIP_GRAD:-1.0}"
@@ -258,8 +268,12 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-12}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-12}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-16}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-16}"
+SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-false}"
+# The installed FlashInfer may include CUDA 13 CuTe libraries even when this
+# launcher uses CUDA 12.9. Prefer FlashInfer's CUDA JIT norm on this workload.
+FLASHINFER_USE_CUDA_NORM="${FLASHINFER_USE_CUDA_NORM:-1}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-100}"
 SGLANG_DETERMINISTIC_INFERENCE="${SGLANG_DETERMINISTIC_INFERENCE:-true}"
@@ -350,6 +364,10 @@ while [ "$#" -gt 0 ]; do
       --retrieval-lexrank-max-input-sentences) RLLM_RETRIEVAL_LEXRANK_MAX_INPUT_SENTENCES="${2:?Missing value for --retrieval-lexrank-max-input-sentences}"; shift 2 ;;
       --retrieval-lexrank-multiprocessing) RLLM_RETRIEVAL_LEXRANK_MULTIPROCESSING="${2:?Missing value for --retrieval-lexrank-multiprocessing}"; shift 2 ;;
       --retrieval-lexrank-workers) RLLM_RETRIEVAL_LEXRANK_WORKERS="${2:?Missing value for --retrieval-lexrank-workers}"; shift 2 ;;
+      --master-addr) MASTER_ADDR="${2:?Missing value for --master-addr}"; shift 2 ;;
+      --worker-addr) WORKER_ADDR="${2:?Missing value for --worker-addr}"; shift 2 ;;
+      --ray-ssh-user) RAY_SSH_USER="${2:?Missing value for --ray-ssh-user}"; shift 2 ;;
+      --socket-ifname) SOCKET_IFNAME="${2:?Missing value for --socket-ifname}"; shift 2 ;;
       --ray-num-cpus) RAY_NUM_CPUS="${2:?Missing value for --ray-num-cpus}"; shift 2 ;;
       --tail-guard) TAIL_GUARD="${2:?Missing value for --tail-guard}"; shift 2 ;;
       --tail-guard-time-guard) TAIL_GUARD_TIME_GUARD="${2:?Missing value for --tail-guard-time-guard}"; shift 2 ;;
@@ -450,6 +468,7 @@ while [ "$#" -gt 0 ]; do
       --max-tool-output-length) MAX_TOOL_OUTPUT_LENGTH="${2:?Missing value for --max-tool-output-length}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
+      --sglang-disable-cuda-graph) SGLANG_DISABLE_CUDA_GRAPH="${2:?Missing value for --sglang-disable-cuda-graph}"; shift 2 ;;
       --sglang-router-request-timeout-secs) SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${2:?Missing value for --sglang-router-request-timeout-secs}"; shift 2 ;;
       --colocate) COLOCATE=true; shift ;;
       --no-colocate) COLOCATE=false; shift ;;
@@ -472,7 +491,13 @@ OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${COLOCATE}}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-40960}"
 
 # Release-train avoids native TMS pause/resume failures by trading persistent
-# trainer actors for checkpoint/reload I/O.
+# trainer actors for checkpoint/reload I/O. The persistent colocated path can
+# terminate a distributed rank inside torch_memory_saver.pause(), so keep old
+# invocations that pass RELEASE_TRAIN=false on the supported lifecycle.
+if is_truthy "${COLOCATE}" && ! is_truthy "${RELEASE_TRAIN}"; then
+   echo "RELEASE_TRAIN=false is unsafe with colocated Qwen3; forcing RELEASE_TRAIN=true." >&2
+   RELEASE_TRAIN=true
+fi
 if is_truthy "${RELEASE_TRAIN}"; then
    if ! is_truthy "${COLOCATE}"; then
       echo "RELEASE_TRAIN=true requires COLOCATE=true in this launcher." >&2
@@ -992,16 +1017,16 @@ MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-40960}"
 DEFAULT_TOKENS_PER_GPU=$(((MAX_CONTEXT_LEN + CP_SIZE - 1) / CP_SIZE))
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_PER_GPU}}"
 LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_PER_GPU}}"
-LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-2048}"
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-4096}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 # Keep the post-filter training batch at 50/50 webqa and mcp. The synchronous
 # collector keeps sampling each family until both accepted quotas are full.
-#ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
-ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-}"
+ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
+#ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-}"
 ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-true}"
 # Bound aggressive admission even when low ROI or long-tail groups keep the
 # collector refilling candidates before the previous wave fully drains.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-64}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
 # Keep the reservoir bounded by the number of rollout engines.  A group has
 # 32 samples, so a 96-group reservoir admitted thousands of requests while
@@ -1011,6 +1036,7 @@ SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS:-0}"
 SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-0}"
 SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-0}"
 SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-0}"
+SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-64}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-196400}"
@@ -1032,6 +1058,7 @@ if [ $((EFFECTIVE_GLOBAL_BATCH_SIZE % MICRO_BATCH_DATA_PARALLEL_SIZE)) -ne 0 ]; 
    exit 2
 fi
 ENABLE_DYNAMIC_SAMPLING_FILTER="${ENABLE_DYNAMIC_SAMPLING_FILTER:-true}"
+#DYNAMIC_SAMPLING_FILTER_PATH="${DYNAMIC_SAMPLING_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
 DYNAMIC_SAMPLING_FILTER_PATH="${DYNAMIC_SAMPLING_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
 ENABLE_QUOTA_BUCKET_SAMPLING="${ENABLE_QUOTA_BUCKET_SAMPLING:-0}"
 # This launcher requires strict reward-variance filtering. Zero disables the
@@ -1134,6 +1161,9 @@ fi
 LOAD="${LOAD-${SAVE_DIR}}"
 if [ -n "${LOAD}" ]; then
    CKPT_ARGS+=(--load "${LOAD}")
+   if ! is_truthy "${NO_LOAD_OPTIM}"; then
+      CKPT_ARGS+=(--use-checkpoint-opt-param-scheduler)
+   fi
 fi
 if [ -n "${CKPT_STEP}" ]; then
    if ! [[ "${CKPT_STEP}" =~ ^[0-9]+$ ]]; then
@@ -1453,6 +1483,9 @@ SGLANG_ARGS=(
    --sglang-disable-piecewise-cuda-graph
    --router-policy "${ROUTER_POLICY}"
 )
+if is_truthy "${SGLANG_DISABLE_CUDA_GRAPH}"; then
+   SGLANG_ARGS+=(--sglang-disable-cuda-graph)
+fi
 WANDB_ARGS=()
 if [ "${USE_WANDB}" = "1" ]; then
    WANDB_ARGS=(
@@ -1500,7 +1533,9 @@ fi
 if [ -n "${SLIME_DIAGNOSTIC_ROLLOUT_DATA:-}" ] && ! is_truthy "${REPLAY_AND_GENERATE}"; then
    MISC_ARGS+=(--load-debug-rollout-data "${SLIME_DIAGNOSTIC_ROLLOUT_DATA}")
 fi
-if [ -n "${REPLAY_ROLLOUT_ID}" ] && ! is_truthy "${REPLAY_AND_GENERATE}"; then
+if [ -n "${REPLAY_ROLLOUT_ID}" ]; then
+   # Replay consumes the durable rollout shard and trains only; it must remain
+   # usable while the failed SGLang node is still unavailable.
    MISC_ARGS+=(--debug-train-only)
 fi
 if is_truthy "${USE_FAULT_TOLERANCE}"; then
@@ -1513,6 +1548,10 @@ export UPDATE_WEIGHT_DISK_DIR WANDB_DIR WANDB_CACHE_DIR HF_HOME TORCH_HOME TORCH
 export TORCH_COMPILE_JOB_ID TORCHINDUCTOR_FORCE_DISABLE_CACHES
 export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=1
 export SLIME_SGLANG_EXACT_RMSNORM=1
+# Avoid materializing up to 40K x 152K full-sequence logits during policy
+# training. Only response positions are projected, in LOG_PROBS_CHUNK_SIZE tiles.
+export SLIME_TILED_POLICY_LOSS=1
+export SLIME_TILED_POLICY_LOSS_CLEAR_CACHE_BEFORE_BACKWARD=1
 export SLIME_MCP_ENV_ROOT="${MCP_ENV_ROOT}"
 export SLIME_MCP_ENV_COPY_CONCURRENCY="${MCP_ENV_COPY_CONCURRENCY}"
 export SLIME_MCP_WORKSPACE_SCOPE="${SLIME_MCP_WORKSPACE_SCOPE:-task}"
@@ -1664,12 +1703,20 @@ export SLIME_SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS}"
 export SLIME_SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS}"
 export SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS}"
 
+# Export the CUDA 12.9-compatible norm selection to the Ray workers. When CUDA
+# graphs are explicitly disabled, use SGLang's native PyTorch norm as well.
+export FLASHINFER_USE_CUDA_NORM
+if is_truthy "${SGLANG_DISABLE_CUDA_GRAPH}"; then
+   export FLASHINFER_USE_TORCH_NORM="${FLASHINFER_USE_TORCH_NORM:-1}"
+fi
+
 # RUNTIME_ENV_JSON contains service credentials and is passed verbatim to Ray.
 set +x
 RUNTIME_ENV_JSON=$(python3 - <<PY
-import json, os
+import json, os, sys
 keys = (
     "CUDA_HOME", "LD_LIBRARY_PATH", "PATH", "CC", "CXX", "CUDAHOSTCXX",
+    "FLASHINFER_USE_CUDA_NORM", "FLASHINFER_USE_TORCH_NORM",
     "HYDRA_FULL_ERROR", "NCCL_IB_DISABLE", "NCCL_TIMEOUT",
     "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL", "OPENROUTER_APP_NAME",
     "SLIME_EPISODE_LOG_DIR", "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE",
@@ -1732,6 +1779,9 @@ keys = (
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["PYTHONPATH"] = f"{os.environ['MEGATRON_LM_PATH']}:{os.environ['REPO_ROOT']}:{os.environ['SCRIPT_DIR']}"
+env["LD_LIBRARY_PATH"] = os.pathsep.join(
+    path for path in (os.path.join(sys.prefix, "lib"), os.environ.get("LD_LIBRARY_PATH")) if path
+)
 env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 env["NCCL_ALGO"] = "Ring"
 env["NCCL_NVLS_ENABLE"] = os.environ["HAS_NVLINK"]

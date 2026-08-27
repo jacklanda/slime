@@ -34,12 +34,14 @@ def _group(monkeypatch, engines):
     rollout_manager = Namespace(
         onload_weights=_RemoteCall(lambda: None),
         get_updatable_engines_and_lock=_RemoteCall(lambda: (engines, None, 0, None, None)),
+        set_latest_rollout_weight=_RemoteCall(lambda _path, _version: None),
     )
     group = RayTrainGroup.__new__(RayTrainGroup)
     group.args = Namespace(
         offload_rollout=False,
         update_weight_local_checkpoint_dir=None,
         update_weight_disk_keep_files=True,
+        use_fault_tolerance=False,
         verify_rollout_weight_versions=True,
         ci_test=False,
     )
@@ -75,6 +77,22 @@ def test_full_disk_reload_rejects_version_mismatch(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="expected '1'.*default"):
         _group(monkeypatch, engines)._reload_rollout_weights_from_disk(tmp_path, "1")
+
+
+@pytest.mark.unit
+def test_fault_tolerant_disk_reload_retains_latest_weight_only(monkeypatch, tmp_path):
+    previous = tmp_path / "weight_v000001"
+    current = tmp_path / "weight_v000002"
+    previous.mkdir()
+    current.mkdir()
+
+    group = _group(monkeypatch, [_Engine()])
+    group.args.update_weight_disk_keep_files = False
+    group.args.use_fault_tolerance = True
+    group._reload_rollout_weights_from_disk(current, "2")
+
+    assert not previous.exists()
+    assert current.exists()
 
 
 @pytest.mark.unit

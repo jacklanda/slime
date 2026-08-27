@@ -493,6 +493,7 @@ class ServerGroup:
     router_port: int | None = None
     engine_urls: list[str | None] = dataclasses.field(default_factory=list)
     generation_health_check_enabled: bool = True
+    pending_router_registration_indices: set[int] = dataclasses.field(default_factory=set)
 
     @property
     def nodes_per_engine(self):
@@ -503,7 +504,12 @@ class ServerGroup:
         """Node-0 engines only (for multi-node serving)."""
         return self.all_engines[:: self.nodes_per_engine]
 
-    def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
+    def start_engines(
+        self,
+        port_cursors: dict[int, int] | None = None,
+        *,
+        register_to_router: bool = True,
+    ) -> tuple[list, dict[int, int]]:
         """Create Ray actors, allocate ports, and fire ``engine.init()`` without waiting.
 
         Returns ``(init_handles, port_cursors)`` where *init_handles* is a list
@@ -628,17 +634,27 @@ class ServerGroup:
                 **(addr_and_ports[rank]),
                 router_ip=self.router_ip,
                 router_port=self.router_port,
+                register_to_router=register_to_router,
             )
             for rank, engine in rollout_engines
         ]
         for rank, _engine in rollout_engines:
             local_idx = rank - self.rank_offset
+            if not register_to_router:
+                self.pending_router_registration_indices.add(local_idx)
             node_rank = local_idx % self.nodes_per_engine
             if self.worker_type != "encoder" and node_rank == 0:
                 self.engine_urls[local_idx] = (
                     f"http://{_wrap_ipv6(addr_and_ports[rank]['host'])}:{addr_and_ports[rank]['port']}"
                 )
         return init_handles, port_cursors
+
+    def register_pending_router_workers(self) -> None:
+        indices = sorted(self.pending_router_registration_indices)
+        if not indices:
+            return
+        ray.get([self.all_engines[i].register_to_router.remote() for i in indices])
+        self.pending_router_registration_indices.difference_update(indices)
 
     def mark_unhealthy_engines(self, timeout: float) -> None:
         """Probe node-0 engines and mark failed engine groups for restart."""
@@ -699,6 +715,7 @@ class ServerGroup:
             else:
                 logger.info(f"Engine at index {i} is already None")
             self.all_engines[i] = None
+            self.pending_router_registration_indices.discard(i)
 
     def remove_stale_router_workers(self, engine_indices: list[int]) -> None:
         for i in engine_indices:
@@ -802,7 +819,11 @@ class RolloutServer:
             raise ValueError(f"Heterogeneous nodes_per_engine across groups: {values}")
         return values.pop()
 
-    def recover(self, health_check_timeout: float | None = None):
+    def recover(
+        self,
+        health_check_timeout: float | None = None,
+        active_rollout_weight: tuple[str, str] | None = None,
+    ):
         """Recover dead engines across all active groups, overlapping init."""
         if health_check_timeout is not None:
             for g in self.server_groups:
@@ -817,12 +838,43 @@ class RolloutServer:
         all_handles = []
         port_cursors: dict[int, int] = {}
         for g in self.server_groups:
-            handles, port_cursors = g.start_engines(port_cursors)
+            handles, port_cursors = g.start_engines(port_cursors, register_to_router=False)
             all_handles.extend(handles)
         if all_handles:
             ray.get(all_handles)
 
-        # Post-recovery: offload then onload weights for newly created engines.
+        if active_rollout_weight is not None:
+            model_path, weight_version = active_rollout_weight
+            for g, dead_indices in zip(self.server_groups, dead_per_group, strict=True):
+                if not dead_indices:
+                    continue
+                new_engines = [g.all_engines[i] for i in dead_indices]
+                g.generation_health_check_enabled = False
+                ray.get([engine.pause_generation.remote() for engine in new_engines])
+                if self.update_weights:
+                    memory_tags = [GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
+                    ray.get(
+                        [engine.release_memory_occupation.remote(tags=memory_tags) for engine in new_engines]
+                    )
+                    ray.get(
+                        [
+                            engine.update_weights_from_disk.remote(
+                                model_path=model_path,
+                                weight_version=weight_version,
+                            )
+                            for engine in new_engines
+                        ]
+                    )
+                    ray.get(
+                        [engine.resume_memory_occupation.remote(tags=memory_tags) for engine in new_engines]
+                    )
+                ray.get([engine.continue_generation.remote() for engine in new_engines])
+                g.register_pending_router_workers()
+                g.generation_health_check_enabled = True
+            return
+
+        # During the train/offload phase, leave new colocated engines
+        # quarantined until onload_kv restores generation memory.
         release_handles = []
         updatable_new_engines = []
         non_updatable_groups_engines: list[tuple[str, list]] = []
@@ -830,6 +882,10 @@ class RolloutServer:
             logger.info(f"Recovered {g.num_new_engines} dead rollout engines (worker_type={g.worker_type})")
             assert g.num_new_engines == len(dead_indices), "num_new_engines does not match dead_indices length"
             if g.needs_offload and dead_indices:
+                # Newly launched engines are about to have their KV pool moved
+                # to CPU. Keep generation probes disabled until onload_kv()
+                # restores that pool and resumes the scheduler.
+                g.generation_health_check_enabled = False
                 new_engines = [g.all_engines[i] for i in dead_indices]
                 release_handles.extend(engine.release_memory_occupation.remote() for engine in new_engines)
                 if self.update_weights:
@@ -850,6 +906,10 @@ class RolloutServer:
                         for engine in all_resume_engines
                     ]
                 )
+
+        for g in self.server_groups:
+            if not g.needs_offload:
+                g.register_pending_router_workers()
 
     @staticmethod
     def _resolve_lifecycle_operations(operations, operation_name: str):
@@ -891,22 +951,15 @@ class RolloutServer:
     def offload(self):
         """Release memory occupation across all groups (concurrent).
 
-        Pause each engine's scheduler before releasing its KV cache. Without
-        this, a colocated multi-turn rollout (e.g. fused-agent) can still have
-        generation requests queued in the SGLang scheduler when we release the
-        memory pool; the scheduler then tries to ``prepare_for_extend`` against
-        a pool that has already been moved to CPU and dies with a Triton
-        "Pointer argument ... cpu tensor" error, taking the engine down. Flush
-        is already part of ``release_memory_occupation``, so a pause here is
-        enough to stop new prefill before the pool disappears.
+        Disable generation probes and pause each scheduler before releasing its
+        KV cache. A generation-based health check is itself a prefill request,
+        so issuing one at this lifecycle boundary can race an offloaded pool
+        and take down the scheduler with Triton's "cpu tensor" pointer error.
         """
-        for g in self.server_groups:
-            if g.needs_offload and g.generation_health_check_enabled:
-                g.mark_unhealthy_engines(timeout=g.args.rollout_health_check_timeout)
-
         for g in self.server_groups:
             if g.needs_offload:
                 g.generation_health_check_enabled = False
+                g.mark_unavailable_actors()
 
         pause_operations = [
             (g, rollout_engine_id, engine.pause_generation.remote())
@@ -1010,6 +1063,9 @@ class RolloutServer:
         self._continue_generation_for_offloaded_groups()
         for g in self.server_groups:
             if g.needs_offload:
+                g.register_pending_router_workers()
+        for g in self.server_groups:
+            if g.needs_offload:
                 g.generation_health_check_enabled = True
         return result
 
@@ -1067,6 +1123,7 @@ class RolloutManager:
 
         self._health_monitors = []
         self._reboost_lock = threading.Lock()
+        self._latest_rollout_weight: tuple[str, str] | None = None
         if not self.args.debug_train_only and self.args.use_fault_tolerance:
             for srv in self.servers.values():
                 for group in srv.server_groups:
@@ -1102,13 +1159,12 @@ class RolloutManager:
             try:
                 timeout = getattr(self.args, "rollout_health_check_timeout", None)
                 if isinstance(server, RolloutServer):
-                    server.recover(health_check_timeout=timeout)
-                    # ``recover`` restores weights for colocated engines but
-                    # intentionally leaves KV/CUDA-graph memory offloaded;
-                    # reboost happens during rollout, so finish that lifecycle
-                    # here before failed logical slots are retried.
-                    if failed_group.needs_offload:
-                        server.onload_kv()
+                    if server.update_weights and self._latest_rollout_weight is None:
+                        raise RuntimeError("Cannot reboost an updatable rollout engine before policy weights are published")
+                    server.recover(
+                        health_check_timeout=timeout,
+                        active_rollout_weight=self._latest_rollout_weight,
+                    )
                 else:
                     server.recover()
                 logger.info("Rollout engine group %s reboost completed", rollout_engine_id)
@@ -1194,6 +1250,9 @@ class RolloutManager:
         gpu_offsets = srv.engine_gpu_offsets if srv else []
         num_new = srv.num_new_engines if srv else 0
         return engines, self.rollout_engine_lock, num_new, gpu_counts, gpu_offsets
+
+    def set_latest_rollout_weight(self, model_path: str, weight_version: str) -> None:
+        self._latest_rollout_weight = (model_path, weight_version)
 
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
@@ -1297,6 +1356,10 @@ class RolloutManager:
             logger.error("Restarting rollout engines after an incomplete SGLang abort")
             for server in self.servers.values():
                 server.restart_with_overrides({})
+            # abort() normally installs a fresh transport immediately. Retry
+            # idempotently here so a transport cleanup failure cannot leave the
+            # replacement engines without a usable client.
+            init_http_client(self.args)
             self.args._rollout_abort_engine_restart_required = False
             # Recovery already leaves colocated replacement engines with KV
             # and CUDA-graph memory offloaded and weights available for sync.

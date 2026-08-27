@@ -181,6 +181,7 @@ class SGLangEngine(RayActor):
         disaggregation_bootstrap_port=None,
         router_ip=None,
         router_port=None,
+        register_to_router=True,
     ):
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
@@ -218,13 +219,19 @@ class SGLangEngine(RayActor):
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
+        self._router_server_args = server_args_dict
+        self._registered_to_router = False
 
         if self.args.rollout_external:
-            self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
+            self._init_external(
+                server_args_dict,
+                external_engine_need_check_fields=external_engine_need_check_fields,
+                register_to_router=register_to_router,
+            )
         else:
-            self._init_normal(server_args_dict)
+            self._init_normal(server_args_dict, register_to_router=register_to_router)
 
-    def _init_external(self, expect_server_args, external_engine_need_check_fields):
+    def _init_external(self, expect_server_args, external_engine_need_check_fields, register_to_router):
         logger.info(f"Use external SGLang engine (rank={self.rank}, expect_server_args={expect_server_args})")
 
         def _sanity_check_server_args(actual_server_args, expect_server_args):
@@ -235,15 +242,33 @@ class SGLangEngine(RayActor):
 
         actual_server_args = get_server_info(f"http://{self.server_host}:{self.server_port}")
         _sanity_check_server_args(actual_server_args, expect_server_args)
-        self._register_to_router(expect_server_args)
+        if register_to_router:
+            self.register_to_router()
 
-    def _init_normal(self, server_args_dict):
+    def _init_normal(self, server_args_dict, register_to_router):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         # SGLang resolves the checkpoint config while constructing ServerArgs.
         # Register transitional Gemma 4 model-type aliases before that happens.
         register_gemma4_config_aliases()
         self.process = launch_server_process(ServerArgs(**server_args_dict))
-        self._register_to_router(server_args_dict)
+        if register_to_router:
+            self.register_to_router()
+
+    def register_to_router(self):
+        if self._registered_to_router or self.worker_type == "encoder" or self.node_rank != 0:
+            return
+        self._register_to_router(self._router_server_args)
+        self._registered_to_router = True
+
+    def unregister_from_router(self):
+        if not self._registered_to_router or self.worker_type == "encoder" or self.node_rank != 0:
+            return
+        remove_worker_from_router(
+            f"http://{self.server_host}:{self.server_port}",
+            self.router_ip,
+            self.router_port,
+        )
+        self._registered_to_router = False
 
     def _register_to_router(self, server_args_dict):
         if self.worker_type == "encoder":
@@ -379,12 +404,7 @@ class SGLangEngine(RayActor):
             return
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
-        if self.worker_type != "encoder" and self.node_rank == 0:
-            remove_worker_from_router(
-                f"http://{self.server_host}:{self.server_port}",
-                self.router_ip,
-                self.router_port,
-            )
+        self.unregister_from_router()
         kill_process_tree(self.process.pid)
 
     def get_weight_version(self):

@@ -40,6 +40,8 @@ Options:
   --ckpt-step N                          Resume this exact iteration from --load instead of its latest tracker.
   --replay-rollout-id N                  Train exactly one saved rollout N from logs/debug/rollout_data/N.pt.
                                          Requires checkpoint N-1 and does not start SGLang engines.
+  --replay-and-generate                  Replay rollout N for actor training, then keep SGLang live and
+                                         generate the next canary rollout after actor weight update.
   --fault-tolerance BOOL                 Monitor and recover failed rollout engines. Default: true.
   --retrieval-backend local|serper       Set both train and eval backends (compatibility alias).
   --train-retrieval-backend local|serper Training retrieval backend. Default: local.
@@ -95,7 +97,7 @@ Options:
   --normalize-advantages / --no-normalize-advantages
                                          Whiten advantages across the data-parallel batch. Default: enabled.
   --enable_use_grm_train BOOL            Use OpenRouter GRM with rule-based fallback for WebQA training rewards.
-                                         MCP retains environment verifier rewards. Default: true.
+                                         MCP retains environment verifier rewards. Default: false.
   --enable_use_grm_evals BOOL            Use OpenRouter GRM before rule-based fallback for WebQA interval evals.
                                          MCP retains dataset verifier rewards. Default: true.
   --train-grm-model NAME                 Training OpenRouter judge model. Default: deepseek/deepseek-v4-flash-0731.
@@ -145,9 +147,10 @@ Options:
   --offload-train BOOL                   Offload trainer model between phases. Disabled by --release-train.
   --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: true.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 256.
+  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 128.
   --sglang-router-request-timeout-secs N Router request timeout. Default: 21600.
-  --sglang-max-running-requests N        SGLang max running requests. Default: 256.
+  --sglang-max-running-requests N        SGLang max running requests. Default: 128.
+  --sglang-disable-cuda-graph BOOL       Disable CUDA graph capture for insufficient-driver hosts.
   --colocate                             Share trainer and rollout GPUs with offload. Required by this launcher.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
@@ -167,9 +170,21 @@ PARTIAL_ROLLOUT="${PARTIAL_ROLLOUT:-false}"
 # running the asynchronous collector as a separate experiment.
 FULLY_ASYNC="${FULLY_ASYNC:-false}"
 CKPT_STEP="${CKPT_STEP:-}"
+START_ROLLOUT_ID="${START_ROLLOUT_ID:-}"
 REPLAY_ROLLOUT_ID="${REPLAY_ROLLOUT_ID:-}"
+REPLAY_ROLLOUT_DATA_PATH="${REPLAY_ROLLOUT_DATA_PATH:-}"
+REPLAY_AND_GENERATE="${REPLAY_AND_GENERATE:-false}"
 USE_FAULT_TOLERANCE="${USE_FAULT_TOLERANCE:-true}"
-ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"
+# Keep the raw model construction mode for exact optimizer/checkpoint resume.
+# Qwen3's tied embedding/output publication is hardened in the raw converter.
+MEGATRON_TO_HF_MODE="${MEGATRON_TO_HF_MODE:-raw}"
+UPDATE_WEIGHT_DISK_KEEP_FILES="${UPDATE_WEIGHT_DISK_KEEP_FILES:-false}"
+NO_LOAD_OPTIM="${NO_LOAD_OPTIM:-false}"
+ALLOW_NO_LOAD_OPTIM="${ALLOW_NO_LOAD_OPTIM:-false}"
+# Newer SGLang-Miles exposes cache-aware routing instead of the removed
+# consistent_hashing alias. Keep an explicit environment override for older
+# deployments while defaulting to a parser-compatible policy.
+ROUTER_POLICY="${ROUTER_POLICY:-cache_aware}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 # Alternate training and rollout across all eight GPU slots on one node.
@@ -177,8 +192,8 @@ COLOCATE="${COLOCATE:-true}"
 ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
 HYPERPLANE01_CUDA_VISIBLE_DEVICES="${HYPERPLANE01_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-MASTER_ADDR="${MASTER_ADDR:-dgx-hyperplane17}"
-WORKER_ADDR="${WORKER_ADDR:-hgx-hyperplane08}"
+MASTER_ADDR="${MASTER_ADDR:-dgx-hyperplane19}"
+WORKER_ADDR="${WORKER_ADDR:-hgx-hyperplane01}"
 RAY_SSH_USER="${RAY_SSH_USER:-$(id -un)}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-enp225s0f0np0}}"
 RAY_BIN="${RAY_BIN:-$(command -v ray)}"
@@ -224,7 +239,8 @@ CREDIT_ASSIGNMENT_MAX_TURNS="${CREDIT_ASSIGNMENT_MAX_TURNS:-True}"
 CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN="${CREDIT_ASSIGNMENT_MAX_RESPONSE_LEN:-True}"
 HORIZON_REWARD_SHAPING="${HORIZON_REWARD_SHAPING:-false}"
 NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
-LR="${LR:-2e-6}"
+LR="${LR:-1e-6}"
+CLIP_GRAD="${CLIP_GRAD:-1.0}"
 EPS_CLIP="${EPS_CLIP:-0.2}"
 EPS_CLIP_HIGH="${EPS_CLIP_HIGH:-0.28}"
 KL_COEF="${KL_COEF:-0.0}"
@@ -233,7 +249,8 @@ KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
 # Keep the expensive reference-model forward opt-in for this Qwen3 workload.
 USE_KL_LOSS="${USE_KL_LOSS:-0}"
 USE_TIS="${USE_TIS:-0}"
-USE_WANDB="${USE_WANDB:-1}"
+USE_WANDB="${USE_WANDB:-0}"
+WANDB_RESUME_SAME_RUN="${WANDB_RESUME_SAME_RUN:-1}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
 FUSED_HORIZON_REWARD_STEP_WEIGHT="${FUSED_HORIZON_REWARD_STEP_WEIGHT:-0.7}"
@@ -249,16 +266,21 @@ TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-7200}"
 # Bound each group attempt. The rollout stage determines whether an unfinished
 # slot is retryable infra, permanent task failure, or policy behavior.
-ROLLOUT_GROUP_TIMEOUT="${ROLLOUT_GROUP_TIMEOUT:-7200}"
+ROLLOUT_GROUP_TIMEOUT="${ROLLOUT_GROUP_TIMEOUT:-3600}"
 ROLLOUT_INFRA_RETRY_TIMES="${ROLLOUT_INFRA_RETRY_TIMES:-4}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-128}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-128}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-64}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
+SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-false}"
+# The installed FlashInfer may include CUDA 13 CuTe libraries even when this
+# launcher uses CUDA 12.9. Prefer FlashInfer's CUDA JIT norm on this workload.
+FLASHINFER_USE_CUDA_NORM="${FLASHINFER_USE_CUDA_NORM:-1}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-50}"
+SGLANG_DETERMINISTIC_INFERENCE="${SGLANG_DETERMINISTIC_INFERENCE:-true}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-}"
 EVAL_INCLUDE_BENCHMARKS="${EVAL_INCLUDE_BENCHMARKS:-asearcher}"
@@ -329,6 +351,7 @@ while [ "$#" -gt 0 ]; do
       --rollout-num-gpus-per-engine) ROLLOUT_NUM_GPUS_PER_ENGINE="${2:?Missing value for --rollout-num-gpus-per-engine}"; shift 2 ;;
       --ckpt-step) CKPT_STEP="${2:?Missing value for --ckpt-step}"; shift 2 ;;
       --replay-rollout-id) REPLAY_ROLLOUT_ID="${2:?Missing value for --replay-rollout-id}"; shift 2 ;;
+      --replay-and-generate) REPLAY_AND_GENERATE=true; shift ;;
       --fault-tolerance) USE_FAULT_TOLERANCE="${2:?Missing value for --fault-tolerance}"; shift 2 ;;
       --retrieval-backend) TRAIN_RETRIEVAL_BACKEND="${2:?Missing value for --retrieval-backend}"; EVAL_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND}"; shift 2 ;;
       --train-retrieval-backend) TRAIN_RETRIEVAL_BACKEND="${2:?Missing value for --train-retrieval-backend}"; shift 2 ;;
@@ -380,6 +403,8 @@ while [ "$#" -gt 0 ]; do
       --rollout-task-family-top-mean-steps) ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${2:?Missing value for --rollout-task-family-top-mean-steps}"; shift 2 ;;
       --normalize-advantages) NORMALIZE_ADVANTAGES=true; shift ;;
       --no-normalize-advantages) NORMALIZE_ADVANTAGES=false; shift ;;
+      --grpo-std-normalization) GRPO_STD_NORMALIZATION=true; shift ;;
+      --disable-grpo-std-normalization) GRPO_STD_NORMALIZATION=false; shift ;;
       --enable_use_grm_train|--enable-use-grm-train) ENABLE_USE_GRM_TRAIN="${2:?Missing value for --enable_use_grm_train}"; shift 2 ;;
       --enable_use_grm_evals|--enable-use-grm-evals) ENABLE_USE_GRM_EVALS="${2:?Missing value for --enable_use_grm_evals}"; shift 2 ;;
       --train-grm-model) TRAIN_GRM_MODEL="${2:?Missing value for --train-grm-model}"; shift 2 ;;
@@ -447,6 +472,7 @@ while [ "$#" -gt 0 ]; do
       --max-tool-output-length) MAX_TOOL_OUTPUT_LENGTH="${2:?Missing value for --max-tool-output-length}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
+      --sglang-disable-cuda-graph) SGLANG_DISABLE_CUDA_GRAPH="${2:?Missing value for --sglang-disable-cuda-graph}"; shift 2 ;;
       --sglang-router-request-timeout-secs) SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${2:?Missing value for --sglang-router-request-timeout-secs}"; shift 2 ;;
       --colocate) COLOCATE=true; shift ;;
       --no-colocate) COLOCATE=false; shift ;;
@@ -465,8 +491,8 @@ if [ "${ACTOR_NUM_NODES}" -ne 2 ] || [ "${ACTOR_NUM_GPUS_PER_NODE}" -ne 8 ]; the
    exit 2
 fi
 case "${MASTER_ADDR%%.*}" in
-   dgx-hyperplane17) ;;
-   *) echo "This launcher requires dgx-hyperplane17 as the Ray head; got MASTER_ADDR=${MASTER_ADDR}." >&2; exit 2 ;;
+   dgx-hyperplane19|dgx-hyperplane17) ;;
+   *) echo "This launcher requires dgx-hyperplane19 (or legacy dgx-hyperplane17) as the Ray head; got MASTER_ADDR=${MASTER_ADDR}." >&2; exit 2 ;;
 esac
 if [ "${WORKER_ADDR%%.*}" = "${MASTER_ADDR%%.*}" ]; then
    echo "Ray head and worker must be different hosts; both resolve from ${MASTER_ADDR}." >&2
@@ -482,6 +508,12 @@ EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-40960}"
 
 # Release-train is an explicit fallback for hosts where native TMS pause/resume
 # is unhealthy. It trades that failure isolation for checkpoint/reload I/O.
+# terminate a distributed rank inside torch_memory_saver.pause(), so keep old
+# invocations that pass RELEASE_TRAIN=false on the supported lifecycle.
+if is_truthy "${COLOCATE}" && ! is_truthy "${RELEASE_TRAIN}"; then
+   echo "RELEASE_TRAIN=false is unsafe with colocated Qwen3; forcing RELEASE_TRAIN=true." >&2
+   RELEASE_TRAIN=true
+fi
 if is_truthy "${RELEASE_TRAIN}"; then
    if ! is_truthy "${COLOCATE}"; then
       echo "RELEASE_TRAIN=true requires COLOCATE=true in this launcher." >&2
@@ -694,7 +726,7 @@ if [ -n "${REPLAY_ROLLOUT_ID}" ]; then
       exit 2
    fi
    CKPT_STEP="${replay_ckpt_step}"
-   SLIME_DIAGNOSTIC_ROLLOUT_DATA="${DUMP_DETAILS}/rollout_data/${REPLAY_ROLLOUT_ID}.pt"
+   SLIME_DIAGNOSTIC_ROLLOUT_DATA="${REPLAY_ROLLOUT_DATA_PATH:-${DUMP_DETAILS}/rollout_data/${REPLAY_ROLLOUT_ID}.pt}"
    if [ ! -f "${SLIME_DIAGNOSTIC_ROLLOUT_DATA}" ]; then
       echo "Replay rollout dump does not exist: ${SLIME_DIAGNOSTIC_ROLLOUT_DATA}" >&2
       exit 2
@@ -721,6 +753,16 @@ print(
     f"cursor_state={'data_source_state' in payload}, path={path}"
 )
 PY
+fi
+
+if is_truthy "${REPLAY_AND_GENERATE}"; then
+   if [ -z "${REPLAY_ROLLOUT_ID}" ]; then
+      echo "--replay-and-generate requires --replay-rollout-id N." >&2
+      exit 2
+   fi
+   # The forged rollout is consumed for training at N; the next loop iteration
+   # is the canary generation after the actor update.
+   START_ROLLOUT_ID="${START_ROLLOUT_ID:-${REPLAY_ROLLOUT_ID}}"
 fi
 
 mkdir -p \
@@ -967,11 +1009,12 @@ LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_P
 # [chunk, vocab] BF16 buffers during backward recomputation. At vocab=151936,
 # a 256-token chunk is about 74 MiB, leaving room below TMS's 512 MiB margin
 # even on the rank with the smallest fragmented free block.
-LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-256}"
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-512}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 # Keep the post-filter training batch at 50/50 webqa and mcp. The synchronous
 # collector keeps sampling each family until both accepted quotas are full.
 ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
+#ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-}"
 ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-true}"
 # Bound aggressive admission even when low ROI or long-tail groups keep the
 # collector refilling candidates before the previous wave fully drains.
@@ -985,12 +1028,15 @@ SYNC_MIN_PENDING_GROUPS=96
 # gives top-mean-step selection a deeper pool without changing the 50/50 batch.
 SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-32}"
 SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-32}"
-SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-96}"
+SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-64}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-196400}"
 if [ -n "${REPLAY_ROLLOUT_ID}" ]; then
    NUM_ROLLOUT=$((REPLAY_ROLLOUT_ID + 1))
+fi
+if is_truthy "${REPLAY_AND_GENERATE}"; then
+   NUM_ROLLOUT=$((REPLAY_ROLLOUT_ID + 2))
 fi
 if [ $((ROLLOUT_BATCH_SIZE % 2)) -ne 0 ]; then
    echo "ROLLOUT_BATCH_SIZE must be even for the 50/50 webqa/mcp training mix; got ${ROLLOUT_BATCH_SIZE}." >&2
@@ -1023,6 +1069,10 @@ if is_truthy "${FULLY_ASYNC}"; then
    ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.fully_async_rollout.generate_rollout_fully_async}"
 else
    ROLLOUT_FUNCTION_PATH="${ROLLOUT_FUNCTION_PATH:-slime.rollout.sglang_rollout.generate_rollout}"
+fi
+LOAD_FORGE_ROLLOUT_DATA="${LOAD_FORGE_ROLLOUT_DATA:-}"
+if is_truthy "${REPLAY_AND_GENERATE}"; then
+   LOAD_FORGE_ROLLOUT_DATA="${SLIME_DIAGNOSTIC_ROLLOUT_DATA}"
 fi
 FULLY_ASYNC_ADAPTIVE_CONCURRENCY="${FULLY_ASYNC_ADAPTIVE_CONCURRENCY:-true}"
 FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY="${FULLY_ASYNC_INITIAL_GROUP_CONCURRENCY:-$((ROLLOUT_ENGINE_COUNT * 4))}"
@@ -1093,6 +1143,10 @@ CKPT_ARGS=(
    # more than exact interruption recovery.
    --save-interval "${SAVE_INTERVAL:-1}"
 )
+CKPT_ARGS+=(--megatron-to-hf-mode "${MEGATRON_TO_HF_MODE}")
+if is_truthy "${NO_LOAD_OPTIM}"; then
+   CKPT_ARGS+=(--no-load-optim --no-load-rng)
+fi
 # Resume training state (model/optimizer/rng/step + rollout data state) from an
 # existing Megatron checkpoint dir. Defaults to SAVE_DIR so a re-launch with the
 # same EXPERIMENT_NAME continues from the latest saved iteration. Set LOAD=""
@@ -1100,6 +1154,9 @@ CKPT_ARGS=(
 LOAD="${LOAD-${SAVE_DIR}}"
 if [ -n "${LOAD}" ]; then
    CKPT_ARGS+=(--load "${LOAD}")
+   if ! is_truthy "${NO_LOAD_OPTIM}"; then
+      CKPT_ARGS+=(--use-checkpoint-opt-param-scheduler)
+   fi
 fi
 if [ -n "${CKPT_STEP}" ]; then
    if ! [[ "${CKPT_STEP}" =~ ^[0-9]+$ ]]; then
@@ -1111,6 +1168,15 @@ if [ -n "${CKPT_STEP}" ]; then
       exit 2
    fi
    CKPT_ARGS+=(--ckpt-step "${CKPT_STEP}")
+fi
+
+START_ROLLOUT_ARGS=()
+if [ -n "${START_ROLLOUT_ID}" ]; then
+   if ! [[ "${START_ROLLOUT_ID}" =~ ^[0-9]+$ ]]; then
+      echo "START_ROLLOUT_ID must be a non-negative integer; got ${START_ROLLOUT_ID}." >&2
+      exit 2
+   fi
+   START_ROLLOUT_ARGS+=(--start-rollout-id "${START_ROLLOUT_ID}")
 fi
 
 # torch_dist checkpoints can reshard the distributed optimizer across a changed
@@ -1189,6 +1255,12 @@ ROLLOUT_ARGS=(
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
    --balance-data
 )
+if [ -n "${LOAD_FORGE_ROLLOUT_DATA}" ]; then
+   ROLLOUT_ARGS+=(--load-forge-rollout-data "${LOAD_FORGE_ROLLOUT_DATA}")
+fi
+if is_truthy "${REPLAY_AND_GENERATE}"; then
+   ROLLOUT_ARGS+=(--replay-and-generate)
+fi
 
 if [ -n "${DYNAMIC_SAMPLING_FILTER_PATH}" ]; then
    ROLLOUT_ARGS+=(
@@ -1393,13 +1465,16 @@ SGLANG_ARGS=(
    --sglang-router-request-timeout-secs "${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS}"
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
    --sglang-context-length "${MAX_CONTEXT_LEN}"
+   #--sglang-rl-on-policy-target megatron
    --sglang-enable-deterministic-inference
-   --sglang-rl-on-policy-target megatron
-   --sglang-attention-backend fa3
+   --sglang-attention-backend triton
    --sglang-disable-custom-all-reduce
    --sglang-disable-piecewise-cuda-graph
    --router-policy "${ROUTER_POLICY}"
 )
+if is_truthy "${SGLANG_DISABLE_CUDA_GRAPH}"; then
+   SGLANG_ARGS+=(--sglang-disable-cuda-graph)
+fi
 WANDB_ARGS=()
 if [ "${USE_WANDB}" = "1" ]; then
    WANDB_ARGS=(
@@ -1419,13 +1494,14 @@ if [ "${USE_WANDB}" = "1" ]; then
 fi
 
 MISC_ARGS=(
+   --clip-grad "${CLIP_GRAD}"
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
-   --fp32-residual-connection
+   #--fp32-residual-connection
    --attention-backend flash
-   --batch-invariant-mode
+   #--batch-invariant-mode
    --deterministic-mode
    --moe-token-dispatcher-type alltoall
    --train-memory-margin-bytes "${TRAIN_MEMORY_MARGIN_BYTES}"
@@ -1443,7 +1519,7 @@ fi
 if [ "${PRINT_TRAIN_METRICS_TABLE:-1}" = "1" ]; then
    MISC_ARGS+=(--print-train-metrics-table)
 fi
-if [ -n "${SLIME_DIAGNOSTIC_ROLLOUT_DATA:-}" ]; then
+if [ -n "${SLIME_DIAGNOSTIC_ROLLOUT_DATA:-}" ] && ! is_truthy "${REPLAY_AND_GENERATE}"; then
    MISC_ARGS+=(--load-debug-rollout-data "${SLIME_DIAGNOSTIC_ROLLOUT_DATA}")
 fi
 if [ -n "${REPLAY_ROLLOUT_ID}" ]; then
@@ -1479,6 +1555,12 @@ export SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE="${EVAL_TRAJECTORY_SAMPLE_RATE}"
 export SLIME_FUSED_EVAL_DUMP_FAILURES="${EVAL_DUMP_FAILURES}"
 export SLIME_FUSED_EVAL_USE_SGLANG_SESSION="${NATIVE_SGLANG_SESSION}"
 export MASTER_ADDR SOCKET_IFNAME
+
+if is_truthy "${COLOCATE}"; then
+   export NUM_GPUS="${NUM_GPUS:-${ACTOR_GPUS}}"
+else
+   export NUM_GPUS="${NUM_GPUS:-$((ACTOR_GPUS + ROLLOUT_GPUS))}"
+fi
 export NUM_GPUS_PER_NODE="${NUM_GPUS_PER_NODE:-${ACTOR_NUM_GPUS_PER_NODE}}"
 if [ "${NUM_GPUS_PER_NODE}" -ne 8 ]; then
    echo "This launcher requires NUM_GPUS_PER_NODE=8; got ${NUM_GPUS_PER_NODE}." >&2
@@ -1510,6 +1592,7 @@ export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 # blocks instead, so long dynamic microbatches can reuse them without failing a
 # multi-GiB allocation due to allocator fragmentation.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False,max_split_size_mb:256}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
 export OPENROUTER_APP_NAME="${OPENROUTER_APP_NAME:-GRM}"
 export SLIME_FUSED_REQUIRE_WEIGHT_VERSION="${SLIME_FUSED_REQUIRE_WEIGHT_VERSION:-1}"
 
@@ -1614,14 +1697,27 @@ export SLIME_SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS}"
 export SLIME_SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS}"
 export SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS}"
 
+# Export the CUDA 12.9-compatible norm selection to the Ray workers. When CUDA
+# graphs are explicitly disabled, use SGLang's native PyTorch norm as well.
+export FLASHINFER_USE_CUDA_NORM
+if is_truthy "${SGLANG_DISABLE_CUDA_GRAPH}"; then
+   export FLASHINFER_USE_TORCH_NORM="${FLASHINFER_USE_TORCH_NORM:-1}"
+fi
+
 # RUNTIME_ENV_JSON contains service credentials and is passed verbatim to Ray.
 set +x
 RUNTIME_ENV_JSON=$(python3 - <<PY
-import json, os
+import json, os, sys
 keys = (
     "CUDA_HOME", "LD_LIBRARY_PATH", "PATH", "CC", "CXX", "CUDAHOSTCXX",
+    "FLASHINFER_USE_CUDA_NORM", "FLASHINFER_USE_TORCH_NORM",
     "HYDRA_FULL_ERROR", "NCCL_IB_DISABLE", "NCCL_TIMEOUT",
-    "MASTER_ADDR", "GLOO_SOCKET_IFNAME", "NCCL_SOCKET_IFNAME", "no_proxy", "NO_PROXY",
+    # Do not propagate Gloo/NCCL interface names into Ray's runtime env.  The
+    # DGX and HGX nodes use different NIC names, so a head-node interface
+    # override makes distributed workers on the other node fail before SGLang
+    # can form its local process group.  Both libraries select the 10.141.0.0
+    # route automatically when no node-specific override is present.
+    "MASTER_ADDR", "no_proxy", "NO_PROXY",
     "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL", "OPENROUTER_APP_NAME",
     "SLIME_EPISODE_LOG_DIR", "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE",
     "SLIME_FUSED_EVAL_DUMP_FAILURES", "SLIME_FUSED_EVAL_USE_SGLANG_SESSION",
@@ -1686,7 +1782,6 @@ keys = (
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["PYTHONPATH"] = f"{os.environ['MEGATRON_LM_PATH']}:{os.environ['REPO_ROOT']}:{os.environ['SCRIPT_DIR']}"
 env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-env["TP_SOCKET_IFNAME"] = os.environ["GLOO_SOCKET_IFNAME"]
 env["NCCL_ALGO"] = "Ring"
 env["NCCL_NVLS_ENABLE"] = os.environ["HAS_NVLINK"]
 env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"

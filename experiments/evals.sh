@@ -179,7 +179,8 @@ Generation/eval:
 
 SGLang/runtime:
   --sglang-mem-fraction-static X       Default: 0.9.
-  --sglang-disable-cuda-graph BOOL     Disable CUDA graph capture (use for insufficient-driver errors).
+  --sglang-disable-cuda-graph BOOL     Disable CUDA graph capture (default: true for Gemma 4;
+                                       use for insufficient-driver errors).
   --sglang-cuda-graph-max-bs N         Limit CUDA graph capture batch size.
   --sglang-server-concurrency N        Default: 60.
   --sglang-max-running-requests N      Per-engine limit. Default: cot=4, agent=96.
@@ -311,6 +312,11 @@ GRM_MAX_NEW_TOKENS="${GRM_MAX_NEW_TOKENS:-2048}"
 GRM_TEMPERATURE="${GRM_TEMPERATURE:-0.6}"
 GRM_FAILURE_REWARD="${GRM_FAILURE_REWARD:-0.0}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.9}"
+if [ -n "${SGLANG_DISABLE_CUDA_GRAPH+x}" ]; then
+   sglang_disable_cuda_graph_explicit=true
+else
+   sglang_disable_cuda_graph_explicit=false
+fi
 SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-false}"
 SGLANG_CUDA_GRAPH_MAX_BS="${SGLANG_CUDA_GRAPH_MAX_BS:-}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-60}"
@@ -532,7 +538,7 @@ while [ "$#" -gt 0 ]; do
       --mcp-atlas-skip-state-check) MCP_ATLAS_SKIP_STATE_CHECK="${2:?Missing value for --mcp-atlas-skip-state-check}"; shift 2 ;;
       --mcp-atlas-allow-busy-ray) MCP_ATLAS_ALLOW_BUSY_RAY="${2:?Missing value for --mcp-atlas-allow-busy-ray}"; shift 2 ;;
       --sglang-mem-fraction-static) SGLANG_MEM_FRACTION_STATIC="${2:?Missing value for --sglang-mem-fraction-static}"; shift 2 ;;
-      --sglang-disable-cuda-graph) SGLANG_DISABLE_CUDA_GRAPH="${2:?Missing value for --sglang-disable-cuda-graph}"; shift 2 ;;
+      --sglang-disable-cuda-graph) SGLANG_DISABLE_CUDA_GRAPH="${2:?Missing value for --sglang-disable-cuda-graph}"; sglang_disable_cuda_graph_explicit=true; shift 2 ;;
       --sglang-cuda-graph-max-bs) SGLANG_CUDA_GRAPH_MAX_BS="${2:?Missing value for --sglang-cuda-graph-max-bs}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
@@ -821,6 +827,14 @@ esac
 case "${MODEL_SERIES}" in
    gemma-4|gemma-4-*) MODEL_SERIES="gemma4" ;;
 esac
+# Gemma 4's per-layer projection RMSNorm currently reaches the CUTLASS
+# FlashInfer kernel during SGLang graph capture. On drivers that cannot load
+# that kernel, graph initialization aborts before the first request. Keep the
+# compatibility fallback automatic while allowing an explicit override.
+if [ "${MODEL_SERIES}" = "gemma4" ] && ! is_truthy "${sglang_disable_cuda_graph_explicit}"; then
+   SGLANG_DISABLE_CUDA_GRAPH=true
+   echo "Gemma 4 detected: disabling SGLang CUDA graphs for driver compatibility."
+fi
 if [ "${MODEL_SERIES}" = "qwen3.5" ]; then
    TEMPERATURE=1.0
    TOP_P=0.95

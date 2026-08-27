@@ -68,6 +68,18 @@ from slime.utils.types import Sample
 NUM_GPUS = 0
 
 
+def test_retired_generate_state_cancels_before_trajectory_setup(monkeypatch):
+    monkeypatch.setattr(fused_generate, "GenerateState", lambda _args: SimpleNamespace(aborted=True))
+    monkeypatch.setattr(
+        fused_generate,
+        "_task_from_sample",
+        lambda _sample: pytest.fail("retired trajectory must not start setup"),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(fused_generate.generate(SimpleNamespace(), Sample(prompt="question"), {}))
+
+
 def test_cancelled_local_mcp_workspace_setup_returns_before_copy_finishes(monkeypatch):
     copy_started = threading.Event()
     release_copy = threading.Event()
@@ -78,7 +90,7 @@ def test_cancelled_local_mcp_workspace_setup_returns_before_copy_finishes(monkey
         release_copy.wait(timeout=2)
         return task, "workspace"
 
-    monkeypatch.setattr(fused_generate, "GenerateState", lambda _args: SimpleNamespace())
+    monkeypatch.setattr(fused_generate, "GenerateState", lambda _args: SimpleNamespace(aborted=False))
     monkeypatch.setattr(fused_generate, "is_local_mcp_task", lambda _task: True)
     monkeypatch.setattr(fused_generate, "prepare_mcp_workspace", prepare)
     monkeypatch.setattr(fused_generate, "cleanup_mcp_workspace", cleaned.append)
@@ -331,6 +343,7 @@ def _run_generate_with_fake_sglang(
     fused_generate.GenerateState = lambda args: SimpleNamespace(
         tokenizer=fake_tokenizer,
         semaphore=asyncio.Semaphore(1000),
+        aborted=False,
     )
     fused_generate._call_sglang = fake_call_sglang
     try:

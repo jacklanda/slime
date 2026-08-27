@@ -1,4 +1,6 @@
 from argparse import Namespace
+import threading
+import time
 
 import pytest
 
@@ -30,6 +32,8 @@ class _FakeEngine:
         self.health_generate = _RemoteMethod("health_generate", self.calls, health_generate_result)
         self.health_actor = _RemoteMethod("health_actor", self.calls, health_actor_result)
         self.shutdown = _RemoteMethod("shutdown", self.calls)
+        self.register_to_router = _RemoteMethod("register_to_router", self.calls)
+        self.update_weights_from_disk = _RemoteMethod("update_weights_from_disk", self.calls)
 
 
 def _ray_get(value):
@@ -63,7 +67,7 @@ def test_recover_skips_generation_health_check_until_kv_is_onloaded(monkeypatch)
     server.offload()
     assert group.generation_health_check_enabled is False
     assert [name for name, _args, _kwargs in engine.calls[:3]] == [
-        "health_generate",
+        "health_actor",
         "pause_generation",
         "release_memory_occupation",
     ]
@@ -72,23 +76,23 @@ def test_recover_skips_generation_health_check_until_kv_is_onloaded(monkeypatch)
     server.onload_weights()
     assert group.generation_health_check_enabled is False
 
-    group.start_engines = lambda port_cursors: ([], port_cursors)
+    group.start_engines = lambda port_cursors, **_kwargs: ([], port_cursors)
     server.recover(health_check_timeout=3.0)
-    assert [name for name, _args, _kwargs in engine.calls].count("health_generate") == 1
+    assert [name for name, _args, _kwargs in engine.calls].count("health_generate") == 0
 
     server.onload_kv()
     assert group.generation_health_check_enabled is True
     assert [name for name, _args, _kwargs in engine.calls].count("continue_generation") == 1
 
     server.recover(health_check_timeout=3.0)
-    assert [name for name, _args, _kwargs in engine.calls].count("health_generate") == 2
+    assert [name for name, _args, _kwargs in engine.calls].count("health_generate") == 1
 
 
 def test_offload_marks_dead_actor_and_keeps_other_engines_progressing(monkeypatch):
     monkeypatch.setattr("slime.ray.rollout.ray.get", _ray_get)
     monkeypatch.setattr("slime.ray.rollout.ray.kill", lambda *_args, **_kwargs: None)
 
-    dead = _FakeEngine(health_generate_result=RuntimeError("actor died"))
+    dead = _FakeEngine(health_actor_result=RuntimeError("actor died"))
     healthy = _FakeEngine()
     args = Namespace(num_gpus_per_node=1, debug_train_only=False, rollout_health_check_timeout=3.0)
     group = ServerGroup(
@@ -106,7 +110,7 @@ def test_offload_marks_dead_actor_and_keeps_other_engines_progressing(monkeypatc
 
     assert group.all_engines[0] is None
     assert [name for name, _args, _kwargs in healthy.calls] == [
-        "health_generate",
+        "health_actor",
         "pause_generation",
         "release_memory_occupation",
     ]
@@ -137,9 +141,10 @@ def test_dead_actor_found_during_offload_is_rebuilt_before_weight_update(monkeyp
 
     replacement = _FakeEngine()
 
-    def start_replacement(port_cursors):
+    def start_replacement(port_cursors, **_kwargs):
         group.all_engines[0] = replacement
         group.num_new_engines = 1
+        group.pending_router_registration_indices.add(0)
         return ["replacement-init"], port_cursors
 
     group.start_engines = start_replacement
@@ -151,6 +156,40 @@ def test_dead_actor_found_during_offload_is_rebuilt_before_weight_update(monkeyp
         "resume_memory_occupation",
     ]
     assert replacement.calls[1][2] == {"tags": ["weights"]}
+
+
+def test_active_rollout_reboost_loads_current_weights_before_router_registration(monkeypatch):
+    monkeypatch.setattr("slime.ray.rollout.ray.get", _ray_get)
+
+    server, group = _make_server(None)
+    replacement = _FakeEngine()
+
+    def start_replacement(port_cursors, **kwargs):
+        assert kwargs == {"register_to_router": False}
+        group.all_engines[0] = replacement
+        group.num_new_engines = 1
+        group.pending_router_registration_indices.add(0)
+        return ["replacement-init"], port_cursors
+
+    group.start_engines = start_replacement
+    server.recover(active_rollout_weight=("/weights/weight_v000002", "2"))
+
+    assert [name for name, _args, _kwargs in replacement.calls] == [
+        "pause_generation",
+        "release_memory_occupation",
+        "update_weights_from_disk",
+        "resume_memory_occupation",
+        "continue_generation",
+        "register_to_router",
+    ]
+    assert replacement.calls[1][2] == {"tags": ["kv_cache", "cuda_graph"]}
+    assert replacement.calls[2][2] == {
+        "model_path": "/weights/weight_v000002",
+        "weight_version": "2",
+    }
+    assert replacement.calls[3][2] == {"tags": ["kv_cache", "cuda_graph"]}
+    assert group.generation_health_check_enabled is True
+    assert group.pending_router_registration_indices == set()
 
 
 def test_onload_checks_actor_liveness_without_generation(monkeypatch):
@@ -213,6 +252,45 @@ def test_health_monitor_reboosts_after_marking_engine_dead(monkeypatch):
     assert reboosts == [(group, 0)]
 
 
+def test_health_monitor_pause_waits_for_inflight_generation_check(monkeypatch):
+    check_started = threading.Event()
+    release_check = threading.Event()
+
+    def blocking_ray_get(_value):
+        check_started.set()
+        assert release_check.wait(timeout=2.0)
+        return True
+
+    monkeypatch.setattr("slime.utils.health_monitor.ray.get", blocking_ray_get)
+
+    engine = _FakeEngine()
+    _server_obj, group = _make_server(engine)
+    monitor = RolloutHealthMonitor(
+        group,
+        Namespace(
+            rollout_health_check_interval=1.0,
+            rollout_health_check_timeout=1.0,
+            rollout_health_check_first_wait=0.0,
+        ),
+    )
+    monitor._pause_event = threading.Event()
+
+    check_thread = threading.Thread(target=monitor._run_health_checks)
+    check_thread.start()
+    assert check_started.wait(timeout=1.0)
+
+    pause_thread = threading.Thread(target=monitor.pause)
+    pause_thread.start()
+    time.sleep(0.05)
+    assert pause_thread.is_alive()
+
+    release_check.set()
+    pause_thread.join(timeout=1.0)
+    check_thread.join(timeout=1.0)
+    assert not pause_thread.is_alive()
+    assert not check_thread.is_alive()
+
+
 def test_offload_restarts_local_engines_after_incomplete_abort(monkeypatch):
     events = []
 
@@ -238,12 +316,13 @@ def test_offload_restarts_local_engines_after_incomplete_abort(monkeypatch):
     manager._get_rollout_data = lambda rollout_id: ([object()], {})
     manager._save_debug_rollout_data = lambda *_args, **_kwargs: None
     monkeypatch.setattr("slime.ray.rollout._log_rollout_data", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr("slime.ray.rollout.init_http_client", lambda _args: events.append(("init", None)))
 
     with pytest.raises(RuntimeError, match=r"call offload\(\)"):
         manager.generate(59)
     assert events == []
     manager.offload()
-    assert events == [("restart", {})]
+    assert events == [("restart", {}), ("init", None)]
     assert manager.args._rollout_abort_engine_restart_required is False
 
 

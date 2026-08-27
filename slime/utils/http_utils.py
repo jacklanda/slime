@@ -307,6 +307,33 @@ def init_http_client(args):
         _distributed_post_enabled = True
 
 
+async def reset_http_client(args) -> None:
+    """Replace rollout HTTP transports after an incomplete request drain."""
+    global _http_client, _distributed_post_enabled, _post_actors, _post_actor_idx
+
+    old_client, _http_client = _http_client, None
+    old_post_actors, _post_actors = _post_actors, []
+    _post_actor_idx = 0
+    _distributed_post_enabled = False
+
+    if old_client is not None:
+        try:
+            await asyncio.wait_for(
+                old_client.aclose(),
+                timeout=max(0.1, float(os.environ.get("SLIME_HTTP_RESET_TIMEOUT_SECONDS", "5"))),
+            )
+        except Exception:
+            logger.exception("Failed to close the retired rollout HTTP client cleanly")
+
+    if old_post_actors:
+        import ray
+
+        for actor in old_post_actors:
+            ray.kill(actor, no_restart=True)
+
+    init_http_client(args)
+
+
 def _init_ray_distributed_post(args):
     """Initialize one or more Ray async actors per node for HTTP POST.
 

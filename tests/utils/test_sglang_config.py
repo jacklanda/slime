@@ -174,7 +174,7 @@ class TestZeroGpuRolloutConfig:
             assert force_new is False
             return "127.0.0.1", 3456
 
-        def fake_start_engines(self, port_cursors=None):
+        def fake_start_engines(self, port_cursors=None, **_kwargs):
             self.all_engines = [object() for _ in self.all_engines]
             return [f"init-{self.rank_offset}"], port_cursors or {}
 
@@ -242,7 +242,7 @@ class TestZeroGpuRolloutConfig:
                 ]
             )
 
-        def fake_start_engines(self, port_cursors=None):
+        def fake_start_engines(self, port_cursors=None, **_kwargs):
             if self.worker_type == "encoder":
                 self.all_engines = [FakeEngine("encoder-url-ref") for _ in self.all_engines]
             else:
@@ -373,7 +373,7 @@ class TestRolloutServerRecovery:
         def fake_remove_worker_from_router(worker_url, router_ip, router_port):
             events.append(("remove", worker_url, router_ip, router_port))
 
-        def fake_start_engines(self, port_cursors=None):
+        def fake_start_engines(self, port_cursors=None, **_kwargs):
             events.append(("start",))
             self.all_engines[0] = object()
             self.num_new_engines = 1
@@ -418,7 +418,7 @@ class TestRolloutServerRecovery:
         def fake_remove_worker_from_router(worker_url, router_ip, router_port):
             events.append(("remove", worker_url, router_ip, router_port))
 
-        def fake_start_engines(self, port_cursors=None):
+        def fake_start_engines(self, port_cursors=None, **_kwargs):
             events.append(("start",))
             self.all_engines[0] = object()
             self.num_new_engines = 1

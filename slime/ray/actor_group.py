@@ -326,6 +326,7 @@ class RayTrainGroup:
             model_path = self.args.update_weight_local_checkpoint_dir
         else:
             model_path = str(disk_weight_dir)
+        ray.get(self._rollout_manager.set_latest_rollout_weight.remote(model_path, weight_version))
         ray.get([engine.pause_generation.remote() for engine in engines])
         ray.get([engine.flush_cache.remote() for engine in engines])
         ray.get(
@@ -341,7 +342,11 @@ class RayTrainGroup:
         if verify_versions:
             engine_versions = ray.get([engine.get_weight_version.remote() for engine in engines])
             validate_rollout_weight_versions(weight_version, engine_versions)
-        if not self.args.update_weight_disk_keep_files:
+        retain_for_recovery = self.args.use_fault_tolerance and not self.args.update_weight_local_checkpoint_dir
+        if retain_for_recovery:
+            previous_weight_dir = disk_weight_dir.parent / f"weight_v{int(weight_version) - 1:06d}"
+            shutil.rmtree(previous_weight_dir, ignore_errors=True)
+        elif not self.args.update_weight_disk_keep_files:
             shutil.rmtree(disk_weight_dir, ignore_errors=True)
         # Colocated engines still have their KV cache offloaded here.  The
         # rollout manager resumes generation after onload_kv restores it.

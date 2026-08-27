@@ -643,6 +643,18 @@ def test_single_node_odyssey_launcher_avoids_train_memory_saver_by_default():
 
 
 @pytest.mark.unit
+def test_single_node_odyssey_launcher_uses_cuda12_compatible_flashinfer_norm():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments" / "train_odyssey_qwen3_sync.sh").read_text(encoding="utf-8")
+
+    assert 'FLASHINFER_USE_CUDA_NORM="${FLASHINFER_USE_CUDA_NORM:-1}"' in launcher
+    assert "export FLASHINFER_USE_CUDA_NORM" in launcher
+    assert 'export FLASHINFER_USE_TORCH_NORM="${FLASHINFER_USE_TORCH_NORM:-1}"' in launcher
+    assert 'os.path.join(sys.prefix, "lib")' in launcher
+    assert '"FLASHINFER_USE_CUDA_NORM", "FLASHINFER_USE_TORCH_NORM",' in launcher
+
+
+@pytest.mark.unit
 def test_odyssey_launcher_enforces_strict_dynamic_sampling():
     repo_root = Path(__file__).resolve().parents[1]
     launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")

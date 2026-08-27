@@ -391,6 +391,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     ``Sample`` objects with token/logprob/loss-mask fields populated.
     """
     state = GenerateState(args)
+    if state.aborted:
+        raise asyncio.CancelledError
     task = _task_from_sample(base_sample)
     session_id = base_sample.session_id or uuid.uuid4().hex
     base_sample.session_id = session_id
@@ -647,6 +649,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     deepsearch_action_turns = 0
     try:
         for step_idx in range(max_steps):
+            if state.aborted:
+                raise asyncio.CancelledError
             rollout_messages = (
                 _messages_without_historical_thinking(messages, parser=parser)
                 if discard_historical_thinking

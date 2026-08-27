@@ -102,8 +102,13 @@ def _normalize_legacy_te_extra_state(state):
     """Convert pre-TE-2.0 torch-dist extra state to the current byte tensor format."""
     if not isinstance(state, io.BytesIO):
         return state
-    state.seek(0)
-    legacy = torch.load(state, map_location="cpu", weights_only=False)
+    # ``BytesIO`` is the legacy container used by torch-dist for object state.
+    # Read from a fresh stream so a non-zero cursor (which is common after
+    # checkpoint deserialization) cannot truncate or invalidate the payload.
+    payload = state.getvalue()
+    if not payload:
+        return torch.empty(0, dtype=torch.uint8)
+    legacy = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=False)
     # Older TE checkpoints commonly contain ``[empty_uint8_tensor]`` when no
     # FP8 metadata was active.  Current TE represents that as an empty tensor.
     if legacy is None or (

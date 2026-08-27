@@ -10,6 +10,7 @@ from slime.rollout import sglang_rollout
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput
 from slime.rollout.task_family import select_task_family_quota_groups
 from slime.utils.eval_config import EvalDatasetConfig
+from slime.utils.misc import SingletonMeta
 from slime.utils.types import Sample
 
 NUM_GPUS = 0
@@ -670,6 +671,9 @@ def test_abort_cancels_pending_before_using_known_engine_urls(monkeypatch):
             self.pendings.add(task)
             self.pending_groups[task] = pending_group
 
+        def retire(self):
+            events.append("retire")
+
     async def unexpected_router_request(_url):
         raise AssertionError("known engine URLs should avoid router discovery")
 
@@ -680,9 +684,13 @@ def test_abort_cancels_pending_before_using_known_engine_urls(monkeypatch):
         aborted_urls.extend(urls)
         return False
 
+    async def reset_http_client(_args):
+        events.append("reset_http")
+
     monkeypatch.setattr(sglang_rollout, "GenerateState", AbortGenerateState)
     monkeypatch.setattr(sglang_rollout, "get", unexpected_router_request)
     monkeypatch.setattr(sglang_rollout, "abort_servers_until_idle", abort_known_engines)
+    monkeypatch.setattr(sglang_rollout.http_utils, "reset_http_client", reset_http_client)
 
     args = Namespace(
         partial_rollout=True,
@@ -698,7 +706,7 @@ def test_abort_cancels_pending_before_using_known_engine_urls(monkeypatch):
     )
 
     assert aborted_urls == ["http://engine-0", "http://engine-1"]
-    assert events == ["cancelled", "abort"]
+    assert events == ["cancelled", "abort", "retire", "reset_http"]
     assert aborted == [pending_group]
     assert pending_group[0].metadata["start_rollout_id"] == 7
     assert args._rollout_abort_engine_restart_required is True
@@ -722,8 +730,16 @@ def test_abort_requires_restart_when_task_cancellation_does_not_finish(monkeypat
             self.pendings.add(task)
             self.pending_groups[task] = [Sample(index=0, prompt="a")]
 
+        def retire(self):
+            self.aborted = True
+
     async def abort_cleanly(_urls):
         return True
+
+    resets = []
+
+    async def reset_http_client(_args):
+        resets.append("http")
 
     async def cancellation_stays_pending(tasks, timeout):
         return set(), set(tasks)
@@ -731,6 +747,7 @@ def test_abort_requires_restart_when_task_cancellation_does_not_finish(monkeypat
     monkeypatch.setattr(sglang_rollout, "GenerateState", AbortGenerateState)
     monkeypatch.setattr(sglang_rollout, "ABORT_TIMEOUT_SECONDS", 0.001)
     monkeypatch.setattr(sglang_rollout, "abort_servers_until_idle", abort_cleanly)
+    monkeypatch.setattr(sglang_rollout.http_utils, "reset_http_client", reset_http_client)
     monkeypatch.setattr(sglang_rollout.asyncio, "wait", cancellation_stays_pending)
     args = Namespace(
         partial_rollout=False,
@@ -742,6 +759,114 @@ def test_abort_requires_restart_when_task_cancellation_does_not_finish(monkeypat
     asyncio.run(sglang_rollout.abort(args, rollout_id=8))
 
     assert args._rollout_abort_engine_restart_required is True
+    assert resets == ["http"]
+
+
+def test_incomplete_abort_retires_generate_state(monkeypatch):
+    class RetirableState:
+        def __init__(self, _args):
+            self.aborted = False
+            self.pending_groups = {}
+            self.pendings = set()
+            self.quarantined_tasks = set()
+            self.retired = False
+
+            async def slow_cancellation():
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.05)
+
+            task = asyncio.create_task(slow_cancellation())
+            self.pendings.add(task)
+            self.pending_groups[task] = [Sample(index=0, prompt="a")]
+
+        def retire(self):
+            self.retired = True
+            self.aborted = True
+
+    state = None
+
+    def get_state(args):
+        nonlocal state
+        if state is None:
+            state = RetirableState(args)
+        return state
+
+    async def cancellation_stays_pending(tasks, timeout):
+        return set(), set(tasks)
+
+    async def reset_http_client(_args):
+        return None
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", get_state)
+    monkeypatch.setattr(sglang_rollout.asyncio, "wait", cancellation_stays_pending)
+    monkeypatch.setattr(sglang_rollout, "abort_servers_until_idle", lambda _urls: asyncio.sleep(0, result=True))
+    monkeypatch.setattr(sglang_rollout.http_utils, "reset_http_client", reset_http_client)
+
+    args = Namespace(
+        partial_rollout=False,
+        sglang_router_ip="router",
+        sglang_router_port=30000,
+        sglang_engine_urls=["http://engine-0"],
+    )
+    asyncio.run(sglang_rollout.abort(args, rollout_id=9))
+
+    assert state.retired is True
+    assert state.aborted is True
+
+
+def test_http_reset_failure_does_not_interrupt_abort_recovery(monkeypatch):
+    class RetirableState:
+        aborted = False
+        pending_groups = {}
+        pendings = set()
+        quarantined_tasks = set()
+
+        def __init__(self, _args):
+            pass
+
+        def retire(self):
+            self.aborted = True
+
+    async def reset_http_client(_args):
+        raise RuntimeError("transport reset failed")
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", RetirableState)
+    monkeypatch.setattr(sglang_rollout, "abort_servers_until_idle", lambda _urls: asyncio.sleep(0, result=False))
+    monkeypatch.setattr(sglang_rollout.http_utils, "reset_http_client", reset_http_client)
+    args = Namespace(
+        partial_rollout=False,
+        sglang_router_ip="router",
+        sglang_router_port=30000,
+        sglang_engine_urls=["http://engine-0"],
+    )
+
+    assert asyncio.run(sglang_rollout.abort(args, rollout_id=10)) == []
+    assert args._rollout_abort_engine_restart_required is True
+
+
+def test_generate_state_retirement_removes_singleton_and_cannot_be_reset():
+    original_instances = dict(SingletonMeta._instances)
+    try:
+        state = object.__new__(sglang_rollout.GenerateState)
+        state.aborted = False
+        state.retired = False
+        state.remaining_batch_size = 1
+        state.pendings = {object()}
+        state.pending_groups = {object(): object()}
+        SingletonMeta._instances[sglang_rollout.GenerateState] = state
+
+        state.retire()
+        state.reset()
+
+        assert sglang_rollout.GenerateState not in SingletonMeta._instances
+        assert state.aborted is True
+        assert state.retired is True
+        assert state.remaining_batch_size == 1
+    finally:
+        SingletonMeta._instances.clear()
+        SingletonMeta._instances.update(original_instances)
 
 
 def test_eval_generation_limits_inflight_tasks_and_preserves_order(monkeypatch):

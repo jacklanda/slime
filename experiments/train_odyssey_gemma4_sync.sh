@@ -249,8 +249,8 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-64}"
-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-48}"
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-48}"
 SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS:-21600}"
 # Gemma4 compounds small batch-shape-dependent kernel differences through 42
 # PLE-enhanced layers. Keep rollout batch-invariant to match deterministic
@@ -527,8 +527,8 @@ RUNS_ROOT="${RUNS_ROOT:-/share/nlp/share/gem/runs}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 
 default_experiment_name() {
-   #local prefix="odyssey-g4-8b-it-dev"
-   local prefix="odyssey-g4-4b-it-dev"
+   local prefix="odyssey-g4-8b-it-dev"
+   #local prefix="odyssey-g4-4b-it-dev"
    #local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
    #local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
    #local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
@@ -574,8 +574,8 @@ fi
 # Resolve the model before constructing MODEL_ARGS.  Gemma4's provider reads
 # the full HF config at runtime, but Megatron needs these shape arguments while
 # constructing the model and while converting the initial checkpoint.
-MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/gemma-4-E2B-it}"
-#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/gemma-4-E4B-it}"
+#MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/gemma-4-E2B-it}"
+MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/gemma-4-E4B-it}"
 if [ ! -f "${MODEL_DIR}/config.json" ]; then
    echo "Gemma4 model config does not exist: ${MODEL_DIR}/config.json" >&2
    exit 1
@@ -960,7 +960,7 @@ LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-20480}"
 # policy-loss checkpoint materializes a [chunk, vocab] logits tile during
 # backward, so 8192 would require roughly 4.3 GiB for one temporary tensor and
 # can exhaust an 80 GiB rank even when the forward pass fits.
-LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-1024}"
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-2048}"
 # Keep at least eight independent groups per task family with the default
 # 50/50 WebQA/MCP quota and a 256-sample global batch.
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"

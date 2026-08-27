@@ -33,6 +33,9 @@ class RolloutHealthMonitor:
         self._check_first_wait = args.rollout_health_check_first_wait
         self._need_first_wait = True  # Need to wait after each resume
         self._is_checking_enabled = False  # Track if health checking should be active
+        # pause() is a lifecycle barrier: memory must not be released while a
+        # generation health request is still executing.
+        self._check_lock = threading.RLock()
 
     def start(self) -> bool:
         """Start the health monitor thread. Called once during initialization.
@@ -84,12 +87,16 @@ class RolloutHealthMonitor:
         self._is_checking_enabled = False
 
     def pause(self) -> None:
-        """Pause health checking. Called when engines are offloaded."""
+        """Pause health checking and drain any check already in flight."""
         if self._pause_event is None:
             return
         logger.info("Pausing health monitor...")
         self._pause_event.set()
         self._is_checking_enabled = False
+        # RLock keeps this safe when an engine-failure callback pauses the
+        # monitor from the monitor thread itself.
+        with self._check_lock:
+            pass
 
     def resume(self) -> None:
         """Resume health checking. Called when engines are onloaded."""
@@ -137,24 +144,32 @@ class RolloutHealthMonitor:
                 break
 
     def _run_health_checks(self) -> None:
-        for rollout_engine_id, engine in enumerate(self._server_group.engines):
-            if self._stop_event is not None and self._stop_event.is_set():
-                break
-            if self._pause_event is not None and self._pause_event.is_set():
-                break
-            self._check_engine_health(rollout_engine_id, engine)
+        failed_engine_ids = []
+        with self._check_lock:
+            for rollout_engine_id, engine in enumerate(self._server_group.engines):
+                if self._stop_event is not None and self._stop_event.is_set():
+                    break
+                if self._pause_event is not None and self._pause_event.is_set():
+                    break
+                if not self._check_engine_health(rollout_engine_id, engine, notify_failure=False):
+                    failed_engine_ids.append(rollout_engine_id)
 
-    def _check_engine_health(self, rollout_engine_id, engine) -> None:
+        # Recovery can pause every monitor. Run callbacks after releasing this
+        # monitor's lock so simultaneous failures cannot deadlock each other.
+        for rollout_engine_id in failed_engine_ids:
+            self._notify_engine_failure(rollout_engine_id)
+
+    def _check_engine_health(self, rollout_engine_id, engine, *, notify_failure: bool = True) -> bool:
         if engine is None:
             logger.info(f"Skipping health check for engine {rollout_engine_id} (None)")
-            return
+            return True
 
         if not self._server_group.generation_health_check_enabled:
             logger.info(
                 "Skipping health check for engine %s because its server group is not generation-ready",
                 rollout_engine_id,
             )
-            return
+            return True
 
         try:
             ray.get(engine.health_generate.remote(timeout=self._check_timeout))
@@ -162,12 +177,15 @@ class RolloutHealthMonitor:
             logger.error(
                 f"Health check failed for rollout engine {rollout_engine_id} (ray timeout or error). Killing actor. Exception: {e}"
             )
-            self._kill_engine(rollout_engine_id=rollout_engine_id)
+            self._server_group.mark_engine_group_dead(rollout_engine_id)
+            if notify_failure:
+                self._notify_engine_failure(rollout_engine_id)
+            return False
         else:
             logger.debug(f"Health check passed for rollout engine {rollout_engine_id}")
+            return True
 
-    def _kill_engine(self, rollout_engine_id: int):
-        self._server_group.mark_engine_group_dead(rollout_engine_id)
+    def _notify_engine_failure(self, rollout_engine_id: int) -> None:
         if self._on_engine_failure is not None:
             try:
                 self._on_engine_failure(self._server_group, rollout_engine_id)

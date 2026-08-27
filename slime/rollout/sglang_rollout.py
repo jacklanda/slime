@@ -384,6 +384,7 @@ class GenerateState(metaclass=SingletonMeta):
         self.dp_counts = [0] * (args.sglang_dp_size or 1)
         self.dp_rank = 0
         self.quarantined_tasks: set[asyncio.Task] = set()
+        self.retired = False
 
         self.reset()
 
@@ -400,10 +401,18 @@ class GenerateState(metaclass=SingletonMeta):
             assert self.dp_counts[dp_rank] >= 0
 
     def reset(self) -> None:
+        if self.retired:
+            return
         self.remaining_batch_size = 0
         self.pendings = set()
         self.pending_groups = {}
         self.aborted = False
+
+    def retire(self) -> None:
+        """Prevent a failed rollout generation from sharing state with its successor."""
+        self.aborted = True
+        self.retired = True
+        SingletonMeta._instances.pop(type(self), None)
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         for group in samples:
@@ -928,19 +937,34 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         except Exception:
             logger.exception("Failed to discover SGLang workers from the router during abort")
 
+    restart_required = cancellation_incomplete
     if urls:
         engines_idle = await abort_servers_until_idle(urls)
         if not engines_idle or cancellation_incomplete:
             # The control-plane abort timed out, so the server-side requests
             # may outlive these Python tasks.  Tell RolloutManager to replace
             # the engine actors before any offload/onload cycle can reuse them.
-            setattr(args, "_rollout_abort_engine_restart_required", True)
+            args._rollout_abort_engine_restart_required = True
+            restart_required = True
             logger.error(
                 "SGLang abort left cancellation or engine state incomplete; marking rollout engines for restart"
             )
     else:
         logger.error("No SGLang engine URLs are available during abort; local rollout tasks were cancelled")
-        setattr(args, "_rollout_abort_engine_restart_required", True)
+        args._rollout_abort_engine_restart_required = True
+        restart_required = True
+
+    if restart_required:
+        # Quarantined producers and HTTP requests can retain permits from the
+        # current singleton semaphore/connection pool. Retire both generations
+        # so replacement engines are never paired with polluted client state.
+        state.retire()
+        try:
+            await http_utils.reset_http_client(args)
+        except Exception:
+            # Engine replacement is the authoritative recovery step. A broken
+            # client transport must not prevent RolloutManager from reaching it.
+            logger.exception("Failed to reset rollout HTTP transport during abort; engine restart will retry setup")
 
     if args.partial_rollout:
         logger.info(f"Collected {count} partial samples into the data buffer")

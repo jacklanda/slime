@@ -25,6 +25,15 @@ def test_gemma4_eval_accepts_series_alias_and_e4b_config():
 
 
 @pytest.mark.unit
+def test_gemma4_eval_disables_cuda_graphs_by_default():
+    launcher = (Path(__file__).resolve().parents[1] / "experiments" / "evals.sh").read_text(encoding="utf-8")
+
+    assert 'sglang_disable_cuda_graph_explicit=false' in launcher
+    assert '[ "${MODEL_SERIES}" = "gemma4" ] && ! is_truthy "${sglang_disable_cuda_graph_explicit}"' in launcher
+    assert 'SGLANG_DISABLE_CUDA_GRAPH=true' in launcher
+
+
+@pytest.mark.unit
 def test_hyperplane18_uses_sglang_cuda_compatibility_settings():
     launcher = (Path(__file__).resolve().parents[1] / "experiments" / "evals.sh").read_text(encoding="utf-8")
     rollout = (Path(__file__).resolve().parents[1] / "slime" / "ray" / "rollout.py").read_text(encoding="utf-8")
