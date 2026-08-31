@@ -54,65 +54,16 @@ def all_gather_params_async(
     param_infos_and_params: list[tuple[ParamInfo, torch.Tensor]],
 ) -> list[torch.Tensor]:
     """
-    Parallel TP all-gather for multiple params. Loop 1: for each TP param, allocate buffers +
-    dist.all_gather(async_op=True) on expert-TP/regular-TP group (skip expert_bias/non-TP/duplicated).
-    Loop 2: wait all NCCL handles (enables overlap). Loop 3: concat partitions + apply GLU rechunk/MoE dim fix.
+    TP all-gather for multiple params with bounded temporary memory.
+
+    This used to launch asynchronous gathers for every parameter in a bucket and
+    retain all partition buffers until every communication completed. Concatenating
+    the partitions then required another full copy of the bucket, which could exceed
+    device memory even when the configured bucket itself fit. Gather and materialize
+    each parameter before moving to the next one so only one parameter's temporary
+    partition buffers are live at a time.
     """
-    # Phase 1: Start all async all_gather operations
-    gather_tasks = []
-    handles = []
-
-    for info, param in param_infos_and_params:
-        # Prepare async all_gather
-        if _is_direct_buffer_name(info.name):
-            gather_tasks.append((info, param, None, None, None))
-            handles.append(None)
-        elif not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
-            gather_tasks.append((info, param.data, None, None, None))
-            handles.append(None)
-        else:
-            # Start async all_gather
-            if ".experts." in info.name:
-                tp_size = mpu.get_expert_tensor_parallel_world_size()
-                tp_group = mpu.get_expert_tensor_parallel_group()
-            else:
-                tp_size = mpu.get_tensor_model_parallel_world_size()
-                tp_group = mpu.get_tensor_model_parallel_group()
-
-            param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
-            handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
-            gather_tasks.append((info, None, handle, param_partitions, param.partition_dim))
-            handles.append(handle)
-
-    # Phase 2: Wait for ALL async operations to complete at once
-    # This ensures maximum parallelism by not blocking on individual operations
-    for handle in handles:
-        if handle is not None:
-            handle.wait()
-
-    # Phase 3: Process all results after all communications are done
-    gathered_params = []
-    for info, direct_param, handle, param_partitions, partition_dim in gather_tasks:
-        if handle is None:
-            # No all_gather needed
-            param = direct_param
-        else:
-            # Process the gathered partitions (same logic as original all_gather_param)
-            assert partition_dim is not None, "partition_stride != 1 is not supported"
-            # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
-            # TODO: check only GLU is used.
-            if "linear_fc1.weight" in info.name or "linear_fc1.bias" in info.name:
-                param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
-                param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
-            # this is bug in megatron's grouped moe.
-            if "linear_fc2.weight" in info.name:
-                if partition_dim == 0:
-                    partition_dim = 1
-            param = torch.cat(param_partitions, dim=partition_dim)
-
-        gathered_params.append(param)
-
-    return gathered_params
+    return [all_gather_param(info.name, param) for info, param in param_infos_and_params]
 
 
 def _is_direct_buffer_name(name: str) -> bool:

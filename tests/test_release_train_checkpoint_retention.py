@@ -52,6 +52,25 @@ def test_release_train_removes_only_previous_non_periodic_checkpoint(tmp_path):
     assert current.is_dir()
 
 
+def test_release_train_cleans_temporary_critic_checkpoint_without_releasing_critic(monkeypatch, tmp_path):
+    group = RayTrainGroup.__new__(RayTrainGroup)
+    group.role = "critic"
+    group.args = SimpleNamespace(
+        save=str(tmp_path),
+        save_interval=10,
+        release_train=True,
+    )
+    group._actor_handlers = [SimpleNamespace(save_model=SimpleNamespace(remote=lambda *_args, **_kwargs: None))]
+    temporary = tmp_path / "iter_0000000"
+    temporary.mkdir()
+    monkeypatch.setattr("slime.ray.actor_group.ray.get", lambda refs: refs)
+
+    group.save_model(1)
+
+    assert not temporary.exists()
+    assert group._actor_handlers
+
+
 @pytest.mark.unit
 def test_release_train_waits_for_force_killed_actor_processes_to_exit(monkeypatch):
     actors = [_Actor("actor-0"), _Actor("actor-1")]

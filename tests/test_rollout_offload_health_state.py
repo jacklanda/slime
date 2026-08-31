@@ -3,6 +3,7 @@ import threading
 import time
 
 import pytest
+import requests
 
 from slime.ray.rollout import RolloutManager, RolloutServer, ServerGroup
 from slime.utils.health_monitor import RolloutHealthMonitor
@@ -192,6 +193,46 @@ def test_active_rollout_reboost_loads_current_weights_before_router_registration
     assert group.pending_router_registration_indices == set()
 
 
+def test_reboost_before_first_weight_publication_recovers_initial_checkpoint(monkeypatch):
+    server, group = _make_server(None)
+    events = []
+    server.recover = lambda **kwargs: events.append(("recover", kwargs))
+    server.onload_kv = lambda: events.append(("onload_kv", {}))
+
+    manager_cls = RolloutManager.__ray_metadata__.modified_class
+    manager = object.__new__(manager_cls)
+    manager.args = Namespace(rollout_health_check_timeout=3.0)
+    manager.servers = {"default": server}
+    manager._latest_rollout_weight = None
+    manager._reboost_lock = threading.Lock()
+    manager.health_monitoring_pause = lambda: events.append(("pause", {}))
+    manager.health_monitoring_resume = lambda: events.append(("resume", {}))
+
+    manager._reboost_engine_group(group, 0)
+
+    assert events == [
+        ("pause", {}),
+        ("recover", {"health_check_timeout": 3.0}),
+        ("onload_kv", {}),
+        ("resume", {}),
+    ]
+
+
+def test_manager_onload_weights_pauses_health_monitor_before_memory_restore(monkeypatch):
+    server, _group = _make_server(_FakeEngine())
+    events = []
+    server.onload_weights = lambda: events.append("onload_weights")
+
+    manager_cls = RolloutManager.__ray_metadata__.modified_class
+    manager = object.__new__(manager_cls)
+    manager.servers = {"default": server}
+    manager.health_monitoring_pause = lambda: events.append("pause")
+
+    manager.onload_weights()
+
+    assert events[:2] == ["pause", "onload_weights"]
+
+
 def test_onload_checks_actor_liveness_without_generation(monkeypatch):
     monkeypatch.setattr("slime.ray.rollout.ray.get", _ray_get)
     monkeypatch.setattr("slime.ray.rollout.ray.kill", lambda *_args, **_kwargs: None)
@@ -250,6 +291,57 @@ def test_health_monitor_reboosts_after_marking_engine_dead(monkeypatch):
 
     assert group.all_engines == [None]
     assert reboosts == [(group, 0)]
+
+
+def test_health_monitor_tolerates_transient_http_503(monkeypatch):
+    monkeypatch.setattr("slime.utils.health_monitor.ray.get", _ray_get)
+    monkeypatch.setattr("slime.utils.health_monitor.ray.kill", lambda *_args, **_kwargs: None)
+
+    response = requests.Response()
+    response.status_code = 503
+    error = requests.HTTPError("service unavailable", response=response)
+    engine = _FakeEngine(health_generate_result=error)
+    _server_obj, group = _make_server(engine)
+    monitor = RolloutHealthMonitor(
+        group,
+        Namespace(
+            rollout_health_check_interval=1.0,
+            rollout_health_check_timeout=1.0,
+            rollout_health_check_first_wait=0.0,
+            rollout_health_check_failure_threshold=3,
+        ),
+    )
+
+    assert monitor._check_engine_health(0, engine) is True
+    assert group.all_engines == [engine]
+    assert monitor._check_engine_health(0, engine) is True
+    assert group.all_engines == [engine]
+    assert monitor._check_engine_health(0, engine) is False
+    assert group.all_engines == [None]
+
+
+def test_health_monitor_resets_transient_failures_after_success(monkeypatch):
+    monkeypatch.setattr("slime.utils.health_monitor.ray.get", _ray_get)
+    response = requests.Response()
+    response.status_code = 503
+    engine = _FakeEngine(health_generate_result=requests.HTTPError(response=response))
+    _server_obj, group = _make_server(engine)
+    monitor = RolloutHealthMonitor(
+        group,
+        Namespace(
+            rollout_health_check_interval=1.0,
+            rollout_health_check_timeout=1.0,
+            rollout_health_check_first_wait=0.0,
+            rollout_health_check_failure_threshold=2,
+        ),
+    )
+
+    assert monitor._check_engine_health(0, engine) is True
+    engine.health_generate.result = True
+    assert monitor._check_engine_health(0, engine) is True
+    engine.health_generate.result = requests.HTTPError(response=response)
+    assert monitor._check_engine_health(0, engine) is True
+    assert group.all_engines == [engine]
 
 
 def test_health_monitor_pause_waits_for_inflight_generation_check(monkeypatch):

@@ -162,3 +162,42 @@ class TestMegatronRoleConfig:
         assert actor_model.args.lr == 1e-6
         assert actor_model.create_calls[0]["args"].lr == 1e-6
         assert args.start_rollout_id == 7
+
+    def test_release_train_keeps_only_critic_on_train_offload(self, monkeypatch, tmp_path):
+        from slime.ray import placement_group as placement_group_module
+
+        args = _base_args(
+            use_critic=True,
+            release_train=True,
+            offload_train=False,
+            disable_param_buffers_cpu_backup=True,
+            save=str(tmp_path / "checkpoints"),
+            load="/initial/model",
+        )
+        groups = []
+
+        class DummyModel:
+            def __init__(self, model_args, role):
+                self.args = model_args
+                self.role = role
+
+            def create(self, rollout_manager=None):
+                return [0]
+
+        def fake_allocate_train_group(args, role="actor", **_kwargs):
+            model = DummyModel(args, role)
+            groups.append(model)
+            return model
+
+        monkeypatch.setattr(placement_group_module, "allocate_train_group", fake_allocate_train_group)
+
+        actor_model, critic_model = placement_group_module.create_training_models(
+            args,
+            {"actor": None, "critic": None},
+            object(),
+        )
+
+        assert actor_model.args.offload_train is False
+        assert critic_model.args.offload_train is True
+        assert critic_model.args.save == str(tmp_path / "checkpoints" / "critic")
+        assert critic_model.args.load == "/initial/model"

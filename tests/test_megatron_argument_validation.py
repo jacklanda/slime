@@ -477,6 +477,26 @@ def test_slime_validate_args_preserves_zero_rollout_gpus_without_colocate(monkey
 
 
 @pytest.mark.unit
+def test_release_train_with_critic_releases_actor_instead_of_enabling_actor_offload(monkeypatch, tmp_path):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        advantage_estimator="ppo",
+        colocate=True,
+        release_train=True,
+        save=str(tmp_path / "checkpoints"),
+        update_weight_mode="full",
+        update_weight_transport="disk",
+        update_weight_disk_dir=str(tmp_path / "weights"),
+    )
+
+    module.slime_validate_args(args)
+
+    assert args.use_critic is True
+    assert args.offload_train is False
+    assert args.offload_rollout is True
+
+
+@pytest.mark.unit
 def test_update_weight_delta_requires_disk_transport(monkeypatch):
     module = load_slime_arguments_module(monkeypatch)
     args = make_slime_validate_args(

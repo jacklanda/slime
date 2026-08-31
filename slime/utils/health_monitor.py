@@ -31,6 +31,12 @@ class RolloutHealthMonitor:
         self._check_interval = args.rollout_health_check_interval
         self._check_timeout = args.rollout_health_check_timeout
         self._check_first_wait = args.rollout_health_check_first_wait
+        # SGLang may briefly return 503 while its detokenizer is saturated or
+        # recovering. Keep that engine alive for a bounded number of checks.
+        self._transient_failure_threshold = max(
+            1, int(getattr(args, "rollout_health_check_failure_threshold", 3))
+        )
+        self._transient_failures: dict[int, int] = {}
         self._need_first_wait = True  # Need to wait after each resume
         self._is_checking_enabled = False  # Track if health checking should be active
         # pause() is a lifecycle barrier: memory must not be released while a
@@ -85,6 +91,7 @@ class RolloutHealthMonitor:
         self._stop_event = None
         self._pause_event = None
         self._is_checking_enabled = False
+        self._transient_failures.clear()
 
     def pause(self) -> None:
         """Pause health checking and drain any check already in flight."""
@@ -97,6 +104,7 @@ class RolloutHealthMonitor:
         # monitor from the monitor thread itself.
         with self._check_lock:
             pass
+        self._transient_failures.clear()
 
     def resume(self) -> None:
         """Resume health checking. Called when engines are onloaded."""
@@ -174,6 +182,26 @@ class RolloutHealthMonitor:
         try:
             ray.get(engine.health_generate.remote(timeout=self._check_timeout))
         except Exception as e:
+            status_code = self._http_status_code(e)
+            if status_code == 503:
+                failures = self._transient_failures.get(rollout_engine_id, 0) + 1
+                self._transient_failures[rollout_engine_id] = failures
+                if failures < self._transient_failure_threshold:
+                    logger.warning(
+                        "Health check for rollout engine %s returned transient HTTP 503 "
+                        "(%s/%s); keeping actor alive.",
+                        rollout_engine_id,
+                        failures,
+                        self._transient_failure_threshold,
+                    )
+                    return True
+                logger.error(
+                    "Health check for rollout engine %s returned HTTP 503 for %s "
+                    "consecutive checks; treating actor as failed. Exception: %s",
+                    rollout_engine_id,
+                    failures,
+                    e,
+                )
             logger.error(
                 f"Health check failed for rollout engine {rollout_engine_id} (ray timeout or error). Killing actor. Exception: {e}"
             )
@@ -182,8 +210,23 @@ class RolloutHealthMonitor:
                 self._notify_engine_failure(rollout_engine_id)
             return False
         else:
+            self._transient_failures.pop(rollout_engine_id, None)
             logger.debug(f"Health check passed for rollout engine {rollout_engine_id}")
             return True
+
+    @staticmethod
+    def _http_status_code(error: Exception) -> int | None:
+        """Find an HTTP status on direct or Ray-wrapped request exceptions."""
+        current = error
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            response = getattr(current, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if status_code is not None:
+                return status_code
+            current = getattr(current, "cause", None) or getattr(current, "__cause__", None)
+        return None
 
     def _notify_engine_failure(self, rollout_engine_id: int) -> None:
         if self._on_engine_failure is not None:

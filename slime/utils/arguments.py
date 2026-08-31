@@ -676,6 +676,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Timeout in seconds to wait for a rollout engine /health_generate response before killing it.",
             )
             parser.add_argument(
+                "--rollout-health-check-failure-threshold",
+                type=int,
+                default=3,
+                help="Consecutive HTTP 503 health checks tolerated before marking a rollout engine dead.",
+            )
+            parser.add_argument(
                 "--rollout-generation-control-timeout",
                 type=float,
                 default=300.0,
@@ -1123,6 +1129,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "(e.g., my_module.py:my_advantage_fn)."
                 ),
             )
+            parser.add_argument(
+                "--srppo-mode",
+                type=str,
+                default="shrinkage-critic-1-gradient-1",
+                choices=[
+                    "shrinkage-critic-k-gradient-1",
+                    "shrinkage-critic-1-gradient-1",
+                    "shrinkage-critic-k-gradient-k",
+                    "shrinkage-critic-1-gradient-k",
+                    "raw",
+                ],
+                help="SR-PPO sequential-credit mode used by the custom advantage hook.",
+            )
+            parser.add_argument("--srppo-pass-at-k", type=float, default=4.0)
+            parser.add_argument("--srppo-normalize-gradient-k", action="store_true")
             parser.add_argument(
                 "--use-kl-loss", action="store_true", default=False, help="whether to use KL loss from GRPO"
             )
@@ -2328,7 +2349,7 @@ def slime_validate_args(args):
     if args.offload_rollout is None:
         args.offload_rollout = False
 
-    if args.use_critic:
+    if args.use_critic and not args.release_train:
         args.offload_train = True
 
     if args.offload_train:
@@ -2416,8 +2437,6 @@ def slime_validate_args(args):
     if args.release_train:
         if args.train_backend != "megatron":
             raise ValueError("--release-train is only supported with the Megatron train backend.")
-        if args.use_critic:
-            raise ValueError("--release-train does not support critic training yet.")
         if args.keep_old_actor:
             raise ValueError("--release-train does not support --keep-old-actor.")
         if args.save is None:

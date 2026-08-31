@@ -1516,6 +1516,128 @@ def test_gemma4_finish_shadow_recovers_mixed_native_string_boundaries(result, ex
     assert parser.last_shadow_finish_repairs == ["implicit_structure_repair"]
 
 
+def test_gemma4_finish_shadow_accepts_generated_paired_quote_strings():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    response = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+        'result:{features:[\u00abCollaboration without conflicts.\u00bb,'
+        '\u300cFormatting rules\u300d]}}<tool_call|>'
+    )
+
+    assert parser.parse(response) == []
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert calls[0].arguments["result"] == {
+        "features": ["Collaboration without conflicts.", "Formatting rules"]
+    }
+    assert parser.last_shadow_finish_repairs == ["implicit_structure_repair"]
+
+
+def test_gemma4_finish_shadow_ignores_quote_noise_before_bare_field_name():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    response = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+        'result:{description:<|"|>Check the burner.<|"|>,'
+        '"safety_warning:<|"|>Yellow flames are unsafe.<|"|>}}<tool_call|>'
+    )
+
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert calls[0].arguments["result"] == {
+        "description": "Check the burner.",
+        "safety_warning": "Yellow flames are unsafe.",
+    }
+    assert parser.last_shadow_finish_repairs == ["implicit_structure_repair"]
+
+
+def test_gemma4_finish_shadow_ignores_quote_noise_after_bare_field_name():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    response = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+        'result:{computed_ranking":[],official_ranking:[]}}<tool_call|>'
+    )
+
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert calls[0].arguments["result"] == {
+        "computed_ranking": [],
+        "official_ranking": [],
+    }
+    assert parser.last_shadow_finish_repairs == ["implicit_structure_repair"]
+
+
+def test_gemma4_finish_shadow_splits_native_value_before_quoted_sibling_key():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    response = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:{'
+        'example:<|"|>Flame height is one inch.</h2>,"safety_warning:<|"|>'
+        'Yellow flames are unsafe.<|"|>}}<tool_call|>'
+    )
+
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert calls[0].arguments["result"] == {
+        "example": "Flame height is one inch.</h2>",
+        "safety_warning": "Yellow flames are unsafe.",
+    }
+    assert parser.last_shadow_finish_repairs == ["implicit_structure_repair"]
+
+
+def test_gemma4_finish_shadow_ignores_underscored_marker_after_field_name():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    response = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+        'result:{application_to_scarcity_ INSPECTION_NEEDED:<|"|>review<|"|>}}'
+        '<tool_call|>'
+    )
+
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert calls[0].arguments["result"] == {
+        "application_to_scarcity_": "review"
+    }
+    assert parser.last_shadow_finish_repairs == ["implicit_structure_repair"]
+
+
+def test_gemma4_finish_shadow_recovers_sibling_after_extra_closers():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    response = (
+        '<|tool_call>call:finish{command:<|"|>submit<|"|>,'
+        'result:{analysis:{ready:true}}}},summary:<|"|>complete<|"|>}<tool_call|>'
+    )
+
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert calls[0].arguments["result"] == {
+        "analysis": {"ready": True},
+        "summary": "complete",
+    }
+    assert parser.last_shadow_finish_repairs == ["implicit_structure_repair"]
+
+
+def test_gemma4_finish_shadow_wraps_only_plain_action_channel_answer():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    response = (
+        "<|channel>thought\nUse the evidence.\n<channel|>"
+        "The answer emitted by the policy.\n<eos>"
+    )
+
+    call = parser.repair_finish_shadow(response, [])
+
+    assert call is not None
+    assert call.arguments == {
+        "command": "submit",
+        "result": "The answer emitted by the policy.",
+    }
+    assert parser.last_shadow_finish_repairs == ["bare_answer"]
+    repaired_call = parser.repair_finish_shadow(
+        '<|tool_call>call:finish{result:{broken:true}<tool_call|>',
+        [],
+    )
+    assert repaired_call is not None
+    assert "bare_answer" not in parser.last_shadow_finish_repairs
+
+
 @pytest.mark.parametrize("suffix", [",\n<eos>", "}`<channel|><eos>"])
 def test_gemma4_finish_shadow_ignores_terminal_control_suffix(suffix):
     parser = make_tool_parser("gemma4", valid_tools={"finish"})
@@ -2395,6 +2517,43 @@ def test_mcp_unrepaired_finish_parser_error_penalizes_only_real_action_tokens(tm
     assert _policy_masked_text(sample) != evidence_call
 
 
+def test_mcp_plain_answer_shadow_uses_real_text_and_masks_repaired_turn(tmp_path: Path):
+    evidence_call = _gemma4_echo_call("evidence")
+    raw_response = (
+        "<|channel>thought\nThe evidence is sufficient.\n<channel|>"
+        "policy-authored answer"
+    )
+    sample_spec = _local_mcp_sample(tmp_path, question="Submit a plain string answer")
+    sample_spec.metadata["answer_schema"] = {"type": "string", "const": "policy-authored answer"}
+    sample_spec.metadata["verifier"]["verification_code"] = """
+def verify(tools, answer):
+    evidence = tools["echo"](value="verification")
+    return {
+        "passed": answer == "policy-authored answer" and evidence.get("echo") == "verification"
+    }
+"""
+
+    result = _run_generate_with_fake_sglang(
+        sample_spec,
+        [{"text": evidence_call}, {"text": raw_response}],
+        {
+            "SLIME_LOCAL_MCP_PROCESS_ISOLATION": "false",
+            "CREDIT_ASSIGNMENT_ENABLE": "True",
+            "FUSED_DISABLE_THINKING": "True",
+        },
+        tokenizer=FakeGemma4Tokenizer(),
+    )
+
+    sample = result[0] if isinstance(result, list) else result
+    assert sample.reward == 1.0
+    assert sample.metadata["tool_parser_shadow_finish_repairs"] == ["bare_answer"]
+    assert sample.metadata["tool_parser_shadow_finish_policy_masked"] is True
+    assert _response_text(sample).endswith(raw_response)
+    assert _policy_masked_text(sample) == evidence_call
+    policy_mask = sample.policy_loss_mask if sample.policy_loss_mask is not None else sample.loss_mask
+    assert policy_mask[-len(raw_response) :] == [0] * len(raw_response)
+
+
 @pytest.mark.parametrize(
     ("raw_response", "repair"),
     [
@@ -2540,6 +2699,81 @@ def test_gemma4_web_search_recovers_terminal_missing_ordinary_quote():
     assert parser.last_schema_errors == []
 
 
+def test_gemma4_web_search_ignores_terminal_backtick_after_complete_object():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+    response = (
+        '<|tool_call>call:web_search{query: "Anafi et al sleep stage '
+        '"coherent theta" RUN"}`<tool_call|><|tool_response>'
+    )
+
+    calls = parser.parse(response)
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {
+        "query": 'Anafi et al sleep stage "coherent theta" RUN'
+    }
+    assert parser.last_syntax_repairs == ["extra_wrapper_closer"]
+
+
+def test_gemma4_web_search_ignores_terminal_backtick_before_eos():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+    response = '<|tool_call>call:web_search{query:"exact query"}`\n<eos>'
+
+    calls = parser.parse(response)
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "exact query"}
+    assert parser.last_syntax_repairs == ["missing_tool_call_end"]
+
+
+def test_gemma4_web_search_repairs_terminal_delimiters_at_eos_only():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search", "file_editor"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+    response = '<|tool_call>call:web_search{query:<|"|>Mandinka 21 strings calabash\n<eos>'
+
+    calls = parser.parse(response)
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "Mandinka 21 strings calabash"}
+    assert parser.last_syntax_repairs == [
+        "missing_native_string_end",
+        "missing_argument_object_end",
+        "missing_tool_call_end",
+    ]
+
+    mutating = '<|tool_call>call:file_editor{path:<|"|>/tmp/value\n<eos>'
+    assert parser.parse(mutating) == []
+
+
+def test_gemma4_web_search_recovers_missing_call_end_with_trailing_eos_noise():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+
+    response = '<|tool_call>call:web_search{query:<|"|>exact query<|"|>} trailing text<eos>'
+
+    calls = parser.parse(response)
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "exact query"}
+    assert parser.last_syntax_repairs == ["missing_tool_call_end"]
+
+
+def test_gemma4_finish_shadow_recovers_missing_call_end_with_trailing_eos_noise():
+    parser = make_tool_parser("gemma4", valid_tools={"finish"})
+    parser.get_tool_prompt(json.dumps(finish_schema(), ensure_ascii=False))
+
+    response = '<|tool_call>call:finish{command:<|"|>submit<|"|>,result:<|"|>done<|"|>} trailing text<eos>'
+
+    assert parser.parse(response) == []
+    calls = parser.parse(response, shadow_finish=True)
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"command": "submit", "result": "done"}
+    assert parser.last_syntax_repairs == ["missing_tool_call_end"]
+
+
 def test_gemma4_tool_parser_accepts_logged_channel_call_wrapper():
     parser = make_tool_parser("gemma4", valid_tools={"web_search"})
     parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
@@ -2556,6 +2790,58 @@ def test_gemma4_tool_parser_accepts_logged_channel_call_wrapper():
         '<|channel>call:web_search{query:<|"|>Cheirolepidiaceae cone phyllotaxy<|"|>}'
         '<tool_call|><|tool_response>'
     ) is False
+
+
+def test_gemma4_tool_parser_ignores_native_calls_quoted_inside_thought_channel():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search", "finish"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+    response = (
+        '<|channel>thought\n'
+        'The example is <|tool_call>call:finish{command:<|"|>submit<|"|>,result:{...}}'
+        '<tool_call|>.\n<channel|>'
+        '<|tool_call>call:web_search{query:<|"|>actual query<|"|>}<tool_call|>'
+    )
+
+    calls = parser.parse(response)
+
+    assert len(calls) == 1
+    assert calls[0].name == "web_search"
+    assert calls[0].arguments == {"query": "actual query"}
+    assert parser.last_schema_errors == []
+
+
+def test_gemma4_tool_parser_ignores_malformed_native_marker_inside_think_block():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+    response = (
+        '<think>Use <|tool_call>call:web_search{query:<|"|>unfinished'
+        '<tool_call|></think>'
+        '<|tool_call>call:web_search{query:<|"|>actual<|"|>}<tool_call|>'
+    )
+
+    calls = parser.parse(response)
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "actual"}
+    assert parser.last_schema_errors == []
+
+
+def test_gemma4_tool_parser_discards_call_interrupted_by_new_thought_channel():
+    parser = make_tool_parser("gemma4", valid_tools={"web_search"})
+    parser.get_tool_prompt(json.dumps(web_search_schema(), ensure_ascii=False))
+    response = (
+        '<|channel>thought\nFirst attempt.\n<channel|>'
+        '<|tool_call>call:web_search{query:<|"|>unfinished query'
+        '<|channel>thought\nRetry cleanly.\n<channel|>'
+        '<|tool_call>call:web_search{query:<|"|>actual query<|"|>}<tool_call|>'
+        '<|tool_response>'
+    )
+
+    calls = parser.parse(response)
+
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "actual query"}
+    assert parser.last_schema_errors == []
 
 
 def test_gemma4_tool_parser_ignores_extra_wrapper_closer_after_argument_object():

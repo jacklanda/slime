@@ -975,7 +975,7 @@ N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
 # Keep a large candidate pool before selecting the fixed training batch. These
 # admission thresholds mirror the Qwen3 synchronous collector and prevent a
 # batch from being formed from the first few sparse mixed-reward groups.
-ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-false}"
+ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-true}"
 SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS:-0}"
 SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-0}"
 SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-0}"
@@ -1380,7 +1380,7 @@ OPTIMIZER_ARGS=(
 # has enough headroom while trainer CUDA allocations are still being released.
 if [ -z "${SGLANG_MEM_FRACTION_STATIC:-}" ]; then
    if is_truthy "${COLOCATE}"; then
-      SGLANG_MEM_FRACTION_STATIC=0.8
+      SGLANG_MEM_FRACTION_STATIC=0.6
    else
       SGLANG_MEM_FRACTION_STATIC="${GPU_MEMORY_UTILIZATION:-0.9}"
    fi
@@ -1478,12 +1478,18 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
 export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-10000000000}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 # Dynamic sequence packing and tiled-vocabulary backward create different-sized
-# allocations across microbatches, but the colocated lifecycle takes precedence:
-# TorchMemorySaver must be able to track and release every SGLang allocation.
-# Colocated rollout relies on TorchMemorySaver to release SGLang allocations
-# before actor training. TorchMemorySaver cannot track expandable segments and
-# refuses to initialize when they are enabled.
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
+# allocations across microbatches. Colocated rollout always enables SGLang's
+# TorchMemorySaver (including release-train mode), which cannot track
+# expandable segments. Keep the non-expandable allocator whenever colocated;
+# only the non-colocated path can safely use expandable segments by default.
+if [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ]; then
+   if is_truthy "${COLOCATE}"; then
+      PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False,max_split_size_mb:256"
+   else
+      PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+   fi
+fi
+export PYTORCH_CUDA_ALLOC_CONF
 export OPENROUTER_APP_NAME="${OPENROUTER_APP_NAME:-GRM}"
 export SLIME_FUSED_REQUIRE_WEIGHT_VERSION="${SLIME_FUSED_REQUIRE_WEIGHT_VERSION:-1}"
 

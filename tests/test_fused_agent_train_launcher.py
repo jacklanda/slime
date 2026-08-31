@@ -574,6 +574,12 @@ def test_odyssey_gemma4_sync_launcher_avoids_train_memory_saver_by_default():
     assert "OFFLOAD_TRAIN=false" in launcher
     assert "--update-weight-mode full" in launcher
     assert "--update-weight-transport disk" in launcher
+    assert 'if is_truthy "${COLOCATE}"; then' in launcher
+    assert 'SGLANG_MEM_FRACTION_STATIC=0.6' in launcher
+    assert (
+        'PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False,max_split_size_mb:256"'
+        in launcher
+    )
 
 
 @pytest.mark.unit
@@ -640,6 +646,16 @@ def test_single_node_odyssey_launcher_avoids_train_memory_saver_by_default():
     assert "OFFLOAD_TRAIN=false" in launcher
     assert "--update-weight-mode full" in launcher
     assert "--update-weight-transport disk" in launcher
+
+
+@pytest.mark.unit
+def test_srppo_launcher_releases_actor_but_keeps_custom_advantage_isolated():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments" / "train_srppo_qwen3_sync.sh").read_text(encoding="utf-8")
+
+    assert 'RELEASE_TRAIN="${RELEASE_TRAIN:-true}"' in launcher
+    assert '--custom-advantage-function-path "slime.algorithms.srppo.custom_advantage_fn"' in launcher
+    assert '--advantage-estimator "ppo"' in launcher
 
 
 @pytest.mark.unit

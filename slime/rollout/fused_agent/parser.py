@@ -1022,7 +1022,35 @@ class Gemma4ToolParser(QwenToolParser):
             and self.last_shadow_finish_repairs
         ):
             return shadow_actions[0]
-        return super().repair_finish_shadow(model_response, [])
+        shadow = super().repair_finish_shadow(model_response, [])
+        if shadow is not None:
+            return shadow
+
+        channel_end = model_response.rfind("<channel|>")
+        think_end = model_response.rfind("</think>")
+        if channel_end >= think_end and channel_end >= 0:
+            tail_start = channel_end + len("<channel|>")
+        elif think_end >= 0:
+            tail_start = think_end + len("</think>")
+        else:
+            tail_start = 0
+        tail = model_response[tail_start:].strip()
+        if tail.endswith("<eos>"):
+            tail = tail[: -len("<eos>")].rstrip()
+        if (
+            not tail
+            or "<|" in tail
+            or "<channel|>" in tail
+            or any(marker in tail for marker in self._CALL_BEGIN_MARKERS)
+        ):
+            return None
+        self.last_shadow_finish_repairs.append("bare_answer")
+        return ToolCall(
+            "finish",
+            {"command": "submit", "result": tail},
+            tail_start,
+            len(model_response),
+        )
 
     @staticmethod
     def _syntax_error_span(native_call: _Gemma4NativeCall, exc: ValueError) -> tuple[int, int] | None:
@@ -1195,6 +1223,15 @@ class Gemma4ToolParser(QwenToolParser):
                 return calls
             start, begin_marker = min(marker_matches)
 
+            # The native channel format allows the model to quote tool-call
+            # examples while reasoning.  Those examples are not executable
+            # actions; parsing them can both create false calls and attribute
+            # a later real action to the wrong syntax error.  Keep the raw
+            # response untouched and skip only markers inside a thought block.
+            if cls._in_thought_channel(text, start):
+                search_pos = start + len(begin_marker)
+                continue
+
             pos = start + len(begin_marker)
             prefix = cls._CALL_PREFIX_RE.match(text, pos)
             if prefix is None:
@@ -1208,10 +1245,19 @@ class Gemma4ToolParser(QwenToolParser):
             )
             obj_start = prefix.end()
             name_span = (prefix.start(1), prefix.end(1))
+            next_reasoning_boundaries = [
+                boundary
+                for marker in ("<|channel>thought", "<think>")
+                if (boundary := text.find(marker, obj_start)) >= 0
+            ]
+            next_reasoning = min(next_reasoning_boundaries) if next_reasoning_boundaries else -1
             try:
                 obj_end = cls._find_argument_object_end(text, obj_start)
             except ValueError:
                 end_marker_start = text.find(cls.tool_call_end, obj_start)
+                if next_reasoning >= 0 and (end_marker_start < 0 or next_reasoning < end_marker_start):
+                    search_pos = next_reasoning
+                    continue
                 if end_marker_start >= 0:
                     end = end_marker_start + len(cls.tool_call_end)
                     raw_args = text[obj_start:end_marker_start]
@@ -1237,6 +1283,32 @@ class Gemma4ToolParser(QwenToolParser):
                     search_pos = end
                     continue
                 raw_args = text[obj_start:].rstrip()
+                if not finish_call and raw_name == "web_search":
+                    boundary_candidates = [
+                        boundary
+                        for marker in (cls.tool_output_begin, "<eos>")
+                        if (boundary := text.find(marker, obj_start)) >= 0
+                    ]
+                    if boundary_candidates:
+                        boundary = min(boundary_candidates)
+                        repaired = cls._repair_incomplete_native_arguments(
+                            text[obj_start:boundary].rstrip(),
+                        )
+                        if repaired is not None:
+                            raw_args, repairs = repaired
+                            calls.append(
+                                _Gemma4NativeCall(
+                                    raw_name=raw_name,
+                                    raw_args=raw_args,
+                                    start=start,
+                                    end=boundary,
+                                    name_span=name_span,
+                                    args_start=obj_start,
+                                    repairs=(*repairs, "missing_tool_call_end"),
+                                )
+                            )
+                            search_pos = boundary
+                            continue
                 if repair_finish and finish_call:
                     repaired = cls._repair_incomplete_native_arguments(
                         raw_args,
@@ -1272,6 +1344,10 @@ class Gemma4ToolParser(QwenToolParser):
                 search_pos = pos
                 continue
 
+            if next_reasoning >= 0 and next_reasoning < obj_end:
+                search_pos = next_reasoning
+                continue
+
             end_marker_start = cls._skip_ws(text, obj_end)
             # Gemma4 occasionally closes the argument object correctly and then
             # leaks one or more array/parenthesis closers before the call marker.
@@ -1286,6 +1362,18 @@ class Gemma4ToolParser(QwenToolParser):
             ):
                 extra_wrapper_closer = True
                 end_marker_start = cls._skip_ws(text, end_marker_start + 1)
+            if (
+                raw_name == "web_search"
+                and end_marker_start < len(text)
+                and text[end_marker_start] == "`"
+            ):
+                after_backtick = cls._skip_ws(text, end_marker_start + 1)
+                if text.startswith(cls.tool_call_end, after_backtick) or cls._is_missing_call_end_boundary(
+                    text,
+                    after_backtick,
+                ):
+                    extra_wrapper_closer = True
+                    end_marker_start = after_backtick
             if not text.startswith(cls.tool_call_end, end_marker_start):
                 if repair_finish and finish_call:
                     # A wrong nested closer can make the strict boundary
@@ -1310,6 +1398,7 @@ class Gemma4ToolParser(QwenToolParser):
                 if (repair_finish or not finish_call) and cls._is_missing_call_end_boundary(
                     text,
                     end_marker_start,
+                    allow_trailing_eos_suffix=raw_name == "web_search" or (repair_finish and finish_call),
                 ):
                     calls.append(
                         _Gemma4NativeCall(
@@ -1340,6 +1429,17 @@ class Gemma4ToolParser(QwenToolParser):
                 )
             )
             search_pos = end
+
+    @staticmethod
+    def _in_thought_channel(text: str, position: int) -> bool:
+        """Return whether *position* is inside a non-action reasoning block."""
+        channel_start = text.rfind("<|channel>thought", 0, position + 1)
+        channel_end = text.rfind("<channel|>", 0, position + 1)
+        if channel_start > channel_end and text.find("<channel|>", position) >= 0:
+            return True
+        think_start = text.rfind("<think>", 0, position + 1)
+        think_end = text.rfind("</think>", 0, position + 1)
+        return think_start > think_end and text.find("</think>", position) >= 0
 
     @classmethod
     def _repair_incomplete_native_arguments(
@@ -1459,9 +1559,23 @@ class Gemma4ToolParser(QwenToolParser):
         return "".join(reversed(stack))
 
     @classmethod
-    def _is_missing_call_end_boundary(cls, text: str, pos: int) -> bool:
+    def _is_missing_call_end_boundary(
+        cls,
+        text: str,
+        pos: int,
+        *,
+        allow_trailing_eos_suffix: bool = False,
+    ) -> bool:
         suffix = text[pos:]
-        return not suffix or suffix.startswith(cls.tool_output_begin) or suffix.startswith("<eos>")
+        if not suffix or suffix.startswith(cls.tool_output_begin) or suffix.startswith("<eos>"):
+            return True
+        if not allow_trailing_eos_suffix or "<eos>" not in suffix:
+            return False
+        # A malformed web-search turn may append a small amount of model text
+        # before EOS after omitting the native closing marker.  Recover only
+        # when no later action/observation marker exists, so a genuine second
+        # turn is never consumed as part of the first call.
+        return not any(marker in suffix for marker in (cls.tool_call_begin, cls.tool_output_begin, "<|channel>"))
 
     @staticmethod
     def _skip_ws(text: str, pos: int) -> int:
@@ -1743,6 +1857,8 @@ class _Gemma4ArgumentParser:
         self.skip_ws()
         if self.text.startswith('<|"|>', self.pos):
             return self.parse_gemma_string(allow_terminal_object_close=terminal_native_string)
+        if self.allow_implicit_commas and self.peek() in {"\u00ab", "\u300c"}:
+            return self.parse_paired_quote_string()
         ch = self.peek()
         if schema_string and ch in {'"', "'"}:
             return self.parse_schema_string(allow_terminal_object_close=terminal_native_string)
@@ -1787,12 +1903,25 @@ class _Gemma4ArgumentParser:
             self.skip_ws()
             schema_string = self.object_depth == 1 and key in self.top_level_string_keys
             terminal_native_string = self.object_depth == 1 and key in self.terminal_native_string_keys
+            quoted_separator_pos = self._skip_ws_pos(self.pos + 1)
             if self.peek() in {":", "="}:
                 self.pos += 1
             elif (
                 self.allow_implicit_commas
+                and self.peek() in {'"', "'"}
+                and self.text[quoted_separator_pos : quoted_separator_pos + 1] in {":", "="}
+            ):
+                self.pos = quoted_separator_pos + 1
+            elif (
+                self.allow_implicit_commas
                 and "_" in key
-                and (separator := re.match(r"[A-Za-z]+\s*[:=]", self.text[self.pos :])) is not None
+                and (
+                    separator := re.match(
+                        r"[A-Za-z_][A-Za-z0-9_]*\s*[:=]",
+                        self.text[self.pos :],
+                    )
+                )
+                is not None
             ):
                 # A single hallucinated word occasionally appears between a
                 # valid snake_case key and its separator (for example
@@ -1864,6 +1993,8 @@ class _Gemma4ArgumentParser:
                 continue
             if self.allow_implicit_commas and self.object_depth == 2 and ch == "}":
                 comma_pos = self._skip_ws_pos(self.pos + 1)
+                while comma_pos < len(self.text) and self.text[comma_pos] in "}])":
+                    comma_pos = self._skip_ws_pos(comma_pos + 1)
                 if self.text.startswith('<|"|>', comma_pos):
                     comma_pos = self._skip_ws_pos(comma_pos + len('<|"|>'))
                 next_pos = (
@@ -1877,6 +2008,13 @@ class _Gemma4ArgumentParser:
                     # end of the argument object.
                     self.pos = next_pos
                     continue
+            if self.allow_implicit_commas and self.object_depth == 1 and ch == "]":
+                comma_pos = self._skip_ws_pos(self.pos + 1)
+                if self.text[comma_pos : comma_pos + 1] == ",":
+                    next_pos = self._skip_ws_pos(comma_pos + 1)
+                    if self._key_at(next_pos) is not None:
+                        self.pos = next_pos
+                        continue
             if ch == "}":
                 self.pos += 1
                 self.object_depth -= 1
@@ -1960,9 +2098,28 @@ class _Gemma4ArgumentParser:
         self.skip_ws()
         if self.text.startswith('<|"|>', self.pos):
             return self.parse_gemma_string()
+        if self.allow_implicit_commas and self.peek() in {'"', "'"}:
+            noisy_bare_key = re.match(
+                r'''["']([A-Za-z_][A-Za-z0-9_.-]*)(?=\s*[:=])''',
+                self.text[self.pos :],
+            )
+            if noisy_bare_key is not None:
+                self.pos += noisy_bare_key.end()
+                return noisy_bare_key.group(1)
         if self.peek() in {'"', "'"}:
             return self.parse_quoted_string(close_follow={":"})
         return self.parse_token(stop_chars={":", "=", "<", '"', "'", " ", "\n", "\t", "\r"})
+
+    def parse_paired_quote_string(self) -> str:
+        pairs = {"\u00ab": "\u00bb", "\u300c": "\u300d"}
+        opening = self.peek()
+        closing = pairs[opening]
+        start = self.pos + 1
+        end = self.text.find(closing, start)
+        if end < 0:
+            raise ValueError(f"Unterminated paired-quote string at offset {self.pos}.")
+        self.pos = end + 1
+        return self.text[start:end]
 
     def parse_schema_string(self, *, allow_terminal_object_close: bool = False) -> str:
         quote = self.peek()
@@ -2073,7 +2230,7 @@ class _Gemma4ArgumentParser:
         if self.allow_implicit_commas:
             search_end = end if end >= 0 else len(self.text)
             missing_key_close = re.search(
-                r',\s*(?=[A-Za-z][A-Za-z0-9.-]*_[A-Za-z0-9_.-]+\s*[:=])',
+                r''',\s*["']?(?=[A-Za-z][A-Za-z0-9.-]*_[A-Za-z0-9_.-]+\s*[:=])''',
                 self.text[start:search_end],
             )
             if missing_key_close is not None:

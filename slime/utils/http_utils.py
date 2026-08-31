@@ -240,6 +240,18 @@ async def _post(client, url, payload, max_retries=60, headers=None):
                     url,
                     response_text,
                 )
+                # httpx.HTTPStatusError retains its Request and Response
+                # objects. Those objects are not reliably serializable when
+                # this helper runs inside a Ray actor, which can mask the
+                # actual SGLang failure as Ray's UnserializableException.
+                # Keep the exception type for existing callers, but strip
+                # transport state before it crosses the actor boundary.
+                if isinstance(e, httpx.HTTPStatusError):
+                    status_code = e.response.status_code if e.response is not None else "unknown"
+                    message = f"HTTP {status_code} for {url}"
+                    if response_text:
+                        message += f": {response_text[:2000]}"
+                    raise httpx.HTTPStatusError(message, request=None, response=None) from None
                 raise
             logger.info(
                 "HTTP %s: %r, retrying... (attempt %d/%d, url=%s, response=%s)",

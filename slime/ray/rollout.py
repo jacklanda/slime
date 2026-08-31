@@ -1160,11 +1160,19 @@ class RolloutManager:
                 timeout = getattr(self.args, "rollout_health_check_timeout", None)
                 if isinstance(server, RolloutServer):
                     if server.update_weights and self._latest_rollout_weight is None:
-                        raise RuntimeError("Cannot reboost an updatable rollout engine before policy weights are published")
-                    server.recover(
-                        health_check_timeout=timeout,
-                        active_rollout_weight=self._latest_rollout_weight,
-                    )
+                        # Before the first policy publication, a replacement can
+                        # load the initial checkpoint used during startup.  It
+                        # still needs the normal KV onload before generation is
+                        # enabled; rejecting recovery leaves the logical slot
+                        # permanently dead (and the router with no worker).
+                        server.recover(health_check_timeout=timeout)
+                        if failed_group.needs_offload:
+                            server.onload_kv()
+                    else:
+                        server.recover(
+                            health_check_timeout=timeout,
+                            active_rollout_weight=self._latest_rollout_weight,
+                        )
                 else:
                     server.recover()
                 logger.info("Rollout engine group %s reboost completed", rollout_engine_id)
@@ -1372,6 +1380,11 @@ class RolloutManager:
             srv.onload(tags)
 
     def onload_weights(self):
+        # Weight onload is the first half of the update lifecycle.  Pause
+        # generation probes before restoring GPU weights; an in-flight
+        # /health_generate request can otherwise race the updater's subsequent
+        # pause_generation call and kill a healthy engine during synchronization.
+        self.health_monitoring_pause()
         for srv in self.servers.values():
             srv.onload_weights()
             if isinstance(srv, RolloutServer) and not srv.update_weights:

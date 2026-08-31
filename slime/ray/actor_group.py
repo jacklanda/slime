@@ -203,6 +203,7 @@ class RayTrainGroup:
             self.args.finetune = False
             self.args.no_load_optim = self.args.no_save_optim
             self.args.no_load_rng = False
+        if getattr(self.args, "release_train", False):
             self._remove_previous_temporary_checkpoint(rollout_id)
         return ret
 

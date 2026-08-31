@@ -1,6 +1,7 @@
 import copy
 import logging
 import socket
+from pathlib import Path
 
 import ray
 from ray.util.placement_group import placement_group
@@ -195,6 +196,13 @@ def create_training_models(args, pgs, rollout_manager, actor_cls=None):
             if args.megatron_config_path is not None
             else copy.deepcopy(args)
         )
+        if args.release_train:
+            # Release mode applies to actor workers only. The critic must remain
+            # resident across updates and use the normal colocated offload cycle.
+            critic_args.offload_train = True
+            critic_args.save = str(Path(args.save) / "critic")
+            if (Path(critic_args.save) / "latest_checkpointed_iteration.txt").is_file():
+                critic_args.load = critic_args.save
         if args.megatron_config_path is None:
             critic_args.disable_param_buffers_cpu_backup = False
 
