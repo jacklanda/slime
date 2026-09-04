@@ -29,20 +29,45 @@ def test_eval_launcher_routes_acebench_to_isolated_official_pipeline():
     assert 'ACEBENCH_AGENT_BACKEND=rllm_tool_agent' in launcher
     assert 'ACEBENCH_NUM_THREADS="${ACEBENCH_NUM_THREADS:-auto}"' in launcher
     assert 'ACEBENCH_NUM_THREADS=$((ACEBENCH_DP_SIZE * 8))' in launcher
-    assert 'ACEBENCH_OVERWRITE="${ACEBENCH_OVERWRITE:-false}"' in launcher
+    assert 'ACEBENCH_OVERWRITE="${ACEBENCH_OVERWRITE:-true}"' in launcher
     assert 'is_truthy "${ACEBENCH_OVERWRITE}"' in launcher
-    assert '--max-tokens "${EVAL_MAX_RESPONSE_LEN}"' not in launcher
-    assert 'ACEBENCH_MAX_TOKENS="${ACEBENCH_MAX_TOKENS:-}"' in launcher
+    acebench_branch = launcher.split('if is_truthy "${ACEBENCH_SELECTED}"; then', 1)[1].split(
+        'if is_truthy "${TAU2_SELECTED}"; then', 1
+    )[0]
+    assert 'ACEBENCH_OVERWRITE=true' in acebench_branch
+    assert '--max-tokens "${EVAL_MAX_RESPONSE_LEN}"' not in acebench_branch
+    assert 'ACEBENCH_LANGUAGE="${ACEBENCH_LANGUAGE:-en}"' in launcher
+    assert 'ACEBENCH_USER_MODEL="${ACEBENCH_USER_MODEL:-${OPENROUTER_MODEL:-openai/gpt-4o}}"' in launcher
+    assert 'ACEBENCH_USER_BASE_URL="${ACEBENCH_USER_BASE_URL:-${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}}"' in launcher
+    assert 'ACEBENCH_MAX_TOKENS="${ACEBENCH_MAX_TOKENS:-16384}"' in launcher
+    assert 'ACEBENCH_MAX_TOKENS=16384' in acebench_branch
     assert 'ACEBENCH_CMD+=(--max-tokens "${ACEBENCH_MAX_TOKENS}")' in launcher
+    assert 'ACEBENCH_TEMPERATURE="${ACEBENCH_TEMPERATURE:-0.2}"' in launcher
+    assert 'ACEBENCH_TOP_P="${ACEBENCH_TOP_P:-0.95}"' in launcher
+    assert 'EVAL_MAX_CONTEXT_LEN=40960' in launcher
+    assert 'EVAL_MAX_PROMPT_LEN=8192' in launcher
+    assert 'EVAL_MAX_RESPONSE_LEN=8192' in launcher
+    assert 'PER_STEP_MAX_TOKENS=8192' in launcher
+    assert 'SGLANG_MAX_RUNNING_REQUESTS=64' in launcher
+    assert 'LIMIT_PER_BENCHMARK=99999' in launcher
+    assert 'N_SAMPLES_PER_PROMPT=1' in launcher
+    assert '--temperature "${ACEBENCH_TEMPERATURE}"' in acebench_branch
+    assert '--top-p "${ACEBENCH_TOP_P}"' in acebench_branch
     assert 'ACEBENCH_VENV_DIR="${ACEBENCH_ROOT}/.venv-slime-evals"' in launcher
     assert 'python3 -m venv "${ACEBENCH_VENV_DIR}"' in launcher
     assert 'tomllib.load(file)["project"]["dependencies"]' in launcher
     assert 'export OPENROUTER_API_KEY="${ACEBENCH_USER_API_KEY}"' in launcher
     assert '--user-api-key "${ACEBENCH_USER_API_KEY}"' not in launcher
     assert 'exec "${ACEBENCH_CMD[@]}"' in launcher
-    acebench_branch = launcher.split('if is_truthy "${ACEBENCH_SELECTED}"; then', 1)[1].split(
-        'if is_truthy "${TAU2_SELECTED}"; then', 1
-    )[0]
+    assert 'LANGUAGE="en"' in acebench_launcher
+    assert 'NUM_THREADS="16"' in acebench_launcher
+    assert 'TEMPERATURE="0.2"' in acebench_launcher
+    assert 'MAX_SAMPLES_PER_TASK="99999"' in acebench_launcher
+    assert 'MAX_TOKENS="16384"' in acebench_launcher
+    assert 'ENABLE_THINKING="true"' in acebench_launcher
+    assert 'SGLANG_CONTEXT_LENGTH="40960"' in acebench_launcher
+    assert 'USER_MODEL="${OPENROUTER_MODEL:-openai/gpt-4o}"' in acebench_launcher
+    assert 'USER_BASE_URL="${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"' in acebench_launcher
     assert "ray stop --force" not in acebench_branch
     assert 'is_truthy "${CLEANUP}"' not in acebench_branch
     assert 'export PYTHONPATH="${REPO_ROOT}' in acebench_branch

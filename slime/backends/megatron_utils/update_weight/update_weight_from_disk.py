@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import time
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -12,6 +13,28 @@ from ray.actor import ActorHandle
 from slime.utils.distributed_utils import get_gloo_group
 
 from ..hf_checkpoint_saver import save_hf_model_to_path
+
+
+def _mkdir_shared(path: Path, *, retries: int = 20, delay: float = 0.1) -> None:
+    """Create ``path`` while tolerating eventually-consistent shared filesystems.
+
+    On object-store-backed filesystems a concurrent rank can create the directory
+    between ``mkdir`` and the follow-up ``is_dir`` check performed by
+    :meth:`Path.mkdir`.  The directory may not be visible to that rank yet,
+    causing ``mkdir(exist_ok=True)`` to leak ``FileExistsError``.  Retry the
+    visibility check briefly before surfacing a genuine path collision.
+    """
+
+    for attempt in range(retries):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return
+        except FileExistsError:
+            if path.is_dir():
+                return
+            if attempt + 1 == retries:
+                raise
+            time.sleep(delay)
 
 
 class UpdateWeightFromDisk:
@@ -72,7 +95,7 @@ class UpdateWeightFromDisk:
 
         # every writing rank creates the dir itself: a non-POSIX shared filesystem may not surface
         # one rank's mkdir to another until commit
-        version_dir.mkdir(parents=True, exist_ok=True)
+        _mkdir_shared(version_dir)
         save_hf_model_to_path(
             self.args,
             version_dir,

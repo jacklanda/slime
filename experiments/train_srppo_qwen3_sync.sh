@@ -161,6 +161,7 @@ Options:
   --val_before_train BOOL                Run one eval before training starts. Default: true.
   --n-samples-per-eval-prompt N          Eval samples per prompt. Default: 1.
   --offload-train BOOL                   Offload trainer model between phases. Disabled by --release-train.
+  --critic-offload-train BOOL            Offload the persistent critic in release mode. Default: true.
   --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: true.
   --max-tool-output-length N             Fused max tool output length env.
   --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 128.
@@ -319,6 +320,7 @@ EVAL_PROMPT_DATA=()
 # changes it. Release-train overrides this below because it replaces the trainer
 # actor instead of pausing it.
 OFFLOAD_TRAIN="${OFFLOAD_TRAIN:-${offload_train:-}}"
+CRITIC_OFFLOAD_TRAIN="${CRITIC_OFFLOAD_TRAIN:-true}"
 # Recreate actor workers through the shared checkpoint path by default. The
 # critic remains persistent and uses the normal colocated offload cycle.
 RELEASE_TRAIN="${RELEASE_TRAIN:-true}"
@@ -479,6 +481,7 @@ while [ "$#" -gt 0 ]; do
          ;;
       --n-samples-per-eval-prompt) N_SAMPLES_PER_EVAL_PROMPT="${2:?Missing value for --n-samples-per-eval-prompt}"; shift 2 ;;
       --offload-train) OFFLOAD_TRAIN="${2:?Missing value for --offload-train}"; shift 2 ;;
+      --critic-offload-train) CRITIC_OFFLOAD_TRAIN="${2:?Missing value for --critic-offload-train}"; shift 2 ;;
       --release-train) RELEASE_TRAIN="${2:?Missing value for --release-train}"; shift 2 ;;
       --max-tool-output-length) MAX_TOOL_OUTPUT_LENGTH="${2:?Missing value for --max-tool-output-length}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
@@ -521,6 +524,12 @@ if is_truthy "${RELEASE_TRAIN}"; then
    fi
    OFFLOAD_TRAIN=false
 fi
+
+if ! is_truthy "${CRITIC_OFFLOAD_TRAIN}" && ! is_truthy "${RELEASE_TRAIN}"; then
+   echo "CRITIC_OFFLOAD_TRAIN=false requires RELEASE_TRAIN=true." >&2
+   exit 2
+fi
+export SLIME_CRITIC_OFFLOAD_TRAIN="${CRITIC_OFFLOAD_TRAIN}"
 
 if is_truthy "${ENABLE_USE_GRM_TRAIN}" || is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTOM_RM_PATH}" ]; then
    if [ -z "${OPENROUTER_API_KEY:-}" ] \
@@ -1487,7 +1496,11 @@ OPTIMIZER_ARGS=(
 # weight synchronization. Keep the static pool at 0.6 so KV/CUDA graph resume
 # has enough headroom while trainer CUDA allocations are still being released.
 if [ -z "${SGLANG_MEM_FRACTION_STATIC:-}" ]; then
-   if is_truthy "${COLOCATE}"; then
+   if ! is_truthy "${CRITIC_OFFLOAD_TRAIN}"; then
+      # A resident Qwen3-4B critic occupies about 29 GiB on each 80 GiB GPU.
+      # Keep the rollout pool below the remaining capacity.
+      SGLANG_MEM_FRACTION_STATIC=0.55
+   elif is_truthy "${COLOCATE}"; then
       SGLANG_MEM_FRACTION_STATIC=0.8
    else
       SGLANG_MEM_FRACTION_STATIC="${GPU_MEMORY_UTILIZATION:-0.9}"

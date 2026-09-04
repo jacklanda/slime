@@ -45,3 +45,14 @@ def test_hyperplane18_uses_sglang_cuda_compatibility_settings():
     assert launcher.index("export FLASHINFER_USE_CUDA_NORM=1") < launcher.index("ray start --head")
     assert '"FLASHINFER_USE_CUDA_NORM",' in rollout
     assert '"FLASHINFER_USE_TORCH_NORM",' in rollout
+
+
+@pytest.mark.unit
+def test_eval_avoids_flashinfer_cutlass_norm_by_default_without_disabling_cuda_graphs():
+    launcher = (Path(__file__).resolve().parents[1] / "experiments" / "evals.sh").read_text(encoding="utf-8")
+
+    fallback = 'export FLASHINFER_USE_TORCH_NORM="${FLASHINFER_USE_TORCH_NORM:-1}"'
+    assert fallback in launcher
+    assert launcher.index(fallback) < launcher.index('"${BFCL_CMD[@]}"')
+    assert launcher.index(fallback) < launcher.index("ray start --head")
+    assert 'SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-false}"' in launcher

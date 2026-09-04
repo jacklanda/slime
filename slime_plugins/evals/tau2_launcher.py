@@ -386,9 +386,10 @@ import tau2.environment.utils.interface_agent as interface_agent
 import tau2.evaluator.evaluator_nl_assertions as evaluator_nl_assertions
 import tau2.runner.batch as batch
 import tau2.user.user_simulator as user_simulator
+import httpx
+from tau2.data_model.message import AssistantMessage, ToolCall
 from tau2.data_model.simulation import TextRunConfig
 from tau2.run import run_domain
-from tau2.utils.llm_utils import generate as official_generate
 from slime_plugins.evals import tau2_fused_transport
 
 def safe_event_loop_del(self, original_del=batch._original_del):
@@ -406,13 +407,94 @@ llm_agent.AGENT_INSTRUCTION = tau2_fused_transport.AGENT_INSTRUCTION
 llm_agent.generate = tau2_fused_transport.generate
 
 def generate_external(config, api_key_env, *args, **kwargs):
-    if args:
-        args = (config["model"], *args[1:])
-    else:
-        kwargs["model"] = config["model"]
-    kwargs["base_url"] = config["base_url"]
-    kwargs["api_key"] = os.environ[api_key_env]
-    return official_generate(*args, **kwargs)
+    messages = kwargs.pop("messages", args[1] if len(args) > 1 else None)
+    if messages is None:
+        raise TypeError("tau2 external generation requires messages")
+    tools = kwargs.pop("tools", None)
+    serialized_messages = []
+    for message in messages:
+        item = {"role": message.role, "content": message.content or ""}
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls:
+            item["tool_calls"] = [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+                }
+                for call in tool_calls
+            ]
+        if message.role == "tool" and getattr(message, "id", None):
+            item["tool_call_id"] = message.id
+        serialized_messages.append(item)
+    payload = {"model": config["model"], "messages": serialized_messages}
+    if tools:
+        payload["tools"] = [tool.openai_schema for tool in tools]
+        payload["tool_choice"] = kwargs.pop("tool_choice", "auto")
+    for name in ("temperature", "top_p", "max_tokens", "response_format"):
+        if name in kwargs and kwargs[name] is not None:
+            payload[name] = kwargs[name]
+    if config.get("max_tokens") is not None:
+        payload.setdefault("max_tokens", config["max_tokens"])
+    if config.get("json_mode"):
+        payload["response_format"] = {"type": "json_object"}
+    timeout = kwargs.get("timeout", 60)
+    endpoint = config["base_url"].rstrip("/") + "/chat/completions"
+    response = httpx.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {os.environ[api_key_env]}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    data = response.json()
+    choice = data["choices"][0]
+    message = choice["message"]
+    raw_tool_calls = message.get("tool_calls", [])
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    if config.get("json_mode"):
+        parsed_content = None
+        for candidate in (content, message.get("reasoning"), message.get("reasoning_content")):
+            if not isinstance(candidate, str):
+                continue
+            start = candidate.find("{")
+            if start < 0:
+                continue
+            try:
+                parsed_content, _ = json.JSONDecoder().raw_decode(candidate[start:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed_content, dict):
+                break
+            parsed_content = None
+        if parsed_content is None:
+            raise ValueError("OpenRouter evaluator response contained no JSON object")
+        content = json.dumps(parsed_content)
+    elif (not isinstance(content, str) or not content.strip()) and not raw_tool_calls:
+        raise ValueError("OpenRouter response contained no assistant text")
+    tool_calls = []
+    for call in raw_tool_calls:
+        function = call.get("function") or {}
+        arguments = function.get("arguments") or "{}"
+        parsed_arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+        if not isinstance(parsed_arguments, dict):
+            raise ValueError("OpenRouter returned non-object tool arguments")
+        tool_calls.append(
+            ToolCall(id=call.get("id", ""), name=function.get("name", ""), arguments=parsed_arguments)
+        )
+    tool_calls = tool_calls or None
+    usage = data.get("usage")
+    return AssistantMessage.text(
+        content,
+        tool_calls=tool_calls,
+        usage=usage,
+        raw_data=data,
+    )
 
 def generate_user(*args, **kwargs):
     message = generate_external(payload["user_llm"], "TAU2_USER_API_KEY", *args, **kwargs)
@@ -432,14 +514,12 @@ def run_single_task_with_session_cleanup(*args, **kwargs):
         simulation = original_run_single_task(*args, **kwargs)
         if simulation.termination_reason.value == "user_error":
             raise RuntimeError("user simulator violated the tau2 communication protocol")
-        if simulation.termination_reason.value in {"max_steps", "context_window_exceeded"}:
-            raise RuntimeError(f"tau2 trajectory ended abnormally: {simulation.termination_reason.value}")
-        if any(
-            (message.raw_data or {}).get("slime_fused_finish_reason") == "length"
-            for message in simulation.messages
-            if message.role == "assistant"
-        ):
-            raise RuntimeError("tau2 trajectory contains a max-length agent response")
+        # max_steps is a normal tau2 termination.  The official evaluator
+        # records it with zero reward; converting it into an exception makes
+        # the batch runner retry and finally misclassify it as an infrastructure
+        # error with an empty trajectory.
+        if simulation.termination_reason.value == "context_window_exceeded":
+            raise RuntimeError("tau2 trajectory ended abnormally: context_window_exceeded")
         return simulation
     finally:
         if simulation:
@@ -512,6 +592,8 @@ run_domain(TextRunConfig(**payload["settings"]))
                         "evaluator_llm": {
                             "model": args.evaluator_model or args.user_model,
                             "base_url": (args.evaluator_base_url or args.user_base_url).rstrip("/"),
+                            "json_mode": True,
+                            "max_tokens": args.user_max_tokens,
                         },
                     }
                 ),

@@ -204,7 +204,7 @@ UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
 # all advertised CPUs are consumed by rollout/trainer workers, a synchronous
 # torch-dist save can starve raylet long enough for the node to be declared
 # dead.  Preserve an explicit override for hosts with a different topology.
-RAY_NUM_CPUS="${RAY_NUM_CPUS:-60}"
+RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 TRAIN_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND:-${RETRIEVAL_BACKEND:-local}}"
 #TRAIN_RETRIEVAL_BACKEND="${TRAIN_RETRIEVAL_BACKEND:-${RETRIEVAL_BACKEND:-serper}}"
 EVAL_RETRIEVAL_BACKEND="${EVAL_RETRIEVAL_BACKEND:-serper}"

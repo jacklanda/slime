@@ -201,3 +201,36 @@ class TestMegatronRoleConfig:
         assert critic_model.args.offload_train is True
         assert critic_model.args.save == str(tmp_path / "checkpoints" / "critic")
         assert critic_model.args.load == "/initial/model"
+
+    def test_release_train_can_keep_critic_resident_when_tms_offload_is_disabled(self, monkeypatch, tmp_path):
+        from slime.ray import placement_group as placement_group_module
+
+        args = _base_args(
+            use_critic=True,
+            release_train=True,
+            offload_train=False,
+            save=str(tmp_path / "checkpoints"),
+        )
+
+        class DummyModel:
+            def __init__(self, model_args, role):
+                self.args = model_args
+                self.role = role
+
+            def create(self, rollout_manager=None):
+                return [0]
+
+        monkeypatch.setenv("SLIME_CRITIC_OFFLOAD_TRAIN", "false")
+        monkeypatch.setattr(
+            placement_group_module,
+            "allocate_train_group",
+            lambda args, role="actor", **_kwargs: DummyModel(args, role),
+        )
+
+        _actor_model, critic_model = placement_group_module.create_training_models(
+            args,
+            {"actor": None, "critic": None},
+            object(),
+        )
+
+        assert critic_model.args.offload_train is False

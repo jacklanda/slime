@@ -26,7 +26,7 @@ def test_eval_launcher_routes_bfcl_v3_to_gorilla_pipeline():
     assert '--tp-size "${ROLLOUT_NUM_GPUS_PER_ENGINE}"' in launcher
     assert '--dp-size "${BFCL_DP_SIZE}"' in launcher
     assert 'BFCL_STICKY_ENGINE_ROUTING="${BFCL_STICKY_ENGINE_ROUTING:-true}"' in launcher
-    assert "BFCL_NUM_THREADS=$((BFCL_DP_SIZE * 16))" in launcher
+    assert "BFCL_NUM_THREADS=$((BFCL_DP_SIZE * 32))" in launcher
     assert '--max-running-requests "${BFCL_SGLANG_MAX_RUNNING_REQUESTS}"' in launcher
     assert "BFCL_CMD+=(--sticky-engine-routing)" in launcher
     assert '--agent-mode "${BFCL_AGENT_MODE}"' in launcher
@@ -56,6 +56,7 @@ def test_eval_launcher_routes_bfcl_v3_to_gorilla_pipeline():
     assert "unset BFCL_DATA_DIR || true" in launcher
     assert '*qwen3.5-4b*) BFCL_MODEL_KEY="Qwen/Qwen3.5-4B"' in launcher
     assert '*qwen3-8b*) BFCL_MODEL_KEY="Qwen/Qwen3-8B"' in launcher
+    assert '*qwen3-14b*) BFCL_MODEL_KEY="Qwen/Qwen3-14B"' in launcher
     assert "export BFCL_SLIME_TOOL_PARSER_PATH=" in launcher
     assert 'export FUSED_MODEL_SERIES="${MODEL_SERIES}"' in launcher
     assert 'export FUSED_MAX_STEPS="${MAX_STEPS}"' in launcher
@@ -63,6 +64,8 @@ def test_eval_launcher_routes_bfcl_v3_to_gorilla_pipeline():
     assert 'BFCL_SEED="${BFCL_SEED:-${ROLLOUT_SEED}}"' in launcher
     assert 'BFCL_MAX_TOKENS="${EVAL_MAX_RESPONSE_LEN}"' in launcher
     assert 'export BFCL_WEB_SEARCH_MAX_STEPS="${BFCL_WEB_SEARCH_MAX_STEPS}"' in launcher
+    norm_fallback = 'export FLASHINFER_USE_TORCH_NORM="${FLASHINFER_USE_TORCH_NORM:-1}"'
+    assert launcher.index(norm_fallback) < launcher.index('"${BFCL_CMD[@]}"')
     assert "BFCL_WEB_SEARCH_MAX_STEPS=16" in launcher
     assert 'BFCL_DISCARD_HISTORICAL_THINKING="${BFCL_DISCARD_HISTORICAL_THINKING:-}"' in launcher
     assert 'BFCL_DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING}"' in launcher
@@ -77,6 +80,7 @@ def test_eval_launcher_routes_bfcl_v3_to_gorilla_pipeline():
     assert '"Qwen/Qwen3-4B-Thinking-2507-FC-RLLM-ToolAgent"' in model_config
     assert '"Qwen/Qwen3.5-4B-FC-RLLM-ToolAgent"' in model_config
     assert '"Qwen/Qwen3-8B-FC-RLLM-ToolAgent"' in model_config
+    assert '"Qwen/Qwen3-14B-FC-RLLM-ToolAgent"' in model_config
 
 
 @pytest.mark.unit

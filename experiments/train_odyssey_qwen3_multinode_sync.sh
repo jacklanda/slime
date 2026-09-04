@@ -60,10 +60,10 @@ Options:
   --retrieval-lexrank-multiprocessing BOOL
                                          Retrieval LexRank multiprocessing env.
   --retrieval-lexrank-workers N          Retrieval LexRank workers env.
-  --master-addr HOST                     Ray head address. Default: dgx-hyperplane17.
-  --worker-addr HOST                     Ray worker address. Default: hgx-hyperplane08.
+  --master-addr HOST                     Ray head address. Default: hgx-hyperplane02.
+  --worker-addr HOST                     Ray worker address. Default: hgx-hyperplane09.
   --ray-ssh-user USER                    SSH user used to start Ray on the worker. Default: current user.
-  --socket-ifname NAME                   Interface used by Gloo/NCCL. Default: enp225s0f0np0.
+  --socket-ifname NAME                   Interface used by Gloo/NCCL. Default: enp168s0f0np0.
   --ray-num-cpus N                       Ray CPU resource count.
   --tail-guard BOOL                      Stored in env for compatible fused code.
   --tail-guard-time-guard BOOL           Stored in env for compatible fused code.
@@ -191,11 +191,11 @@ SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 COLOCATE="${COLOCATE:-true}"
 ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
-HYPERPLANE01_CUDA_VISIBLE_DEVICES="${HYPERPLANE01_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-MASTER_ADDR="${MASTER_ADDR:-dgx-hyperplane19}"
-WORKER_ADDR="${WORKER_ADDR:-hgx-hyperplane01}"
+HYPERPLANE02_CUDA_VISIBLE_DEVICES="${HYPERPLANE02_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+MASTER_ADDR="${MASTER_ADDR:-hgx-hyperplane02}"
+WORKER_ADDR="${WORKER_ADDR:-hgx-hyperplane09}"
 RAY_SSH_USER="${RAY_SSH_USER:-$(id -un)}"
-SOCKET_IFNAME="${SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-enp225s0f0np0}}"
+SOCKET_IFNAME="${SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-enp168s0f0np0}}"
 RAY_BIN="${RAY_BIN:-$(command -v ray)}"
 UNIFIED_SYSTEM_PROMPT="${UNIFIED_SYSTEM_PROMPT:-false}"
 DISABLE_THINKING="${DISABLE_THINKING:-false}"
@@ -242,14 +242,14 @@ NORMALIZE_ADVANTAGES="${NORMALIZE_ADVANTAGES:-false}"
 LR="${LR:-1e-6}"
 CLIP_GRAD="${CLIP_GRAD:-1.0}"
 EPS_CLIP="${EPS_CLIP:-0.2}"
-EPS_CLIP_HIGH="${EPS_CLIP_HIGH:-0.28}"
+EPS_CLIP_HIGH="${EPS_CLIP_HIGH:-0.6}"
 KL_COEF="${KL_COEF:-0.0}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
 # A zero-weight reference KL neither changes advantages nor the actor loss.
 # Keep the expensive reference-model forward opt-in for this Qwen3 workload.
 USE_KL_LOSS="${USE_KL_LOSS:-0}"
 USE_TIS="${USE_TIS:-0}"
-USE_WANDB="${USE_WANDB:-0}"
+USE_WANDB="${USE_WANDB:-1}"
 WANDB_RESUME_SAME_RUN="${WANDB_RESUME_SAME_RUN:-1}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
@@ -266,7 +266,7 @@ TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-7200}"
 # Bound each group attempt. The rollout stage determines whether an unfinished
 # slot is retryable infra, permanent task failure, or policy behavior.
-ROLLOUT_GROUP_TIMEOUT="${ROLLOUT_GROUP_TIMEOUT:-3600}"
+ROLLOUT_GROUP_TIMEOUT="${ROLLOUT_GROUP_TIMEOUT:-7200}"
 ROLLOUT_INFRA_RETRY_TIMES="${ROLLOUT_INFRA_RETRY_TIMES:-4}"
 MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
@@ -491,8 +491,8 @@ if [ "${ACTOR_NUM_NODES}" -ne 2 ] || [ "${ACTOR_NUM_GPUS_PER_NODE}" -ne 8 ]; the
    exit 2
 fi
 case "${MASTER_ADDR%%.*}" in
-   dgx-hyperplane19|dgx-hyperplane17) ;;
-   *) echo "This launcher requires dgx-hyperplane19 (or legacy dgx-hyperplane17) as the Ray head; got MASTER_ADDR=${MASTER_ADDR}." >&2; exit 2 ;;
+   hgx-hyperplane02) ;;
+   *) echo "This launcher requires hgx-hyperplane02 as the Ray head; got MASTER_ADDR=${MASTER_ADDR}." >&2; exit 2 ;;
 esac
 if [ "${WORKER_ADDR%%.*}" = "${MASTER_ADDR%%.*}" ]; then
    echo "Ray head and worker must be different hosts; both resolve from ${MASTER_ADDR}." >&2
@@ -571,7 +571,7 @@ RUNS_ROOT="${RUNS_ROOT:-/share/nlp/share/gem/runs}"
 EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks}"
 
 default_experiment_name() {
-   local prefix="odyssey-q3-4b-local-dev"
+   local prefix="odyssey-q3-4b-think-dev"
    #local prefix="odyssey-q3-8b-local-dev"
    #local prefix="asearcher-dapo-q3-4b-think-gem-sync-dev"
    local max_dev=-1
@@ -1009,8 +1009,8 @@ LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_P
 # [chunk, vocab] BF16 buffers during backward recomputation. At vocab=151936,
 # a 256-token chunk is about 74 MiB, leaving room below TMS's 512 MiB margin
 # even on the rank with the smallest fragmented free block.
-LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-512}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-2048}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 # Keep the post-filter training batch at 50/50 webqa and mcp. The synchronous
 # collector keeps sampling each family until both accepted quotas are full.
 ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
@@ -1018,17 +1018,17 @@ ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
 ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-true}"
 # Bound aggressive admission even when low ROI or long-tail groups keep the
 # collector refilling candidates before the previous wave fully drains.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
-N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-96}"
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
 # Keep 96 groups (3072 trajectories at n=32) admitted so tool and retrieval
 # waits cannot drain the decode engines. Extra requests are aborted once the
 # final per-family candidate selection has enough groups for the actor update.
 SYNC_MIN_PENDING_GROUPS=96
 # Preserve candidates from both families after either quota is satisfied. This
 # gives top-mean-step selection a deeper pool without changing the 50/50 batch.
-SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-32}"
+SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-64}"
 SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-32}"
-SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-64}"
+SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-32}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-196400}"
@@ -1452,7 +1452,7 @@ OPTIMIZER_ARGS=(
 # has enough headroom while trainer CUDA allocations are still being released.
 if [ -z "${SGLANG_MEM_FRACTION_STATIC:-}" ]; then
    if is_truthy "${COLOCATE}"; then
-      SGLANG_MEM_FRACTION_STATIC=0.6
+      SGLANG_MEM_FRACTION_STATIC=0.8
    else
       SGLANG_MEM_FRACTION_STATIC="${GPU_MEMORY_UTILIZATION:-0.9}"
    fi
@@ -1537,10 +1537,13 @@ export UPDATE_WEIGHT_DISK_DIR WANDB_DIR WANDB_CACHE_DIR HF_HOME TORCH_HOME TORCH
 export TORCH_COMPILE_JOB_ID TORCHINDUCTOR_FORCE_DISABLE_CACHES
 export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=1
 export SLIME_SGLANG_EXACT_RMSNORM=1
-# Avoid materializing up to 40K x 152K full-sequence logits during policy
-# training. Only response positions are projected, in LOG_PROBS_CHUNK_SIZE tiles.
-export SLIME_TILED_POLICY_LOSS=1
-export SLIME_TILED_POLICY_LOSS_CLEAR_CACHE_BEFORE_BACKWARD=1
+# Keep the experimental tiled policy projection disabled for Qwen3. The run's
+# final failures were accompanied by malformed rollout generations; forcing the
+# switch here prevents inherited environment settings from re-enabling the tile
+# implementation. LOG_PROBS_CHUNK_SIZE remains available for explicit opt-in
+# experiments in other launchers.
+export SLIME_TILED_POLICY_LOSS=0
+export SLIME_TILED_POLICY_LOSS_CLEAR_CACHE_BEFORE_BACKWARD=0
 export SLIME_MCP_ENV_ROOT="${MCP_ENV_ROOT}"
 export SLIME_MCP_ENV_COPY_CONCURRENCY="${MCP_ENV_COPY_CONCURRENCY}"
 export SLIME_MCP_WORKSPACE_SCOPE="${SLIME_MCP_WORKSPACE_SCOPE:-task}"
@@ -1871,7 +1874,7 @@ if [ "$(hostname -s)" != "${MASTER_ADDR%%.*}" ] \
    exit 2
 fi
 
-MASTER_CUDA_VISIBLE_DEVICES="${HYPERPLANE01_CUDA_VISIBLE_DEVICES}"
+MASTER_CUDA_VISIBLE_DEVICES="${HYPERPLANE02_CUDA_VISIBLE_DEVICES}"
 
 python3 - "${NUM_GPUS_PER_NODE}" "${MASTER_CUDA_VISIBLE_DEVICES}" <<'PY'
 import sys

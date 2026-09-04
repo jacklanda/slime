@@ -18,12 +18,19 @@ from slime.rollout.fused_agent.parser import make_tool_parser
 
 PROTOCOL_VERSION = 2
 AGENT_INSTRUCTION = """You are a tool agent helping a user under the supplied domain policy.
+For mobile_data_issue and mms_issue troubleshooting, never transfer to a human while any listed repair step remains
+unattempted; execute the supplied repair tools in policy order first.
+For these connectivity tasks, do not investigate bills or payments unless the task explicitly includes an overdue-bill
+or suspension condition; stay focused on the listed network, device, and MMS corrections.
 Use the available tools step by step and communicate with the user whenever required information is missing.
 Prefer read/query tools before consequential actions, provide complete and valid tool arguments, and adapt to tool results.
 Only call functions listed in the supplied tool definitions. When the policy says that the user must perform an
 action whose function is not supplied to you, ask the user to perform it in natural language; never emit a tool call
-for that user action.
+for that user action. If a matching device operation is supplied (for example, enable_roaming), call it directly. For
+troubleshooting tasks, perform every applicable supplied corrective operation in policy order before transferring to a
+human; do not transfer while a required check or correction remains unattempted.
 Do not combine a user-facing reply and a tool call in the same turn. When the request is complete, clearly report the result."""
+
 _THINK_RE = re.compile(r"\s*<think\b[^>]*>(.*?)</think\s*>\s*", re.DOTALL)
 _HTTP_LOCAL = threading.local()
 _SESSIONS: dict[str, dict[str, Any]] = {}
@@ -132,7 +139,8 @@ def _render_messages(messages: list[Any], tools: list[Any], parser: Any) -> list
                 tool_names_by_id[str(call.id)] = str(call.name)
             raw_content = message.raw_data.get("slime_fused_content") if message.raw_data else None
             if isinstance(raw_content, str) and not _config().discard_historical_thinking:
-                content = raw_content
+                # Keep tool markup and visible replies, but do not replay old chain-of-thought.
+                content = _THINK_RE.sub("", raw_content).strip()
             else:
                 content = str(message.content or "")
                 if message.tool_calls:
@@ -193,6 +201,17 @@ def _finish_reason(value: Any) -> str | None:
     if isinstance(value, dict):
         value = value.get("type")
     return value if isinstance(value, str) and value else None
+
+
+def _normalize_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Normalize lossless formatting variants emitted by the model."""
+    normalized = dict(arguments)
+    phone = normalized.get("phone_number")
+    if isinstance(phone, str):
+        digits = re.sub(r"\D", "", phone)
+        if len(digits) == 10:
+            normalized["phone_number"] = f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+    return normalized
 
 
 def _session_generate(messages: list[Any], prompt_ids: list[int], sampling: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -367,7 +386,14 @@ def generate(
         end = action.end - (think_match.end() if think_match else 0)
         if 0 <= start <= end <= len(visible_content):
             visible_content = visible_content[:start] + visible_content[end:]
-    tau_tool_calls = [ToolCall(id=uuid.uuid4().hex, name=action.name, arguments=action.arguments) for action in parsed_actions]
+    tau_tool_calls = [
+        ToolCall(
+            id=uuid.uuid4().hex,
+            name=action.name,
+            arguments=_normalize_tool_arguments(action.arguments),
+        )
+        for action in parsed_actions
+    ]
     usage = {
         "prompt_tokens": len(prompt_ids),
         "completion_tokens": int(metadata.get("slime_fused_completion_tokens", 0)),

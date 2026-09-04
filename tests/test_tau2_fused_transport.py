@@ -110,8 +110,12 @@ def test_render_uses_slime_tool_definition_action_and_observation(monkeypatch):
         [SystemMessage("policy"), prior, ToolMessage("result")], [Tool()], parser
     )
     assert rendered[0]["content"].startswith("policy\nTOOLS:")
-    assert rendered[1]["content"] == "<think>reason</think>RAW"
+    assert rendered[1]["content"] == "RAW"
     assert rendered[2] == {"role": "user", "content": "OBS:lookup:result"}
+    assert "If a matching device operation is supplied" in transport.AGENT_INSTRUCTION
+    assert "perform every applicable supplied corrective operation" in transport.AGENT_INSTRUCTION
+    assert "never transfer to a human while any listed repair step remains" in transport.AGENT_INSTRUCTION
+    assert "do not investigate bills or payments" in transport.AGENT_INSTRUCTION
 
     _configure(discard_historical_thinking=True)
     rendered = transport._render_messages([SystemMessage("policy"), prior], [Tool()], parser)
@@ -158,6 +162,15 @@ def test_external_user_tool_call_drops_mixed_visible_content():
     assert transport.normalize_external_user_message(message) is message
     assert message.content is None
     assert message.tool_calls[0].name == "lookup"
+
+
+def test_tool_arguments_normalize_phone_number_format():
+    assert transport._normalize_tool_arguments({"phone_number": "5551232002"}) == {
+        "phone_number": "555-123-2002"
+    }
+    assert transport._normalize_tool_arguments({"phone_number": "555-123-2002"}) == {
+        "phone_number": "555-123-2002"
+    }
 
 
 def test_native_session_routes_sticky_dp_and_sends_only_prompt_delta(monkeypatch):

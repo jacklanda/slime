@@ -110,19 +110,33 @@ def test_tau2_run_uses_public_api_and_validates_results(tmp_path: Path, monkeypa
     assert captured["transport"]["model_path"] == str(args.model.resolve())
     assert captured["transport"]["use_session"] is True
     assert captured["user_llm"] == {"model": "openai/user", "base_url": "https://example.test/v1"}
-    assert captured["evaluator_llm"] == {"model": "openai/user", "base_url": "https://example.test/v1"}
+    assert captured["evaluator_llm"] == {
+        "model": "openai/user",
+        "base_url": "https://example.test/v1",
+        "json_mode": True,
+        "max_tokens": 4096,
+    }
     assert "llm_agent.AGENT_INSTRUCTION = tau2_fused_transport.AGENT_INSTRUCTION" in captured["command"][2]
     assert "original_del=batch._original_del" in captured["command"][2]
     assert "asyncio.base_events.BaseEventLoop.__del__ = safe_event_loop_del" in captured["command"][2]
     assert "tau2_fused_transport.normalize_external_user_message(message)" in captured["command"][2]
     assert 'simulation.termination_reason.value == "user_error"' in captured["command"][2]
-    assert 'simulation.termination_reason.value in {"max_steps", "context_window_exceeded"}' in captured["command"][2]
-    assert 'get("slime_fused_finish_reason") == "length"' in captured["command"][2]
-    assert 'raise RuntimeError("tau2 trajectory contains a max-length agent response")' in captured["command"][2]
+    assert 'simulation.termination_reason.value == "context_window_exceeded"' in captured["command"][2]
+    assert 'simulation.termination_reason.value in {"max_steps", "context_window_exceeded"}' not in captured["command"][2]
+    assert 'get("slime_fused_finish_reason") == "length"' not in captured["command"][2]
+    assert 'raise RuntimeError("tau2 trajectory contains a max-length agent response")' not in captured["command"][2]
     assert "evaluator_nl_assertions.generate = generate_evaluator" in captured["command"][2]
     assert "interface_agent.generate = generate_evaluator" in captured["command"][2]
-    assert 'kwargs["base_url"] = config["base_url"]' in captured["command"][2]
-    assert 'kwargs["api_key"] = os.environ[api_key_env]' in captured["command"][2]
+    assert 'config["base_url"].rstrip("/") + "/chat/completions"' in captured["command"][2]
+    assert "official_generate" not in captured["command"][2]
+    assert '"Authorization": f"Bearer {os.environ[api_key_env]}"' in captured["command"][2]
+    assert 'tool_calls = getattr(message, "tool_calls", None)' in captured["command"][2]
+    assert 'item["tool_call_id"] = message.id' in captured["command"][2]
+    assert 'payload["response_format"] = {"type": "json_object"}' in captured["command"][2]
+    assert 'payload.setdefault("max_tokens", config["max_tokens"])' in captured["command"][2]
+    assert '"json_mode": true' in captured["serialized_config"]
+    assert 'json.JSONDecoder().raw_decode(candidate[start:])' in captured["command"][2]
+    assert 'raise ValueError("OpenRouter evaluator response contained no JSON object")' in captured["command"][2]
     assert "api_key" not in settings["llm_args_user"]
     assert "secret" not in captured["serialized_config"]
     assert captured["env"]["TAU2_USER_API_KEY"] == "secret"
@@ -194,9 +208,17 @@ def test_tau2_result_validation_rejects_empty_benchmark(tmp_path: Path, monkeypa
 def test_evals_script_routes_tau2_to_official_pipeline():
     launcher = (Path(__file__).resolve().parents[1] / "experiments" / "evals.sh").read_text(encoding="utf-8")
     assert 'TAU2_ROOT="${BENCHMARKS_ROOT}/tau^2-bench"' in launcher
+    assert 'TAU2_USER_MODEL="${TAU2_USER_MODEL:-openai/gpt-4.1}"' in launcher
+    assert 'TAU2_EVALUATOR_MODEL="${TAU2_EVALUATOR_MODEL:-anthropic/claude-opus-4.5}"' in launcher
+    assert 'TAU2_TEMPERATURE="${TAU2_TEMPERATURE:-0.2}"' in launcher
+    assert 'TAU2_MAX_TOKENS="${TAU2_MAX_TOKENS:-16384}"' in launcher
+    assert 'TAU2_MAX_STEPS="${TAU2_MAX_STEPS:-200}"' in launcher
+    assert 'TAU2_MAX_RETRIES="${TAU2_MAX_RETRIES:-4}"' in launcher
     assert "slime_plugins.evals.tau2_launcher" in launcher
     assert '--num-tasks "${TAU2_NUM_TASKS}"' in launcher
     assert '--max-retries "${TAU2_MAX_RETRIES}"' in launcher
+    assert '--temperature "${TAU2_TEMPERATURE}"' in launcher
+    assert 'temperature=${TAU2_TEMPERATURE}, context=${EVAL_MAX_CONTEXT_LEN}, max_tokens=${TAU2_MAX_TOKENS}' in launcher
     assert 'is_truthy "${CLEANUP}" && ! is_truthy "${PREFLIGHT_ONLY}"' in launcher
     assert '--discard-historical-thinking "${DISCARD_HISTORICAL_THINKING}"' in launcher
     assert '--use-sglang-session "${TAU2_USE_SGLANG_SESSION}"' in launcher

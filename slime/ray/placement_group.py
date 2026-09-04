@@ -1,5 +1,6 @@
 import copy
 import logging
+import os
 import socket
 from pathlib import Path
 
@@ -198,8 +199,15 @@ def create_training_models(args, pgs, rollout_manager, actor_cls=None):
         )
         if args.release_train:
             # Release mode applies to actor workers only. The critic must remain
-            # resident across updates and use the normal colocated offload cycle.
-            critic_args.offload_train = True
+            # resident across updates. Offload it by default to make room for
+            # rollout engines, but permit hosts with an incompatible TMS pause
+            # implementation to keep it resident.
+            critic_args.offload_train = os.environ.get("SLIME_CRITIC_OFFLOAD_TRAIN", "true").lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
             critic_args.save = str(Path(args.save) / "critic")
             if (Path(critic_args.save) / "latest_checkpointed_iteration.txt").is_file():
                 critic_args.load = critic_args.save

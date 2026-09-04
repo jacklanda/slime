@@ -30,18 +30,19 @@ Core:
                                        Default: search_r1.
   --exclude LIST                       Extra comma-separated benchmark names to skip.
   --tau2-domain all|LIST                Domains: airline,retail,telecom. Default: all.
-  --tau2-user-model NAME               User simulator model. Default: deepseek/deepseek-v4-flash.
+  --tau2-user-model NAME               User simulator model. Default: openai/gpt-4.1.
   --tau2-user-base-url URL             User simulator OpenAI-compatible endpoint.
   --tau2-user-api-key KEY              Default: OPENROUTER_API_KEY.
-  --tau2-evaluator-model NAME          NL-assertion/interface model. Default: user model.
-  --tau2-evaluator-base-url URL        Default: user simulator endpoint.
+  --tau2-evaluator-model NAME          NL-assertion/interface model. Default: anthropic/claude-opus-4.5.
+  --tau2-evaluator-base-url URL        Default: https://openrouter.ai/api/v1.
   --tau2-evaluator-api-key KEY         Default: user simulator key.
-  --tau2-max-concurrency N|auto        Global budget shared by selected domains. Default: 8 per DP replica.
+  --tau2-max-concurrency N|auto        Global budget shared by selected domains. Default: 16 per DP replica.
   --tau2-concurrency-sweep LIST        Benchmark multiple global budgets, e.g. 64,96,128,192.
                                        Planned tasks x trials must cover the largest budget.
-  --tau2-max-tokens N                  Agent output limit. Default: 8192.
-  --tau2-max-steps N                   Conversation turn limit. Default: --max-steps.
-  --tau2-max-retries N                 Retry exceptions and max_steps trajectories. Default: 3.
+  --tau2-temperature FLOAT             Agent sampling temperature. Default: 0.2.
+  --tau2-max-tokens N                  Agent output limit. Default: 16384.
+  --tau2-max-steps N                   Conversation turn limit. Default: 200.
+  --tau2-max-retries N                 Retry trajectory exceptions. Default: 4.
   --tau2-use-sglang-session BOOL       Reuse incremental KV state. Default: true.
   --tau2-python-bin PATH               Python 3.12 used for its isolated venv.
   --tau2-sglang-python-bin PATH        Python with SGLang installed. Default: current python.
@@ -73,6 +74,8 @@ Core:
   --bfcl-python-bin PATH               Base Python used to create an isolated BFCL venv.
   --bfcl-venv-dir PATH                 BFCL dependency venv. Default: Gorilla/.venv-slime-evals.
   --bfcl-num-threads N|auto            BFCL trajectory concurrency. Default: 16 per DP replica.
+  --bfcl-test-category LIST             BFCL categories to generate and score, comma-separated.
+                                       Default: multi_turn. Use all_scoring for the full BFCL-v4 set.
   --bfcl-sticky-engine-routing BOOL    Launch one single-GPU SGLang server per DP replica and
                                        route each trajectory to one server. Default: true.
   --bfcl-agent-mode MODE               auto, bfcl, or slime_fused_gem. Default: auto.
@@ -86,12 +89,14 @@ Core:
                                        --discard-historical-thinking.
   --officeqa-use-sglang-session BOOL   Reuse incremental KV state. Default: true.
   --officeqa-overwrite                 Replace normalized OfficeQA inputs and prior results.
-  --acebench-language zh|en|both       ACEBench language. Default: both.
+  --acebench-language zh|en|both       ACEBench language. Default: en.
   --acebench-category NAME             ACEBench category group. Default: test_all.
   --acebench-num-threads N|auto        ACEBench generation concurrency. Default: 8 per DP replica.
-  --acebench-overwrite BOOL            Remove matching ACEBench cache before running. Default: false.
+  --acebench-overwrite BOOL            ACEBench cache policy (fixed to true for ACEBench runs).
   --acebench-max-dialog-turns N        ACEBench agent turn limit. Default: 40.
-  --acebench-max-tokens N              Optional per-request output limit. Default: endpoint decides.
+  --acebench-max-tokens N              Per-request output limit (fixed to 16384 for ACEBench runs).
+  --acebench-temperature FLOAT         ACEBench sampling temperature. Default: 0.2.
+  --acebench-top-p FLOAT               ACEBench nucleus sampling threshold. Default: 0.95.
   --acebench-agent-backend NAME        acebench or rllm_tool_agent. Alias: --agent-backend.
                                        Default: rllm_tool_agent.
   --acebench-protocol MODE             auto, official_acebench, or slime_fused_gem.
@@ -101,6 +106,8 @@ Core:
   --acebench-user-base-url URL         Simulated user OpenAI-compatible endpoint.
   --acebench-user-api-key KEY          Simulated user endpoint key.
   --acebench-sglang-python-bin PATH    Python with SGLang installed. Default: current python.
+                                       Selecting AceBench activates the reproducible qwen3-14B
+                                       fused-agent profile automatically.
   --experiment-name NAME               Log/run name.
   --gpus N                             Total rollout GPUs. Default: 8.
   --gpus-per-engine N                  Tensor parallel size per SGLang engine. Default: 1.
@@ -250,7 +257,7 @@ CLI_MAX_STEPS="${CLI_MAX_STEPS:-${MAX_STEPS}}"
 TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-7200}"
 EVAL_TRAJECTORY_TIMEOUT="${EVAL_TRAJECTORY_TIMEOUT:-${TRAJECTORY_TIMEOUT}}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-1}"
-TEMPERATURE="${TEMPERATURE:-0.6}"
+TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:--1}"
 ROLLOUT_SEED="${ROLLOUT_SEED:-42}"
@@ -321,6 +328,11 @@ SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-false}"
 SGLANG_CUDA_GRAPH_MAX_BS="${SGLANG_CUDA_GRAPH_MAX_BS:-}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-60}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-128}"
+# FlashInfer 0.6 defaults RMSNorm to a CUTLASS DSL kernel whose bundled CUDA
+# runtime can require a newer driver than the PyTorch/SGLang runtime. SGLang's
+# native implementation is CUDA-graph compatible, so avoid that JIT path by
+# default without disabling graph capture. Set the variable to 0 to opt out.
+export FLASHINFER_USE_TORCH_NORM="${FLASHINFER_USE_TORCH_NORM:-1}"
 ROUTER_POLICY="${ROUTER_POLICY:-manual}"
 ROUTER_ASSIGNMENT_MODE="${ROUTER_ASSIGNMENT_MODE:-min_load}"
 RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
@@ -328,16 +340,18 @@ RAY_JOB_WAIT="${RAY_JOB_WAIT:-0}"
 RAY_JOB_FOLLOW_LOGS="${RAY_JOB_FOLLOW_LOGS:-1}"
 CLEANUP="${CLEANUP:-false}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-false}"
-ACEBENCH_LANGUAGE="${ACEBENCH_LANGUAGE:-both}"
+ACEBENCH_LANGUAGE="${ACEBENCH_LANGUAGE:-en}"
 ACEBENCH_CATEGORY="${ACEBENCH_CATEGORY:-test_all}"
 ACEBENCH_NUM_THREADS="${ACEBENCH_NUM_THREADS:-auto}"
-ACEBENCH_OVERWRITE="${ACEBENCH_OVERWRITE:-false}"
+ACEBENCH_OVERWRITE="${ACEBENCH_OVERWRITE:-true}"
 ACEBENCH_MAX_DIALOG_TURNS="${ACEBENCH_MAX_DIALOG_TURNS:-40}"
-ACEBENCH_MAX_TOKENS="${ACEBENCH_MAX_TOKENS:-}"
+ACEBENCH_MAX_TOKENS="${ACEBENCH_MAX_TOKENS:-16384}"
+ACEBENCH_TEMPERATURE="${ACEBENCH_TEMPERATURE:-0.2}"
+ACEBENCH_TOP_P="${ACEBENCH_TOP_P:-0.95}"
 ACEBENCH_AGENT_BACKEND="${ACEBENCH_AGENT_BACKEND:-rllm_tool_agent}"
-ACEBENCH_PROTOCOL="${ACEBENCH_PROTOCOL:-auto}"
-ACEBENCH_USER_MODEL="${ACEBENCH_USER_MODEL:-${OPENROUTER_MODEL:-}}"
-ACEBENCH_USER_BASE_URL="${ACEBENCH_USER_BASE_URL:-${OPENROUTER_BASE_URL:-}}"
+ACEBENCH_PROTOCOL="${ACEBENCH_PROTOCOL:-slime_fused_gem}"
+ACEBENCH_USER_MODEL="${ACEBENCH_USER_MODEL:-${OPENROUTER_MODEL:-openai/gpt-4o}}"
+ACEBENCH_USER_BASE_URL="${ACEBENCH_USER_BASE_URL:-${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}}"
 ACEBENCH_USER_API_KEY="${ACEBENCH_USER_API_KEY:-${OPENROUTER_API_KEY:-}}"
 ACEBENCH_SGLANG_PYTHON_BIN="${ACEBENCH_SGLANG_PYTHON_BIN:-python}"
 ACEBENCH_SGLANG_LIBSTDCXX="${ACEBENCH_SGLANG_LIBSTDCXX:-}"
@@ -345,6 +359,7 @@ BFCL_MODEL_KEY="${BFCL_MODEL_KEY:-}"
 BFCL_PYTHON_BIN="${BFCL_PYTHON_BIN:-python3}"
 BFCL_VENV_DIR="${BFCL_VENV_DIR:-}"
 BFCL_NUM_THREADS="${BFCL_NUM_THREADS:-auto}"
+BFCL_TEST_CATEGORY="${BFCL_TEST_CATEGORY:-multi_turn}"
 BFCL_STICKY_ENGINE_ROUTING="${BFCL_STICKY_ENGINE_ROUTING:-true}"
 BFCL_AGENT_MODE="${BFCL_AGENT_MODE:-auto}"
 BFCL_USE_FC_INTERFACE="${BFCL_USE_FC_INTERFACE:-true}"
@@ -375,17 +390,18 @@ VITABENCH_SGLANG_PYTHON_BIN="${VITABENCH_SGLANG_PYTHON_BIN:-python}"
 VITABENCH_PORT="${VITABENCH_PORT:-18080}"
 VITABENCH_OVERWRITE="${VITABENCH_OVERWRITE:-false}"
 TAU2_DOMAIN="${TAU2_DOMAIN:-all}"
-TAU2_USER_MODEL="${TAU2_USER_MODEL:-deepseek/deepseek-v4-flash}"
+TAU2_USER_MODEL="${TAU2_USER_MODEL:-openai/gpt-4.1}"
 TAU2_USER_BASE_URL="${TAU2_USER_BASE_URL:-${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}}"
 TAU2_USER_API_KEY="${TAU2_USER_API_KEY:-${OPENROUTER_API_KEY:-}}"
-TAU2_EVALUATOR_MODEL="${TAU2_EVALUATOR_MODEL:-}"
-TAU2_EVALUATOR_BASE_URL="${TAU2_EVALUATOR_BASE_URL:-}"
+TAU2_EVALUATOR_MODEL="${TAU2_EVALUATOR_MODEL:-anthropic/claude-opus-4.5}"
+TAU2_EVALUATOR_BASE_URL="${TAU2_EVALUATOR_BASE_URL:-https://openrouter.ai/api/v1}"
 TAU2_EVALUATOR_API_KEY="${TAU2_EVALUATOR_API_KEY:-}"
 TAU2_MAX_CONCURRENCY="${TAU2_MAX_CONCURRENCY:-auto}"
 TAU2_CONCURRENCY_SWEEP="${TAU2_CONCURRENCY_SWEEP:-}"
-TAU2_MAX_TOKENS="${TAU2_MAX_TOKENS:-8192}"
-TAU2_MAX_STEPS="${TAU2_MAX_STEPS:-}"
-TAU2_MAX_RETRIES="${TAU2_MAX_RETRIES:-3}"
+TAU2_TEMPERATURE="${TAU2_TEMPERATURE:-0.2}"
+TAU2_MAX_TOKENS="${TAU2_MAX_TOKENS:-16384}"
+TAU2_MAX_STEPS="${TAU2_MAX_STEPS:-200}"
+TAU2_MAX_RETRIES="${TAU2_MAX_RETRIES:-4}"
 TAU2_USE_SGLANG_SESSION="${TAU2_USE_SGLANG_SESSION:-true}"
 TAU2_PYTHON_BIN="${TAU2_PYTHON_BIN:-python3.12}"
 TAU2_SGLANG_PYTHON_BIN="${TAU2_SGLANG_PYTHON_BIN:-python}"
@@ -421,6 +437,7 @@ while [ "$#" -gt 0 ]; do
       --tau2-evaluator-api-key) TAU2_EVALUATOR_API_KEY="${2:?Missing value for --tau2-evaluator-api-key}"; shift 2 ;;
       --tau2-max-concurrency) TAU2_MAX_CONCURRENCY="${2:?Missing value for --tau2-max-concurrency}"; shift 2 ;;
       --tau2-concurrency-sweep) TAU2_CONCURRENCY_SWEEP="${2:?Missing value for --tau2-concurrency-sweep}"; shift 2 ;;
+      --tau2-temperature) TAU2_TEMPERATURE="${2:?Missing value for --tau2-temperature}"; shift 2 ;;
       --tau2-max-tokens) TAU2_MAX_TOKENS="${2:?Missing value for --tau2-max-tokens}"; shift 2 ;;
       --tau2-max-steps) TAU2_MAX_STEPS="${2:?Missing value for --tau2-max-steps}"; shift 2 ;;
       --tau2-max-retries) TAU2_MAX_RETRIES="${2:?Missing value for --tau2-max-retries}"; shift 2 ;;
@@ -453,6 +470,7 @@ while [ "$#" -gt 0 ]; do
       --bfcl-python-bin) BFCL_PYTHON_BIN="${2:?Missing value for --bfcl-python-bin}"; shift 2 ;;
       --bfcl-venv-dir) BFCL_VENV_DIR="${2:?Missing value for --bfcl-venv-dir}"; shift 2 ;;
       --bfcl-num-threads) BFCL_NUM_THREADS="${2:?Missing value for --bfcl-num-threads}"; shift 2 ;;
+      --bfcl-test-category) BFCL_TEST_CATEGORY="${2:?Missing value for --bfcl-test-category}"; shift 2 ;;
       --bfcl-sticky-engine-routing) BFCL_STICKY_ENGINE_ROUTING="${2:?Missing value for --bfcl-sticky-engine-routing}"; shift 2 ;;
       --bfcl-agent-mode) BFCL_AGENT_MODE="${2:?Missing value for --bfcl-agent-mode}"; shift 2 ;;
       --bfcl-use-fc-interface) BFCL_USE_FC_INTERFACE="${2:?Missing value for --bfcl-use-fc-interface}"; shift 2 ;;
@@ -468,6 +486,8 @@ while [ "$#" -gt 0 ]; do
       --acebench-overwrite) ACEBENCH_OVERWRITE="${2:?Missing value for --acebench-overwrite}"; shift 2 ;;
       --acebench-max-dialog-turns) ACEBENCH_MAX_DIALOG_TURNS="${2:?Missing value for --acebench-max-dialog-turns}"; shift 2 ;;
       --acebench-max-tokens) ACEBENCH_MAX_TOKENS="${2:?Missing value for --acebench-max-tokens}"; shift 2 ;;
+      --acebench-temperature) ACEBENCH_TEMPERATURE="${2:?Missing value for --acebench-temperature}"; shift 2 ;;
+      --acebench-top-p) ACEBENCH_TOP_P="${2:?Missing value for --acebench-top-p}"; shift 2 ;;
       --acebench-agent-backend|--agent-backend) ACEBENCH_AGENT_BACKEND="${2:?Missing value for $1}"; acebench_agent_backend_explicit=true; shift 2 ;;
       --acebench-protocol|--protocol-mode) ACEBENCH_PROTOCOL="${2:?Missing value for $1}"; shift 2 ;;
       --acebench-user-model) ACEBENCH_USER_MODEL="${2:?Missing value for --acebench-user-model}"; shift 2 ;;
@@ -623,10 +643,11 @@ if is_truthy "${BFCL_SELECTED}"; then
          *qwen3.5-4b*) BFCL_MODEL_KEY="Qwen/Qwen3.5-4B" ;;
          *qwen3-4b*) BFCL_MODEL_KEY="Qwen/Qwen3-4B-Thinking-2507" ;;
          *qwen3-8b*) BFCL_MODEL_KEY="Qwen/Qwen3-8B" ;;
+         *qwen3-14b*) BFCL_MODEL_KEY="Qwen/Qwen3-14B" ;;
          *qwen3-32b*) BFCL_MODEL_KEY="Qwen/Qwen3-32B" ;;
          *)
             echo "Cannot infer a BFCL handler key from --model-config ${MODEL_CONFIG@Q}." >&2
-            echo "Pass --bfcl-model-key explicitly; supported slime-gem defaults currently cover Qwen3.5 4B and Qwen3 4B/8B/32B." >&2
+            echo "Pass --bfcl-model-key explicitly; supported slime-gem defaults currently cover Qwen3.5 4B and Qwen3 4B/8B/14B/32B." >&2
             exit 2
             ;;
       esac
@@ -652,6 +673,23 @@ if is_truthy "${ACEBENCH_SELECTED}" && [ "${normalized_include}" != "acebench" ]
    echo "ACEBench uses its official generation and scoring pipeline and cannot be mixed with slime datasets in one run." >&2
    echo "Run it separately with --include ACEBench." >&2
    exit 2
+fi
+if [ "${ACEBENCH_SELECTED}" = "true" ]; then
+   # Selecting ACEBench activates the reproducible fused-agent profile.
+   FUSED_HARNESS=gem
+   DISABLE_THINKING=false
+   DISCARD_HISTORICAL_THINKING=false
+   EVAL_MAX_CONTEXT_LEN=40960
+   EVAL_MAX_PROMPT_LEN=8192
+   EVAL_MAX_RESPONSE_LEN=8192
+   PER_STEP_MAX_TOKENS=8192
+   SGLANG_MAX_RUNNING_REQUESTS=64
+   LIMIT_PER_BENCHMARK=99999
+   N_SAMPLES_PER_PROMPT=1
+   if [ "${MODEL_SERIES}" = "qwen3" ]; then
+      MODEL_CONFIG="${MODEL_CONFIG:-qwen3-14B}"
+      MODEL_DIR="${MODEL_DIR:-/share/nlp/share/gem/odyssey-q3-14b-120-steps}"
+   fi
 fi
 
 MCP_ATLAS_SELECTED=false
@@ -965,7 +1003,7 @@ PY
       --yarn-original-max-position-embeddings "${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
    )
 fi
-ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
 if [ "${ROLLOUT_GPUS}" -lt 1 ]; then
    echo "--gpus must be >= 1" >&2
    exit 2
@@ -1066,7 +1104,7 @@ if is_truthy "${BFCL_SELECTED}"; then
       fi
    fi
    if [ "${BFCL_NUM_THREADS}" = "auto" ]; then
-      BFCL_NUM_THREADS=$((BFCL_DP_SIZE * 16))
+      BFCL_NUM_THREADS=$((BFCL_DP_SIZE * 32))
    fi
    # BFCL runs before the generic fused-agent defaults are resolved. Keep its
    # per-request budget aligned with the user-facing evaluation response limit
@@ -1105,8 +1143,8 @@ if is_truthy "${BFCL_SELECTED}"; then
    BFCL_RESULT_DIR="${BFCL_LOG_ROOT}/bfcl_results"
    BFCL_SCORE_DIR="${BFCL_LOG_ROOT}/bfcl_scores"
    export BFCL_VERSION_PREFIX="BFCL_${BFCL_BENCH_VERSION}"
-   if [ "${BFCL_BENCH_VERSION}" = v4 ] && [ -z "${RETRIEVAL_SERVER_URL:-}" ]; then
-      echo "BFCL-v4 all_scoring requires RETRIEVAL_SERVER_URL for its web-search categories." >&2
+   if [ "${BFCL_BENCH_VERSION}" = v4 ] && [[ ",${BFCL_TEST_CATEGORY}," == *,all,* || ",${BFCL_TEST_CATEGORY}," == *,all_scoring,* || ",${BFCL_TEST_CATEGORY}," == *,*web_search* ]] && [ -z "${RETRIEVAL_SERVER_URL:-}" ]; then
+      echo "BFCL-v4 categories including web_search require RETRIEVAL_SERVER_URL." >&2
       echo "Use the default managed Serper backend or set RETRIEVAL_SERVER_URL explicitly." >&2
       exit 2
    fi
@@ -1117,6 +1155,7 @@ if is_truthy "${BFCL_SELECTED}"; then
       --sglang-python-bin "${BFCL_SGLANG_PYTHON_BIN}"
       --server-mode local-sglang
       --bench-version "${BFCL_BENCH_VERSION}"
+      --test-category "${BFCL_TEST_CATEGORY}"
       --bfcl-model-key "${BFCL_MODEL_KEY}"
       --agent-mode "${BFCL_AGENT_MODE}"
       --slime-tool-parser-path "${REPO_ROOT}/slime/rollout/fused_agent/parser.py"
@@ -1160,11 +1199,6 @@ if is_truthy "${BFCL_SELECTED}"; then
    if [ -n "${BFCL_MAX_TOKENS}" ]; then BFCL_CMD+=(--max-tokens "${BFCL_MAX_TOKENS}"); fi
    if is_truthy "${BFCL_OVERWRITE}"; then BFCL_CMD+=(--recompute); else BFCL_CMD+=(--reuse-existing); fi
 
-   if [ "${BFCL_BENCH_VERSION}" = v4 ]; then
-      BFCL_TEST_CATEGORY=all_scoring
-   else
-      BFCL_TEST_CATEGORY=single_turn,multi_turn
-   fi
    BFCL_EVALUATE_CMD=(
       "${BFCL_VENV_DIR}/bin/bfcl" evaluate
       --test-category "${BFCL_TEST_CATEGORY}"
@@ -1238,36 +1272,17 @@ fi
 if is_truthy "${ACEBENCH_SELECTED}"; then
    ACEBENCH_ROOT="${BENCHMARKS_ROOT}/ACEBench"
    ACEBENCH_MODEL_DIR="$(realpath "${MODEL_DIR}")"
+   # Keep ACEBench runs on the fused-agent protocol and a fixed sampling
+   # configuration so results are comparable across checkpoints.
+   ACEBENCH_PROTOCOL=slime_fused_gem
+   ACEBENCH_AGENT_BACKEND=rllm_tool_agent
+   ACEBENCH_OVERWRITE=true
+   ACEBENCH_MAX_TOKENS=16384
    if [ ! -x "${ACEBENCH_ROOT}/run_eval.sh" ] || [ ! -f "${ACEBENCH_ROOT}/pyproject.toml" ]; then
       echo "ACEBench is incomplete under ${ACEBENCH_ROOT}; expected executable run_eval.sh and pyproject.toml." >&2
       exit 2
    fi
    case "${ACEBENCH_LANGUAGE}" in zh|en|both) ;; *) echo "--acebench-language must be zh, en, or both" >&2; exit 2 ;; esac
-   case "${ACEBENCH_AGENT_BACKEND}" in acebench|rllm_tool_agent) ;; *) echo "--acebench-agent-backend must be acebench or rllm_tool_agent" >&2; exit 2 ;; esac
-   case "${ACEBENCH_PROTOCOL}" in
-      auto)
-         if [ "${FUSED_HARNESS}" = "gem" ]; then
-            ACEBENCH_PROTOCOL=slime_fused_gem
-         else
-            ACEBENCH_PROTOCOL=official_acebench
-         fi
-         ;;
-      official_acebench|slime_fused_gem) ;;
-      *) echo "--acebench-protocol must be auto, official_acebench, or slime_fused_gem" >&2; exit 2 ;;
-   esac
-   if [ "${ACEBENCH_PROTOCOL}" = "slime_fused_gem" ]; then
-      if [ "${FUSED_HARNESS}" != "gem" ]; then
-         echo "slime_fused_gem currently requires --harness gem, got ${FUSED_HARNESS}" >&2
-         exit 2
-      fi
-      if is_truthy "${acebench_agent_backend_explicit}" && [ "${ACEBENCH_AGENT_BACKEND}" != "rllm_tool_agent" ]; then
-         echo "slime_fused_gem requires --acebench-agent-backend rllm_tool_agent" >&2
-         exit 2
-      fi
-      ACEBENCH_AGENT_BACKEND=rllm_tool_agent
-   elif ! is_truthy "${acebench_agent_backend_explicit}"; then
-      ACEBENCH_AGENT_BACKEND=acebench
-   fi
    if [ "${ACEBENCH_NUM_THREADS}" != "auto" ] && ! [[ "${ACEBENCH_NUM_THREADS}" =~ ^[1-9][0-9]*$ ]]; then
       echo "--acebench-num-threads must be auto or a positive integer" >&2
       exit 2
@@ -1346,8 +1361,8 @@ if is_truthy "${ACEBENCH_SELECTED}"; then
       --num-threads "${ACEBENCH_NUM_THREADS}"
       --max-samples-per-task "${LIMIT_PER_BENCHMARK}"
       --max-dialog-turns "${ACEBENCH_MAX_DIALOG_TURNS}"
-      --temperature "${TEMPERATURE}"
-      --top-p "${TOP_P}"
+      --temperature "${ACEBENCH_TEMPERATURE}"
+      --top-p "${ACEBENCH_TOP_P}"
       --agent-backend "${ACEBENCH_AGENT_BACKEND}"
       --protocol-mode "${ACEBENCH_PROTOCOL}"
       --response-mode "${ACEBENCH_RESPONSE_MODE}"
@@ -1430,8 +1445,15 @@ if is_truthy "${TAU2_SELECTED}"; then
    TAU2_EVALUATOR_MODEL="${TAU2_EVALUATOR_MODEL:-${TAU2_USER_MODEL}}"
    TAU2_EVALUATOR_BASE_URL="${TAU2_EVALUATOR_BASE_URL:-${TAU2_USER_BASE_URL}}"
    TAU2_EVALUATOR_API_KEY="${TAU2_EVALUATOR_API_KEY:-${TAU2_USER_API_KEY}}"
-   if [ "${TAU2_MAX_CONCURRENCY}" = "auto" ]; then TAU2_MAX_CONCURRENCY=$((TAU2_DP_SIZE * 8)); fi
-   TAU2_MAX_STEPS="${TAU2_MAX_STEPS:-${MAX_STEPS}}"
+   if [ "${TAU2_MAX_CONCURRENCY}" = "auto" ]; then TAU2_MAX_CONCURRENCY=$((TAU2_DP_SIZE * 16)); fi
+   # tau2 workflows often need several read/confirm/write turns.  Keep an
+   # accidentally inherited short generic MAX_STEPS (commonly 8) from
+   # truncating otherwise valid trajectories; an explicit tau2 override still
+   # takes precedence.
+   if [ -z "${TAU2_MAX_STEPS}" ]; then
+      TAU2_MAX_STEPS="${MAX_STEPS}"
+      if [ "${TAU2_MAX_STEPS}" -lt 16 ]; then TAU2_MAX_STEPS=16; fi
+   fi
    if is_truthy "${DISABLE_THINKING}"; then TAU2_ENABLE_THINKING=false; else TAU2_ENABLE_THINKING=true; fi
    TAU2_NUM_TASKS="${LIMIT_PER_BENCHMARK}"
    if [ "${TAU2_NUM_TASKS}" -ge 99999 ]; then TAU2_NUM_TASKS=0; fi
@@ -1464,7 +1486,7 @@ if is_truthy "${TAU2_SELECTED}"; then
       --max-retries "${TAU2_MAX_RETRIES}"
       --max-concurrency "${TAU2_MAX_CONCURRENCY}"
       --seed "${ROLLOUT_SEED}"
-      --temperature "${TEMPERATURE}"
+      --temperature "${TAU2_TEMPERATURE}"
       --top-p "${TOP_P}"
       --top-k "${TOP_K}"
       --max-tokens "${TAU2_MAX_TOKENS}"
@@ -1482,7 +1504,7 @@ if is_truthy "${TAU2_SELECTED}"; then
    if [ -n "${TAU2_SGLANG_LIBSTDCXX}" ]; then TAU2_CMD+=(--sglang-libstdcxx "${TAU2_SGLANG_LIBSTDCXX}"); fi
    export TAU2_USER_API_KEY TAU2_EVALUATOR_API_KEY
    if is_truthy "${PREFLIGHT_ONLY}"; then TAU2_CMD+=(--preflight-only); fi
-   echo "tau2: domain=${TAU2_DOMAIN}, model=${MODEL_DIR}, user_model=${TAU2_USER_MODEL}, tasks=$([ "${TAU2_NUM_TASKS}" -eq 0 ] && echo all || echo "${TAU2_NUM_TASKS}"), trials=${N_SAMPLES_PER_PROMPT}, retries=${TAU2_MAX_RETRIES}, output=${TAU2_LOG_ROOT}/tau2"
+   echo "tau2: domain=${TAU2_DOMAIN}, model=${MODEL_DIR}, user_model=${TAU2_USER_MODEL}, evaluator_model=${TAU2_EVALUATOR_MODEL}, tasks=$([ "${TAU2_NUM_TASKS}" -eq 0 ] && echo all || echo "${TAU2_NUM_TASKS}"), trials=${N_SAMPLES_PER_PROMPT}, retries=${TAU2_MAX_RETRIES}, concurrency=${TAU2_MAX_CONCURRENCY}, temperature=${TAU2_TEMPERATURE}, context=${EVAL_MAX_CONTEXT_LEN}, max_tokens=${TAU2_MAX_TOKENS}, thinking=${TAU2_ENABLE_THINKING}, discard_history=${DISCARD_HISTORICAL_THINKING}, session=${TAU2_USE_SGLANG_SESSION}, output=${TAU2_LOG_ROOT}/tau2"
    if is_truthy "${CLEANUP}" && ! is_truthy "${PREFLIGHT_ONLY}"; then ray stop --force; fi
    exec "${TAU2_CMD[@]}"
 fi
