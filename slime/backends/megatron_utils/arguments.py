@@ -117,6 +117,14 @@ def _hf_validate_args(args, hf_config):
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
 
+    if getattr(args, "true_on_policy_mode", False):
+        model_type = getattr(hf_config, "model_type", "")
+        if model_type != "qwen3" or _is_moe_config(hf_config):
+            errors.append(
+                "--true-on-policy-mode currently supports dense Qwen3 models only; "
+                f"got model_type={model_type!r}"
+            )
+
     # Some models store rope_theta inside rope_parameters dict rather than
     # as a top-level attribute.  Prefer the dict value when available so
     # the validation doesn't compare against a stale class default.

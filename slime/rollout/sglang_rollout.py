@@ -58,6 +58,7 @@ from slime.utils.types import Sample
 from slime.utils.visualization import maybe_print_rollout_group
 
 from .rm_hub import async_rm, batched_async_rm
+from .prefill_logprobs import recompute_rollout_logprobs_via_prefill
 
 __all__ = ["generate_rollout", "get_model_url"]
 
@@ -1304,6 +1305,13 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source) 
         all_samples = sorted(all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
         process_func = load_function(args.rollout_all_samples_process_path)
         process_func(args, all_samples, data_source)
+
+    await recompute_rollout_logprobs_via_prefill(
+        args,
+        _flatten_samples(data),
+        url=f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate",
+        sampling_params=state.sampling_params,
+    )
 
     metrics = metric_gatherer.collect()
     metrics["rollout/dynamic_filter/completed_groups"] = completed_groups

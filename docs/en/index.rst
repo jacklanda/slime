@@ -77,6 +77,7 @@ Start by Use Case
    :caption: Advanced Features
 
    advanced/on-policy-distillation.md
+   advanced/true-on-policy.md
    advanced/speculative-decoding.md
    advanced/low-precision.md
    advanced/reproducibility.md

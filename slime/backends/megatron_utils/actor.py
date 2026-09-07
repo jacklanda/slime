@@ -35,7 +35,7 @@ from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .cp_utils import prepare_routed_experts_for_routing_replay, slice_log_prob_with_cp
-from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data
+from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, rollout_logprob_dtype
 from .hf_checkpoint_saver import save_hf_model_to_path
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
@@ -298,10 +298,11 @@ class MegatronTrainRayActor(TrainRayActor):
         for key in ["rollout_log_probs", "teacher_log_probs"]:
             if key not in rollout_data:
                 continue
+            dtype = rollout_logprob_dtype(self.args) if key == "rollout_log_probs" else torch.float32
             rollout_data[key] = [
                 slice_log_prob_with_cp(log_prob, total_length, response_length).to(
                     device=device,
-                    dtype=torch.float32,
+                    dtype=dtype,
                     non_blocking=True,
                 )
                 for log_prob, total_length, response_length in zip(

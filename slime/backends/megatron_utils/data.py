@@ -25,6 +25,15 @@ from .cp_utils import (
 logger = logging.getLogger(__name__)
 
 
+def rollout_logprob_dtype(args: Namespace) -> torch.dtype:
+    if getattr(args, "true_on_policy_mode", False):
+        if getattr(args, "bf16", False):
+            return torch.bfloat16
+        if getattr(args, "fp16", False):
+            return torch.float16
+    return torch.float32
+
+
 def _normalize_response_loss_mask(loss_mask: torch.Tensor, total_length: int, response_length: int) -> torch.Tensor:
     if loss_mask.size(0) != response_length:
         raise ValueError(

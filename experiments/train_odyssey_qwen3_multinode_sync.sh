@@ -33,6 +33,7 @@ Options:
   --terminal-log-style STYLE             progress, rollouts, or both. Stored in env for compatible fused code.
   --show-rollout-progress-logs BOOL      Show periodic fused rollout request/progress logs. Default: false.
   --temperature X                       Training rollout sampling temperature. Default: 1.0.
+  --true-on-policy                     Enable bitwise-parity Qwen3 RL training (default).
   --micro-batch-size N                   Training micro-batch size.
   --update-weights-interval N            Rollout weight update interval. Default: 1.
   --rollout-num-gpus-per-engine N        Tensor-parallel GPUs per rollout engine.
@@ -157,7 +158,7 @@ Options:
                                          Default: write_through.
   --sglang-hicache-io-backend BACKEND   kernel, direct, or kernel_ascend. Default: kernel.
   --sglang-hicache-mem-layout LAYOUT    Host KV cache layout. Default: layer_first.
-  --sglang-disable-cuda-graph BOOL       Disable CUDA graph capture for insufficient-driver hosts.
+  --sglang-disable-cuda-graph BOOL       Disable CUDA graph capture. Defaults to true with True On-Policy.
   --colocate                             Share trainer and rollout GPUs with offload. Required by this launcher.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
   -h, --help                             Show this help.
@@ -182,6 +183,7 @@ REPLAY_ROLLOUT_ID="${REPLAY_ROLLOUT_ID:-}"
 REPLAY_ROLLOUT_DATA_PATH="${REPLAY_ROLLOUT_DATA_PATH:-}"
 REPLAY_AND_GENERATE="${REPLAY_AND_GENERATE:-false}"
 USE_FAULT_TOLERANCE="${USE_FAULT_TOLERANCE:-true}"
+TRUE_ON_POLICY="${TRUE_ON_POLICY:-true}"
 # Keep the raw model construction mode for exact optimizer/checkpoint resume.
 # Qwen3's tied embedding/output publication is hardened in the raw converter.
 MEGATRON_TO_HF_MODE="${MEGATRON_TO_HF_MODE:-raw}"
@@ -287,7 +289,7 @@ SGLANG_HICACHE_SIZE="${SGLANG_HICACHE_SIZE:-32}"
 SGLANG_HICACHE_WRITE_POLICY="${SGLANG_HICACHE_WRITE_POLICY:-write_through}"
 SGLANG_HICACHE_IO_BACKEND="${SGLANG_HICACHE_IO_BACKEND:-kernel}"
 SGLANG_HICACHE_MEM_LAYOUT="${SGLANG_HICACHE_MEM_LAYOUT:-layer_first}"
-SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-false}"
+SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-}"
 # The installed FlashInfer may include CUDA 13 CuTe libraries even when this
 # launcher uses CUDA 12.9. Prefer FlashInfer's CUDA JIT norm on this workload.
 FLASHINFER_USE_CUDA_NORM="${FLASHINFER_USE_CUDA_NORM:-1}"
@@ -359,6 +361,7 @@ while [ "$#" -gt 0 ]; do
       --terminal-log-style) TERMINAL_LOG_STYLE="${2:?Missing value for --terminal-log-style}"; shift 2 ;;
       --show-rollout-progress-logs) SHOW_ROLLOUT_PROGRESS_LOGS="${2:?Missing value for --show-rollout-progress-logs}"; shift 2 ;;
       --temperature) TEMPERATURE="${2:?Missing value for --temperature}"; shift 2 ;;
+      --true-on-policy) TRUE_ON_POLICY=true; shift ;;
       --micro-batch-size) MICRO_BATCH_SIZE="${2:?Missing value for --micro-batch-size}"; shift 2 ;;
       --update-weights-interval) UPDATE_WEIGHTS_INTERVAL="${2:?Missing value for --update-weights-interval}"; shift 2 ;;
       --rollout-num-gpus-per-engine) ROLLOUT_NUM_GPUS_PER_ENGINE="${2:?Missing value for --rollout-num-gpus-per-engine}"; shift 2 ;;
@@ -499,6 +502,11 @@ while [ "$#" -gt 0 ]; do
       *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
    esac
 done
+
+# Miles disables CUDA graphs for its minimal parity runs. This is also required
+# by the cu129 FA3 kernel on the A100 hosts used by this launcher; callers on a
+# graph-compatible platform can explicitly set SGLANG_DISABLE_CUDA_GRAPH=false.
+SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-${TRUE_ON_POLICY}}"
 
 if ! is_truthy "${COLOCATE}"; then
    echo "This launcher is fixed to collocate mode; remove --no-colocate or set COLOCATE=true." >&2
@@ -676,6 +684,10 @@ if [ "${ROLLOUT_GPUS}" -ne "${ACTOR_GPUS}" ]; then
    echo "Colocate mode requires ROLLOUT_GPUS=ACTOR_GPUS=${ACTOR_GPUS}; got ${ROLLOUT_GPUS}." >&2
    exit 2
 fi
+ROLLOUT_TP_EXPLICIT=false
+if [ -n "${ROLLOUT_NUM_GPUS_PER_ENGINE:-}" ]; then
+   ROLLOUT_TP_EXPLICIT=true
+fi
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-${DEFAULT_ROLLOUT_NUM_GPUS_PER_ENGINE}}"
 CP_SIZE="${CP_SIZE:-${DEFAULT_CP_SIZE}}"
 PP_SIZE="${PP_SIZE:-1}"
@@ -711,6 +723,19 @@ if [ $((ACTOR_GPUS % MODEL_PARALLEL_SIZE)) -ne 0 ]; then
    echo "ACTOR_GPUS=${ACTOR_GPUS} must be divisible by TP_SIZE*CP_SIZE*PP_SIZE=${MODEL_PARALLEL_SIZE}" >&2
    exit 2
 fi
+if is_truthy "${TRUE_ON_POLICY}" && ! is_truthy "${ROLLOUT_TP_EXPLICIT}"; then
+   ROLLOUT_NUM_GPUS_PER_ENGINE="${TP_SIZE}"
+   if [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ] \
+      || [ $((ACTOR_NUM_GPUS_PER_NODE % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
+      echo "True on-policy default rollout TP=${ROLLOUT_NUM_GPUS_PER_ENGINE} must divide rollout and per-node actor GPUs." >&2
+      exit 2
+   fi
+   ROLLOUT_ENGINE_COUNT=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
+fi
+if is_truthy "${TRUE_ON_POLICY}" && [ "${TP_SIZE}" -ne "${ROLLOUT_NUM_GPUS_PER_ENGINE}" ]; then
+   echo "True on-policy requires TP_SIZE=ROLLOUT_NUM_GPUS_PER_ENGINE with the installed parity contract; got ${TP_SIZE} and ${ROLLOUT_NUM_GPUS_PER_ENGINE}." >&2
+   exit 2
+fi
 
 if [ "${UPDATE_WEIGHTS_INTERVAL}" -lt 1 ]; then
    echo "UPDATE_WEIGHTS_INTERVAL must be at least 1; got ${UPDATE_WEIGHTS_INTERVAL}" >&2
@@ -727,7 +752,9 @@ MODEL_DIR="${MODEL_DIR:-/share/nlp/share/plm/Qwen3-4B}"
 REF_LOAD="${REF_LOAD:-${MODEL_DIR}_torch_dist}"
 RUN_ROOT="${RUN_ROOT:-${RUNS_ROOT}/${EXPERIMENT_NAME}}"
 SAVE_DIR="${SAVE_DIR:-${RUN_ROOT}/checkpoints}"
-MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM}"
+MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${BASE_DIR}/Megatron-LM-Miles}"
+SGLANG_PATH="${SGLANG_PATH:-${BASE_DIR}/sglang-miles-runtime}"
+MILES_PATH="${MILES_PATH:-${BASE_DIR}/miles}"
 LOG_ROOT="${LOG_ROOT:-${RUN_ROOT}/logs}"
 EPISODE_LOG_DIR="${EPISODE_LOG_DIR:-${LOG_ROOT}/episodes}"
 DUMP_DETAILS="${DUMP_DETAILS:-${LOG_ROOT}/debug}"
@@ -1014,6 +1041,14 @@ if [ ! -d "${MEGATRON_LM_PATH}" ]; then
    echo "MEGATRON_LM_PATH does not exist: ${MEGATRON_LM_PATH}" >&2
    exit 1
 fi
+if [ ! -d "${SGLANG_PATH}/python/sglang" ]; then
+   echo "SGLANG_PATH does not contain an SGLang source tree: ${SGLANG_PATH}" >&2
+   exit 1
+fi
+if [ ! -d "${MILES_PATH}/miles" ]; then
+   echo "MILES_PATH does not contain the Miles Python package: ${MILES_PATH}" >&2
+   exit 1
+fi
 if [ ! -d "${REF_LOAD}" ]; then
    if [ "${AUTO_CONVERT_REF:-1}" != "1" ]; then
       echo "REF_LOAD does not exist: ${REF_LOAD}" >&2
@@ -1024,7 +1059,7 @@ if [ ! -d "${REF_LOAD}" ]; then
    mkdir -p "$(dirname "${REF_LOAD}")"
    CONVERT_GPUS="${CONVERT_GPUS:-1}"
    CONVERT_MASTER_PORT="${CONVERT_MASTER_PORT:-12355}"
-   PYTHONPATH="${MEGATRON_LM_PATH}:${REPO_ROOT}:${PYTHONPATH:-}" \
+   PYTHONPATH="${MEGATRON_LM_PATH}:${MILES_PATH}:${REPO_ROOT}:${PYTHONPATH:-}" \
    torchrun --nproc_per_node "${CONVERT_GPUS}" --master_port "${CONVERT_MASTER_PORT}" \
       "${REPO_ROOT}/tools/convert_hf_to_torch_dist.py" \
       "${MODEL_ARGS[@]}" \
@@ -1418,7 +1453,6 @@ fi
 PERF_ARGS=(
    # Training and rollout tensor parallelism are configured independently.
    --tensor-model-parallel-size "${TP_SIZE}"
-   --sequence-parallel
    --pipeline-model-parallel-size "${PP_SIZE}"
    --context-parallel-size "${CP_SIZE}"
    --expert-model-parallel-size "${EP_SIZE:-1}"
@@ -1434,6 +1468,10 @@ PERF_ARGS=(
    --log-probs-max-tokens-per-gpu "${LOG_PROBS_MAX_TOKENS_PER_GPU}"
    --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE}"
 )
+
+if ! is_truthy "${TRUE_ON_POLICY}"; then
+   PERF_ARGS+=(--sequence-parallel)
+fi
 
 if [ "${USE_DYNAMIC_BATCH_SIZE:-1}" = "1" ]; then
    PERF_ARGS+=(--use-dynamic-batch-size)
@@ -1501,13 +1539,20 @@ SGLANG_ARGS=(
    --sglang-router-request-timeout-secs "${SGLANG_ROUTER_REQUEST_TIMEOUT_SECS}"
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
    --sglang-context-length "${MAX_CONTEXT_LEN}"
-   #--sglang-rl-on-policy-target megatron
-   --sglang-enable-deterministic-inference
-   --sglang-attention-backend triton
    --sglang-disable-custom-all-reduce
    --sglang-disable-piecewise-cuda-graph
    --router-policy "${ROUTER_POLICY}"
 )
+if is_truthy "${TRUE_ON_POLICY}"; then
+   SGLANG_ARGS+=(
+      --sglang-enable-deterministic-inference
+      --sglang-enable-prefill-only-deterministic-inference
+      --sglang-true-on-policy-contract qwen3_dense_true_on_policy_v1
+      --sglang-attention-backend fa3
+   )
+else
+   SGLANG_ARGS+=(--sglang-attention-backend triton)
+fi
 if is_truthy "${SGLANG_ENABLE_HIERARCHICAL_CACHE}"; then
    SGLANG_ARGS+=(
       --sglang-enable-hierarchical-cache
@@ -1544,14 +1589,18 @@ MISC_ARGS=(
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
-   #--fp32-residual-connection
    --attention-backend flash
-   #--batch-invariant-mode
    --deterministic-mode
    --moe-token-dispatcher-type alltoall
    --train-memory-margin-bytes "${TRAIN_MEMORY_MARGIN_BYTES}"
    --train-env-vars '{"TMS_INIT_ENABLE_CPU_BACKUP":"1"}'
 )
+if is_truthy "${TRUE_ON_POLICY}"; then
+   MISC_ARGS+=(
+      --true-on-policy-mode
+      --recompute-logprobs-via-prefill
+   )
+fi
 if is_truthy "${CHECK_WEIGHT_UPDATE_EQUAL:-1}"; then
    # One tensor-level equality check validates the transport at startup;
    # lightweight weight-version checks cover every subsequent update.
@@ -1576,12 +1625,18 @@ if is_truthy "${USE_FAULT_TOLERANCE}"; then
    MISC_ARGS+=(--use-fault-tolerance)
 fi
 
-export SCRIPT_DIR REPO_ROOT MEGATRON_LM_PATH HAS_NVLINK
+export SCRIPT_DIR REPO_ROOT MEGATRON_LM_PATH SGLANG_PATH MILES_PATH HAS_NVLINK
+export TRUE_ON_POLICY
 export RUNS_ROOT RUN_ROOT SAVE_DIR LOG_ROOT EPISODE_LOG_DIR DUMP_DETAILS EVAL_CACHE_DIR PREPARED_PROMPT_DATA
 export UPDATE_WEIGHT_DISK_DIR WANDB_DIR WANDB_CACHE_DIR HF_HOME TORCH_HOME TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR XDG_CACHE_HOME MCP_ENV_ROOT
 export TORCH_COMPILE_JOB_ID TORCHINDUCTOR_FORCE_DISABLE_CACHES
-export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=1
-export SLIME_SGLANG_EXACT_RMSNORM=1
+if is_truthy "${TRUE_ON_POLICY}"; then
+   export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=1
+   export SLIME_SGLANG_EXACT_RMSNORM=1
+else
+   export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=0
+   export SLIME_SGLANG_EXACT_RMSNORM=0
+fi
 # Keep the experimental tiled policy projection disabled for Qwen3. The run's
 # final failures were accompanied by malformed rollout generations; forcing the
 # switch here prevents inherited environment settings from re-enabling the tile
@@ -1833,7 +1888,12 @@ keys = (
     "SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
-env["PYTHONPATH"] = f"{os.environ['MEGATRON_LM_PATH']}:{os.environ['REPO_ROOT']}:{os.environ['SCRIPT_DIR']}"
+env["PYTHONPATH"] = (
+    f"{os.environ['MEGATRON_LM_PATH']}:"
+    f"{os.environ['SGLANG_PATH']}/python:"
+    f"{os.environ['MILES_PATH']}:"
+    f"{os.environ['REPO_ROOT']}:{os.environ['SCRIPT_DIR']}"
+)
 env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 env["NCCL_ALGO"] = "Ring"
 env["NCCL_NVLS_ENABLE"] = os.environ["HAS_NVLINK"]
@@ -1862,7 +1922,7 @@ echo "Cluster: head=${MASTER_ADDR}, worker=${WORKER_ADDR}, nodes=${ACTOR_NUM_NOD
 echo "Actor GPUs: ${ACTOR_GPUS}, actor TP=${TP_SIZE}, CP=${CP_SIZE}, PP=${PP_SIZE}, rollout GPUs: ${ROLLOUT_GPUS}, rollout TP=${ROLLOUT_NUM_GPUS_PER_ENGINE}, rollout engines=${ROLLOUT_ENGINE_COUNT}, colocate=${COLOCATE}, offload_train=${OFFLOAD_TRAIN}"
 echo "Training token budgets: max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}, log_probs_max_tokens_per_gpu=${LOG_PROBS_MAX_TOKENS_PER_GPU}, log_probs_chunk_size=${LOG_PROBS_CHUNK_SIZE}, max_context_len=${MAX_CONTEXT_LEN}"
 echo "YaRN: enable=${ENABLE_YARN}, factor=${YARN_FACTOR}, original_max_position_embeddings=${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
-echo "SGLang: mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}, server_concurrency=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}, rl_on_policy_target=megatron"
+echo "SGLang: mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}, server_concurrency=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}, true_on_policy=${TRUE_ON_POLICY}"
 echo "SGLang HiCache: enable=${SGLANG_ENABLE_HIERARCHICAL_CACHE}, size_gib_per_server=${SGLANG_HICACHE_SIZE}, write_policy=${SGLANG_HICACHE_WRITE_POLICY}, io_backend=${SGLANG_HICACHE_IO_BACKEND}, mem_layout=${SGLANG_HICACHE_MEM_LAYOUT}"
 echo "Rollout collector: fully_async=${FULLY_ASYNC}, function=${ROLLOUT_FUNCTION_PATH}"
 echo "Compiler cache: force_disable=${TORCHINDUCTOR_FORCE_DISABLE_CACHES}, job_id=${TORCH_COMPILE_JOB_ID}, inductor_dir=${TORCHINDUCTOR_CACHE_DIR}, triton_dir=${TRITON_CACHE_DIR}"

@@ -77,6 +77,7 @@ slime 的设计目标，是让这两大能力彼此强化，同时避免把系�
    :caption: 高级特性
 
    advanced/on-policy-distillation.md
+   advanced/true-on-policy.md
    advanced/speculative-decoding.md
    advanced/low-precision.md
    advanced/reproducibility.md

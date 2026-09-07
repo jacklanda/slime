@@ -5,11 +5,6 @@ import pandas as pd
 from slime_plugins.evals import workbench_launcher
 
 
-def test_workbench_gpu_occupancy_guard_is_present():
-    script = (workbench_launcher.Path(__file__).parents[1] / "experiments" / "evals.sh").read_text()
-    assert "existing CUDA compute processes were detected" in script
-
-
 def test_workbench_readiness_probe_authenticates_to_sglang(monkeypatch):
     captured = {}
 

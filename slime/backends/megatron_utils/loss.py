@@ -526,6 +526,13 @@ def get_log_probs_and_entropy(
     # Apply rollout temperature scaling to logits to match rollout-time log-probs.
     rollout_temperature = getattr(args, "rollout_temperature", 1.0)
     logits = logits.contiguous()
+    true_on_policy = getattr(args, "true_on_policy_mode", False)
+    if true_on_policy:
+        # Match SGLang Sampler exactly: cast logits before temperature division,
+        # then retain BF16 for the batch-invariant log-softmax kernel.
+        logits = logits.bfloat16()
+        if rollout_temperature != 1.0:
+            logits = logits.div(rollout_temperature).bfloat16()
     T = logits.size(0)
     device = logits.device
     tp_group = mpu.get_tensor_model_parallel_group()
@@ -560,7 +567,9 @@ def get_log_probs_and_entropy(
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
-        logits_scale=1.0 / rollout_temperature,
+        logits_scale=1.0 if true_on_policy else 1.0 / rollout_temperature,
+        true_on_policy=true_on_policy,
+        vocab_size=getattr(args, "vocab_size", None),
     )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 
@@ -675,6 +684,11 @@ def get_tiled_log_probs_and_entropy(
             )
             logits_tile = projected[0] if isinstance(projected, tuple) else projected
             logits_tile = logits_tile.squeeze(1)
+            true_on_policy = getattr(args, "true_on_policy_mode", False)
+            if true_on_policy:
+                logits_tile = logits_tile.bfloat16()
+                if rollout_temperature != 1.0:
+                    logits_tile = logits_tile.div(rollout_temperature).bfloat16()
             return calculate_log_probs_and_entropy(
                 logits_tile,
                 target_tile,
@@ -683,7 +697,9 @@ def get_tiled_log_probs_and_entropy(
                 with_entropy_grad=with_entropy_grad,
                 chunk_size=-1,
                 log_prob_keep_mask=keep_mask,
-                logits_scale=1.0 / rollout_temperature,
+                logits_scale=1.0 if true_on_policy else 1.0 / rollout_temperature,
+                true_on_policy=true_on_policy,
+                vocab_size=getattr(args, "vocab_size", None),
             )
 
         log_prob_tile, entropy_tile = checkpoint(

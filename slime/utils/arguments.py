@@ -108,6 +108,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
         def add_train_arguments(parser):
             parser.add_argument(
+                "--true-on-policy-mode",
+                action="store_true",
+                default=False,
+                help="Enable the internal deterministic train/rollout parity path.",
+            )
+            parser.add_argument(
+                "--recompute-logprobs-via-prefill",
+                action="store_true",
+                default=False,
+                help="Replace decode logprobs with deterministic clean-prefill scores.",
+            )
+            parser.add_argument(
                 "--use-yarn-rope",
                 action="store_true",
                 help="Use static YaRN RoPE in the Megatron actor model.",
@@ -2106,6 +2118,53 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    if args.recompute_logprobs_via_prefill and not args.true_on_policy_mode:
+        raise ValueError("--recompute-logprobs-via-prefill requires --true-on-policy-mode")
+    if args.true_on_policy_mode:
+        if getattr(args, "fully_async", False):
+            raise ValueError("--true-on-policy-mode is only supported by synchronous rollout")
+        if getattr(args, "partial_rollout", False):
+            raise ValueError("--true-on-policy-mode does not support partial rollout")
+        if not getattr(args, "bf16", False):
+            raise ValueError("Qwen3 true-on-policy currently requires --bf16")
+        if args.tensor_model_parallel_size != args.rollout_num_gpus_per_engine:
+            raise ValueError(
+                "--true-on-policy-mode requires matching training and rollout tensor parallel sizes; "
+                f"got {args.tensor_model_parallel_size} and {args.rollout_num_gpus_per_engine}"
+            )
+        if getattr(args, "num_steps_per_rollout", None) not in (None, 1):
+            raise ValueError("--true-on-policy-mode requires --num-steps-per-rollout 1")
+        if getattr(args, "update_weights_interval", 1) != 1:
+            raise ValueError("--true-on-policy-mode requires --update-weights-interval 1")
+        incompatible_sampling = []
+        if args.rollout_top_p != 1.0:
+            incompatible_sampling.append("--rollout-top-p must be 1.0")
+        if args.rollout_top_k != -1:
+            incompatible_sampling.append("--rollout-top-k must be -1")
+        if args.rollout_min_p != 0.0:
+            incompatible_sampling.append("--rollout-min-p must be 0.0")
+        if args.rollout_presence_penalty != 0.0:
+            incompatible_sampling.append("--rollout-presence-penalty must be 0.0")
+        if args.rollout_repetition_penalty != 1.0:
+            incompatible_sampling.append("--rollout-repetition-penalty must be 1.0")
+        if incompatible_sampling:
+            raise ValueError(
+                "--true-on-policy-mode requires unmodified sampling logits: "
+                + ", ".join(incompatible_sampling)
+            )
+        # Keep the internal mode self-contained. Launchers expose only their
+        # public --true-on-policy switch; these are the cross-engine contract.
+        args.recompute_logprobs_via_prefill = True
+        args.batch_invariant_mode = True
+        args.deterministic_mode = True
+        args.sequence_parallel = False
+        args.true_on_policy_contract = "qwen3_dense_true_on_policy_v1"
+        args.transformer_impl = "local"
+        args.fp32_residual_connection = False
+        args.bias_swiglu_fusion = False
+        args.apply_rope_fusion = False
+        args.use_cpu_initialization = True
 
     if getattr(args, "update_weights_interval", 1) < 1:
         raise ValueError("--update-weights-interval must be at least 1")

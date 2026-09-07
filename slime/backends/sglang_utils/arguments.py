@@ -161,6 +161,12 @@ def validate_args(args):
     else:
         args.sglang_tp_size = args.rollout_num_gpus_per_engine
 
+    if getattr(args, "true_on_policy_mode", False):
+        args.sglang_enable_deterministic_inference = True
+        args.sglang_enable_prefill_only_deterministic_inference = True
+        args.sglang_true_on_policy_contract = "qwen3_dense_true_on_policy_v1"
+        args.sglang_attention_backend = "fa3"
+
     if args.sglang_dp_size > 1:
         assert args.sglang_enable_dp_attention
 
