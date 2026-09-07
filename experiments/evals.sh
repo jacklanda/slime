@@ -33,6 +33,7 @@ Core:
   --tau2-user-model NAME               User simulator model. Default: openai/gpt-4.1.
   --tau2-user-base-url URL             User simulator OpenAI-compatible endpoint.
   --tau2-user-api-key KEY              Default: OPENROUTER_API_KEY.
+  --tau2-model-base-url URL            Agent endpoint for openrouter tau2 runs. Default: https://openrouter.ai/api/v1.
   --tau2-evaluator-model NAME          NL-assertion/interface model. Default: anthropic/claude-opus-4.5.
   --tau2-evaluator-base-url URL        Default: https://openrouter.ai/api/v1.
   --tau2-evaluator-api-key KEY         Default: user simulator key.
@@ -70,6 +71,10 @@ Core:
   --vitabench-sglang-python-bin PATH   Python with SGLang installed. Default: current python.
   --vitabench-port N                   Local SGLang HTTP port. Default: 18080.
   --vitabench-overwrite BOOL           Replace an existing result. Default: false.
+  --workbench-domains LIST              WorkBench domains, or all. Default: all.
+  --workbench-workers N                 Official WorkBench task workers. Default: 128.
+  --workbench-port N                   Local WorkBench SGLang port. Default: 18082.
+  --workbench-overwrite BOOL            Replace existing WorkBench results. Default: false.
   --bfcl-model-key NAME                BFCL handler key. Inferred from --model-config for supported Qwen sizes.
   --bfcl-python-bin PATH               Base Python used to create an isolated BFCL venv.
   --bfcl-venv-dir PATH                 BFCL dependency venv. Default: Gorilla/.venv-slime-evals.
@@ -389,10 +394,15 @@ VITABENCH_VENV_DIR="${VITABENCH_VENV_DIR:-}"
 VITABENCH_SGLANG_PYTHON_BIN="${VITABENCH_SGLANG_PYTHON_BIN:-python}"
 VITABENCH_PORT="${VITABENCH_PORT:-18080}"
 VITABENCH_OVERWRITE="${VITABENCH_OVERWRITE:-false}"
+WORKBENCH_DOMAINS="${WORKBENCH_DOMAINS:-all}"
+WORKBENCH_WORKERS="${WORKBENCH_WORKERS:-128}"
+WORKBENCH_PORT="${WORKBENCH_PORT:-18082}"
+WORKBENCH_OVERWRITE="${WORKBENCH_OVERWRITE:-false}"
 TAU2_DOMAIN="${TAU2_DOMAIN:-all}"
 TAU2_USER_MODEL="${TAU2_USER_MODEL:-openai/gpt-4.1}"
 TAU2_USER_BASE_URL="${TAU2_USER_BASE_URL:-${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}}"
 TAU2_USER_API_KEY="${TAU2_USER_API_KEY:-${OPENROUTER_API_KEY:-}}"
+TAU2_MODEL_BASE_URL="${TAU2_MODEL_BASE_URL:-${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}}"
 TAU2_EVALUATOR_MODEL="${TAU2_EVALUATOR_MODEL:-anthropic/claude-opus-4.5}"
 TAU2_EVALUATOR_BASE_URL="${TAU2_EVALUATOR_BASE_URL:-https://openrouter.ai/api/v1}"
 TAU2_EVALUATOR_API_KEY="${TAU2_EVALUATOR_API_KEY:-}"
@@ -432,6 +442,7 @@ while [ "$#" -gt 0 ]; do
       --tau2-user-model) TAU2_USER_MODEL="${2:?Missing value for --tau2-user-model}"; shift 2 ;;
       --tau2-user-base-url) TAU2_USER_BASE_URL="${2:?Missing value for --tau2-user-base-url}"; shift 2 ;;
       --tau2-user-api-key) TAU2_USER_API_KEY="${2:?Missing value for --tau2-user-api-key}"; shift 2 ;;
+      --tau2-model-base-url) TAU2_MODEL_BASE_URL="${2:?Missing value for --tau2-model-base-url}"; shift 2 ;;
       --tau2-evaluator-model) TAU2_EVALUATOR_MODEL="${2:?Missing value for --tau2-evaluator-model}"; shift 2 ;;
       --tau2-evaluator-base-url) TAU2_EVALUATOR_BASE_URL="${2:?Missing value for --tau2-evaluator-base-url}"; shift 2 ;;
       --tau2-evaluator-api-key) TAU2_EVALUATOR_API_KEY="${2:?Missing value for --tau2-evaluator-api-key}"; shift 2 ;;
@@ -466,6 +477,10 @@ while [ "$#" -gt 0 ]; do
       --vitabench-sglang-python-bin) VITABENCH_SGLANG_PYTHON_BIN="${2:?Missing value for --vitabench-sglang-python-bin}"; shift 2 ;;
       --vitabench-port) VITABENCH_PORT="${2:?Missing value for --vitabench-port}"; shift 2 ;;
       --vitabench-overwrite) VITABENCH_OVERWRITE="${2:?Missing value for --vitabench-overwrite}"; shift 2 ;;
+      --workbench-domains) WORKBENCH_DOMAINS="${2:?Missing value for --workbench-domains}"; shift 2 ;;
+      --workbench-workers) WORKBENCH_WORKERS="${2:?Missing value for --workbench-workers}"; shift 2 ;;
+      --workbench-port) WORKBENCH_PORT="${2:?Missing value for --workbench-port}"; shift 2 ;;
+      --workbench-overwrite) WORKBENCH_OVERWRITE="${2:?Missing value for --workbench-overwrite}"; shift 2 ;;
       --bfcl-model-key) BFCL_MODEL_KEY="${2:?Missing value for --bfcl-model-key}"; shift 2 ;;
       --bfcl-python-bin) BFCL_PYTHON_BIN="${2:?Missing value for --bfcl-python-bin}"; shift 2 ;;
       --bfcl-venv-dir) BFCL_VENV_DIR="${2:?Missing value for --bfcl-venv-dir}"; shift 2 ;;
@@ -629,6 +644,19 @@ if is_truthy "${VITABENCH_SELECTED}" && [ "${normalized_include}" != "vitabench"
    echo "Run it separately with --include vitabench." >&2
    exit 2
 fi
+WORKBENCH_SELECTED=false
+case ",${normalized_include}," in *,workbench,*) WORKBENCH_SELECTED=true ;; esac
+case ",${normalized_exclude}," in *,workbench,*) WORKBENCH_SELECTED=false ;; esac
+if is_truthy "${WORKBENCH_SELECTED}" && [ "${normalized_include}" != "workbench" ]; then
+   echo "WorkBench uses its official stateful agent loop and cannot be mixed with other datasets in one run." >&2
+   echo "Run it separately with --include workbench." >&2
+   exit 2
+fi
+if is_truthy "${WORKBENCH_SELECTED}"; then
+   # WorkBench owns its local stateful tools and does not use slime retrieval.
+   RETRIEVAL_BACKEND=local
+   retrieval_url_explicit=true
+fi
 case ",${normalized_include}," in
    *,bfcl-v3,*|*,gorilla,*|*,gorilla-bfcl-v3,*) BFCL_SELECTED=true; BFCL_BENCH_VERSION=v3 ;;
    *,bfcl-v4,*|*,gorilla-bfcl-v4,*) BFCL_SELECTED=true; BFCL_BENCH_VERSION=v4 ;;
@@ -639,18 +667,33 @@ esac
 if is_truthy "${BFCL_SELECTED}"; then
    if [ -z "${BFCL_MODEL_KEY}" ]; then
       normalized_model_config="$(printf '%s' "${MODEL_CONFIG}" | tr '[:upper:]_' '[:lower:]-')"
-      case "${normalized_model_config}" in
-         *qwen3.5-4b*) BFCL_MODEL_KEY="Qwen/Qwen3.5-4B" ;;
-         *qwen3-4b*) BFCL_MODEL_KEY="Qwen/Qwen3-4B-Thinking-2507" ;;
-         *qwen3-8b*) BFCL_MODEL_KEY="Qwen/Qwen3-8B" ;;
-         *qwen3-14b*) BFCL_MODEL_KEY="Qwen/Qwen3-14B" ;;
-         *qwen3-32b*) BFCL_MODEL_KEY="Qwen/Qwen3-32B" ;;
-         *)
-            echo "Cannot infer a BFCL handler key from --model-config ${MODEL_CONFIG@Q}." >&2
-            echo "Pass --bfcl-model-key explicitly; supported slime-gem defaults currently cover Qwen3.5 4B and Qwen3 4B/8B/14B/32B." >&2
-            exit 2
-            ;;
-      esac
+      if [ "${MODEL_SERIES}" = "openrouter" ]; then
+         normalized_openrouter_model="$(printf '%s' "${MODEL_DIR}" | tr '[:upper:]_' '[:lower:]-')"
+         case "${normalized_openrouter_model}" in
+            *deepseek-v3.2*) BFCL_MODEL_KEY="DeepSeek-V3.2-Exp-FC" ;;
+            *claude-haiku-4.5*|*claude-haiku-4-5*) BFCL_MODEL_KEY="claude-haiku-4-5-20251001-FC" ;;
+            *claude-sonnet-4.5*|*claude-sonnet-4-5*) BFCL_MODEL_KEY="claude-sonnet-4-5-20250929-FC" ;;
+            *claude-opus-4.5*|*claude-opus-4-5*) BFCL_MODEL_KEY="claude-opus-4-5-20251101-FC" ;;
+            *)
+               echo "Cannot infer a BFCL handler key from OpenRouter model ${MODEL_DIR@Q}." >&2
+               echo "Pass --bfcl-model-key explicitly (for example, claude-haiku-4-5-20251001-FC)." >&2
+               exit 2
+               ;;
+         esac
+      else
+         case "${normalized_model_config}" in
+            *qwen3.5-4b*) BFCL_MODEL_KEY="Qwen/Qwen3.5-4B" ;;
+            *qwen3-4b*) BFCL_MODEL_KEY="Qwen/Qwen3-4B-Thinking-2507" ;;
+            *qwen3-8b*) BFCL_MODEL_KEY="Qwen/Qwen3-8B" ;;
+            *qwen3-14b*) BFCL_MODEL_KEY="Qwen/Qwen3-14B" ;;
+            *qwen3-32b*) BFCL_MODEL_KEY="Qwen/Qwen3-32B" ;;
+            *)
+               echo "Cannot infer a BFCL handler key from --model-config ${MODEL_CONFIG@Q}." >&2
+               echo "Pass --bfcl-model-key explicitly; supported slime-gem defaults currently cover Qwen3.5 4B and Qwen3 4B/8B/14B/32B." >&2
+               exit 2
+               ;;
+         esac
+      fi
    fi
    case "${normalized_include}" in
       bfcl-v3|bfcl-v4|gorilla|gorilla-bfcl-v3|gorilla-bfcl-v4) ;;
@@ -838,7 +881,13 @@ PY
 }
 
 # OpenRouter API model mode: provider/model ids do not require a local checkpoint.
-if [ "${MODEL_SERIES}" = "openrouter" ]; then
+# Dedicated benchmark integrations must run first; they own their data loading,
+# protocol, and scoring instead of using the generic normalized-dataset path.
+if [ "${MODEL_SERIES}" = "openrouter" ] && ! is_truthy "${ACEBENCH_SELECTED:-false}" \
+   && ! is_truthy "${TAU2_SELECTED:-false}" \
+   && ! is_truthy "${VITABENCH_SELECTED:-false}" \
+   && ! is_truthy "${BFCL_SELECTED:-false}" \
+   && ! is_truthy "${WORKBENCH_SELECTED:-false}"; then
    if [ -z "${MODEL_DIR}" ]; then
       echo "--model is required with --model-series openrouter" >&2
       exit 2
@@ -859,7 +908,7 @@ if [ "${MODEL_SERIES}" = "openrouter" ]; then
 fi
 
 case "${MODEL_SERIES}" in
-   qwen3|qwen3.5|gemma4|gemma-4|gemma-4-*) ;;
+   openrouter|qwen3|qwen3.5|gemma4|gemma-4|gemma-4-*) ;;
    *) echo "Unsupported --model-series ${MODEL_SERIES}; expected openrouter, qwen3, qwen3.5, or gemma4." >&2; exit 2 ;;
 esac
 case "${MODEL_SERIES}" in
@@ -909,20 +958,20 @@ if [ "${MODEL_SERIES}" = "gemma4" ]; then
 fi
 
 MODEL_CONFIG_PATH="${REPO_ROOT}/scripts/models/${MODEL_CONFIG}.sh"
-if [ ! -f "${MODEL_CONFIG_PATH}" ]; then
-   echo "MODEL_CONFIG does not exist: ${MODEL_CONFIG_PATH}" >&2
-   exit 2
-fi
-if [ ! -d "${MODEL_DIR}" ]; then
-   echo "MODEL_DIR does not exist: ${MODEL_DIR}" >&2
-   exit 2
-fi
 if [ ! -d "${BENCHMARKS_ROOT}" ]; then
    echo "BENCHMARKS_ROOT does not exist: ${BENCHMARKS_ROOT}" >&2
    exit 2
 fi
-
-python3 - "${MODEL_DIR}" "${MODEL_SERIES}" <<'PY' || exit 2
+if [ "${MODEL_SERIES}" != "openrouter" ]; then
+   if [ ! -f "${MODEL_CONFIG_PATH}" ]; then
+      echo "MODEL_CONFIG does not exist: ${MODEL_CONFIG_PATH}" >&2
+      exit 2
+   fi
+   if [ ! -d "${MODEL_DIR}" ]; then
+      echo "MODEL_DIR does not exist: ${MODEL_DIR}" >&2
+      exit 2
+   fi
+   python3 - "${MODEL_DIR}" "${MODEL_SERIES}" <<'PY' || exit 2
 import json
 import pathlib
 import sys
@@ -950,8 +999,11 @@ if not matches:
         f"--model-series {model_series} does not match {config_path} model_type={model_type!r}"
     )
 PY
+fi
 
-source "${MODEL_CONFIG_PATH}"
+if [ "${MODEL_SERIES}" != "openrouter" ]; then
+   source "${MODEL_CONFIG_PATH}"
+fi
 
 if [ -z "${EVAL_MAX_CONTEXT_LEN}" ]; then
    if [ "${MODEL_SERIES}" = "qwen3" ]; then
@@ -1035,7 +1087,7 @@ if is_truthy "${BFCL_SELECTED}"; then
    else
       unset BFCL_SGLANG_LD_PRELOAD || true
    fi
-   if [ "${MODEL_SERIES}" != "qwen3" ] && [ "${MODEL_SERIES}" != "qwen3.5" ]; then
+   if [ "${MODEL_SERIES}" != "openrouter" ] && [ "${MODEL_SERIES}" != "qwen3" ] && [ "${MODEL_SERIES}" != "qwen3.5" ]; then
       echo "BFCL's local handler currently supports --model-series qwen3 or qwen3.5 only." >&2
       exit 2
    fi
@@ -1043,13 +1095,15 @@ if is_truthy "${BFCL_SELECTED}"; then
       echo "BFCL currently supports --n-samples-per-prompt 1 only." >&2
       exit 2
    fi
-   if [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
+   if [ "${MODEL_SERIES}" != "openrouter" ] && [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
       echo "--gpus (${ROLLOUT_GPUS}) must be divisible by --gpus-per-engine (${ROLLOUT_NUM_GPUS_PER_ENGINE}) for BFCL." >&2
       exit 2
    fi
    case "${BFCL_AGENT_MODE}" in
       auto)
-         if [ "${FUSED_HARNESS}" = "gem" ]; then
+         if [ "${MODEL_SERIES}" = "openrouter" ]; then
+            BFCL_AGENT_MODE=bfcl
+         elif [ "${FUSED_HARNESS}" = "gem" ]; then
             BFCL_AGENT_MODE=slime_fused_gem
          else
             BFCL_AGENT_MODE=bfcl
@@ -1129,10 +1183,12 @@ if is_truthy "${BFCL_SELECTED}"; then
       exit 2
    fi
    BFCL_CUDA_DEVICES=""
-   for ((gpu_index = 0; gpu_index < ROLLOUT_GPUS; gpu_index++)); do
-      if [ -n "${BFCL_CUDA_DEVICES}" ]; then BFCL_CUDA_DEVICES+=","; fi
-      BFCL_CUDA_DEVICES+="${gpu_index}"
-   done
+   if [ "${MODEL_SERIES}" != "openrouter" ]; then
+      for ((gpu_index = 0; gpu_index < ROLLOUT_GPUS; gpu_index++)); do
+         if [ -n "${BFCL_CUDA_DEVICES}" ]; then BFCL_CUDA_DEVICES+=","; fi
+         BFCL_CUDA_DEVICES+="${gpu_index}"
+      done
+   fi
    if is_truthy "${DISABLE_THINKING}"; then
       BFCL_QWEN_PARSE_MODE=instruct
    else
@@ -1142,6 +1198,14 @@ if is_truthy "${BFCL_SELECTED}"; then
    BFCL_LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/evals/${EXPERIMENT_NAME}}"
    BFCL_RESULT_DIR="${BFCL_LOG_ROOT}/bfcl_results"
    BFCL_SCORE_DIR="${BFCL_LOG_ROOT}/bfcl_scores"
+   # BFCL records transport failures as result entries. Reusing those entries
+   # would make the scorer report 0% forever after a transient/API mismatch.
+   if [ "${MODEL_SERIES}" = "openrouter" ] && [ "${BFCL_OVERWRITE}" = "false" ] \
+      && [ -d "${BFCL_RESULT_DIR}" ] \
+      && rg -l 'Error during inference|model_not_found|InternalServerError' "${BFCL_RESULT_DIR}" -g '*.json' >/dev/null 2>&1; then
+      echo "Discarding failed cached OpenRouter BFCL results and regenerating them."
+      BFCL_OVERWRITE=true
+   fi
    export BFCL_VERSION_PREFIX="BFCL_${BFCL_BENCH_VERSION}"
    if [ "${BFCL_BENCH_VERSION}" = v4 ] && [[ ",${BFCL_TEST_CATEGORY}," == *,all,* || ",${BFCL_TEST_CATEGORY}," == *,all_scoring,* || ",${BFCL_TEST_CATEGORY}," == *,*web_search* ]] && [ -z "${RETRIEVAL_SERVER_URL:-}" ]; then
       echo "BFCL-v4 categories including web_search require RETRIEVAL_SERVER_URL." >&2
@@ -1149,33 +1213,43 @@ if is_truthy "${BFCL_SELECTED}"; then
       exit 2
    fi
    mkdir -p "${BFCL_RESULT_DIR}" "${BFCL_SCORE_DIR}"
+   BFCL_SERVER_MODE=local-sglang
+   if [ "${MODEL_SERIES}" = "openrouter" ]; then BFCL_SERVER_MODE=remote; fi
    BFCL_CMD=(
       "${BFCL_ROOT}/run_eval.sh"
       --no-conda
-      --sglang-python-bin "${BFCL_SGLANG_PYTHON_BIN}"
-      --server-mode local-sglang
+      --server-mode "${BFCL_SERVER_MODE}"
       --bench-version "${BFCL_BENCH_VERSION}"
       --test-category "${BFCL_TEST_CATEGORY}"
       --bfcl-model-key "${BFCL_MODEL_KEY}"
       --agent-mode "${BFCL_AGENT_MODE}"
-      --slime-tool-parser-path "${REPO_ROOT}/slime/rollout/fused_agent/parser.py"
-      --qwen-parse-mode "${BFCL_QWEN_PARSE_MODE}"
-      --local-model-path "$(realpath "${MODEL_DIR}")"
       --served-model-name "${EXPERIMENT_NAME}"
       --artifact-name "${EXPERIMENT_NAME}"
-      --cuda-visible-devices "${BFCL_CUDA_DEVICES}"
-      --tp-size "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
-      --dp-size "${BFCL_DP_SIZE}"
-      --context-length "${EVAL_MAX_CONTEXT_LEN}"
-      --gpu-memory-utilization "${SGLANG_MEM_FRACTION_STATIC}"
-      --max-running-requests "${BFCL_SGLANG_MAX_RUNNING_REQUESTS}"
       --num-threads "${BFCL_NUM_THREADS}"
       --result-dir "${BFCL_RESULT_DIR}"
       --temperature "${TEMPERATURE}"
       --top-p "${TOP_P}"
       --top-k "${TOP_K}"
    )
-   if is_truthy "${BFCL_STICKY_ENGINE_ROUTING}"; then BFCL_CMD+=(--sticky-engine-routing); fi
+   if [ "${MODEL_SERIES}" = "openrouter" ]; then
+      BFCL_CMD+=(--remote-base-url "${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}" --remote-api-key "${OPENROUTER_API_KEY:-}" --remote-model-name "${MODEL_DIR}" --skip-prompt-tokenize)
+   else
+      BFCL_CMD+=(
+         --sglang-python-bin "${BFCL_SGLANG_PYTHON_BIN}"
+         --slime-tool-parser-path "${REPO_ROOT}/slime/rollout/fused_agent/parser.py"
+         --qwen-parse-mode "${BFCL_QWEN_PARSE_MODE}"
+         --local-model-path "$(realpath "${MODEL_DIR}")"
+         --cuda-visible-devices "${BFCL_CUDA_DEVICES}"
+         --tp-size "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
+         --dp-size "${BFCL_DP_SIZE}"
+         --context-length "${EVAL_MAX_CONTEXT_LEN}"
+         --gpu-memory-utilization "${SGLANG_MEM_FRACTION_STATIC}"
+         --max-running-requests "${BFCL_SGLANG_MAX_RUNNING_REQUESTS}"
+      )
+   fi
+   if [ "${MODEL_SERIES}" != "openrouter" ] && is_truthy "${BFCL_STICKY_ENGINE_ROUTING}"; then
+      BFCL_CMD+=(--sticky-engine-routing)
+   fi
    if [ "${BFCL_BENCH_VERSION}" = v3 ]; then
       BFCL_DATA_DIR="${BFCL_DATA_DIR:-${BFCL_ROOT}/.cache/bfcl-v3-data/${BFCL_V3_COMMIT}}"
       export BFCL_DATA_DIR
@@ -1271,7 +1345,13 @@ fi
 
 if is_truthy "${ACEBENCH_SELECTED}"; then
    ACEBENCH_ROOT="${BENCHMARKS_ROOT}/ACEBench"
-   ACEBENCH_MODEL_DIR="$(realpath "${MODEL_DIR}")"
+   if [ "${MODEL_SERIES}" = "openrouter" ]; then
+      # ACEBench accepts any OpenAI-compatible endpoint. Keep the provider
+      # model id intact; it is not a filesystem path.
+      ACEBENCH_MODEL_DIR="${MODEL_DIR}"
+   else
+      ACEBENCH_MODEL_DIR="$(realpath "${MODEL_DIR}")"
+   fi
    # Keep ACEBench runs on the fused-agent protocol and a fixed sampling
    # configuration so results are comparable across checkpoints.
    ACEBENCH_PROTOCOL=slime_fused_gem
@@ -1369,8 +1449,17 @@ if is_truthy "${ACEBENCH_SELECTED}"; then
       --top-k "${TOP_K}"
       --seed "${ROLLOUT_SEED}"
       --slime-repo-root "${REPO_ROOT}"
-      --model-series "${MODEL_SERIES}"
    )
+   if [ "${MODEL_SERIES}" != "openrouter" ]; then
+      ACEBENCH_CMD+=(--model-series "${MODEL_SERIES}")
+   fi
+   if [ "${MODEL_SERIES}" = "openrouter" ]; then
+      # ACEBench uses served-model-name in its API adapter; for remote models
+      # it must be the provider model id rather than our result alias.
+      ACEBENCH_CMD+=(--served-model-name "${MODEL_DIR}")
+      ACEBENCH_CMD+=(--api-base-url "${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}" --api-key "${OPENROUTER_API_KEY:-}")
+      ACEBENCH_CMD+=(--no-auto-start-sglang)
+   fi
    if is_truthy "${DISABLE_THINKING}"; then
       ACEBENCH_CMD+=(--enable-thinking false)
    else
@@ -1414,7 +1503,12 @@ PY
       export PATH="${ACEBENCH_VENV_DIR}/bin:${PATH}"
    fi
    export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-   export FUSED_MODEL_SERIES="${MODEL_SERIES}"
+   if [ "${MODEL_SERIES}" != "openrouter" ]; then
+      export FUSED_MODEL_SERIES="${MODEL_SERIES}"
+   else
+      unset FUSED_MODEL_SERIES || true
+      export API_MODEL_NAME="${MODEL_DIR}"
+   fi
    exec "${ACEBENCH_CMD[@]}"
 fi
 
@@ -1468,6 +1562,7 @@ if is_truthy "${TAU2_SELECTED}"; then
       --tau2-root "${TAU2_ROOT}"
       --model "${MODEL_DIR}"
       --model-series "${MODEL_SERIES}"
+      --model-base-url "${TAU2_MODEL_BASE_URL}"
       --served-model-name "${EXPERIMENT_NAME}"
       --output-dir "${TAU2_LOG_ROOT}/tau2"
       --venv-dir "${TAU2_VENV_DIR}"
@@ -1607,6 +1702,47 @@ if is_truthy "${VITABENCH_SELECTED}"; then
    export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
    export VITABENCH_USER_API_KEY VITABENCH_EVALUATOR_API_KEY
    exec "${VITABENCH_CMD[@]}"
+fi
+if is_truthy "${WORKBENCH_SELECTED}"; then
+   if [ "${FUSED_HARNESS}" != "gem" ]; then
+      echo "WorkBench's slime plugin requires --harness gem, got ${FUSED_HARNESS}" >&2
+      exit 2
+   fi
+   case "${WORKBENCH_OVERWRITE,,}" in true|false|1|0|yes|no|on|off) ;; *) echo "--workbench-overwrite must be a boolean" >&2; exit 2 ;; esac
+   if ! [[ "${WORKBENCH_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "--workbench-workers must be a positive integer" >&2; exit 2
+   fi
+   if [ $((ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE)) -ne 0 ]; then
+      echo "--gpus (${ROLLOUT_GPUS}) must be divisible by --gpus-per-engine (${ROLLOUT_NUM_GPUS_PER_ENGINE}) for WorkBench." >&2
+      exit 2
+   fi
+   if ! [[ "${WORKBENCH_PORT}" =~ ^[1-9][0-9]*$ ]] || [ "${WORKBENCH_PORT}" -gt 65535 ]; then
+      echo "--workbench-port must be an integer in [1, 65535]" >&2
+      exit 2
+   fi
+   if [ "${N_SAMPLES_PER_PROMPT}" -ne 1 ]; then
+      echo "WorkBench currently supports --n-samples-per-prompt 1 only." >&2
+      exit 2
+   fi
+   WORKBENCH_ROOT="${BENCHMARKS_ROOT}/workbench"
+   WORKBENCH_LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/experiments/logs/evals/${EXPERIMENT_NAME}}"
+   WORKBENCH_CMD=(
+      python3 -m slime_plugins.evals.workbench_launcher
+      --workbench-root "${WORKBENCH_ROOT}" --model "${MODEL_DIR}"
+      --served-model-name "${EXPERIMENT_NAME}" --output-dir "${WORKBENCH_LOG_ROOT}/workbench"
+      --cuda-visible-devices "$(seq -s, 0 $((ROLLOUT_GPUS - 1)))"
+      --tp-size "${ROLLOUT_NUM_GPUS_PER_ENGINE}" --dp-size "$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))"
+      --context-length "${EVAL_MAX_CONTEXT_LEN}" --mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
+      --port "${WORKBENCH_PORT}" --workers "${WORKBENCH_WORKERS}" --limit "${LIMIT_PER_BENCHMARK}"
+      --max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
+      --domains "${WORKBENCH_DOMAINS}" --max-tokens "${EVAL_MAX_RESPONSE_LEN}"
+      --enable-thinking "$(is_truthy "${DISABLE_THINKING}" && echo false || echo true)"
+      --overwrite "${WORKBENCH_OVERWRITE}" --structured-outputs true
+   )
+   if is_truthy "${PREFLIGHT_ONLY}"; then WORKBENCH_CMD+=(--preflight-only); fi
+   echo "WorkBench: protocol=official_workbench, transport=slime_sglang, domains=${WORKBENCH_DOMAINS}, workers=${WORKBENCH_WORKERS}, output=${WORKBENCH_LOG_ROOT}/workbench"
+   export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:+:${PYTHONPATH}}"
+   exec "${WORKBENCH_CMD[@]}"
 fi
 case "${ROUTER_POLICY}" in
    manual|consistent_hashing|cache_aware|round_robin|random|power_of_two|prefix_hash) ;;

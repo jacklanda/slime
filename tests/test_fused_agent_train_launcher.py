@@ -636,6 +636,26 @@ def test_odyssey_sync_launcher_avoids_train_memory_saver_by_default():
 
 
 @pytest.mark.unit
+def test_odyssey_sync_launcher_enables_host_hicache_by_default():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "experiments/train_odyssey_qwen3_multinode_sync.sh").read_text(encoding="utf-8")
+
+    assert 'SGLANG_ENABLE_HIERARCHICAL_CACHE="${SGLANG_ENABLE_HIERARCHICAL_CACHE:-true}"' in launcher
+    assert 'SGLANG_HICACHE_SIZE="${SGLANG_HICACHE_SIZE:-32}"' in launcher
+    assert 'SGLANG_HICACHE_WRITE_POLICY="${SGLANG_HICACHE_WRITE_POLICY:-write_through}"' in launcher
+    assert 'SGLANG_HICACHE_IO_BACKEND="${SGLANG_HICACHE_IO_BACKEND:-kernel}"' in launcher
+    assert 'SGLANG_HICACHE_MEM_LAYOUT="${SGLANG_HICACHE_MEM_LAYOUT:-layer_first}"' in launcher
+    assert 'SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-96}"' in launcher
+    assert 'SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"' in launcher
+    assert 'OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"' in launcher
+    assert "--sglang-enable-hierarchical-cache" in launcher
+    assert '--sglang-hicache-size "${SGLANG_HICACHE_SIZE}"' in launcher
+    assert '--sglang-hicache-write-policy "${SGLANG_HICACHE_WRITE_POLICY}"' in launcher
+    assert '--sglang-hicache-io-backend "${SGLANG_HICACHE_IO_BACKEND}"' in launcher
+    assert '--sglang-hicache-mem-layout "${SGLANG_HICACHE_MEM_LAYOUT}"' in launcher
+
+
+@pytest.mark.unit
 def test_single_node_odyssey_launcher_avoids_train_memory_saver_by_default():
     repo_root = Path(__file__).resolve().parents[1]
     launcher = (repo_root / "experiments" / "train_odyssey_qwen3_sync.sh").read_text(encoding="utf-8")
@@ -646,6 +666,20 @@ def test_single_node_odyssey_launcher_avoids_train_memory_saver_by_default():
     assert "OFFLOAD_TRAIN=false" in launcher
     assert "--update-weight-mode full" in launcher
     assert "--update-weight-transport disk" in launcher
+
+
+@pytest.mark.unit
+def test_odyssey_qwen3_launchers_use_pageable_tensor_backups():
+    repo_root = Path(__file__).resolve().parents[1]
+
+    for launcher_name in (
+        "train_odyssey_qwen3_multinode_sync.sh",
+        "train_odyssey_qwen3_sync.sh",
+    ):
+        launcher = (repo_root / "experiments" / launcher_name).read_text(encoding="utf-8")
+
+        assert 'export SLIME_TENSOR_BACKUP_PIN_MEMORY="${SLIME_TENSOR_BACKUP_PIN_MEMORY:-0}"' in launcher
+        assert '"SLIME_FUSED_REQUIRE_WEIGHT_VERSION", "SLIME_TENSOR_BACKUP_PIN_MEMORY",' in launcher
 
 
 @pytest.mark.unit

@@ -60,8 +60,8 @@ Options:
   --retrieval-lexrank-multiprocessing BOOL
                                          Retrieval LexRank multiprocessing env.
   --retrieval-lexrank-workers N          Retrieval LexRank workers env.
-  --master-addr HOST                     Ray head address. Default: hgx-hyperplane02.
-  --worker-addr HOST                     Ray worker address. Default: hgx-hyperplane09.
+  --master-addr HOST                     Ray head address. Default: hgx-hyperplane09.
+  --worker-addr HOST                     Ray worker address. Default: hgx-hyperplane05.
   --ray-ssh-user USER                    SSH user used to start Ray on the worker. Default: current user.
   --socket-ifname NAME                   Interface used by Gloo/NCCL. Default: enp168s0f0np0.
   --ray-num-cpus N                       Ray CPU resource count.
@@ -147,9 +147,16 @@ Options:
   --offload-train BOOL                   Offload trainer model between phases. Disabled by --release-train.
   --release-train BOOL                   Recreate trainer each step instead of pausing it. Default: true.
   --max-tool-output-length N             Fused max tool output length env.
-  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 128.
+  --sglang-server-concurrency N          Max concurrent requests per SGLang server. Default: 96.
   --sglang-router-request-timeout-secs N Router request timeout. Default: 21600.
-  --sglang-max-running-requests N        SGLang max running requests. Default: 128.
+  --sglang-max-running-requests N        SGLang max running requests. Default: 64.
+  --sglang-enable-hierarchical-cache BOOL
+                                         Offload evictable KV prefixes to host memory. Default: true.
+  --sglang-hicache-size N               Host KV cache GiB per SGLang server. Default: 32.
+  --sglang-hicache-write-policy POLICY  write_through, write_back, or write_through_selective.
+                                         Default: write_through.
+  --sglang-hicache-io-backend BACKEND   kernel, direct, or kernel_ascend. Default: kernel.
+  --sglang-hicache-mem-layout LAYOUT    Host KV cache layout. Default: layer_first.
   --sglang-disable-cuda-graph BOOL       Disable CUDA graph capture for insufficient-driver hosts.
   --colocate                             Share trainer and rollout GPUs with offload. Required by this launcher.
   --experiment-name NAME                 Experiment/run name. Defaults to the next dev suffix below.
@@ -184,16 +191,17 @@ ALLOW_NO_LOAD_OPTIM="${ALLOW_NO_LOAD_OPTIM:-false}"
 # Newer SGLang-Miles exposes cache-aware routing instead of the removed
 # consistent_hashing alias. Keep an explicit environment override for older
 # deployments while defaulting to a parser-compatible policy.
-ROUTER_POLICY="${ROUTER_POLICY:-cache_aware}"
+#ROUTER_POLICY="${ROUTER_POLICY:-cache_aware}"
+ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 # Alternate training and rollout across all eight GPU slots on one node.
 COLOCATE="${COLOCATE:-true}"
 ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
-HYPERPLANE02_CUDA_VISIBLE_DEVICES="${HYPERPLANE02_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-MASTER_ADDR="${MASTER_ADDR:-hgx-hyperplane02}"
-WORKER_ADDR="${WORKER_ADDR:-hgx-hyperplane09}"
+HYPERPLANE09_CUDA_VISIBLE_DEVICES="${HYPERPLANE09_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+MASTER_ADDR="${MASTER_ADDR:-hgx-hyperplane09}"
+WORKER_ADDR="${WORKER_ADDR:-hgx-hyperplane05}"
 RAY_SSH_USER="${RAY_SSH_USER:-$(id -un)}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-enp168s0f0np0}}"
 RAY_BIN="${RAY_BIN:-$(command -v ray)}"
@@ -272,8 +280,13 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Keep enough queued requests to cover retrieval/tool I/O waits, but cap the
 # running batch so growing agent contexts do not repeatedly exhaust the KV pool.
 # Queued HTTP requests do not consume the running batch's KV allocation.
-SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-64}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-96}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
+SGLANG_ENABLE_HIERARCHICAL_CACHE="${SGLANG_ENABLE_HIERARCHICAL_CACHE:-true}"
+SGLANG_HICACHE_SIZE="${SGLANG_HICACHE_SIZE:-32}"
+SGLANG_HICACHE_WRITE_POLICY="${SGLANG_HICACHE_WRITE_POLICY:-write_through}"
+SGLANG_HICACHE_IO_BACKEND="${SGLANG_HICACHE_IO_BACKEND:-kernel}"
+SGLANG_HICACHE_MEM_LAYOUT="${SGLANG_HICACHE_MEM_LAYOUT:-layer_first}"
 SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-false}"
 # The installed FlashInfer may include CUDA 13 CuTe libraries even when this
 # launcher uses CUDA 12.9. Prefer FlashInfer's CUDA JIT norm on this workload.
@@ -472,6 +485,11 @@ while [ "$#" -gt 0 ]; do
       --max-tool-output-length) MAX_TOOL_OUTPUT_LENGTH="${2:?Missing value for --max-tool-output-length}"; shift 2 ;;
       --sglang-server-concurrency) SGLANG_SERVER_CONCURRENCY="${2:?Missing value for --sglang-server-concurrency}"; shift 2 ;;
       --sglang-max-running-requests) SGLANG_MAX_RUNNING_REQUESTS="${2:?Missing value for --sglang-max-running-requests}"; shift 2 ;;
+      --sglang-enable-hierarchical-cache) SGLANG_ENABLE_HIERARCHICAL_CACHE="${2:?Missing value for --sglang-enable-hierarchical-cache}"; shift 2 ;;
+      --sglang-hicache-size) SGLANG_HICACHE_SIZE="${2:?Missing value for --sglang-hicache-size}"; shift 2 ;;
+      --sglang-hicache-write-policy) SGLANG_HICACHE_WRITE_POLICY="${2:?Missing value for --sglang-hicache-write-policy}"; shift 2 ;;
+      --sglang-hicache-io-backend) SGLANG_HICACHE_IO_BACKEND="${2:?Missing value for --sglang-hicache-io-backend}"; shift 2 ;;
+      --sglang-hicache-mem-layout) SGLANG_HICACHE_MEM_LAYOUT="${2:?Missing value for --sglang-hicache-mem-layout}"; shift 2 ;;
       --sglang-disable-cuda-graph) SGLANG_DISABLE_CUDA_GRAPH="${2:?Missing value for --sglang-disable-cuda-graph}"; shift 2 ;;
       --sglang-router-request-timeout-secs) SGLANG_ROUTER_REQUEST_TIMEOUT_SECS="${2:?Missing value for --sglang-router-request-timeout-secs}"; shift 2 ;;
       --colocate) COLOCATE=true; shift ;;
@@ -491,8 +509,8 @@ if [ "${ACTOR_NUM_NODES}" -ne 2 ] || [ "${ACTOR_NUM_GPUS_PER_NODE}" -ne 8 ]; the
    exit 2
 fi
 case "${MASTER_ADDR%%.*}" in
-   hgx-hyperplane02) ;;
-   *) echo "This launcher requires hgx-hyperplane02 as the Ray head; got MASTER_ADDR=${MASTER_ADDR}." >&2; exit 2 ;;
+   hgx-hyperplane09) ;;
+   *) echo "This launcher requires hgx-hyperplane09 as the Ray head; got MASTER_ADDR=${MASTER_ADDR}." >&2; exit 2 ;;
 esac
 if [ "${WORKER_ADDR%%.*}" = "${MASTER_ADDR%%.*}" ]; then
    echo "Ray head and worker must be different hosts; both resolve from ${MASTER_ADDR}." >&2
@@ -541,6 +559,24 @@ case "${TERMINAL_LOG_STYLE}" in
    progress|rollouts|both) ;;
    *) echo "Invalid TERMINAL_LOG_STYLE=${TERMINAL_LOG_STYLE}; expected progress, rollouts, or both." >&2; exit 2 ;;
 esac
+if is_truthy "${SGLANG_ENABLE_HIERARCHICAL_CACHE}"; then
+   if ! [[ "${SGLANG_HICACHE_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "SGLANG_HICACHE_SIZE must be a positive integer when HiCache is enabled; got ${SGLANG_HICACHE_SIZE}." >&2
+      exit 2
+   fi
+   case "${SGLANG_HICACHE_WRITE_POLICY}" in
+      write_through|write_back|write_through_selective) ;;
+      *) echo "Invalid SGLANG_HICACHE_WRITE_POLICY=${SGLANG_HICACHE_WRITE_POLICY}." >&2; exit 2 ;;
+   esac
+   case "${SGLANG_HICACHE_IO_BACKEND}" in
+      kernel|direct|kernel_ascend) ;;
+      *) echo "Invalid SGLANG_HICACHE_IO_BACKEND=${SGLANG_HICACHE_IO_BACKEND}." >&2; exit 2 ;;
+   esac
+   case "${SGLANG_HICACHE_MEM_LAYOUT}" in
+      layer_first|page_first|page_first_direct|page_first_kv_split|page_head) ;;
+      *) echo "Invalid SGLANG_HICACHE_MEM_LAYOUT=${SGLANG_HICACHE_MEM_LAYOUT}." >&2; exit 2 ;;
+   esac
+fi
 FUSED_HARNESS="${FUSED_HARNESS:-gem}"
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
@@ -1018,7 +1054,7 @@ ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
 ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-true}"
 # Bound aggressive admission even when low ROI or long-tail groups keep the
 # collector refilling candidates before the previous wave fully drains.
-OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-96}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-128}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
 # Keep 96 groups (3072 trajectories at n=32) admitted so tool and retrieval
 # waits cannot drain the decode engines. Extra requests are aborted once the
@@ -1026,9 +1062,9 @@ N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
 SYNC_MIN_PENDING_GROUPS=96
 # Preserve candidates from both families after either quota is satisfied. This
 # gives top-mean-step selection a deeper pool without changing the 50/50 batch.
-SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-64}"
-SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-32}"
-SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-32}"
+SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS:-96}"
+SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS:-16}"
+SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS:-16}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-196400}"
@@ -1472,6 +1508,15 @@ SGLANG_ARGS=(
    --sglang-disable-piecewise-cuda-graph
    --router-policy "${ROUTER_POLICY}"
 )
+if is_truthy "${SGLANG_ENABLE_HIERARCHICAL_CACHE}"; then
+   SGLANG_ARGS+=(
+      --sglang-enable-hierarchical-cache
+      --sglang-hicache-size "${SGLANG_HICACHE_SIZE}"
+      --sglang-hicache-write-policy "${SGLANG_HICACHE_WRITE_POLICY}"
+      --sglang-hicache-io-backend "${SGLANG_HICACHE_IO_BACKEND}"
+      --sglang-hicache-mem-layout "${SGLANG_HICACHE_MEM_LAYOUT}"
+   )
+fi
 if is_truthy "${SGLANG_DISABLE_CUDA_GRAPH}"; then
    SGLANG_ARGS+=(--sglang-disable-cuda-graph)
 fi
@@ -1699,6 +1744,10 @@ export SLIME_SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS}"
 export SLIME_SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS}"
 export SLIME_SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS}"
 export SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS}"
+# These backups cover the full actor and can exceed CUDA's pinned-host-memory
+# allocation limits during checkpoint resume. Pageable memory is sufficient
+# because backup() synchronizes after the copies complete.
+export SLIME_TENSOR_BACKUP_PIN_MEMORY="${SLIME_TENSOR_BACKUP_PIN_MEMORY:-0}"
 
 # Export the CUDA 12.9-compatible norm selection to the Ray workers. When CUDA
 # graphs are explicitly disabled, use SGLang's native PyTorch norm as well.
@@ -1724,7 +1773,8 @@ keys = (
     "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL", "OPENROUTER_APP_NAME",
     "SLIME_EPISODE_LOG_DIR", "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE",
     "SLIME_FUSED_EVAL_DUMP_FAILURES", "SLIME_FUSED_EVAL_USE_SGLANG_SESSION",
-    "SLIME_FUSED_REQUIRE_WEIGHT_VERSION", "SLIME_SGLANG_BATCH_INVARIANT_LOGPROB",
+    "SLIME_FUSED_REQUIRE_WEIGHT_VERSION", "SLIME_TENSOR_BACKUP_PIN_MEMORY",
+    "SLIME_SGLANG_BATCH_INVARIANT_LOGPROB",
     "SLIME_SGLANG_EXACT_RMSNORM", "SLIME_TILED_POLICY_LOSS",
     "SLIME_TILED_POLICY_LOSS_CLEAR_CACHE_BEFORE_BACKWARD",
     "SLIME_SGLANG_TRANSPORT_RETRY_TIMES",
@@ -1813,6 +1863,7 @@ echo "Actor GPUs: ${ACTOR_GPUS}, actor TP=${TP_SIZE}, CP=${CP_SIZE}, PP=${PP_SIZ
 echo "Training token budgets: max_tokens_per_gpu=${MAX_TOKENS_PER_GPU}, log_probs_max_tokens_per_gpu=${LOG_PROBS_MAX_TOKENS_PER_GPU}, log_probs_chunk_size=${LOG_PROBS_CHUNK_SIZE}, max_context_len=${MAX_CONTEXT_LEN}"
 echo "YaRN: enable=${ENABLE_YARN}, factor=${YARN_FACTOR}, original_max_position_embeddings=${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
 echo "SGLang: mem_fraction_static=${SGLANG_MEM_FRACTION_STATIC}, server_concurrency=${SGLANG_SERVER_CONCURRENCY}, max_running_requests=${SGLANG_MAX_RUNNING_REQUESTS}, rl_on_policy_target=megatron"
+echo "SGLang HiCache: enable=${SGLANG_ENABLE_HIERARCHICAL_CACHE}, size_gib_per_server=${SGLANG_HICACHE_SIZE}, write_policy=${SGLANG_HICACHE_WRITE_POLICY}, io_backend=${SGLANG_HICACHE_IO_BACKEND}, mem_layout=${SGLANG_HICACHE_MEM_LAYOUT}"
 echo "Rollout collector: fully_async=${FULLY_ASYNC}, function=${ROLLOUT_FUNCTION_PATH}"
 echo "Compiler cache: force_disable=${TORCHINDUCTOR_FORCE_DISABLE_CACHES}, job_id=${TORCH_COMPILE_JOB_ID}, inductor_dir=${TORCHINDUCTOR_CACHE_DIR}, triton_dir=${TRITON_CACHE_DIR}"
 echo "SGLang abort: deadline=${SLIME_SGLANG_ABORT_TIMEOUT_SECONDS}s, http_timeout=${SLIME_SGLANG_ABORT_HTTP_TIMEOUT_SECONDS}s, retry_interval=${SLIME_SGLANG_ABORT_RETRY_INTERVAL_SECONDS}s"
@@ -1874,7 +1925,7 @@ if [ "$(hostname -s)" != "${MASTER_ADDR%%.*}" ] \
    exit 2
 fi
 
-MASTER_CUDA_VISIBLE_DEVICES="${HYPERPLANE02_CUDA_VISIBLE_DEVICES}"
+MASTER_CUDA_VISIBLE_DEVICES="${HYPERPLANE09_CUDA_VISIBLE_DEVICES}"
 
 python3 - "${NUM_GPUS_PER_NODE}" "${MASTER_CUDA_VISIBLE_DEVICES}" <<'PY'
 import sys

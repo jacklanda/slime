@@ -184,7 +184,8 @@ ALLOW_NO_LOAD_OPTIM="${ALLOW_NO_LOAD_OPTIM:-false}"
 # Newer SGLang-Miles exposes cache-aware routing instead of the removed
 # consistent_hashing alias. Keep an explicit environment override for older
 # deployments while defaulting to a parser-compatible policy.
-ROUTER_POLICY="${ROUTER_POLICY:-cache_aware}"
+#ROUTER_POLICY="${ROUTER_POLICY:-cache_aware}"
+ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 # Alternate training and rollout across all eight GPUs on this node.
@@ -1706,6 +1707,10 @@ export SLIME_SYNC_MIN_PENDING_GROUPS="${SYNC_MIN_PENDING_GROUPS}"
 export SLIME_SYNC_WEBQA_MIN_PENDING_GROUPS="${SYNC_WEBQA_MIN_PENDING_GROUPS}"
 export SLIME_SYNC_MCP_MIN_PENDING_GROUPS="${SYNC_MCP_MIN_PENDING_GROUPS}"
 export SLIME_SYNC_MCP_ONLY_MIN_PENDING_GROUPS="${SYNC_MCP_ONLY_MIN_PENDING_GROUPS}"
+# These backups cover the full actor and can exceed CUDA's pinned-host-memory
+# allocation limits during checkpoint resume. Pageable memory is sufficient
+# because backup() synchronizes after the copies complete.
+export SLIME_TENSOR_BACKUP_PIN_MEMORY="${SLIME_TENSOR_BACKUP_PIN_MEMORY:-0}"
 
 # Export the CUDA 12.9-compatible norm selection to the Ray workers. When CUDA
 # graphs are explicitly disabled, use SGLang's native PyTorch norm as well.
@@ -1725,7 +1730,8 @@ keys = (
     "OPENROUTER_API_KEY", "OPENROUTER_SITE_URL", "OPENROUTER_APP_NAME",
     "SLIME_EPISODE_LOG_DIR", "SLIME_FUSED_EVAL_TRAJECTORY_SAMPLE_RATE",
     "SLIME_FUSED_EVAL_DUMP_FAILURES", "SLIME_FUSED_EVAL_USE_SGLANG_SESSION",
-    "SLIME_FUSED_REQUIRE_WEIGHT_VERSION", "SLIME_SGLANG_BATCH_INVARIANT_LOGPROB",
+    "SLIME_FUSED_REQUIRE_WEIGHT_VERSION", "SLIME_TENSOR_BACKUP_PIN_MEMORY",
+    "SLIME_SGLANG_BATCH_INVARIANT_LOGPROB",
     "SLIME_SGLANG_EXACT_RMSNORM", "SLIME_SGLANG_TRANSPORT_RETRY_TIMES",
     "SLIME_SGLANG_TRANSPORT_RETRY_BACKOFF_SECONDS",
     "RAY_WARN_BLOCKING_GET_INSIDE_ASYNC", "TOKENIZERS_PARALLELISM",

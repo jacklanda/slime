@@ -57,6 +57,11 @@ def test_eval_launcher_routes_bfcl_v3_to_gorilla_pipeline():
     assert '*qwen3.5-4b*) BFCL_MODEL_KEY="Qwen/Qwen3.5-4B"' in launcher
     assert '*qwen3-8b*) BFCL_MODEL_KEY="Qwen/Qwen3-8B"' in launcher
     assert '*qwen3-14b*) BFCL_MODEL_KEY="Qwen/Qwen3-14B"' in launcher
+    assert '*deepseek-v3.2*) BFCL_MODEL_KEY="DeepSeek-V3.2-Exp-FC"' in launcher
+    assert '*claude-haiku-4.5*|*claude-haiku-4-5*) BFCL_MODEL_KEY="claude-haiku-4-5-20251001-FC"' in launcher
+    assert '--remote-base-url "${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"' in launcher
+    assert 'if [ "${MODEL_SERIES}" != "openrouter" ] && is_truthy "${BFCL_STICKY_ENGINE_ROUTING}"' in launcher
+    assert "Discarding failed cached OpenRouter BFCL results" in launcher
     assert "export BFCL_SLIME_TOOL_PARSER_PATH=" in launcher
     assert 'export FUSED_MODEL_SERIES="${MODEL_SERIES}"' in launcher
     assert 'export FUSED_MAX_STEPS="${MAX_STEPS}"' in launcher

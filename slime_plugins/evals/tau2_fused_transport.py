@@ -48,6 +48,7 @@ class Config:
     use_session: bool
     discard_historical_thinking: bool
     enable_thinking: bool
+    remote: bool = False
 
 
 _CONFIG: Config | None = None

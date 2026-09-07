@@ -43,10 +43,11 @@ def _non_negative_int(value: str) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run tau2-bench against a local SGLang endpoint")
+    parser = argparse.ArgumentParser(description="Run tau2-bench against a local SGLang endpoint or OpenAI-compatible API")
     parser.add_argument("--tau2-root", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--model-series", choices=("qwen3", "qwen3.5", "gemma4"), required=True)
+    parser.add_argument("--model-series", choices=("openrouter", "qwen3", "qwen3.5", "gemma4"), required=True)
+    parser.add_argument("--model-base-url", default="https://openrouter.ai/api/v1")
     parser.add_argument("--served-model-name", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--venv-dir", type=Path, required=True)
@@ -156,7 +157,7 @@ def validate(args: argparse.Namespace) -> None:
         raise SystemExit(f"tau2 pyproject.toml is missing under {args.tau2_root}")
     if not (args.tau2_root / "src" / "tau2" / "cli.py").is_file():
         raise SystemExit(f"tau2 source is incomplete under {args.tau2_root}")
-    if not args.model.exists():
+    if args.model_series != "openrouter" and not Path(args.model).exists():
         raise SystemExit(f"Model does not exist: {args.model}")
     for name in ("python_bin", "sglang_python_bin"):
         path = Path(getattr(args, name))
@@ -164,7 +165,7 @@ def validate(args: argparse.Namespace) -> None:
             raise SystemExit(f"Python is not executable: {path}")
     if args.sglang_libstdcxx is not None and not args.sglang_libstdcxx.is_file():
         raise SystemExit(f"SGLang libstdc++ does not exist: {args.sglang_libstdcxx}")
-    if args.tp_size * args.dp_size != len([x for x in args.cuda_visible_devices.split(",") if x]):
+    if args.model_series != "openrouter" and args.tp_size * args.dp_size != len([x for x in args.cuda_visible_devices.split(",") if x]):
         raise SystemExit("tau2 requires tp-size * dp-size to equal the number of visible GPUs")
     if not 0 < args.mem_fraction_static <= 1:
         raise SystemExit("--mem-fraction-static must be in (0, 1]")
@@ -404,7 +405,6 @@ with open(sys.argv[1], encoding="utf-8") as file:
     payload = json.load(file)
 tau2_fused_transport.configure(**payload["transport"])
 llm_agent.AGENT_INSTRUCTION = tau2_fused_transport.AGENT_INSTRUCTION
-llm_agent.generate = tau2_fused_transport.generate
 
 def generate_external(config, api_key_env, *args, **kwargs):
     messages = kwargs.pop("messages", args[1] if len(args) > 1 else None)
@@ -503,6 +503,11 @@ def generate_user(*args, **kwargs):
 def generate_evaluator(*args, **kwargs):
     return generate_external(payload["evaluator_llm"], "TAU2_EVALUATOR_API_KEY", *args, **kwargs)
 
+def generate_agent(*args, **kwargs):
+    return generate_external(payload["agent_llm"], "TAU2_AGENT_API_KEY", *args, **kwargs)
+
+llm_agent.generate = generate_agent if payload["transport"].get("remote") else tau2_fused_transport.generate
+
 user_simulator.generate = generate_user
 evaluator_nl_assertions.generate = generate_evaluator
 interface_agent.generate = generate_evaluator
@@ -553,9 +558,10 @@ run_domain(TextRunConfig(**payload["settings"]))
         for domain in domains
     ]
     transport = {
-        "base_url": f"http://127.0.0.1:{args.port}/v1",
+        "base_url": args.model_base_url.rstrip("/") if args.model_series == "openrouter" else f"http://127.0.0.1:{args.port}/v1",
         "model": args.served_model_name,
-        "model_path": str(args.model.resolve()),
+        "model_path": str(args.model.resolve()) if args.model_series != "openrouter" else str(args.model),
+        "remote": args.model_series == "openrouter",
         "context_length": args.context_length,
         "dp_size": args.dp_size,
         "use_session": _truthy(args.use_sglang_session),
@@ -566,6 +572,7 @@ run_domain(TextRunConfig(**payload["settings"]))
     env.pop("OPENAI_API_KEY", None)
     env.pop("OPENAI_BASE_URL", None)
     env["TAU2_USER_API_KEY"] = args.user_api_key
+    env["TAU2_AGENT_API_KEY"] = args.user_api_key
     env["TAU2_EVALUATOR_API_KEY"] = args.evaluator_api_key or args.user_api_key
     env["TAU2_DATA_DIR"] = str((args.tau2_root / "data").resolve())
     env["FUSED_MODEL_SERIES"] = args.model_series
@@ -588,6 +595,7 @@ run_domain(TextRunConfig(**payload["settings"]))
                     {
                         "settings": setting,
                         "transport": transport,
+                        "agent_llm": {"model": str(args.model), "base_url": args.model_base_url.rstrip("/"), "max_tokens": args.max_tokens},
                         "user_llm": {"model": args.user_model, "base_url": args.user_base_url.rstrip("/")},
                         "evaluator_llm": {
                             "model": args.evaluator_model or args.user_model,
@@ -653,9 +661,9 @@ run_domain(TextRunConfig(**payload["settings"]))
                     for message in simulation.get("messages") or []
                     if (message.get("raw_data") or {}).get("slime_fused_protocol_version") == 2
                 ]
-                if not fused_messages:
+                if args.model_series != "openrouter" and not fused_messages:
                     protocol_missing += 1
-                if _truthy(args.use_sglang_session) and not any(
+                if args.model_series != "openrouter" and _truthy(args.use_sglang_session) and not any(
                     (message.get("raw_data") or {}).get("slime_fused_session_id") for message in fused_messages
                 ):
                     session_missing += 1
@@ -728,7 +736,8 @@ def main(argv: list[str] | None = None) -> int:
     venv_python = ensure_venv(args)
     process = None
     try:
-        process, _ = start_sglang(args)
+        if args.model_series != "openrouter":
+            process, _ = start_sglang(args)
         sweep = args.concurrency_sweep_values or [args.max_concurrency]
         sweep_summaries = {}
         for concurrency in sweep:

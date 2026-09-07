@@ -43,6 +43,15 @@ def test_tau2_dependencies_exclude_local_inference_stack(tmp_path: Path):
     assert tau2_launcher._project_dependencies(args.tau2_root / "pyproject.toml") == ["requests", "PyYAML"]
 
 
+def test_tau2_accepts_openrouter_model_id_without_local_checkpoint(tmp_path: Path, monkeypatch):
+    args = _args(tmp_path)
+    args.model = Path("deepseek/deepseek-v3.2")
+    args.model_series = "openrouter"
+    monkeypatch.setattr(tau2_launcher, "_python_version", lambda python: (3, 12))
+
+    tau2_launcher.validate(args)
+
+
 def test_tau2_finds_compatible_sglang_libstdcxx(tmp_path: Path, monkeypatch):
     args = _args(tmp_path)
     prefix = tmp_path / "sglang-env"
