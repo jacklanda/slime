@@ -60,8 +60,8 @@ Options:
   --retrieval-lexrank-multiprocessing BOOL
                                          Retrieval LexRank multiprocessing env.
   --retrieval-lexrank-workers N          Retrieval LexRank workers env.
-  --master-addr HOST                     Ray head address. Default: hgx-hyperplane09.
-  --worker-addr HOST                     Ray worker address. Default: hgx-hyperplane05.
+  --master-addr HOST                     Ray head address. Default: hgx-hyperplane01.
+  --worker-addr HOST                     Ray worker address. Default: hgx-hyperplane02.
   --ray-ssh-user USER                    SSH user used to start Ray on the worker. Default: current user.
   --socket-ifname NAME                   Interface used by Gloo/NCCL. Default: enp168s0f0np0.
   --ray-num-cpus N                       Ray CPU resource count.
@@ -151,7 +151,7 @@ Options:
   --sglang-router-request-timeout-secs N Router request timeout. Default: 21600.
   --sglang-max-running-requests N        SGLang max running requests. Default: 64.
   --sglang-enable-hierarchical-cache BOOL
-                                         Offload evictable KV prefixes to host memory. Default: true.
+                                         Offload evictable KV prefixes to host memory. Default: false.
   --sglang-hicache-size N               Host KV cache GiB per SGLang server. Default: 32.
   --sglang-hicache-write-policy POLICY  write_through, write_back, or write_through_selective.
                                          Default: write_through.
@@ -200,8 +200,8 @@ COLOCATE="${COLOCATE:-true}"
 ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
 HYPERPLANE09_CUDA_VISIBLE_DEVICES="${HYPERPLANE09_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-MASTER_ADDR="${MASTER_ADDR:-hgx-hyperplane09}"
-WORKER_ADDR="${WORKER_ADDR:-hgx-hyperplane05}"
+MASTER_ADDR="${MASTER_ADDR:-hgx-hyperplane01}"
+WORKER_ADDR="${WORKER_ADDR:-hgx-hyperplane02}"
 RAY_SSH_USER="${RAY_SSH_USER:-$(id -un)}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-enp168s0f0np0}}"
 RAY_BIN="${RAY_BIN:-$(command -v ray)}"
@@ -282,7 +282,7 @@ MAX_TOOL_OUTPUT_LENGTH="${MAX_TOOL_OUTPUT_LENGTH:-4096}"
 # Queued HTTP requests do not consume the running batch's KV allocation.
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-96}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
-SGLANG_ENABLE_HIERARCHICAL_CACHE="${SGLANG_ENABLE_HIERARCHICAL_CACHE:-true}"
+SGLANG_ENABLE_HIERARCHICAL_CACHE="${SGLANG_ENABLE_HIERARCHICAL_CACHE:-false}"
 SGLANG_HICACHE_SIZE="${SGLANG_HICACHE_SIZE:-32}"
 SGLANG_HICACHE_WRITE_POLICY="${SGLANG_HICACHE_WRITE_POLICY:-write_through}"
 SGLANG_HICACHE_IO_BACKEND="${SGLANG_HICACHE_IO_BACKEND:-kernel}"
@@ -509,8 +509,8 @@ if [ "${ACTOR_NUM_NODES}" -ne 2 ] || [ "${ACTOR_NUM_GPUS_PER_NODE}" -ne 8 ]; the
    exit 2
 fi
 case "${MASTER_ADDR%%.*}" in
-   hgx-hyperplane09) ;;
-   *) echo "This launcher requires hgx-hyperplane09 as the Ray head; got MASTER_ADDR=${MASTER_ADDR}." >&2; exit 2 ;;
+   hgx-hyperplane01) ;;
+   *) echo "This launcher requires hgx-hyperplane01 as the Ray head; got MASTER_ADDR=${MASTER_ADDR}." >&2; exit 2 ;;
 esac
 if [ "${WORKER_ADDR%%.*}" = "${MASTER_ADDR%%.*}" ]; then
    echo "Ray head and worker must be different hosts; both resolve from ${MASTER_ADDR}." >&2
@@ -540,13 +540,12 @@ if is_truthy "${RELEASE_TRAIN}"; then
    OFFLOAD_TRAIN=false
 fi
 
+set +x
 if is_truthy "${ENABLE_USE_GRM_TRAIN}" || is_truthy "${ENABLE_USE_GRM_EVALS}" || [ "${CUSTOM_RM_PATH:-}" = "${GRM_CUSTOM_RM_PATH}" ]; then
    if [ -z "${OPENROUTER_API_KEY:-}" ] \
       && [ -n "${OPENAI_API_KEY:-}" ] \
       && [ -n "${GRM_BASE_URL:-${OPENAI_BASE_URL:-}}" ]; then
-      set +x
       export OPENROUTER_API_KEY="${OPENAI_API_KEY}"
-      set -x
       GRM_BASE_URL="${GRM_BASE_URL:-${OPENAI_BASE_URL}}"
    fi
    if [ -z "${OPENROUTER_API_KEY:-}" ]; then
@@ -554,6 +553,7 @@ if is_truthy "${ENABLE_USE_GRM_TRAIN}" || is_truthy "${ENABLE_USE_GRM_EVALS}" ||
       exit 2
    fi
 fi
+set -x
 
 case "${TERMINAL_LOG_STYLE}" in
    progress|rollouts|both) ;;
