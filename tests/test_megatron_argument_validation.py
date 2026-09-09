@@ -297,6 +297,8 @@ def test_update_weights_interval_must_be_positive(monkeypatch):
 
 def make_slime_validate_args(**overrides):
     values = dict(
+        true_on_policy_mode=False,
+        recompute_logprobs_via_prefill=False,
         eval_config=None,
         eval_prompt_data=None,
         kl_coef=0,
@@ -379,6 +381,39 @@ def make_slime_validate_args(**overrides):
     )
     values.update(overrides)
     return types.SimpleNamespace(**values)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("recompute", [False, True])
+def test_true_on_policy_preserves_optional_parity_settings(monkeypatch, recompute):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        true_on_policy_mode=True,
+        recompute_logprobs_via_prefill=recompute,
+        bf16=True,
+        tensor_model_parallel_size=4,
+        rollout_num_gpus_per_engine=4,
+        num_steps_per_rollout=1,
+        rollout_top_p=1.0,
+        rollout_top_k=-1,
+        rollout_min_p=0.0,
+        rollout_presence_penalty=0.0,
+        rollout_repetition_penalty=1.0,
+        batch_invariant_mode=False,
+        deterministic_mode=False,
+        fp32_residual_connection=True,
+        use_cpu_initialization=False,
+    )
+
+    module.slime_validate_args(args)
+
+    assert args.recompute_logprobs_via_prefill is recompute
+    assert args.batch_invariant_mode is False
+    assert args.deterministic_mode is False
+    assert args.fp32_residual_connection is True
+    assert args.use_cpu_initialization is False
+    assert args.true_on_policy_contract == "qwen3_dense_true_on_policy_v1"
+    assert args.sequence_parallel is False
 
 
 @pytest.mark.unit

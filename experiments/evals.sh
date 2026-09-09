@@ -334,9 +334,11 @@ SGLANG_CUDA_GRAPH_MAX_BS="${SGLANG_CUDA_GRAPH_MAX_BS:-}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-60}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-128}"
 # FlashInfer 0.6 defaults RMSNorm to a CUTLASS DSL kernel whose bundled CUDA
-# runtime can require a newer driver than the PyTorch/SGLang runtime. SGLang's
-# native implementation is CUDA-graph compatible, so avoid that JIT path by
-# default without disabling graph capture. Set the variable to 0 to opt out.
+# runtime can require a newer driver than the PyTorch/SGLang runtime. Select
+# FlashInfer's CUDA norm implementation before any benchmark launches SGLang;
+# newer sgl_kernel versions call FlashInfer directly and bypass the Torch flag.
+# Both fallbacks support CUDA graphs. Set either variable to 0 to opt out.
+export FLASHINFER_USE_CUDA_NORM="${FLASHINFER_USE_CUDA_NORM:-1}"
 export FLASHINFER_USE_TORCH_NORM="${FLASHINFER_USE_TORCH_NORM:-1}"
 ROUTER_POLICY="${ROUTER_POLICY:-manual}"
 ROUTER_ASSIGNMENT_MODE="${ROUTER_ASSIGNMENT_MODE:-min_load}"

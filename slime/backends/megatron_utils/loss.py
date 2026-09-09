@@ -528,9 +528,9 @@ def get_log_probs_and_entropy(
     logits = logits.contiguous()
     true_on_policy = getattr(args, "true_on_policy_mode", False)
     if true_on_policy:
-        # Match SGLang Sampler exactly: cast logits before temperature division,
-        # then retain BF16 for the batch-invariant log-softmax kernel.
-        logits = logits.bfloat16()
+        # The TOP LM head already supplies BF16 logits. Retain BF16 after any
+        # temperature division for the batch-invariant log-softmax kernel.
+        # logits = logits.bfloat16()  # The TOP LM head already returns BF16; no_logits_cast kept exact parity.
         if rollout_temperature != 1.0:
             logits = logits.div(rollout_temperature).bfloat16()
     T = logits.size(0)

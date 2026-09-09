@@ -17,11 +17,18 @@ from slime.utils.ppo_utils import (
 )
 from slime.utils.types import Sample
 
+NUM_GPUS = 0
 
-def test_true_on_policy_rollout_logprob_dtype_matches_training_precision():
-    assert rollout_logprob_dtype(Namespace(true_on_policy_mode=True, bf16=True, fp16=False)) is torch.bfloat16
-    assert rollout_logprob_dtype(Namespace(true_on_policy_mode=True, bf16=False, fp16=True)) is torch.float16
+
+def test_true_on_policy_rollout_logprob_dtype_preserves_server_scores():
+    assert rollout_logprob_dtype(Namespace(true_on_policy_mode=True, bf16=True, fp16=False)) is torch.float32
+    assert rollout_logprob_dtype(Namespace(true_on_policy_mode=True, bf16=False, fp16=True)) is torch.float32
     assert rollout_logprob_dtype(Namespace(true_on_policy_mode=False, bf16=True, fp16=False)) is torch.float32
+    # Preserve a real graph-decode value rather than rounding away its mismatch with BF16 training.
+    score = -0.7130875587463379
+    stored = torch.tensor([score], dtype=rollout_logprob_dtype(Namespace(true_on_policy_mode=True, bf16=True)))
+    assert stored.item() == score
+    assert stored.bfloat16().float().item() != score
 
 
 def test_true_on_policy_full_vocab_gather_trims_padding_and_splits_gradient():
@@ -96,6 +103,7 @@ def test_true_on_policy_derives_sglang_deterministic_contract():
         sglang_dp_size=1,
         true_on_policy_mode=True,
         sglang_enable_deterministic_inference=False,
+        sglang_enable_prefill_only_deterministic_inference=False,
         sglang_rl_on_policy_target=None,
         sglang_attention_backend="triton",
         sglang_router_ip=None,
@@ -107,7 +115,7 @@ def test_true_on_policy_derives_sglang_deterministic_contract():
     validate_sglang_args(args)
 
     assert args.sglang_enable_deterministic_inference is True
-    assert args.sglang_enable_prefill_only_deterministic_inference is True
+    assert args.sglang_enable_prefill_only_deterministic_inference is False
     assert args.sglang_true_on_policy_contract == "qwen3_dense_true_on_policy_v1"
     assert args.sglang_rl_on_policy_target is None
     assert args.sglang_attention_backend == "fa3"
@@ -195,3 +203,7 @@ def test_odyssey_launcher_exposes_one_true_on_policy_switch(launcher_name):
     assert 'SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-${TRUE_ON_POLICY}}"' in launcher
     assert 'f"{os.environ[\'MILES_PATH\']}:"' in launcher
     assert 'env["NCCL_ALGO"] = "Ring"' in launcher
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -26,11 +26,13 @@ logger = logging.getLogger(__name__)
 
 
 def rollout_logprob_dtype(args: Namespace) -> torch.dtype:
-    if getattr(args, "true_on_policy_mode", False):
-        if getattr(args, "bf16", False):
-            return torch.bfloat16
-        if getattr(args, "fp16", False):
-            return torch.float16
+    # Preserve the server's scores. Default no-graph TOP scores already have BF16 precision;
+    # storing them in FP32 is exact and avoids hiding raw decode differences through rounding.
+    # if getattr(args, "true_on_policy_mode", False):
+    #     if getattr(args, "bf16", False):
+    #         return torch.bfloat16
+    #     if getattr(args, "fp16", False):
+    #         return torch.float16
     return torch.float32
 
 

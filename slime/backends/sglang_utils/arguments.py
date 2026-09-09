@@ -163,7 +163,8 @@ def validate_args(args):
 
     if getattr(args, "true_on_policy_mode", False):
         args.sglang_enable_deterministic_inference = True
-        args.sglang_enable_prefill_only_deterministic_inference = True
+        # args.sglang_enable_prefill_only_deterministic_inference = True  # Inactive without CUDA graphs.
+        # Keep the caller's setting: forcing it also breaks FA3 graph capture on the tested A100 runtime.
         args.sglang_true_on_policy_contract = "qwen3_dense_true_on_policy_v1"
         args.sglang_attention_backend = "fa3"
 

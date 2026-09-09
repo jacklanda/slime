@@ -2155,16 +2155,17 @@ def slime_validate_args(args):
             )
         # Keep the internal mode self-contained. Launchers expose only their
         # public --true-on-policy switch; these are the cross-engine contract.
-        args.recompute_logprobs_via_prefill = True
-        args.batch_invariant_mode = True
-        args.deterministic_mode = True
+        # A100 TP4, CUDA graphs off: raw decode matches clean prefill, including ~15K contexts.
+        # args.recompute_logprobs_via_prefill = True  # Keep recomputation opt-in, not forced by TOP.
+        # args.batch_invariant_mode = True  # The SGLang backend enables the required kernels itself.
+        # args.deterministic_mode = True  # Disabling this AND global torch determinism preserved exact parity.
         args.sequence_parallel = False
         args.true_on_policy_contract = "qwen3_dense_true_on_policy_v1"
         args.transformer_impl = "local"
-        args.fp32_residual_connection = False
+        # args.fp32_residual_connection = False  # The retained SGLang residual-pair contract owns this math.
         args.bias_swiglu_fusion = False
         args.apply_rope_fusion = False
-        args.use_cpu_initialization = True
+        # args.use_cpu_initialization = True  # Only RoPE frequencies need CPU math; GPTModel retains that below.
 
     if getattr(args, "update_weights_interval", 1) < 1:
         raise ValueError("--update-weights-interval must be at least 1")

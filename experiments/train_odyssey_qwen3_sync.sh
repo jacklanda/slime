@@ -187,7 +187,8 @@ ALLOW_NO_LOAD_OPTIM="${ALLOW_NO_LOAD_OPTIM:-false}"
 # consistent_hashing alias. Keep an explicit environment override for older
 # deployments while defaulting to a parser-compatible policy.
 #ROUTER_POLICY="${ROUTER_POLICY:-cache_aware}"
-ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"
+# ROUTER_POLICY="${ROUTER_POLICY:-consistent_hashing}"  # Three-round batched scoring stayed bitwise exact.
+ROUTER_POLICY="${ROUTER_POLICY:-round_robin}"
 TERMINAL_LOG_STYLE="${TERMINAL_LOG_STYLE:-both}"
 SHOW_ROLLOUT_PROGRESS_LOGS="${SHOW_ROLLOUT_PROGRESS_LOGS:-false}"
 # Alternate training and rollout across all eight GPUs on this node.
@@ -200,7 +201,7 @@ ENABLE_YARN="${ENABLE_YARN:-false}"
 YARN_FACTOR="${YARN_FACTOR:-1.0}"
 YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS:-32768}"
 DISCARD_HISTORICAL_THINKING="${DISCARD_HISTORICAL_THINKING:-false}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-16}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-2}"
 TRAIN_MEMORY_MARGIN_BYTES="${TRAIN_MEMORY_MARGIN_BYTES:-536870912}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
 # Keep CPU capacity for raylet/dashboard heartbeats and checkpoint I/O.  When
@@ -252,7 +253,7 @@ KL_LOSS_COEF="${KL_LOSS_COEF:-0.00}"
 # Keep the expensive reference-model forward opt-in for this Qwen3 workload.
 USE_KL_LOSS="${USE_KL_LOSS:-0}"
 USE_TIS="${USE_TIS:-0}"
-USE_WANDB="${USE_WANDB:-1}"
+USE_WANDB="${USE_WANDB:-0}"
 WANDB_RESUME_SAME_RUN="${WANDB_RESUME_SAME_RUN:-1}"
 FUSED_HORIZON_REWARD_MIN_MULTIPLIER="${FUSED_HORIZON_REWARD_MIN_MULTIPLIER:-0.2}"
 FUSED_HORIZON_REWARD_GAMMA="${FUSED_HORIZON_REWARD_GAMMA:-1.0}"
@@ -581,7 +582,7 @@ EVAL_BENCHMARKS_ROOT="${EVAL_BENCHMARKS_ROOT:-${SCRIPT_DIR}/artifacts/benchmarks
 
 default_experiment_name() {
    #local prefix="odyssey-q3-4b-local-dev"
-   local prefix="odyssey-q3-4b-bitwise-parity-dev"
+   local prefix="odyssey-q3-4b-bitwise-parity-debug-dev"
    #local prefix="odyssey-q3-8b-think-dev"
    #local prefix="fused-dapo-q3-8b-dht-gem-sync-dev"
    #local prefix="fused-dapo-q3-4b-rft-dht-gem-sync-dev"  # w/ rft warmup
@@ -1058,10 +1059,10 @@ DEFAULT_TOKENS_PER_GPU=$(((MAX_CONTEXT_LEN + CP_SIZE - 1) / CP_SIZE))
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_PER_GPU}}"
 LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-${DEFAULT_TOKENS_PER_GPU}}"
 LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-4096}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-2}"
 # Keep the post-filter training batch at 50/50 webqa and mcp. The synchronous
 # collector keeps sampling each family until both accepted quotas are full.
-ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
+#ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-webqa=0.5,mcp=0.5}"
 ROLLOUT_TASK_FAMILY_QUOTAS="${ROLLOUT_TASK_FAMILY_QUOTAS:-}"
 ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS="${ROLLOUT_TASK_FAMILY_TOP_MEAN_STEPS:-true}"
 # Bound aggressive admission even when low ROI or long-tail groups keep the
@@ -1521,8 +1522,8 @@ SGLANG_ARGS=(
 )
 if is_truthy "${TRUE_ON_POLICY}"; then
    SGLANG_ARGS+=(
-      --sglang-enable-deterministic-inference
-      --sglang-enable-prefill-only-deterministic-inference
+      # --sglang-enable-deterministic-inference  # Already derived by SGLang argument validation.
+      # --sglang-enable-prefill-only-deterministic-inference  # No effect with CUDA graphs disabled.
       --sglang-true-on-policy-contract qwen3_dense_true_on_policy_v1
       --sglang-attention-backend fa3
    )
@@ -1557,7 +1558,7 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
-   --deterministic-mode
+   # --deterministic-mode  # TOP parity comes from the retained kernels; global torch determinism is redundant.
    --moe-token-dispatcher-type alltoall
    --train-memory-margin-bytes "${TRAIN_MEMORY_MARGIN_BYTES}"
    --train-env-vars '{"TMS_INIT_ENABLE_CPU_BACKUP":"1"}'
@@ -1565,8 +1566,10 @@ MISC_ARGS=(
 if is_truthy "${TRUE_ON_POLICY}"; then
    MISC_ARGS+=(
       --true-on-policy-mode
-      --recompute-logprobs-via-prefill
+      # --recompute-logprobs-via-prefill  # Raw/clean scores matched for short and ~15K contexts, graphs off.
    )
+else
+   MISC_ARGS+=(--deterministic-mode)  # Preserve the legacy launcher's setting.
 fi
 if is_truthy "${CHECK_WEIGHT_UPDATE_EQUAL:-1}"; then
    # One tensor-level equality check validates the transport at startup;
@@ -1597,13 +1600,14 @@ export TRUE_ON_POLICY
 export RUNS_ROOT RUN_ROOT SAVE_DIR LOG_ROOT EPISODE_LOG_DIR DUMP_DETAILS EVAL_CACHE_DIR PREPARED_PROMPT_DATA
 export UPDATE_WEIGHT_DISK_DIR WANDB_DIR WANDB_CACHE_DIR HF_HOME TORCH_HOME TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR XDG_CACHE_HOME MCP_ENV_ROOT
 export TORCH_COMPILE_JOB_ID TORCHINDUCTOR_FORCE_DISABLE_CACHES
-if is_truthy "${TRUE_ON_POLICY}"; then
-   export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=1
-   export SLIME_SGLANG_EXACT_RMSNORM=1
-else
-   export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=0
-   export SLIME_SGLANG_EXACT_RMSNORM=0
-fi
+# TOP uses its contract and full-vocabulary loss; these legacy selectors added no parity benefit.
+# if is_truthy "${TRUE_ON_POLICY}"; then
+#    export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=1
+#    export SLIME_SGLANG_EXACT_RMSNORM=1
+# else
+#    export SLIME_SGLANG_BATCH_INVARIANT_LOGPROB=0
+#    export SLIME_SGLANG_EXACT_RMSNORM=0
+# fi
 # Avoid materializing up to 40K x 152K full-sequence logits during policy
 # training. Only response positions are projected, in LOG_PROBS_CHUNK_SIZE tiles.
 export SLIME_TILED_POLICY_LOSS=0
@@ -1849,10 +1853,14 @@ env["LD_LIBRARY_PATH"] = os.pathsep.join(
     path for path in (os.path.join(sys.prefix, "lib"), os.environ.get("LD_LIBRARY_PATH")) if path
 )
 env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-env["NCCL_ALGO"] = "Ring"
+# env["NCCL_ALGO"] = "Ring"  # No difference on tested TP4 topology; deterministic row reduction stays enabled.
 env["NCCL_NVLS_ENABLE"] = os.environ["HAS_NVLINK"]
-env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
-env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+# env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"  # The TOP runtime still sets this; outer export is redundant.
+# env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # The TOP runtime still sets this; effective removal is unproven.
+if os.environ["TRUE_ON_POLICY"].lower() not in ("1", "true", "yes", "on"):
+    env["NCCL_ALGO"] = "Ring"
+    env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+    env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 print(json.dumps({"env_vars": env}))
 PY
 )
